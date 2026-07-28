@@ -1,2 +1,0 @@
-[console_scripts]
-auto-squid = auto_squid.cli:app
