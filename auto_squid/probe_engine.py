@@ -13,19 +13,29 @@ logger = logging.getLogger(__name__)
 
 
 class ProbeEngine:
-    """Minimal probe engine that probes known proxies and keeps recent samples.
+    """Probe engine with concurrency controls, warming/cold-start state, and probe history.
 
-    Stores per-proxy samples: list of (ts, latency_ms, success_bool)
+    Samples: proxy_id -> list of (ts, latency_ms, throughput_kbps, success)
+    States: proxy_id -> 'warming'|'normal'|'degraded'
     """
 
     def __init__(self, proxy_store: ProxyStore, probe_cfg: ProbeConfig | None = None, score_cfg: ScoreConfig | None = None):
         self.proxy_store = proxy_store
         self.probe_cfg = probe_cfg or ProbeConfig()
         self.score_cfg = score_cfg or ScoreConfig()
-        self._samples: Dict[str, List[Tuple[float, float, bool]]] = {}
+        self._samples: Dict[str, List[Tuple[float, float, float, bool]]] = {}
+        self._states: Dict[str, str] = {}
         self._running = False
         self._task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
+        # concurrency controls
+        self._global_sem = asyncio.Semaphore(self.probe_cfg.concurrency)
+        self._proxy_sems: Dict[str, asyncio.Semaphore] = {}
+
+    def _get_proxy_sem(self, proxy_id: str) -> asyncio.Semaphore:
+        if proxy_id not in self._proxy_sems:
+            self._proxy_sems[proxy_id] = asyncio.Semaphore(self.probe_cfg.per_proxy_concurrency)
+        return self._proxy_sems[proxy_id]
 
     async def _probe_proxy(self, proxy_id: str):
         proxy = self.proxy_store.get(proxy_id)
@@ -35,8 +45,10 @@ class ProbeEngine:
         port = proxy.port
         proxy_url = f"http://{host}:{port}"
         ts = time.time()
-        # TCP connect time
         tcp_start = time.time()
+        latency_ms = 0.0
+        throughput_kbps = 0.0
+        success = False
         try:
             reader, writer = await asyncio.open_connection(host, port)
             tcp_latency = (time.time() - tcp_start) * 1000.0
@@ -45,61 +57,116 @@ class ProbeEngine:
                 await writer.wait_closed()
             except Exception:
                 pass
-            # HTTP GET via proxy to probe URL to measure full round trip
             async with httpx.AsyncClient(proxies={"http://": proxy_url, "https://": proxy_url}, timeout=self.probe_cfg.timeout) as client:
                 start = time.time()
                 r = await client.get(str(self.probe_cfg.url))
                 r.raise_for_status()
-                http_latency = (time.time() - start) * 1000.0
+                duration = time.time() - start
+                http_latency = duration * 1000.0
+                content_len = len(r.content or b"")
+                if duration > 0 and content_len > 0:
+                    throughput_kbps = (content_len * 8.0) / (duration * 1024.0)
                 success = True
                 latency_ms = http_latency
         except Exception as e:
             logger.debug("probe proxy %s failed: %s", proxy_id, e)
             success = False
             latency_ms = (time.time() - tcp_start) * 1000.0
+            throughput_kbps = 0.0
 
         async with self._lock:
-            self._samples.setdefault(proxy_id, []).append((ts, latency_ms, success))
-            # trim history to configured history_minutes
+            lst = self._samples.setdefault(proxy_id, [])
+            lst.append((ts, latency_ms, throughput_kbps, success))
             cutoff = time.time() - (self.probe_cfg.history_minutes * 60)
-            self._samples[proxy_id] = [s for s in self._samples[proxy_id] if s[0] >= cutoff]
+            self._samples[proxy_id] = [s for s in lst if s[0] >= cutoff]
+            # update state
+            if len(self._samples[proxy_id]) < self.probe_cfg.min_samples:
+                self._states[proxy_id] = 'warming'
+            else:
+                # if many recent failures, mark degraded
+                failures = sum(1 for (_, _, _, ok) in self._samples[proxy_id] if not ok)
+                if failures / max(1, len(self._samples[proxy_id])) > 0.5:
+                    self._states[proxy_id] = 'degraded'
+                else:
+                    self._states[proxy_id] = 'normal'
 
     async def _probe_cycle(self):
         proxies = [p.id for p in self.proxy_store.list() if p.enabled]
         if not proxies:
             await asyncio.sleep(self.probe_cfg.interval)
             return
-        sem = asyncio.Semaphore(self.probe_cfg.concurrency)
         async def _p(pid):
-            async with sem:
-                await self._probe_proxy(pid)
+            async with self._global_sem:
+                async with self._get_proxy_sem(pid):
+                    await self._probe_proxy(pid)
         await asyncio.gather(*[_p(pid) for pid in proxies])
 
+    def _percentile(self, values: List[float], q: float) -> float:
+        if not values:
+            return 0.0
+        s = sorted(values)
+        idx = (len(s) - 1) * (q / 100.0)
+        lo = math.floor(idx)
+        hi = math.ceil(idx)
+        if lo == hi:
+            return s[int(idx)]
+        frac = idx - lo
+        return s[lo] * (1 - frac) + s[hi] * frac
+
+    def _iqr_filter(self, values: List[float]) -> List[float]:
+        if len(values) < 4:
+            return values
+        q1 = self._percentile(values, 25)
+        q3 = self._percentile(values, 75)
+        iqr = q3 - q1
+        low = q1 - 1.5 * iqr
+        high = q3 + 1.5 * iqr
+        return [v for v in values if v >= low and v <= high]
+
     def _compute_score_for_proxy(self, proxy_id: str) -> float:
-        # Compute combined score 0-100 where higher is better
         samples = self._samples.get(proxy_id, [])
         if not samples:
-            return 50.0  # neutral
+            return 50.0
         now = time.time()
         half_life = max(1, self.score_cfg.half_life_minutes)
-        weights = [math.exp(-math.log(2) * ((now - ts) / 60.0) / half_life) for ts, _, _ in samples]
-        latencies = [lat for (_, lat, ok) in samples]
-        successes = [1 if ok else 0 for (_, _, ok) in samples]
-        # simple weighted averages
+        timestamps = [ts for (ts, _, _, _) in samples]
+        latencies = [lat for (_, lat, _, _) in samples]
+        throughputs = [tp for (_, _, tp, _) in samples]
+        successes = [1 if ok else 0 for (_, _, _, ok) in samples]
+
+        latencies_f = self._iqr_filter(latencies)
+        throughputs_f = self._iqr_filter(throughputs)
+        if not latencies_f:
+            latencies_f = latencies
+        if not throughputs_f:
+            throughputs_f = throughputs
+
+        weights = [math.exp(-math.log(2) * ((now - ts) / 60.0) / half_life) for ts in timestamps]
         w_sum = sum(weights) if sum(weights) > 0 else 1.0
-        avg_latency = sum(w * l for w, l in zip(weights, latencies)) / w_sum
+
+        avg_latency = sum(latencies_f) / len(latencies_f) if latencies_f else 2000.0
+        avg_throughput = sum(throughputs_f) / len(throughputs_f) if throughputs_f else 0.0
         reliability = sum(w * s for w, s in zip(weights, successes)) / w_sum
-        # map latency to score (assuming 2000ms -> 0, 0ms -> 100)
+
         lat_score = max(0.0, 100.0 * (1.0 - min(avg_latency, 2000.0) / 2000.0))
         rel_score = reliability * 100.0
-        total = (self.score_cfg.latency_weight * lat_score + self.score_cfg.reliability_weight * rel_score)
-        # normalize if throughput weight present (we don't measure throughput yet)
-        # assume throughput neutral 50
-        total = total + (self.score_cfg.throughput_weight * 50.0)
+        tp_max = getattr(self.score_cfg, 'throughput_max', 1024.0)
+        tp_score = max(0.0, 100.0 * (min(avg_throughput, tp_max) / tp_max))
+
+        total = (self.score_cfg.latency_weight * lat_score +
+                 self.score_cfg.throughput_weight * tp_score +
+                 self.score_cfg.reliability_weight * rel_score)
         return total
 
     def get_scores(self) -> Dict[str, float]:
-        return {pid: self._compute_score_for_proxy(pid) for pid in self._samples.keys()}
+        proxies = [p.id for p in self.proxy_store.list()]
+        return {pid: self._compute_score_for_proxy(pid) for pid in proxies}
+
+    def get_states(self) -> Dict[str, str]:
+        return dict(self._states)
+
+    def get_history(self) -> Dict[str, List[Tuple[float, float, float, bool]]]:
+        return dict(self._samples)
 
     async def run_loop(self):
         self._running = True

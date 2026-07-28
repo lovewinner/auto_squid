@@ -16,11 +16,11 @@
 - [x] End-to-end smoke test: client -> B (auto_squid) -> selected proxy -> website
 
 优先级 P1 — Robustness & features
-- [ ] Add concurrency controls (global semaphore, per-domain/per-proxy limits) in probe engine.
-- [ ] Implement cold-start strategy and warming state for proxies/domains.
-- [ ] Add logging, metrics endpoints (/metrics) and store probe history for debugging.
-- [ ] Add retry/failover policy for request forwarding.
-- [ ] Add configuration file parsing and CLI flags.
+- [x] Add concurrency controls (global semaphore, per-domain/per-proxy limits) in probe engine.
+- [x] Implement cold-start strategy and warming state for proxies/domains.
+- [x] Add logging, metrics endpoints (/metrics) and store probe history for debugging.
+- [x] Add retry/failover policy for request forwarding.
+- [x] Add configuration file parsing and CLI flags.
 
 优先级 P2 — Ops & Security
 - [ ] Add token-based auth to management API and optional TLS support.

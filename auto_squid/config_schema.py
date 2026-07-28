@@ -21,6 +21,9 @@ class ProbeConfig(BaseModel):
     history_minutes: int = Field(10)
     batch_domains: int = Field(10)
     half_life_minutes: int = Field(5)
+    min_samples: int = Field(3)
+    per_proxy_concurrency: int = Field(5)
+    per_domain_concurrency: int = Field(20)
 
 
 class ScoreConfig(BaseModel):
@@ -28,6 +31,8 @@ class ScoreConfig(BaseModel):
     throughput_weight: float = Field(0.3)
     reliability_weight: float = Field(0.2)
     half_life_minutes: int = Field(5)
+    # throughput_max in kilobits per second used to map throughput to 0-100
+    throughput_max: float = Field(1024.0)
 
 
 class LoggingConfig(BaseModel):

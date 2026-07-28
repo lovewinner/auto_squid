@@ -56,6 +56,30 @@ async def probe_status():
     return {"running": getattr(_probe_engine, '_running', False)}
 
 
+@app.get("/probe/history")
+async def probe_history():
+    if not _probe_engine:
+        return {}
+    return _probe_engine.get_history()
+
+
+@app.get("/probe/states")
+async def probe_states():
+    if not _probe_engine:
+        return {}
+    return _probe_engine.get_states()
+
+
+@app.get("/metrics")
+async def metrics():
+    # basic metrics summary
+    if not _probe_engine:
+        return {}
+    scores = _probe_engine.get_scores()
+    states = _probe_engine.get_states()
+    return {"scores_count": len(scores), "states": states}
+
+
 def mount(proxy_store: ProxyStore, probe_engine: ProbeEngine):
     global _proxy_store, _probe_engine
     _proxy_store = proxy_store
