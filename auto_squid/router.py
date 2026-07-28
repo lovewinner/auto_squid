@@ -96,6 +96,7 @@ class Router:
             proxy_url = f"http://{proxy.host}:{proxy.port}"
         client = httpx.AsyncClient(proxy=proxy_url, limits=httpx.Limits(max_connections=1, max_keepalive_connections=0))
         try:
+            self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
             text = request_bytes.decode('latin-1', errors='ignore')
             lines = text.split('\r\n')
             req_line = lines[0]
@@ -112,16 +113,14 @@ class Router:
                     hdrs[k.strip()] = v.strip()
                 i += 1
             body = '\r\n'.join(lines[i+1:]).encode('latin-1') if i+1 < len(lines) else None
-            self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
             resp = await client.request(method, url, headers=hdrs, content=body, timeout=10)
             self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
             return pid, method, url, resp, client
-        except Exception as e:
+        except BaseException:
             try:
                 await client.aclose()
             except (BrokenPipeError, ConnectionError, OSError):
                 pass
-            logger.debug("_try_proxy exception: %s", e)
             raise
 
     async def _handle_http_request(self, request_bytes: bytes, writer: asyncio.StreamWriter):
