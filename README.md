@@ -2,6 +2,8 @@
 
 Lightweight forward proxy with parallel racing, domain-based stats, and SQLite persistence.
 
+> [中文说明 →](README_cn.md)
+
 ## Overview
 
 - Runs on a gateway host, accepts HTTP/HTTPS proxy traffic, and forwards each request through upstream proxies
