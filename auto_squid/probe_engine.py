@@ -1,6 +1,7 @@
 import asyncio
 import time
 import logging
+import urllib.parse
 from typing import Dict, List, Tuple
 import math
 
@@ -54,7 +55,9 @@ class ProbeEngine:
         host = proxy.host
         port = proxy.port
         if proxy.auth:
-            proxy_url = f"http://{proxy.auth['username']}:{proxy.auth['password']}@{host}:{port}"
+            user = urllib.parse.quote(proxy.auth['username'], safe='')
+            pw = urllib.parse.quote(proxy.auth['password'], safe='')
+            proxy_url = f"http://{user}:{pw}@{host}:{port}"
         else:
             proxy_url = f"http://{host}:{port}"
         ts = time.time()
@@ -70,8 +73,9 @@ class ProbeEngine:
                 await writer.wait_closed()
             except Exception:
                 pass
-            async with httpx.AsyncClient(proxy=proxy_url, timeout=self.probe_cfg.timeout) as client:
-                # set Host header to domain if provided to exercise domain-specific pathing
+            client = httpx.AsyncClient(proxy=proxy_url, timeout=self.probe_cfg.timeout,
+                                       limits=httpx.Limits(max_connections=1, max_keepalive_connections=0))
+            try:
                 headers = {"Host": domain} if domain else None
                 start = time.time()
                 r = await client.get(str(self.probe_cfg.url), headers=headers)
@@ -83,6 +87,16 @@ class ProbeEngine:
                     throughput_kbps = (content_len * 8.0) / (duration * 1024.0)
                 success = True
                 latency_ms = http_latency
+            except Exception as e:
+                logger.debug("probe proxy %s failed: %s", proxy_id, e)
+                success = False
+                latency_ms = (time.time() - tcp_start) * 1000.0
+                throughput_kbps = 0.0
+            finally:
+                try:
+                    await client.aclose()
+                except (BrokenPipeError, ConnectionError, OSError):
+                    pass
         except Exception as e:
             logger.debug("probe proxy %s failed: %s", proxy_id, e)
             success = False
@@ -204,6 +218,8 @@ class ProbeEngine:
         try:
             while self._running:
                 await self._probe_cycle()
+                scores = self.get_scores()
+                logger.info("probe scores: %s", scores)
                 await asyncio.sleep(self.probe_cfg.interval)
         except asyncio.CancelledError:
             logger.info("ProbeEngine cancelled")

@@ -4,6 +4,7 @@ from typing import List
 
 from .proxy_store import ProxyStore
 from .probe_engine import ProbeEngine
+from .router import Router
 from .config_schema import ProxyInfo
 
 app = FastAPI(title="auto_squid API")
@@ -11,6 +12,7 @@ app = FastAPI(title="auto_squid API")
 # these will be set by CLI on startup
 _proxy_store: ProxyStore | None = None
 _probe_engine: ProbeEngine | None = None
+_router: Router | None = None
 
 
 class ProxyIn(BaseModel):
@@ -72,15 +74,24 @@ async def probe_states():
 
 @app.get("/metrics")
 async def metrics():
-    # basic metrics summary
     if not _probe_engine:
         return {}
     scores = _probe_engine.get_scores()
     states = _probe_engine.get_states()
-    return {"scores_count": len(scores), "states": states}
+    counts = _router.request_counts if _router else {}
+    attempts = _router.attempted_counts if _router else {}
+    return {"scores_count": len(scores), "states": states, "request_counts": counts, "attempted_counts": attempts}
 
 
-def mount(proxy_store: ProxyStore, probe_engine: ProbeEngine):
-    global _proxy_store, _probe_engine
+@app.get("/stats")
+async def stats():
+    counts = _router.request_counts if _router else {}
+    attempts = _router.attempted_counts if _router else {}
+    return {"request_counts": counts, "attempted_counts": attempts}
+
+
+def mount(proxy_store: ProxyStore, probe_engine: ProbeEngine, router: Router | None = None):
+    global _proxy_store, _probe_engine, _router
     _proxy_store = proxy_store
     _probe_engine = probe_engine
+    _router = router
