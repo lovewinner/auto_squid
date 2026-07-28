@@ -3,15 +3,16 @@
 目标：把 auto_squid 从设计骨架完善为能在 B 上运行、按域名选择并转发到最优代理的可用原型。
 
 优先级 P0 — MVP
-- [ ] Implement HTTP/CONNECT forwarding router (auto_squid/router)
+- [x] Implement HTTP/CONNECT forwarding router (auto_squid/router)
   - Parse Host/CONNECT target, perform proxy selection, forward request/stream.
-- [ ] Implement ProxyStore persistence (load from examples/proxies.yaml) and runtime CRUD API.
-- [ ] Implement ProbeEngine minimal probes
+- [x] Implement ProxyStore persistence (load from examples/proxies.yaml) and runtime CRUD API.
+- [x] Implement ProbeEngine minimal probes
   - TCP connect timing
   - HTTP GET to probe_url (204) for RTT
   - Store timestamped samples in memory (history window)
-- [ ] Implement scoring (latency/throughput/reliability) with time decay and IQR outlier removal.
-- [ ] Expose Management API endpoints: /health, /proxies, /score?domain=, /probe/status.
+- [x] Implement scoring (latency/throughput/reliability) with time decay and IQR outlier removal.  
+  - NOTE: Partial implementation — time-decayed latency and reliability scoring implemented; IQR outlier removal and throughput measurement remain to be added.
+- [x] Expose Management API endpoints: /health, /proxies, /score?domain=, /probe/status.
 - [ ] End-to-end smoke test: client -> B (auto_squid) -> selected proxy -> website
 
 优先级 P1 — Robustness & features
