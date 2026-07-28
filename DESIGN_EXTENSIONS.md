@@ -67,7 +67,7 @@ Recommended options for storing credentials
   - CLI could accept credentials at runtime and never write to disk (good for ephemeral sessions but inconvenient for long-running services).
 
 API access & tokens
-- Default: management API binds to 127.0.0.1 only and requires no auth for local use.
+- Default: management API binds to 127.0.0.1 and requires no auth for local use.
 - If remote access is enabled, require at least API token in Authorization header (Bearer). Provide CLI helper to generate tokens and revoke them.
 - For high-security deployments, recommend mutual TLS (mTLS) on management API.
 

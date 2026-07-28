@@ -24,8 +24,8 @@ pwd = keyring.get_password("auto-squid", proxy_id)
 B) Encrypted config file
 - Use `cryptography.Fernet` or libsodium to encrypt sensitive fields in proxies.yaml. The app prompts for a master password on startup or reads it from an env var.
 - Example workflow:
-  - `auto-squid encrypt-creds --in proxies.yaml --out proxies.enc --master-pass`
-  - `auto-squid start --creds-file proxies.enc`
+- `auto-squid encrypt-creds --in proxies.yaml --out proxies.enc --master-pass`
+- `auto-squid start --creds-file proxies.enc`
 
 C) In-memory only
 - For ephemeral sessions, accept credentials via CLI or environment and keep them only in memory without writing to disk.
