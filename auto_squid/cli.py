@@ -39,7 +39,7 @@ app = typer.Typer()
 
 
 @app.callback(invoke_without_command=True)
-def start(config: str = "", proxies: str = ""):
+def start(config: str = "", proxies: str = "", db: str = "auto_squid.db"):
     """Start API and proxy router. Optionally pass config YAML and proxies YAML paths."""
     cfg = None
     if config:
@@ -50,7 +50,7 @@ def start(config: str = "", proxies: str = ""):
     setup_logging(cfg)
     proxy_store = ProxyStore(proxies if proxies else "proxies.yaml")
     probe_engine = ProbeEngine(proxy_store, probe_cfg=cfg.probe, score_cfg=cfg.score)
-    router = Router(proxy_store, probe_engine, listen_host=cfg.listen.host, listen_port=cfg.listen.port)
+    router = Router(proxy_store, probe_engine, listen_host=cfg.listen.host, listen_port=cfg.listen.port, db_path=db)
     mount_api(proxy_store, probe_engine, router)
 
     async def _main():

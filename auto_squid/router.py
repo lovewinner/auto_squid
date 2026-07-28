@@ -2,6 +2,7 @@ import asyncio
 import base64
 import logging
 import random
+import sqlite3
 import urllib.parse
 from typing import Optional, List
 import httpx
@@ -33,7 +34,7 @@ class ProxySelector:
 class Router:
     """Router with retry/failover policy: try top N proxies on failure."""
 
-    def __init__(self, proxy_store: ProxyStore, probe_engine: ProbeEngine, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3):
+    def __init__(self, proxy_store: ProxyStore, probe_engine: ProbeEngine, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db"):
         self.proxy_store = proxy_store
         self.probe_engine = probe_engine
         self.selector = ProxySelector(probe_engine, proxy_store)
@@ -44,6 +45,24 @@ class Router:
         self.request_counts: dict[str, int] = {}
         self.attempted_counts: dict[str, int] = {}
         self.domain_stats: dict[str, dict[str, int]] = {}
+        self._db = sqlite3.connect(db_path, check_same_thread=False)
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS domain_stats (
+                domain TEXT NOT NULL,
+                proxy_id TEXT NOT NULL,
+                wins INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (domain, proxy_id)
+            )
+        """)
+        self._db.commit()
+
+    def _save_domain_stats(self, domain: str, pid: str):
+        self._db.execute(
+            "INSERT INTO domain_stats (domain, proxy_id, wins) VALUES (?, ?, 1) "
+            "ON CONFLICT(domain, proxy_id) DO UPDATE SET wins = wins + 1",
+            (domain, pid),
+        )
+        self._db.commit()
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         peer = writer.get_extra_info('peername')
@@ -119,6 +138,7 @@ class Router:
             domain = urllib.parse.urlparse(url).hostname or url
             per_domain = self.domain_stats.setdefault(domain, {})
             per_domain[pid] = per_domain.get(pid, 0) + 1
+            self._save_domain_stats(domain, pid)
             return pid, method, url, resp, client
         except BaseException:
             try:
@@ -228,6 +248,7 @@ class Router:
             self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
             per_domain = self.domain_stats.setdefault(target, {})
             per_domain[pid] = per_domain.get(pid, 0) + 1
+            self._save_domain_stats(target, pid)
             return pid, up_reader, up_writer
         except Exception as e:
             try:
@@ -319,3 +340,4 @@ class Router:
         if self._server:
             self._server.close()
             await self._server.wait_closed()
+        self._db.close()
