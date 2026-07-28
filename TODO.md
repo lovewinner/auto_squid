@@ -10,10 +10,10 @@
   - TCP connect timing
   - HTTP GET to probe_url (204) for RTT
   - Store timestamped samples in memory (history window)
-- [x] Implement scoring (latency/throughput/reliability) with time decay and IQR outlier removal.  
-  - NOTE: Partial implementation — time-decayed latency and reliability scoring implemented; IQR outlier removal and throughput measurement remain to be added.
+- [x] Implement scoring (latency/throughput/reliability) with time decay and IQR outlier removal.
+  - NOTE: Implemented — time-decayed latency, IQR outlier removal and throughput measurement are implemented; scoring combines latency, throughput and reliability.
 - [x] Expose Management API endpoints: /health, /proxies, /score?domain=, /probe/status.
-- [ ] End-to-end smoke test: client -> B (auto_squid) -> selected proxy -> website
+- [x] End-to-end smoke test: client -> B (auto_squid) -> selected proxy -> website
 
 优先级 P1 — Robustness & features
 - [ ] Add concurrency controls (global semaphore, per-domain/per-proxy limits) in probe engine.
