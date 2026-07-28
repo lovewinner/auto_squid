@@ -116,11 +116,12 @@ class Router:
             resp = await client.request(method, url, headers=hdrs, content=body, timeout=10)
             self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
             return pid, method, url, resp, client
-        except BaseException:
+        except Exception as e:
             try:
                 await client.aclose()
             except (BrokenPipeError, ConnectionError, OSError):
                 pass
+            logger.debug("_try_proxy exception: %s", e)
             raise
 
     async def _handle_http_request(self, request_bytes: bytes, writer: asyncio.StreamWriter):
@@ -129,11 +130,12 @@ class Router:
             try:
                 writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n\r\nBad Gateway")
                 await writer.drain()
-            except BaseException:
+            except Exception:
                 pass
             try:
                 writer.close()
-            except BaseException:
+                await writer.wait_closed()
+            except Exception:
                 pass
             return
 
@@ -149,7 +151,7 @@ class Router:
                     pid, method, url, resp, client = t.result()
                     winner_resp = (pid, method, url, resp, client)
                     break
-                except BaseException:
+                except Exception:
                     pass
             if winner_resp:
                 for t in tasks:
@@ -163,8 +165,13 @@ class Router:
             try:
                 status_line = f"HTTP/1.1 {resp.status_code} {resp.reason_phrase}\r\n"
                 writer.write(status_line.encode('latin-1'))
+                hop_by_hop = {'transfer-encoding', 'content-encoding', 'keep-alive',
+                              'proxy-connection', 'te', 'trailer', 'upgrade'}
                 for k, v in resp.headers.items():
+                    if k.lower() in hop_by_hop:
+                        continue
                     writer.write(f"{k}: {v}\r\n".encode('latin-1'))
+                writer.write(f"Content-Length: {len(resp.content)}\r\n".encode('latin-1'))
                 writer.write(b"\r\n")
                 writer.write(resp.content)
                 await writer.drain()
@@ -217,12 +224,13 @@ class Router:
                     break
             self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
             return pid, up_reader, up_writer
-        except BaseException:
+        except Exception as e:
             try:
                 up_writer.close()
                 await up_writer.wait_closed()
             except Exception:
                 pass
+            logger.debug("_try_connect exception: %s", e)
             raise
 
     async def _handle_connect(self, target: str, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter):
@@ -247,7 +255,7 @@ class Router:
                     pid, up_reader, up_writer = t.result()
                     winner = (pid, up_reader, up_writer)
                     break
-                except BaseException:
+                except Exception:
                     pass
             if winner:
                 for t in tasks:
@@ -290,11 +298,12 @@ class Router:
         try:
             client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n\r\nBad Gateway")
             await client_writer.drain()
-        except BaseException:
+        except Exception:
             pass
         try:
             client_writer.close()
-        except BaseException:
+            await client_writer.wait_closed()
+        except Exception:
             pass
 
     async def start(self):
