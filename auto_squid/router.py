@@ -64,6 +64,13 @@ class Router:
         )
         self._db.commit()
 
+    def get_domain_stats_from_db(self) -> dict[str, dict[str, int]]:
+        rows = self._db.execute("SELECT domain, proxy_id, wins FROM domain_stats").fetchall()
+        result: dict[str, dict[str, int]] = {}
+        for domain, pid, wins in rows:
+            result.setdefault(domain, {})[pid] = wins
+        return result
+
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         peer = writer.get_extra_info('peername')
         logger.info("client connected %s", peer)

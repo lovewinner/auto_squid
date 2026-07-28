@@ -80,7 +80,7 @@ async def metrics():
     states = _probe_engine.get_states()
     counts = _router.request_counts if _router else {}
     attempts = _router.attempted_counts if _router else {}
-    domain_stats = _router.domain_stats if _router else {}
+    domain_stats = _router.get_domain_stats_from_db() if _router else {}
     return {"scores_count": len(scores), "states": states, "request_counts": counts, "attempted_counts": attempts, "domain_stats": domain_stats}
 
 
@@ -95,7 +95,7 @@ async def stats():
 async def domains():
     if not _router:
         return {}
-    return dict(_router.domain_stats)
+    return _router.get_domain_stats_from_db()
 
 
 def mount(proxy_store: ProxyStore, probe_engine: ProbeEngine, router: Router | None = None):
