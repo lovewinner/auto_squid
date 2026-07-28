@@ -1,0 +1,26 @@
+# examples/proxies.yaml
+# Each entry follows ProxyInfo schema (id, name, host, port, protocol, auth, enabled, tags)
+
+- id: squid-beijing-01
+  name: "北京 节点 01"
+  host: 10.14.25.86
+  port: 3128
+  protocol: http
+  auth:
+    username: "proxyuser"
+    password: "s3cretP@ss"
+  enabled: true
+  tags:
+    region: beijing
+
+- id: squid-shanghai-01
+  name: "上海 节点 01"
+  host: 10.20.5.10
+  port: 3128
+  protocol: http
+  auth:
+    username: "sh_user"
+    password: "anotherPass123"
+  enabled: true
+  tags:
+    region: shanghai
