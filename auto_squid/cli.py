@@ -13,7 +13,7 @@ from .config_schema import Config
 app = typer.Typer()
 
 
-@app.command()
+@app.callback(invoke_without_command=True)
 def start(config: str = "", proxies: str = ""):
     """Start API and proxy router. Optionally pass config YAML and proxies YAML paths."""
     logging.basicConfig(level=logging.INFO)
