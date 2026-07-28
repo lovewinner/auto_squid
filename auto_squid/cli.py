@@ -23,7 +23,7 @@ def start(config: str = "", proxies: str = ""):
         cfg = Config(**yaml.safe_load(Path(config).read_text()))
     else:
         cfg = Config()
-    proxy_store = ProxyStore(proxies if proxies else None)
+    proxy_store = ProxyStore(proxies if proxies else "proxies.yaml")
     probe_engine = ProbeEngine(proxy_store, probe_cfg=cfg.probe, score_cfg=cfg.score)
     mount_api(proxy_store, probe_engine)
     router = Router(proxy_store, probe_engine, listen_host=cfg.listen.host, listen_port=cfg.listen.port)
@@ -40,6 +40,8 @@ def start(config: str = "", proxies: str = ""):
             await api_task
         finally:
             probe_engine.stop()
+            probe_task.cancel()
+            await asyncio.gather(probe_task, return_exceptions=True)
             await router.stop()
 
     asyncio.run(_main())

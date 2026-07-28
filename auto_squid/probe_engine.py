@@ -53,7 +53,10 @@ class ProbeEngine:
             return
         host = proxy.host
         port = proxy.port
-        proxy_url = f"http://{host}:{port}"
+        if proxy.auth:
+            proxy_url = f"http://{proxy.auth['username']}:{proxy.auth['password']}@{host}:{port}"
+        else:
+            proxy_url = f"http://{host}:{port}"
         ts = time.time()
         tcp_start = time.time()
         latency_ms = 0.0
@@ -67,7 +70,7 @@ class ProbeEngine:
                 await writer.wait_closed()
             except Exception:
                 pass
-            async with httpx.AsyncClient(proxies={"http://": proxy_url, "https://": proxy_url}, timeout=self.probe_cfg.timeout) as client:
+            async with httpx.AsyncClient(proxy=proxy_url, timeout=self.probe_cfg.timeout) as client:
                 # set Host header to domain if provided to exercise domain-specific pathing
                 headers = {"Host": domain} if domain else None
                 start = time.time()
