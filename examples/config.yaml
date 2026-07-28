@@ -1,0 +1,30 @@
+# Example auto_squid config (config.yaml)
+listen:
+  host: 0.0.0.0
+  port: 10808
+api:
+  host: 0.0.0.0
+  port: 18080
+  bind_remote: true
+probe:
+  url: "https://www.gstatic.com/generate_204"
+  interval: 60
+  timeout: 10
+  concurrency: 20
+  history_minutes: 10
+  batch_domains: 10
+score:
+  latency_weight: 0.5
+  throughput_weight: 0.3
+  reliability_weight: 0.2
+logging:
+  level: INFO
+
+# Option A: embed proxies here (small setups)
+# proxies:
+#   - id: squid-beijing-01
+#     host: 10.14.25.86
+#     port: 3128
+#     protocol: http
+
+# Option B: keep proxies in examples/proxies.yaml and load at runtime

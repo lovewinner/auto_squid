@@ -1,0 +1,15 @@
+README.md
+pyproject.toml
+auto_squid/__init__.py
+auto_squid/api.py
+auto_squid/cli.py
+auto_squid/domain_index.py
+auto_squid/probe_engine.py
+auto_squid/proxy_store.py
+auto_squid.egg-info/PKG-INFO
+auto_squid.egg-info/SOURCES.txt
+auto_squid.egg-info/dependency_links.txt
+auto_squid.egg-info/entry_points.txt
+auto_squid.egg-info/requires.txt
+auto_squid.egg-info/top_level.txt
+tests/test_smoke.py
