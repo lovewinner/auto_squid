@@ -106,31 +106,27 @@ class ProbeEngine:
         if not proxies:
             await asyncio.sleep(self.probe_cfg.interval)
             return
--        async def _p(pid):
--            async with self._global_sem:
--                async with self._get_proxy_sem(pid):
--                    await self._probe_proxy(pid)
--        await asyncio.gather(*[_p(pid) for pid in proxies])
-+        # If domain_index provided, probe per (domain, proxy) with per-domain semaphores
-+        domains = []
-+        if self.domain_index:
-+            domains = self.domain_index.recent(limit=self.probe_cfg.batch_domains)
-+        # default to a single None domain to probe proxies generally
-+        if not domains:
-+            domains = [None]
-+
-+        async def _p(pid, domain):
-+            async with self._global_sem:
-+                async with self._get_proxy_sem(pid):
-+                    async with self._get_domain_sem(domain or '__global__'):
-+                        await self._probe_proxy(pid, domain)
-+
-+        tasks = []
-+        for domain in domains:
-+            for pid in proxies:
-+                tasks.append(_p(pid, domain))
-+
-+        await asyncio.gather(*tasks)
+
+        # If domain_index provided, probe per (domain, proxy) with per-domain semaphores
+        domains = []
+        if self.domain_index:
+            domains = self.domain_index.recent(limit=self.probe_cfg.batch_domains)
+        # default to a single None domain to probe proxies generally
+        if not domains:
+            domains = [None]
+
+        async def _p(pid, domain):
+            async with self._global_sem:
+                async with self._get_proxy_sem(pid):
+                    async with self._get_domain_sem(domain or '__global__'):
+                        await self._probe_proxy(pid, domain)
+
+        tasks = []
+        for domain in domains:
+            for pid in proxies:
+                tasks.append(_p(pid, domain))
+
+        await asyncio.gather(*tasks)
 
     def _percentile(self, values: List[float], q: float) -> float:
         if not values:
