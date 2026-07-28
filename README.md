@@ -13,7 +13,8 @@
 Quick start（当前为设计草案）
 
 1. 阅读设计：
-   - 主设计文档：DESIGN.md
+   - 详细设计已归档至 docs/archive/（原 DESIGN.md、PROBING.md 等），主要运行与示例保留在本仓库根目录与 docs/ 下。
+   - 快速集成参考：docs/SQUID_INTEGRATION.md
 
 2. 要实现并运行本项目，你需要：
    - 完整实现源码（router, probe_engine, domain_index, proxy_store, api_server, cli）
