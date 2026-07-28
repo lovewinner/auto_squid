@@ -43,6 +43,7 @@ class Router:
         self._server: Optional[asyncio.AbstractServer] = None
         self.request_counts: dict[str, int] = {}
         self.attempted_counts: dict[str, int] = {}
+        self.domain_stats: dict[str, dict[str, int]] = {}
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         peer = writer.get_extra_info('peername')
@@ -115,6 +116,9 @@ class Router:
             body = '\r\n'.join(lines[i+1:]).encode('latin-1') if i+1 < len(lines) else None
             resp = await client.request(method, url, headers=hdrs, content=body, timeout=10)
             self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
+            domain = urllib.parse.urlparse(url).hostname or url
+            per_domain = self.domain_stats.setdefault(domain, {})
+            per_domain[pid] = per_domain.get(pid, 0) + 1
             return pid, method, url, resp, client
         except BaseException:
             try:
@@ -222,6 +226,8 @@ class Router:
                 if not h or h in (b"\r\n", b"\n"):
                     break
             self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
+            per_domain = self.domain_stats.setdefault(target, {})
+            per_domain[pid] = per_domain.get(pid, 0) + 1
             return pid, up_reader, up_writer
         except Exception as e:
             try:
