@@ -50,7 +50,7 @@ def start(config: str = "", proxies: str = "", db: str = "auto_squid.db"):
     setup_logging(cfg)
     proxy_store = ProxyStore(proxies if proxies else "proxies.yaml")
     probe_engine = ProbeEngine(proxy_store, probe_cfg=cfg.probe, score_cfg=cfg.score)
-    router = Router(proxy_store, probe_engine, listen_host=cfg.listen.host, listen_port=cfg.listen.port, db_path=db)
+    router = Router(proxy_store, probe_engine, listen_host=cfg.listen.host, listen_port=cfg.listen.port, db_path=db, cache_ttl=cfg.router.cache_ttl)
     mount_api(proxy_store, probe_engine, router)
 
     async def _main():

@@ -51,10 +51,14 @@ class ProxyInfo(BaseModel):
     tags: Optional[Dict[str, str]] = None
 
 
+class RouterConfig(BaseModel):
+    cache_ttl: int = Field(600, description="seconds before domain cache expires (default 10 min)")
+
 class Config(BaseModel):
     listen: ListenConfig = Field(default_factory=ListenConfig)
     api: APIConfig = Field(default_factory=APIConfig)
     probe: ProbeConfig = Field(default_factory=ProbeConfig)
     score: ScoreConfig = Field(default_factory=ScoreConfig)
+    router: RouterConfig = Field(default_factory=RouterConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     proxies: Optional[List[ProxyInfo]] = None

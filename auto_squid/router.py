@@ -34,7 +34,7 @@ class ProxySelector:
 class Router:
     """Router with retry/failover policy: try top N proxies on failure."""
 
-    def __init__(self, proxy_store: ProxyStore, probe_engine: ProbeEngine, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db"):
+    def __init__(self, proxy_store: ProxyStore, probe_engine: ProbeEngine, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600):
         self.proxy_store = proxy_store
         self.probe_engine = probe_engine
         self.selector = ProxySelector(probe_engine, proxy_store)
@@ -45,6 +45,7 @@ class Router:
         self.request_counts: dict[str, int] = {}
         self.attempted_counts: dict[str, int] = {}
         self.domain_stats: dict[str, dict[str, int]] = {}
+        self.cache_ttl = cache_ttl
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         from datetime import datetime, timezone
         self._db.execute("""
@@ -92,6 +93,23 @@ class Router:
         rows = self._db.execute("SELECT domain, default_proxy, updated_at FROM domain_meta").fetchall()
         return {domain: {"default_proxy": dp, "updated_at": ua} for domain, dp, ua in rows}
 
+    def _get_fresh_proxy(self, domain: str) -> Optional[str]:
+        from datetime import datetime, timezone
+        row = self._db.execute(
+            "SELECT default_proxy, updated_at FROM domain_meta WHERE domain = ?",
+            (domain,)
+        ).fetchone()
+        if not row:
+            return None
+        pid, updated_at_str = row
+        try:
+            dt = datetime.fromisoformat(updated_at_str)
+            if (datetime.now(timezone.utc) - dt).total_seconds() < self.cache_ttl:
+                return pid
+        except Exception:
+            pass
+        return None
+
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         peer = writer.get_extra_info('peername')
         logger.info("client connected %s", peer)
@@ -132,7 +150,7 @@ class Router:
             except Exception:
                 pass
 
-    async def _try_proxy(self, pid: str, request_bytes: bytes):
+    async def _try_proxy(self, pid: str, request_bytes: bytes, update_meta: bool = True):
         proxy = self.proxy_store.get(pid)
         if not proxy:
             raise ValueError(f"proxy {pid} not found")
@@ -167,7 +185,8 @@ class Router:
             per_domain = self.domain_stats.setdefault(domain, {})
             per_domain[pid] = per_domain.get(pid, 0) + 1
             self._save_domain_stats(domain, pid)
-            self._update_domain_meta(domain, pid)
+            if update_meta:
+                self._update_domain_meta(domain, pid)
             return pid, method, url, resp, client
         except BaseException:
             try:
@@ -177,6 +196,36 @@ class Router:
             raise
 
     async def _handle_http_request(self, request_bytes: bytes, writer: asyncio.StreamWriter):
+        text = request_bytes.decode('latin-1', errors='ignore')
+        first_line = text.split('\r\n')[0]
+        parts = first_line.split(' ')
+        domain = urllib.parse.urlparse(parts[1]).hostname if len(parts) >= 3 else None
+        if domain:
+            cached_pid = self._get_fresh_proxy(domain)
+            if cached_pid:
+                try:
+                    pid, method, url, resp, client = await self._try_proxy(cached_pid, request_bytes, update_meta=False)
+                    logger.info("proxy %s cache hit %s %s", pid, method, url)
+                    status_line = f"HTTP/1.1 {resp.status_code} {resp.reason_phrase}\r\n"
+                    writer.write(status_line.encode('latin-1'))
+                    hop_by_hop = {'transfer-encoding', 'content-encoding', 'keep-alive',
+                                  'proxy-connection', 'te', 'trailer', 'upgrade'}
+                    for k, v in resp.headers.items():
+                        if k.lower() in hop_by_hop:
+                            continue
+                        writer.write(f"{k}: {v}\r\n".encode('latin-1'))
+                    writer.write(f"Content-Length: {len(resp.content)}\r\n".encode('latin-1'))
+                    writer.write(b"\r\n")
+                    writer.write(resp.content)
+                    await writer.drain()
+                    try:
+                        await client.aclose()
+                    except (BrokenPipeError, ConnectionError, OSError):
+                        pass
+                    return
+                except Exception:
+                    logger.debug("cached proxy %s failed for %s", cached_pid, domain)
+
         proxies = self.selector.ordered_proxies()
         if not proxies:
             try:
@@ -246,7 +295,7 @@ class Router:
             await writer.wait_closed()
         except Exception:
             pass
-    async def _try_connect(self, pid: str, target: str):
+    async def _try_connect(self, pid: str, target: str, update_meta: bool = True):
         proxy = self.proxy_store.get(pid)
         if not proxy:
             raise ValueError(f"proxy {pid} not found")
@@ -278,7 +327,8 @@ class Router:
             per_domain = self.domain_stats.setdefault(target, {})
             per_domain[pid] = per_domain.get(pid, 0) + 1
             self._save_domain_stats(target, pid)
-            self._update_domain_meta(target, pid)
+            if update_meta:
+                self._update_domain_meta(target, pid)
             return pid, up_reader, up_writer
         except Exception as e:
             try:
@@ -290,6 +340,38 @@ class Router:
             raise
 
     async def _handle_connect(self, target: str, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter):
+        cached_pid = self._get_fresh_proxy(target)
+        if cached_pid:
+            try:
+                pid, up_reader, up_writer = await self._try_connect(cached_pid, target, update_meta=False)
+                logger.info("proxy %s cache hit CONNECT %s", pid, target)
+                client_writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                await client_writer.drain()
+                async def pipe(reader, writer):
+                    try:
+                        while True:
+                            data = await reader.read(4096)
+                            if not data:
+                                break
+                            writer.write(data)
+                            await writer.drain()
+                    except Exception:
+                        pass
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                await asyncio.gather(pipe(client_reader, up_writer), pipe(up_reader, client_writer))
+                try:
+                    up_writer.close()
+                    await up_writer.wait_closed()
+                except Exception:
+                    pass
+                return
+            except Exception:
+                logger.debug("cached proxy %s failed CONNECT %s", cached_pid, target)
+
         proxies = self.selector.ordered_proxies()
         if not proxies:
             try:
