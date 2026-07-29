@@ -128,38 +128,61 @@ td.domain{font-weight:500;color:#a8d8ea}
 td.num{text-align:center;font-variant-numeric:tabular-nums}
 td.best{font-weight:600;color:#e94560}
 .no-data{padding:40px;text-align:center;color:#666}
-.footer{margin-top:12px;font-size:12px;color:#555}
+.pager{display:flex;gap:8px;margin-top:12px;align-items:center;justify-content:center;flex-wrap:wrap}
+.pager button{padding:6px 14px;border:1px solid #333;border-radius:4px;background:#16213e;color:#e0e0e0;font-size:13px;cursor:pointer}
+.pager button:hover{border-color:#e94560}
+.pager button.active{background:#e94560;color:#fff;border-color:#e94560;font-weight:600}
+.pager button:disabled{opacity:.35;cursor:default}
+.pager span{font-size:13px;color:#888;margin:0 4px}
+.footer{margin-top:8px;font-size:12px;color:#555;text-align:center}
 </style>
 </head>
 <body>
 <h1>Domain Stats</h1>
 <div class="toolbar">
-<input id="filter" placeholder="Filter domains..." oninput="render()">
+<input id="filter" placeholder="Filter domains..." oninput="onFilter()">
 <button onclick="fetchData()">Refresh</button>
 </div>
 <div id="table-wrap"></div>
+<div id="pager" class="pager"></div>
 <div id="footer" class="footer"></div>
 <script>
 let data = {}, proxyIds = [];
+let page = 0, pageSize = 20;
 
 async function fetchData() {
   const r = await fetch('/domains');
   data = await r.json();
   proxyIds = [...new Set(Object.values(data).flatMap(v => Object.keys(v)))].sort();
+  page = 0;
   render();
 }
 
-function render() {
+function getFiltered() {
   const q = document.getElementById('filter').value.toLowerCase();
+  return Object.entries(data).filter(([d]) => d.includes(q));
+}
+
+function onFilter() { page = 0; render(); }
+
+function render() {
+  const entries = getFiltered();
   const wrap = document.getElementById('table-wrap');
-  const entries = Object.entries(data).filter(([d]) => d.includes(q));
-  if (!entries.length) { wrap.innerHTML = '<div class="no-data">No data</div>'; document.getElementById('footer').textContent = ''; return; }
+  if (!entries.length) {
+    wrap.innerHTML = '<div class="no-data">No data</div>';
+    document.getElementById('pager').innerHTML = '';
+    document.getElementById('footer').textContent = '';
+    return;
+  }
+  const pageCount = Math.ceil(entries.length / pageSize);
+  if (page >= pageCount) page = pageCount - 1;
+  const start = page * pageSize;
+  const pageEntries = entries.slice(start, start + pageSize);
+
   let html = '<table><thead><tr><th onclick="sortBy(0)">Domain <span class="arrow">↕</span></th>';
   for (const pid of proxyIds) html += `<th onclick="sortBy(${proxyIds.indexOf(pid)+1})">${pid} <span class="arrow">↕</span></th>`;
-  html += '<th onclick="sortBy('+(proxyIds.length+1)+')">Total <span class="arrow">↕</span></th></tr></thead><tbody id="tbody"></tbody></table>';
-  wrap.innerHTML = html;
-  const tbody = document.getElementById('tbody');
-  for (const [domain, wins] of entries) {
+  html += '<th onclick="sortBy('+(proxyIds.length+1)+')">Total <span class="arrow">↕</span></th></tr></thead><tbody>';
+  for (const [domain, wins] of pageEntries) {
     const total = Object.values(wins).reduce((a,b) => a+b, 0);
     const best = Math.max(...Object.values(wins));
     let row = `<tr><td class="domain">${domain}</td>`;
@@ -168,10 +191,28 @@ function render() {
       row += `<td class="num${v === best && v > 0 ? ' best' : ''}">${v}</td>`;
     }
     row += `<td class="num best">${total}</td></tr>`;
-    tbody.innerHTML += row;
+    html += row;
   }
-  document.getElementById('footer').textContent = entries.length + ' domains · ' + proxyIds.length + ' proxies';
+  html += '</tbody></table>';
+  wrap.innerHTML = html;
+
+  let pagerHtml = '';
+  pagerHtml += `<button onclick="goPage(0)"${page===0?' disabled':''}>&laquo;</button>`;
+  pagerHtml += `<button onclick="goPage(${page-1})"${page===0?' disabled':''}>&lsaquo;</button>`;
+  const rangeStart = Math.max(0, page - 2);
+  const rangeEnd = Math.min(pageCount, page + 3);
+  if (rangeStart > 0) pagerHtml += '<button onclick="goPage(0)">1</button><span>...</span>';
+  for (let i = rangeStart; i < rangeEnd; i++) {
+    pagerHtml += `<button onclick="goPage(${i})"${i===page?' class="active"':''}>${i+1}</button>`;
+  }
+  if (rangeEnd < pageCount) pagerHtml += '<span>...</span>';
+  pagerHtml += `<button onclick="goPage(${page+1})"${page>=pageCount-1?' disabled':''}>&rsaquo;</button>`;
+  pagerHtml += `<button onclick="goPage(${pageCount-1})"${page>=pageCount-1?' disabled':''}>&raquo;</button>`;
+  document.getElementById('pager').innerHTML = pagerHtml;
+  document.getElementById('footer').textContent = entries.length + ' domains \u00b7 ' + proxyIds.length + ' proxies \u00b7 page ' + (page+1) + '/' + pageCount;
 }
+
+function goPage(n) { page = n; render(); }
 
 let sortDir = {}, sortCol = 0;
 function sortBy(col) {
@@ -186,6 +227,7 @@ function sortBy(col) {
     return sortDir[col] === 'asc' ? va - vb : vb - va;
   });
   data = Object.fromEntries(entries);
+  page = 0;
   render();
 }
 
