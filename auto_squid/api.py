@@ -145,13 +145,26 @@ td.updated-at{font-size:11px;color:#888;white-space:nowrap}
 .pager button:disabled{opacity:.35;cursor:default}
 .pager span{font-size:13px;color:#888;margin:0 4px}
 .footer{margin-top:8px;font-size:12px;color:#555;text-align:center}
+select{padding:6px 10px;border:1px solid #333;border-radius:6px;background:#16213e;color:#e0e0e0;font-size:13px;outline:none;cursor:pointer}
+select:focus{border-color:#e94560}
+.autorefresh-label{font-size:12px;color:#555;min-width:70px;text-align:right}
 </style>
 </head>
 <body>
 <h1>Domain Stats</h1>
 <div class="toolbar">
 <input id="filter" placeholder="Filter domains..." oninput="onFilter()">
+<select id="interval" onchange="onIntervalChange(this)">
+<option value="0">关闭</option>
+<option value="10">10s</option>
+<option value="30" selected>30s</option>
+<option value="60">60s</option>
+<option value="180">3m</option>
+<option value="300">5m</option>
+<option value="600">10m</option>
+</select>
 <button onclick="fetchData()">Refresh</button>
+<span id="autorefresh-label" class="autorefresh-label"></span>
 </div>
 <div id="table-wrap"></div>
 <div id="pager" class="pager"></div>
@@ -159,6 +172,21 @@ td.updated-at{font-size:11px;color:#888;white-space:nowrap}
 <script>
 let data = {}, meta = {}, proxyIds = [];
 let page = 0, pageSize = 20;
+let refreshTimer = null;
+let refreshInterval = 30;
+
+function onIntervalChange(sel) {
+  refreshInterval = parseInt(sel.value);
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = null;
+  const label = document.getElementById('autorefresh-label');
+  if (refreshInterval > 0) {
+    label.textContent = '每 ' + sel.options[sel.selectedIndex].text + ' 自动刷新';
+    refreshTimer = setInterval(fetchData, refreshInterval * 1000);
+  } else {
+    label.textContent = '';
+  }
+}
 
 async function fetchData() {
   const [r1, r2] = await Promise.all([fetch('/domains'), fetch('/domains/meta')]);
@@ -167,6 +195,7 @@ async function fetchData() {
   proxyIds = [...new Set(Object.values(data).flatMap(v => Object.keys(v)))].sort();
   page = 0;
   render();
+  if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = setInterval(fetchData, refreshInterval * 1000); }
 }
 
 function copyDomain(el) {
@@ -281,6 +310,7 @@ function sortBy(col) {
 }
 
 fetchData();
+onIntervalChange(document.getElementById('interval'));
 </script>
 </body>
 </html>""")
