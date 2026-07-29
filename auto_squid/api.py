@@ -187,6 +187,11 @@ function copyDomain(el) {
   document.body.removeChild(ta);
 }
 
+function toBeijing(isoStr) {
+  if (!isoStr) return '-';
+  return new Date(isoStr).toLocaleString('zh-CN', {timeZone:'Asia/Shanghai', hour12:false});
+}
+
 function getFiltered() {
   const q = document.getElementById('filter').value.toLowerCase();
   return Object.entries(data).filter(([d]) => d.includes(q));
@@ -220,7 +225,7 @@ function render() {
     const best = Math.max(...Object.values(wins));
     let row = `<tr><td class="domain" title="${domain}" onclick="copyDomain(this)" style="cursor:pointer">${domain}</td>`;
     row += `<td class="default-proxy">${m.default_proxy || '-'}</td>`;
-    row += `<td class="updated-at">${m.updated_at ? m.updated_at.slice(0,19).replace('T',' ') : '-'}</td>`;
+    row += `<td class="updated-at">${toBeijing(m.updated_at)}</td>`;
     for (const pid of proxyIds) {
       const v = wins[pid] || 0;
       row += `<td class="num${v === best && v > 0 ? ' best' : ''}">${v}</td>`;
