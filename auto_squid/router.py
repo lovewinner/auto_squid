@@ -46,6 +46,7 @@ class Router:
         self.attempted_counts: dict[str, int] = {}
         self.domain_stats: dict[str, dict[str, int]] = {}
         self._db = sqlite3.connect(db_path, check_same_thread=False)
+        from datetime import datetime, timezone
         self._db.execute("""
             CREATE TABLE IF NOT EXISTS domain_stats (
                 domain TEXT NOT NULL,
@@ -54,7 +55,15 @@ class Router:
                 PRIMARY KEY (domain, proxy_id)
             )
         """)
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS domain_meta (
+                domain TEXT NOT NULL PRIMARY KEY,
+                default_proxy TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
         self._db.commit()
+        self._now_utc = lambda: datetime.now(timezone.utc).isoformat()
 
     def _save_domain_stats(self, domain: str, pid: str):
         self._db.execute(
@@ -70,6 +79,18 @@ class Router:
         for domain, pid, wins in rows:
             result.setdefault(domain, {})[pid] = wins
         return result
+
+    def _update_domain_meta(self, domain: str, pid: str):
+        self._db.execute(
+            "INSERT INTO domain_meta (domain, default_proxy, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(domain) DO UPDATE SET default_proxy = excluded.default_proxy, updated_at = excluded.updated_at",
+            (domain, pid, self._now_utc()),
+        )
+        self._db.commit()
+
+    def get_domain_meta_from_db(self) -> dict[str, dict[str, str]]:
+        rows = self._db.execute("SELECT domain, default_proxy, updated_at FROM domain_meta").fetchall()
+        return {domain: {"default_proxy": dp, "updated_at": ua} for domain, dp, ua in rows}
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         peer = writer.get_extra_info('peername')
@@ -146,6 +167,7 @@ class Router:
             per_domain = self.domain_stats.setdefault(domain, {})
             per_domain[pid] = per_domain.get(pid, 0) + 1
             self._save_domain_stats(domain, pid)
+            self._update_domain_meta(domain, pid)
             return pid, method, url, resp, client
         except BaseException:
             try:
@@ -256,6 +278,7 @@ class Router:
             per_domain = self.domain_stats.setdefault(target, {})
             per_domain[pid] = per_domain.get(pid, 0) + 1
             self._save_domain_stats(target, pid)
+            self._update_domain_meta(target, pid)
             return pid, up_reader, up_writer
         except Exception as e:
             try:

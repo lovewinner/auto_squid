@@ -99,6 +99,13 @@ async def domains():
     return _router.get_domain_stats_from_db()
 
 
+@app.get("/domains/meta")
+async def domains_meta():
+    if not _router:
+        return {}
+    return _router.get_domain_meta_from_db()
+
+
 @app.get("/")
 async def domains_ui():
     return HTMLResponse("""<!DOCTYPE html>
@@ -127,6 +134,8 @@ tr:last-child td{border-bottom:none}
 td.domain{font-weight:500;color:#a8d8ea}
 td.num{text-align:center;font-variant-numeric:tabular-nums}
 td.best{font-weight:600;color:#e94560}
+td.default-proxy{text-align:center;font-weight:600;color:#e94560}
+td.updated-at{font-size:11px;color:#888;white-space:nowrap}
 .no-data{padding:40px;text-align:center;color:#666}
 .pager{display:flex;gap:8px;margin-top:12px;align-items:center;justify-content:center;flex-wrap:wrap}
 .pager button{padding:6px 14px;border:1px solid #333;border-radius:4px;background:#16213e;color:#e0e0e0;font-size:13px;cursor:pointer}
@@ -147,12 +156,13 @@ td.best{font-weight:600;color:#e94560}
 <div id="pager" class="pager"></div>
 <div id="footer" class="footer"></div>
 <script>
-let data = {}, proxyIds = [];
+let data = {}, meta = {}, proxyIds = [];
 let page = 0, pageSize = 20;
 
 async function fetchData() {
-  const r = await fetch('/domains');
-  data = await r.json();
+  const [r1, r2] = await Promise.all([fetch('/domains'), fetch('/domains/meta')]);
+  data = await r1.json();
+  meta = await r2.json();
   proxyIds = [...new Set(Object.values(data).flatMap(v => Object.keys(v)))].sort();
   page = 0;
   render();
@@ -178,14 +188,20 @@ function render() {
   if (page >= pageCount) page = pageCount - 1;
   const start = page * pageSize;
   const pageEntries = entries.slice(start, start + pageSize);
+  const offset = 2; // cols before proxy columns: domain, default-proxy, updated-at
 
   let html = '<table><thead><tr><th onclick="sortBy(0)">Domain <span class="arrow">↕</span></th>';
-  for (const pid of proxyIds) html += `<th onclick="sortBy(${proxyIds.indexOf(pid)+1})">${pid} <span class="arrow">↕</span></th>`;
-  html += '<th onclick="sortBy('+(proxyIds.length+1)+')">Total <span class="arrow">↕</span></th></tr></thead><tbody>';
+  html += '<th onclick="sortBy(1)">Default Proxy <span class="arrow">↕</span></th>';
+  html += '<th onclick="sortBy(2)">Updated At <span class="arrow">↕</span></th>';
+  for (const pid of proxyIds) html += `<th onclick="sortBy(${proxyIds.indexOf(pid)+offset})">${pid} <span class="arrow">↕</span></th>`;
+  html += '<th onclick="sortBy('+(proxyIds.length+offset)+')">Total <span class="arrow">↕</span></th></tr></thead><tbody>';
   for (const [domain, wins] of pageEntries) {
+    const m = meta[domain] || {};
     const total = Object.values(wins).reduce((a,b) => a+b, 0);
     const best = Math.max(...Object.values(wins));
     let row = `<tr><td class="domain">${domain}</td>`;
+    row += `<td class="default-proxy">${m.default_proxy || '-'}</td>`;
+    row += `<td class="updated-at">${m.updated_at ? m.updated_at.slice(0,19).replace('T',' ') : '-'}</td>`;
     for (const pid of proxyIds) {
       const v = wins[pid] || 0;
       row += `<td class="num${v === best && v > 0 ? ' best' : ''}">${v}</td>`;
@@ -219,10 +235,19 @@ function sortBy(col) {
   sortDir[col] = sortDir[col] === 'asc' ? 'desc' : 'asc';
   sortCol = col;
   const entries = Object.entries(data);
-  const pidKey = i => proxyIds[i-1] || null;
+  const offset = 2;
+  const pidKey = i => proxyIds[i-offset] || null;
   entries.sort((a,b) => {
-    const va = col === 0 ? a[0] : col > proxyIds.length ? Object.values(a[1]).reduce((x,y)=>x+y,0) : (a[1][pidKey(col)]||0);
-    const vb = col === 0 ? b[0] : col > proxyIds.length ? Object.values(b[1]).reduce((x,y)=>x+y,0) : (b[1][pidKey(col)]||0);
+    const m1 = meta[a[0]]||{}, m2 = meta[b[0]]||{};
+    let va, vb;
+    if (col === 0) { va = a[0]; vb = b[0]; }
+    else if (col === 1) { va = m1.default_proxy||''; vb = m2.default_proxy||''; }
+    else if (col === 2) { va = m1.updated_at||''; vb = m2.updated_at||''; }
+    else if (col >= offset && col < proxyIds.length+offset) {
+      va = a[1][pidKey(col)]||0; vb = b[1][pidKey(col)]||0;
+    } else {
+      va = Object.values(a[1]).reduce((x,y)=>x+y,0); vb = Object.values(b[1]).reduce((x,y)=>x+y,0);
+    }
     if (typeof va === 'string') return sortDir[col] === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va);
     return sortDir[col] === 'asc' ? va - vb : vb - va;
   });
