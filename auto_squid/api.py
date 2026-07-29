@@ -156,6 +156,7 @@ select:focus{border-color:#e94560}
 <input id="filter" placeholder="Filter domains..." oninput="onFilter()">
 <select id="interval" onchange="onIntervalChange(this)">
 <option value="0">关闭</option>
+<option value="3">3s</option>
 <option value="10">10s</option>
 <option value="30" selected>30s</option>
 <option value="60">60s</option>
