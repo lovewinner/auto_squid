@@ -169,6 +169,16 @@ async function fetchData() {
   render();
 }
 
+function copyDomain(el) {
+  const text = el.title;
+  navigator.clipboard.writeText(text).then(() => {
+    const orig = el.textContent;
+    el.textContent = '✓ Copied!';
+    el.style.color = '#4caf50';
+    setTimeout(() => { el.textContent = orig; el.style.color = ''; }, 800);
+  }).catch(() => {});
+}
+
 function getFiltered() {
   const q = document.getElementById('filter').value.toLowerCase();
   return Object.entries(data).filter(([d]) => d.includes(q));
@@ -200,7 +210,7 @@ function render() {
     const m = meta[domain] || {};
     const total = Object.values(wins).reduce((a,b) => a+b, 0);
     const best = Math.max(...Object.values(wins));
-    let row = `<tr><td class="domain">${domain}</td>`;
+    let row = `<tr><td class="domain" title="${domain}" onclick="copyDomain(this)" style="cursor:pointer">${domain}</td>`;
     row += `<td class="default-proxy">${m.default_proxy || '-'}</td>`;
     row += `<td class="updated-at">${m.updated_at ? m.updated_at.slice(0,19).replace('T',' ') : '-'}</td>`;
     for (const pid of proxyIds) {
