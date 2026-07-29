@@ -260,6 +260,26 @@ class Router:
                 await asyncio.gather(*tasks, return_exceptions=True)
                 break
 
+        if not winner_resp and len(proxies) > self.max_retries:
+            remaining = proxies[self.max_retries:]
+            tasks = set()
+            for pid in remaining:
+                tasks.add(asyncio.create_task(self._try_proxy(pid, request_bytes)))
+            while tasks:
+                done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for t in done:
+                    try:
+                        pid, method, url, resp, client = t.result()
+                        winner_resp = (pid, method, url, resp, client)
+                        break
+                    except Exception:
+                        pass
+                if winner_resp:
+                    for t in tasks:
+                        t.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    break
+
         if winner_resp:
             pid, method, url, resp, client = winner_resp
             logger.info("proxy %s racing win %s %s", pid, method, url)
@@ -400,6 +420,26 @@ class Router:
                     t.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
                 break
+
+        if not winner and len(proxies) > self.max_retries:
+            remaining = proxies[self.max_retries:]
+            tasks = set()
+            for pid in remaining:
+                tasks.add(asyncio.create_task(self._try_connect(pid, target)))
+            while tasks:
+                done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for t in done:
+                    try:
+                        pid, up_reader, up_writer = t.result()
+                        winner = (pid, up_reader, up_writer)
+                        break
+                    except Exception:
+                        pass
+                if winner:
+                    for t in tasks:
+                        t.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    break
 
         if winner:
             pid, up_reader, up_writer = winner
