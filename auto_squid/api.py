@@ -131,7 +131,8 @@ th .arrow{color:#e94560;margin-left:4px}
 td{padding:8px 12px;border-bottom:1px solid #222}
 tr:hover td{background:rgba(233,69,96,0.08)}
 tr:last-child td{border-bottom:none}
-td.domain{font-weight:500;color:#a8d8ea}
+td.domain{font-weight:500;color:#a8d8ea;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:280px;min-width:280px;width:280px}
+th:first-child{width:280px;min-width:280px;max-width:280px}
 td.num{text-align:center;font-variant-numeric:tabular-nums}
 td.best{font-weight:600;color:#e94560}
 td.default-proxy{text-align:center;font-weight:600;color:#e94560}
