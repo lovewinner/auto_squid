@@ -171,12 +171,20 @@ async function fetchData() {
 
 function copyDomain(el) {
   const text = el.title;
-  navigator.clipboard.writeText(text).then(() => {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  try {
+    document.execCommand('copy');
     const orig = el.textContent;
     el.textContent = '✓ Copied!';
     el.style.color = '#4caf50';
     setTimeout(() => { el.textContent = orig; el.style.color = ''; }, 800);
-  }).catch(() => {});
+  } catch (e) {}
+  document.body.removeChild(ta);
 }
 
 function getFiltered() {
