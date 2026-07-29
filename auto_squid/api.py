@@ -193,6 +193,13 @@ async function fetchData() {
   data = await r1.json();
   meta = await r2.json();
   proxyIds = [...new Set(Object.values(data).flatMap(v => Object.keys(v)))].sort();
+  const entries = Object.entries(data);
+  entries.sort((a,b) => {
+    const ua = (meta[a[0]]||{}).updated_at||'';
+    const ub = (meta[b[0]]||{}).updated_at||'';
+    return ub.localeCompare(ua);
+  });
+  data = Object.fromEntries(entries);
   page = 0;
   render();
   if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = setInterval(fetchData, refreshInterval * 1000); }
@@ -283,7 +290,8 @@ function render() {
 
 function goPage(n) { page = n; render(); }
 
-let sortDir = {}, sortCol = 0;
+let sortDir = {}, sortCol = 2;
+sortDir[2] = 'desc';
 function sortBy(col) {
   sortDir[col] = sortDir[col] === 'asc' ? 'desc' : 'asc';
   sortCol = col;
