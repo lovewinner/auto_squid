@@ -5,15 +5,13 @@ from typing import List
 
 from .proxy_store import ProxyStore
 from .router import Router
-from .config_schema import ProxyInfo, PolicyRuleIn
-from .policy_engine import PolicyEngine
+from .config_schema import ProxyInfo
 
 app = FastAPI(title="auto_squid API")
 
 # 由 CLI 在启动时注入
 _proxy_store: ProxyStore | None = None
 _router: Router | None = None
-_policy_engine: PolicyEngine | None = None
 
 
 class ProxyIn(BaseModel):
@@ -94,23 +92,6 @@ async def domains_ui():
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#1a1a2e;color:#e0e0e0;padding:24px;max-width:1200px;margin:0 auto}
 h1{font-size:22px;margin-bottom:16px;color:#e94560}
-.tabs{display:flex;gap:0;margin-bottom:16px;border-bottom:2px solid #0f3460}
-.tabs button{padding:8px 20px;border:none;background:none;color:#888;font-size:14px;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px}
-.tabs button:hover{color:#e0e0e0}
-.tabs button.active{color:#e94560;border-bottom-color:#e94560}
-.tab-panel{display:none}
-.tab-panel.active{display:block}
-.form-row{display:flex;gap:8px;margin-bottom:12px;align-items:center;flex-wrap:wrap}
-.form-row input,.form-row select{padding:6px 10px;border:1px solid #333;border-radius:4px;background:#16213e;color:#e0e0e0;font-size:13px;outline:none}
-.form-row input:focus,.form-row select:focus{border-color:#e94560}
-.form-row input[type=number]{width:70px}
-.rule-badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;text-transform:uppercase}
-.rule-badge.force{background:#e94560;color:#fff}
-.rule-badge.prefer{background:#f0a500;color:#1a1a2e}
-.rule-badge.deny{background:#444;color:#e0e0e0}
-td.actions{white-space:nowrap}
-td.actions button{padding:3px 10px;border:1px solid #e94560;border-radius:4px;background:0;color:#e94560;font-size:12px;cursor:pointer}
-td.actions button:hover{background:#e94560;color:#fff}
 .toolbar{display:flex;gap:10px;margin-bottom:16px;align-items:center}
 .toolbar input{flex:1;padding:8px 12px;border:1px solid #333;border-radius:6px;background:#16213e;color:#e0e0e0;font-size:14px;outline:none}
 .toolbar input:focus{border-color:#e94560}
@@ -149,12 +130,8 @@ select:focus{border-color:#e94560}
 </style>
 </head>
 <body>
-<h1>auto_squid</h1>
-<div class="tabs">
-<button id="tab-domains" class="active" onclick="switchTab('domains')">Domain Stats</button>
-<button id="tab-policy" onclick="switchTab('policy')">Policy Rules</button>
-</div>
-<div id="panel-domains" class="tab-panel active">
+<h1>Domain Stats</h1>
+<div class="toolbar">
 <input id="filter" placeholder="Filter domains..." oninput="onFilter()">
 <select id="interval" onchange="onIntervalChange(this)">
 <option value="0">关闭</option>
@@ -173,93 +150,12 @@ select:focus{border-color:#e94560}
 <div id="table-wrap"></div>
 <div id="pager" class="pager"></div>
 <div id="footer" class="footer"></div>
-</div><!-- /panel-domains -->
-<div id="panel-policy" class="tab-panel">
-<div class="toolbar">
-<button onclick="fetchRules()">Refresh Rules</button>
-</div>
-<div id="policy-table-wrap"></div>
-<hr style="border-color:#222;margin:20px 0">
-<div class="form-row">
-<select id="new-rule-type">
-<option value="force">force</option>
-<option value="prefer">prefer</option>
-<option value="deny">deny</option>
-</select>
-<select id="new-target-type" onchange="onTargetTypeChange()">
-<option value="proxy_id">proxy_id</option>
-<option value="tag">tag</option>
-</select>
-<input id="new-domain-pattern" placeholder="domain pattern (e.g. *.example.com)" style="flex:1">
-<input id="new-target-proxy" placeholder="proxy id" style="flex:0.5">
-<input id="new-tag-key" placeholder="tag key" style="flex:0.3;display:none">
-<input id="new-tag-value" placeholder="tag value" style="flex:0.3;display:none">
-<input id="new-priority" type="number" value="0" placeholder="priority">
-<button onclick="addRule()">Add Rule</button>
-</div>
-<div id="policy-footer" class="footer"></div>
-</div><!-- /panel-policy -->
 <script>
 let data = {}, meta = {}, proxyIds = [];
 let page = 0, pageSize = 20;
 let refreshTimer = null;
 let refreshInterval = 30;
 let cfg = {};
-
-// ── Tab switching ──
-function switchTab(tab) {
-  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
-  document.querySelectorAll('.tabs button').forEach(b => b.classList.remove('active'));
-  document.getElementById('panel-' + tab).classList.add('active');
-  document.getElementById('tab-' + tab).classList.add('active');
-  if (tab === 'policy') fetchPolicyData();
-  if (tab === 'domains') fetchData();
-}
-
-// ── Policy Rules ──
-let policyRules = [];
-async function fetchPolicyData() {
-  const r = await fetch('/policy/rules');
-  policyRules = await r.json();
-  renderPolicyTable();
-}
-function onTargetTypeChange() {
-  const v = document.getElementById('new-target-type').value;
-  document.getElementById('new-target-proxy').style.display = v === 'proxy_id' ? '' : 'none';
-  document.getElementById('new-tag-key').style.display = v === 'tag' ? '' : 'none';
-  document.getElementById('new-tag-value').style.display = v === 'tag' ? '' : 'none';
-}
-async function addRule() {
-  const body = {
-    rule_type: document.getElementById('new-rule-type').value,
-    domain_pattern: document.getElementById('new-domain-pattern').value,
-    target_type: document.getElementById('new-target-type').value,
-    priority: parseInt(document.getElementById('new-priority').value) || 0,
-    enabled: true
-  };
-  if (body.target_type === 'proxy_id') body.target_proxy = document.getElementById('new-target-proxy').value;
-  else { body.tag_key = document.getElementById('new-tag-key').value; body.tag_value = document.getElementById('new-tag-value').value; }
-  const r = await fetch('/policy/rules', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
-  if (r.ok) { await fetchPolicyData(); document.getElementById('new-domain-pattern').value = ''; }
-}
-async function deleteRule(id) {
-  if (!confirm('Delete rule ' + id + '?')) return;
-  await fetch('/policy/rules/' + id, {method:'DELETE'});
-  await fetchPolicyData();
-}
-function renderPolicyTable() {
-  let html = '<table><thead><tr><th>ID</th><th>Type</th><th>Domain Pattern</th><th>Target</th><th>Priority</th><th>Actions</th></tr></thead><tbody>';
-  if (!policyRules.length) html += '<tr><td colspan="6" class="no-data">No rules</td></tr>';
-  for (const r of policyRules) {
-    let target = '';
-    if (r.target_type === 'proxy_id') target = 'proxy: ' + (r.target_proxy || '-');
-    else target = 'tag: ' + (r.tag_key || '') + '=' + (r.tag_value || '');
-    html += '<tr><td>' + r.id + '</td><td><span class="rule-badge ' + r.rule_type + '">' + r.rule_type + '</span></td><td>' + r.domain_pattern + '</td><td>' + target + '</td><td class="num">' + r.priority + '</td><td class="actions"><button onclick="deleteRule(' + r.id + ')">Delete</button></td></tr>';
-  }
-  html += '</tbody></table>';
-  document.getElementById('policy-table-wrap').innerHTML = html;
-  document.getElementById('policy-footer').textContent = policyRules.length + ' rules';
-}
 
 function onIntervalChange(sel) {
   refreshInterval = parseInt(sel.value);
@@ -268,15 +164,10 @@ function onIntervalChange(sel) {
   const label = document.getElementById('autorefresh-label');
   if (refreshInterval > 0) {
     label.textContent = '每 ' + sel.options[sel.selectedIndex].text + ' 自动刷新';
-    refreshTimer = setInterval(fetchAll, refreshInterval * 1000);
+    refreshTimer = setInterval(fetchData, refreshInterval * 1000);
   } else {
     label.textContent = '';
   }
-}
-
-function fetchAll() {
-  if (document.getElementById('panel-domains').classList.contains('active')) fetchData();
-  if (document.getElementById('panel-policy').classList.contains('active')) fetchPolicyData();
 }
 
 async function fetchData() {
@@ -298,7 +189,7 @@ async function fetchData() {
   page = 0;
   render();
   renderStats();
-  if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = setInterval(fetchAll, refreshInterval * 1000); }
+  if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = setInterval(fetchData, refreshInterval * 1000); }
 }
 
 function copyDomain(el) {
@@ -428,39 +319,7 @@ onIntervalChange(document.getElementById('interval'));
 </body>
 </html>""")
 
-# ── Policy Rules API ─────────────────────────────────────────
-
-@app.get("/policy/rules")
-async def list_policy_rules():
-    if not _policy_engine:
-        raise HTTPException(status_code=500, detail="policy engine not initialized")
-    rules = _policy_engine.load_rules()
-    return [r.model_dump() for r in rules]
-
-
-@app.post("/policy/rules")
-async def create_policy_rule(rule_in: PolicyRuleIn):
-    if not _policy_engine:
-        raise HTTPException(status_code=500, detail="policy engine not initialized")
-    from .config_schema import PolicyRule
-    rule = PolicyRule(**rule_in.model_dump())
-    created = _policy_engine.add_rule(rule)
-    return created.model_dump()
-
-
-@app.delete("/policy/rules/{rule_id}")
-async def delete_policy_rule(rule_id: int):
-    if not _policy_engine:
-        raise HTTPException(status_code=500, detail="policy engine not initialized")
-    deleted = _policy_engine.delete_rule(rule_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="rule not found")
-    return {"deleted": rule_id}
-
-
 def mount(proxy_store: ProxyStore, router: Router | None = None):
-    global _proxy_store, _router, _policy_engine
+    global _proxy_store, _router
     _proxy_store = proxy_store
     _router = router
-    if router:
-        _policy_engine = router.policy_engine
