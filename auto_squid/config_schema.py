@@ -21,7 +21,7 @@ class LoggingConfig(BaseModel):
 class ProxyInfo(BaseModel):
     """单个上游代理节点的配置"""
     id: str
-    name: Optional[str]
+    name: Optional[str] = None
     host: str
     port: int = Field(3128)
     protocol: str = Field("http")

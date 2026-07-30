@@ -15,7 +15,6 @@ logger = logging.getLogger(__name__)
 
 
 class ProxySelector:
-    """返回所有可用代理的随机排列"""
     def __init__(self, proxy_store: ProxyStore):
         self.proxy_store = proxy_store
 
@@ -31,8 +30,6 @@ class ProxySelector:
 
 
 class Router:
-    """代理路由器，支持并行竞速、域名缓存、HTTP GET 缓存和本机直连"""
-
     def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False):
         self.proxy_store = proxy_store
         self.selector = ProxySelector(proxy_store)
@@ -64,9 +61,10 @@ class Router:
         """)
         self._db.commit()
         self._now_utc = lambda: datetime.now(timezone.utc).isoformat()
-        # HTTP GET 响应缓存（内存，TTL 60s）
         self._http_cache: dict[str, dict] = {}
         self._http_cache_ttl = 60
+
+    # ── DB helpers ──────────────────────────────────────────────
 
     def _save_domain_stats(self, domain: str, pid: str):
         self._db.execute(
@@ -84,7 +82,6 @@ class Router:
         return result
 
     def _update_domain_meta(self, domain: str, pid: str):
-        """记录该域名当前默认使用哪个代理"""
         self._db.execute(
             "INSERT INTO domain_meta (domain, default_proxy, updated_at) VALUES (?, ?, ?) "
             "ON CONFLICT(domain) DO UPDATE SET default_proxy = excluded.default_proxy, updated_at = excluded.updated_at",
@@ -97,7 +94,6 @@ class Router:
         return {domain: {"default_proxy": dp, "updated_at": ua} for domain, dp, ua in rows}
 
     def _get_fresh_proxy(self, domain: str) -> Optional[str]:
-        """若域名缓存在 cache_ttl 内，返回缓存代理 ID，否则触发重新竞速"""
         from datetime import datetime, timezone
         row = self._db.execute(
             "SELECT default_proxy, updated_at FROM domain_meta WHERE domain = ?",
@@ -114,9 +110,10 @@ class Router:
             pass
         return None
 
+    # ── TCP 调优 ────────────────────────────────────────────────
+
     @staticmethod
     def _set_nodelay(writer):
-        """为 TCP socket 禁用 Nagle 算法并启用 Quick ACK，降低小包延迟"""
         sock = writer.get_extra_info('socket')
         if sock:
             try:
@@ -125,11 +122,12 @@ class Router:
             except (OSError, AttributeError):
                 pass
 
+    # ── HTTP GET 缓存 ──────────────────────────────────────────
+
     def _http_cache_key(self, method: str, url: str) -> str:
         return f"{method}:{url}"
 
     def _http_cache_get(self, method: str, url: str) -> Optional[dict]:
-        """T 返回缓存的 GET 响应（未过期则返回，否则删除）"""
         if method != 'GET':
             return None
         key = self._http_cache_key(method, url)
@@ -142,7 +140,6 @@ class Router:
         return entry
 
     def _http_cache_set(self, method: str, url: str, resp) -> None:
-        """缓存 GET 响应的状态行、响应头和正文，跳过不含 Content-Length 或禁止缓存的响应"""
         if method != 'GET':
             return
         cl = resp.headers.get('content-length')
@@ -159,277 +156,35 @@ class Router:
             'cached_at': time.time(),
         }
 
-    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        peer = writer.get_extra_info('peername')
-        logger.info("client connected %s", peer)
-        self._set_nodelay(writer)
-        try:
-            line = await reader.readline()
-            if not line:
-                return
-            first = line.decode('latin-1').strip()
-            # 读取完整的请求头
-            headers = b''
-            while True:
-                h = await reader.readline()
-                if not h or h in (b"\r\n", b"\n"):
-                    break
-                headers += h
-            logger.debug("first line: %s", first)
-            if first.upper().startswith('CONNECT'):
-                target = first.split(' ')[1]
-                await self._handle_connect(target, reader, writer)
-            else:
-                # 解析 Content-Length 以确定请求体长度
-                body = b''
-                cl = None
-                for h in headers.decode('latin-1').split('\r\n'):
-                    if h.lower().startswith('content-length:'):
-                        cl = int(h.split(':', 1)[1].strip())
-                        break
-                if cl and cl > 0:
-                    body = await reader.readexactly(cl)
-                elif not cl and first.upper().split(' ')[0] in ('POST', 'PUT', 'PATCH'):
-                    body = await reader.read(-1)
-                request_bytes = (first + '\r\n').encode('latin-1') + headers + b'\r\n' + body
-                await self._handle_http_request(request_bytes, writer)
-        except Exception:
-            logger.exception("error handling client")
-        finally:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
+    # ── 通用竞速 / pipe / 响应写入 ──────────────────────────────
 
-    async def _try_proxy(self, pid: str, request_bytes: bytes, update_meta: bool = True):
-        """通过上游代理发送 HTTP 请求，竞速获胜后返回 (pid, method, url, resp, client)"""
-        proxy = self.proxy_store.get(pid)
-        if not proxy:
-            raise ValueError(f"proxy {pid} not found")
-        if proxy.auth:
-            user = urllib.parse.quote(proxy.auth['username'], safe='')
-            pw = urllib.parse.quote(proxy.auth['password'], safe='')
-            proxy_url = f"http://{user}:{pw}@{proxy.host}:{proxy.port}"
-        else:
-            proxy_url = f"http://{proxy.host}:{proxy.port}"
-        client = httpx.AsyncClient(proxy=proxy_url, limits=httpx.Limits(max_keepalive_connections=10, max_connections=50, keepalive_expiry=30))
-        try:
-            self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
-            text = request_bytes.decode('latin-1', errors='ignore')
-            lines = text.split('\r\n')
-            req_line = lines[0]
-            parts = req_line.split(' ')
-            if len(parts) < 3:
-                raise ValueError('invalid request line')
-            method, url, _ = parts
-            hdrs = {}
-            i = 1
-            while i < len(lines) and lines[i]:
-                h = lines[i]
-                if ':' in h:
-                    k, v = h.split(':', 1)
-                    hdrs[k.strip()] = v.strip()
-                i += 1
-            body = '\r\n'.join(lines[i+1:]).encode('latin-1') if i+1 < len(lines) else None
-            resp = await client.request(method, url, headers=hdrs, content=body, timeout=10)
-            self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
-            domain = urllib.parse.urlparse(url).hostname or url
-            per_domain = self.domain_stats.setdefault(domain, {})
-            per_domain[pid] = per_domain.get(pid, 0) + 1
-            self._save_domain_stats(domain, pid)
-            if update_meta:
-                self._update_domain_meta(domain, pid)
-            return pid, method, url, resp, client
-        except BaseException:
-            try:
-                await client.aclose()
-            except (BrokenPipeError, ConnectionError, OSError):
-                pass
-            raise
-
-    async def _try_direct(self, request_bytes: bytes, update_meta: bool = True):
-        """不经过上游代理，直接从本机发出 HTTP 请求（参与竞速时 pid='local'）"""
-        client = httpx.AsyncClient(limits=httpx.Limits(max_keepalive_connections=10, max_connections=50, keepalive_expiry=30))
-        try:
-            pid = 'local'
-            self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
-            text = request_bytes.decode('latin-1', errors='ignore')
-            lines = text.split('\r\n')
-            req_line = lines[0]
-            parts = req_line.split(' ')
-            if len(parts) < 3:
-                raise ValueError('invalid request line')
-            method, url, _ = parts
-            hdrs = {}
-            i = 1
-            while i < len(lines) and lines[i]:
-                h = lines[i]
-                if ':' in h:
-                    k, v = h.split(':', 1)
-                    hdrs[k.strip()] = v.strip()
-                i += 1
-            body = '\r\n'.join(lines[i + 1:]).encode('latin-1') if i + 1 < len(lines) else None
-            resp = await client.request(method, url, headers=hdrs, content=body, timeout=10)
-            self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
-            domain = urllib.parse.urlparse(url).hostname or url
-            per_domain = self.domain_stats.setdefault(domain, {})
-            per_domain[pid] = per_domain.get(pid, 0) + 1
-            self._save_domain_stats(domain, pid)
-            if update_meta:
-                self._update_domain_meta(domain, pid)
-            return pid, method, url, resp, client
-        except BaseException:
-            try:
-                await client.aclose()
-            except (BrokenPipeError, ConnectionError, OSError):
-                pass
-            raise
-
-    async def _handle_http_request(self, request_bytes: bytes, writer: asyncio.StreamWriter):
-        text = request_bytes.decode('latin-1', errors='ignore')
-        first_line = text.split('\r\n')[0]
-        parts = first_line.split(' ')
-        method = parts[0] if len(parts) >= 3 else ''
-        url = parts[1] if len(parts) >= 3 else ''
-        domain = urllib.parse.urlparse(url).hostname if url else None
-        # 先查 HTTP GET 缓存
-        cached_entry = self._http_cache_get(method, url)
-        if cached_entry:
-            logger.info("HTTP cache hit %s %s", method, url)
-            try:
-                status_line = f"HTTP/1.1 {cached_entry['status_code']} {cached_entry['reason_phrase']}\r\n"
-                writer.write(status_line.encode('latin-1'))
-                for k, v in cached_entry['headers'].items():
-                    writer.write(f"{k}: {v}\r\n".encode('latin-1'))
-                writer.write(f"Content-Length: {len(cached_entry['content'])}\r\n".encode('latin-1'))
-                writer.write(b"\r\n")
-                writer.write(cached_entry['content'])
-                await writer.drain()
-            except (BrokenPipeError, ConnectionError, OSError):
-                pass
-            return
-        # 再查域名缓存（cache_ttl 内免竞速）
-        if domain:
-            cached_pid = self._get_fresh_proxy(domain)
-            if cached_pid:
-                try:
-                    pid, method, url, resp, client = await self._try_proxy(cached_pid, request_bytes, update_meta=False)
-                    logger.info("proxy %s cache hit %s %s", pid, method, url)
-                    status_line = f"HTTP/1.1 {resp.status_code} {resp.reason_phrase}\r\n"
-                    writer.write(status_line.encode('latin-1'))
-                    hop_by_hop = {'transfer-encoding', 'content-encoding', 'keep-alive',
-                                  'proxy-connection', 'te', 'trailer', 'upgrade'}
-                    for k, v in resp.headers.items():
-                        if k.lower() in hop_by_hop:
-                            continue
-                        writer.write(f"{k}: {v}\r\n".encode('latin-1'))
-                    writer.write(f"Content-Length: {len(resp.content)}\r\n".encode('latin-1'))
-                    writer.write(b"\r\n")
-                    writer.write(resp.content)
-                    await writer.drain()
-                    try:
-                        await client.aclose()
-                    except (BrokenPipeError, ConnectionError, OSError):
-                        pass
-                    if resp.status_code >= 200 and resp.status_code < 300:
-                        self._http_cache_set(method, url, resp)
-                    return
-                except Exception:
-                    logger.debug("cached proxy %s failed for %s", cached_pid, domain)
-
-        # 无缓存命中，进入竞速模式
-        proxies = self.selector.ordered_proxies()
-        if not proxies and not self.enable_local_racing:
-            try:
-                writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n\r\nBad Gateway")
-                await writer.drain()
-            except Exception:
-                pass
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
-            return
-
-        # 第一轮：取 top N 代理 + 本机直连（如启用）
-        tasks = set()
-        for pid in proxies[:self.max_retries]:
-            tasks.add(asyncio.create_task(self._try_proxy(pid, request_bytes)))
-        if self.enable_local_racing:
-            tasks.add(asyncio.create_task(self._try_direct(request_bytes)))
-
-        winner_resp = None
+    @staticmethod
+    async def _race(tasks: set) -> Optional[any]:
+        winner = None
         while tasks:
             done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for t in done:
                 try:
-                    pid, method, url, resp, client = t.result()
-                    winner_resp = (pid, method, url, resp, client)
+                    winner = t.result()
                     break
                 except Exception:
                     pass
-            if winner_resp:
+            if winner:
                 for t in tasks:
                     t.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
                 break
+        return winner
 
-        # 第一轮全部失败，退回到剩余代理再竞速
-        if not winner_resp and len(proxies) > self.max_retries:
-            remaining = proxies[self.max_retries:]
-            tasks = set()
-            for pid in remaining:
-                tasks.add(asyncio.create_task(self._try_proxy(pid, request_bytes)))
-            if self.enable_local_racing:
-                tasks.add(asyncio.create_task(self._try_direct(request_bytes)))
-            while tasks:
-                done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                for t in done:
-                    try:
-                        pid, method, url, resp, client = t.result()
-                        winner_resp = (pid, method, url, resp, client)
-                        break
-                    except Exception:
-                        pass
-                if winner_resp:
-                    for t in tasks:
-                        t.cancel()
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    break
-
-        # 将获胜结果写回客户端
-        if winner_resp:
-            pid, method, url, resp, client = winner_resp
-            logger.info("proxy %s racing win %s %s", pid, method, url)
-            try:
-                status_line = f"HTTP/1.1 {resp.status_code} {resp.reason_phrase}\r\n"
-                writer.write(status_line.encode('latin-1'))
-                hop_by_hop = {'transfer-encoding', 'content-encoding', 'keep-alive',
-                              'proxy-connection', 'te', 'trailer', 'upgrade'}
-                for k, v in resp.headers.items():
-                    if k.lower() in hop_by_hop:
-                        continue
-                    writer.write(f"{k}: {v}\r\n".encode('latin-1'))
-                writer.write(f"Content-Length: {len(resp.content)}\r\n".encode('latin-1'))
-                writer.write(b"\r\n")
-                writer.write(resp.content)
-                await writer.drain()
-            except (BrokenPipeError, ConnectionError, OSError):
-                pass
-            try:
-                await client.aclose()
-            except (BrokenPipeError, ConnectionError, OSError):
-                pass
-            if resp.status_code >= 200 and resp.status_code < 300:
-                self._http_cache_set(method, url, resp)
-            return
-
-        logger.error("all proxies failed for HTTP request")
+    @staticmethod
+    async def _pipe(reader, writer):
         try:
-            writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n\r\nBad Gateway")
-            await writer.drain()
+            while True:
+                data = await asyncio.wait_for(reader.read(65536), timeout=300)
+                if not data:
+                    break
+                writer.write(data)
+                await writer.drain()
         except Exception:
             pass
         try:
@@ -437,16 +192,76 @@ class Router:
             await writer.wait_closed()
         except Exception:
             pass
-    async def _try_connect(self, pid: str, target: str, update_meta: bool = True):
-        """通过上游代理建立 CONNECT 隧道，竞速获胜后返回 (pid, reader, writer)"""
-        proxy = self.proxy_store.get(pid)
+
+    @staticmethod
+    async def _write_response(writer, status_code, reason_phrase, headers, body):
+        hop_by_hop = {'transfer-encoding', 'content-encoding', 'keep-alive',
+                      'proxy-connection', 'te', 'trailer', 'upgrade'}
+        try:
+            writer.write(f"HTTP/1.1 {status_code} {reason_phrase}\r\n".encode('latin-1'))
+            for k, v in headers.items():
+                if k.lower() not in hop_by_hop:
+                    writer.write(f"{k}: {v}\r\n".encode('latin-1'))
+            writer.write(f"Content-Length: {len(body)}\r\n".encode('latin-1'))
+            writer.write(b"\r\n")
+            writer.write(body)
+            await writer.drain()
+        except (BrokenPipeError, ConnectionError, OSError):
+            pass
+
+    # ── HTTP 请求 ──────────────────────────────────────────────
+
+    @staticmethod
+    def _build_proxy_url(proxy) -> Optional[str]:
         if not proxy:
-            raise ValueError(f"proxy {pid} not found")
-        up_reader, up_writer = await asyncio.open_connection(proxy.host, proxy.port)
+            return None
+        if proxy.auth:
+            user = urllib.parse.quote(proxy.auth['username'], safe='')
+            pw = urllib.parse.quote(proxy.auth['password'], safe='')
+            return f"http://{user}:{pw}@{proxy.host}:{proxy.port}"
+        return f"http://{proxy.host}:{proxy.port}"
+
+    async def _try_http(self, pid: str, proxy_url: Optional[str], method: str, url: str, headers: dict, body: bytes, update_meta: bool = True):
+        kw = {}
+        if proxy_url:
+            kw['proxy'] = proxy_url
+        client = httpx.AsyncClient(**kw, limits=httpx.Limits(max_keepalive_connections=10, max_connections=50, keepalive_expiry=30))
+        try:
+            self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
+            resp = await client.request(method, url, headers=headers, content=body, timeout=10)
+            self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
+            domain = urllib.parse.urlparse(url).hostname or url
+            per_domain = self.domain_stats.setdefault(domain, {})
+            per_domain[pid] = per_domain.get(pid, 0) + 1
+            self._save_domain_stats(domain, pid)
+            if update_meta:
+                self._update_domain_meta(domain, pid)
+            return pid, method, url, resp, client
+        except BaseException:
+            try:
+                await client.aclose()
+            except (BrokenPipeError, ConnectionError, OSError):
+                pass
+            raise
+
+    async def _try_tunnel(self, pid: str, target: str, proxy_host: Optional[str], proxy_port: Optional[int], proxy_auth: Optional[dict], update_meta: bool = True):
+        if proxy_host is not None:
+            up_reader, up_writer = await asyncio.open_connection(proxy_host, proxy_port)
+        else:
+            if ':' not in target:
+                raise ValueError(f'Invalid CONNECT target: {target}')
+            if target.startswith('['):
+                host_end = target.find(']')
+                host = target[1:host_end]
+                port = int(target[host_end + 2:])
+            else:
+                host, port_str = target.rsplit(':', 1)
+                port = int(port_str)
+            up_reader, up_writer = await asyncio.open_connection(host, port)
         try:
             auth_hdr = ""
-            if proxy.auth:
-                raw = f"{proxy.auth['username']}:{proxy.auth['password']}"
+            if proxy_auth:
+                raw = f"{proxy_auth['username']}:{proxy_auth['password']}"
                 encoded = base64.b64encode(raw.encode()).decode()
                 auth_hdr = f"Proxy-Authorization: Basic {encoded}\r\n"
             up_writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n{auth_hdr}\r\n".encode('latin-1'))
@@ -481,79 +296,170 @@ class Router:
                 pass
             raise
 
-    async def _connect_direct(self, target: str, update_meta: bool = True):
-        """直连目标网站建立 CONNECT 隧道（不经过上游代理）"""
-        pid = 'local'
-        if ':' not in target:
-            raise ValueError(f'Invalid CONNECT target: {target}')
-        if target.startswith('['):
-            host_end = target.find(']')
-            host = target[1:host_end]
-            port = int(target[host_end + 2:])
-        else:
-            host, port_str = target.rsplit(':', 1)
-            port = int(port_str)
-        up_reader, up_writer = await asyncio.open_connection(host, port)
+    # ── 客户端入口 ──────────────────────────────────────────────
+
+    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        peer = writer.get_extra_info('peername')
+        logger.info("client connected %s", peer)
+        self._set_nodelay(writer)
         try:
-            up_writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode('latin-1'))
-            await up_writer.drain()
-            self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
-            status = await up_reader.readline()
-            if not status:
-                raise RuntimeError('no response from target')
-            status_text = status.decode('latin-1')
-            if '200' not in status_text:
-                while True:
-                    h = await up_reader.readline()
-                    if not h or h in (b"\r\n", b"\n"):
-                        break
-                raise RuntimeError(f'target returned non-200 for CONNECT: {status_text.strip()}')
+            line = await reader.readline()
+            if not line:
+                return
+            first = line.decode('latin-1').strip()
+            headers = b''
             while True:
-                h = await up_reader.readline()
+                h = await reader.readline()
                 if not h or h in (b"\r\n", b"\n"):
                     break
-            self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
-            per_domain = self.domain_stats.setdefault(target, {})
-            per_domain[pid] = per_domain.get(pid, 0) + 1
-            self._save_domain_stats(target, pid)
-            if update_meta:
-                self._update_domain_meta(target, pid)
-            return pid, up_reader, up_writer
-        except BaseException:
+                headers += h
+            logger.debug("first line: %s", first)
+            if first.upper().startswith('CONNECT'):
+                target = first.split(' ')[1]
+                await self._handle_connect(target, reader, writer)
+            else:
+                body = b''
+                cl = None
+                for h in headers.decode('latin-1').split('\r\n'):
+                    if h.lower().startswith('content-length:'):
+                        cl = int(h.split(':', 1)[1].strip())
+                        break
+                if cl and cl > 0:
+                    body = await reader.readexactly(cl)
+                elif not cl and first.upper().split(' ')[0] in ('POST', 'PUT', 'PATCH'):
+                    body = await reader.read(-1)
+                request_bytes = (first + '\r\n').encode('latin-1') + headers + b'\r\n' + body
+                await self._handle_http_request(request_bytes, writer)
+        except Exception:
+            logger.exception("error handling client")
+        finally:
             try:
-                up_writer.close()
-                await up_writer.wait_closed()
+                writer.close()
+                await writer.wait_closed()
             except Exception:
                 pass
-            raise
+
+    # ── HTTP 请求处理 ──────────────────────────────────────────
+
+    async def _build_racing_tasks_http(self, proxies: List[str], method: str, url: str, headers: dict, body: bytes) -> set:
+        tasks = set()
+        for pid in proxies[:self.max_retries]:
+            proxy = self.proxy_store.get(pid)
+            if not proxy:
+                continue
+            tasks.add(asyncio.create_task(self._try_http(pid, self._build_proxy_url(proxy), method, url, headers, body)))
+        if self.enable_local_racing:
+            tasks.add(asyncio.create_task(self._try_http('local', None, method, url, headers, body)))
+        return tasks
+
+    async def _handle_http_request(self, request_bytes: bytes, writer: asyncio.StreamWriter):
+        text = request_bytes.decode('latin-1', errors='ignore')
+        first_line = text.split('\r\n')[0]
+        parts = first_line.split(' ')
+        if len(parts) < 3:
+            try:
+                writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nBad Request")
+                await writer.drain()
+            except Exception:
+                pass
+            return
+        method, url, _ = parts
+        domain = urllib.parse.urlparse(url).hostname or url
+        hdrs = {}
+        lines = text.split('\r\n')
+        i = 1
+        while i < len(lines) and lines[i]:
+            h = lines[i]
+            if ':' in h:
+                k, v = h.split(':', 1)
+                hdrs[k.strip()] = v.strip()
+            i += 1
+        body = '\r\n'.join(lines[i+1:]).encode('latin-1') if i+1 < len(lines) else None
+
+        # HTTP GET 缓存
+        cached_entry = self._http_cache_get(method, url)
+        if cached_entry:
+            logger.info("HTTP cache hit %s %s", method, url)
+            await self._write_response(writer, cached_entry['status_code'], cached_entry['reason_phrase'],
+                                       cached_entry['headers'], cached_entry['content'])
+            return
+
+        # 域名缓存
+        if domain:
+            cached_pid = self._get_fresh_proxy(domain)
+            if cached_pid:
+                try:
+                    proxy = self.proxy_store.get(cached_pid)
+                    pid, method, url, resp, client = await self._try_http(
+                        cached_pid, self._build_proxy_url(proxy), method, url, hdrs, body, update_meta=False)
+                    logger.info("proxy %s cache hit %s %s", pid, method, url)
+                    await self._write_response(writer, resp.status_code, resp.reason_phrase,
+                                               dict(resp.headers.items()), resp.content)
+                    try:
+                        await client.aclose()
+                    except (BrokenPipeError, ConnectionError, OSError):
+                        pass
+                    if resp.status_code >= 200 and resp.status_code < 300:
+                        self._http_cache_set(method, url, resp)
+                    return
+                except Exception:
+                    logger.debug("cached proxy %s failed for %s", cached_pid, domain)
+
+        # 竞速
+        proxies = self.selector.ordered_proxies()
+        if not proxies and not self.enable_local_racing:
+            await self._write_response(writer, 502, 'Bad Gateway', {'Content-Type': 'text/plain'}, b'Bad Gateway')
+            return
+
+        tasks = await self._build_racing_tasks_http(proxies, method, url, hdrs, body)
+        winner_resp = await self._race(tasks)
+
+        if not winner_resp and len(proxies) > self.max_retries:
+            remaining = proxies[self.max_retries:]
+            tasks = await self._build_racing_tasks_http(remaining, method, url, hdrs, body)
+            winner_resp = await self._race(tasks)
+
+        if winner_resp:
+            pid, method, url, resp, client = winner_resp
+            logger.info("proxy %s racing win %s %s", pid, method, url)
+            await self._write_response(writer, resp.status_code, resp.reason_phrase,
+                                       dict(resp.headers.items()), resp.content)
+            try:
+                await client.aclose()
+            except (BrokenPipeError, ConnectionError, OSError):
+                pass
+            if resp.status_code >= 200 and resp.status_code < 300:
+                self._http_cache_set(method, url, resp)
+            return
+
+        logger.error("all proxies failed for HTTP request")
+        await self._write_response(writer, 502, 'Bad Gateway', {'Content-Type': 'text/plain'}, b'Bad Gateway')
+
+    # ── CONNECT 处理 ──────────────────────────────────────────
+
+    async def _build_racing_tasks_connect(self, proxies: List[str], target: str) -> set:
+        tasks = set()
+        for pid in proxies[:self.max_retries]:
+            proxy = self.proxy_store.get(pid)
+            if not proxy:
+                continue
+            tasks.add(asyncio.create_task(self._try_tunnel(pid, target, proxy.host, proxy.port, proxy.auth)))
+        if self.enable_local_racing:
+            tasks.add(asyncio.create_task(self._try_tunnel('local', target, None, None, None)))
+        return tasks
 
     async def _handle_connect(self, target: str, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter):
-        """处理 CONNECT 请求：先查域名缓存，再竞速，最后建立双向 pipe 转发"""
         cached_pid = self._get_fresh_proxy(target)
         if cached_pid:
             try:
-                pid, up_reader, up_writer = await self._try_connect(cached_pid, target, update_meta=False)
+                proxy = self.proxy_store.get(cached_pid)
+                pid, up_reader, up_writer = await self._try_tunnel(cached_pid, target, proxy.host, proxy.port, proxy.auth, update_meta=False)
                 logger.info("proxy %s cache hit CONNECT %s", pid, target)
                 self._set_nodelay(client_writer)
                 self._set_nodelay(up_writer)
                 client_writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
                 await client_writer.drain()
-                async def pipe(reader, writer):
-                    try:
-                        while True:
-                            data = await asyncio.wait_for(reader.read(65536), timeout=300)
-                            if not data:
-                                break
-                            writer.write(data)
-                            await writer.drain()
-                    except Exception:
-                        pass
-                    try:
-                        writer.close()
-                        await writer.wait_closed()
-                    except Exception:
-                        pass
-                await asyncio.gather(pipe(client_reader, up_writer), pipe(up_reader, client_writer))
+                await asyncio.gather(self._pipe(client_reader, up_writer), self._pipe(up_reader, client_writer))
                 try:
                     up_writer.close()
                     await up_writer.wait_closed()
@@ -563,7 +469,6 @@ class Router:
             except Exception:
                 logger.debug("cached proxy %s failed CONNECT %s", cached_pid, target)
 
-        # 竞速：同时尝试上游代理和本机直连，谁先建立隧道谁赢
         proxies = self.selector.ordered_proxies()
         if not proxies and not self.enable_local_racing:
             try:
@@ -573,49 +478,13 @@ class Router:
                 pass
             return
 
-        tasks = set()
-        for pid in proxies[:self.max_retries]:
-            tasks.add(asyncio.create_task(self._try_connect(pid, target)))
-        if self.enable_local_racing:
-            tasks.add(asyncio.create_task(self._connect_direct(target)))
-
-        winner = None
-        while tasks:
-            done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for t in done:
-                try:
-                    pid, up_reader, up_writer = t.result()
-                    winner = (pid, up_reader, up_writer)
-                    break
-                except Exception:
-                    pass
-            if winner:
-                for t in tasks:
-                    t.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                break
+        tasks = await self._build_racing_tasks_connect(proxies, target)
+        winner = await self._race(tasks)
 
         if not winner and len(proxies) > self.max_retries:
             remaining = proxies[self.max_retries:]
-            tasks = set()
-            for pid in remaining:
-                tasks.add(asyncio.create_task(self._try_connect(pid, target)))
-            if self.enable_local_racing:
-                tasks.add(asyncio.create_task(self._connect_direct(target)))
-            while tasks:
-                done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                for t in done:
-                    try:
-                        pid, up_reader, up_writer = t.result()
-                        winner = (pid, up_reader, up_writer)
-                        break
-                    except Exception:
-                        pass
-                if winner:
-                    for t in tasks:
-                        t.cancel()
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    break
+            tasks = await self._build_racing_tasks_connect(remaining, target)
+            winner = await self._race(tasks)
 
         if winner:
             pid, up_reader, up_writer = winner
@@ -625,24 +494,7 @@ class Router:
             self._set_nodelay(up_writer)
             client_writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
             await client_writer.drain()
-
-            async def pipe(reader, writer):
-                try:
-                    while True:
-                        data = await asyncio.wait_for(reader.read(65536), timeout=300)
-                        if not data:
-                            break
-                        writer.write(data)
-                        await writer.drain()
-                except Exception:
-                    pass
-                try:
-                    writer.close()
-                    await writer.wait_closed()
-                except Exception:
-                    pass
-
-            await asyncio.gather(pipe(client_reader, up_writer), pipe(up_reader, client_writer))
+            await asyncio.gather(self._pipe(client_reader, up_writer), self._pipe(up_reader, client_writer))
             try:
                 up_writer.close()
                 await up_writer.wait_closed()
