@@ -9,7 +9,7 @@ from .config_schema import ProxyInfo
 
 app = FastAPI(title="auto_squid API")
 
-# these will be set by CLI on startup
+# 由 CLI 在启动时注入
 _proxy_store: ProxyStore | None = None
 _router: Router | None = None
 
@@ -66,6 +66,7 @@ async def router_config():
 
 @app.get("/domains")
 async def domains():
+    """返回各域名在各代理上的获胜次数"""
     if not _router:
         return {}
     return _router.get_domain_stats_from_db()
@@ -73,6 +74,7 @@ async def domains():
 
 @app.get("/domains/meta")
 async def domains_meta():
+    """返回域名缓存元数据（当前默认代理、更新时间）"""
     if not _router:
         return {}
     return _router.get_domain_meta_from_db()
@@ -168,8 +170,10 @@ async function fetchData() {
   meta = await r2.json();
   cfg = await r3.json();
   proxyIds = [...new Set(Object.values(data).flatMap(v => Object.keys(v)))].sort();
+  // 如果开启本机竞速但尚无数据，仍然显示 local 列
   if (cfg.enable_local_racing && !proxyIds.includes('local')) proxyIds.unshift('local');
   const entries = Object.entries(data);
+  // 默认按 Updated At 降序排列
   entries.sort((a,b) => {
     const ua = (meta[a[0]]||{}).updated_at||'';
     const ub = (meta[b[0]]||{}).updated_at||'';
@@ -224,7 +228,7 @@ function render() {
   if (page >= pageCount) page = pageCount - 1;
   const start = page * pageSize;
   const pageEntries = entries.slice(start, start + pageSize);
-  const offset = 2; // cols before proxy columns: domain, default-proxy, updated-at
+  const offset = 2; // 代理数据列之前的列数：domain, default-proxy, updated-at
 
   let html = '<table><thead><tr><th onclick="sortBy(0)">Domain <span class="arrow">↕</span></th>';
   html += '<th onclick="sortBy(1)">Default Proxy <span class="arrow">↕</span></th>';

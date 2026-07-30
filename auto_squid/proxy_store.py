@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 class ProxyStore:
-    """In-memory proxy registry with optional YAML persistence."""
+    """内存代理注册表，支持从 YAML 文件加载/保存"""
 
     def __init__(self, path: Optional[str] = None):
         self._proxies: Dict[str, ProxyInfo] = {}

@@ -2,7 +2,9 @@ import asyncio
 import base64
 import logging
 import random
+import socket
 import sqlite3
+import time
 import urllib.parse
 from typing import Optional, List
 import httpx
@@ -13,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class ProxySelector:
+    """返回所有可用代理的随机排列"""
     def __init__(self, proxy_store: ProxyStore):
         self.proxy_store = proxy_store
 
@@ -28,7 +31,7 @@ class ProxySelector:
 
 
 class Router:
-    """Router with retry/failover policy: try top N proxies on failure."""
+    """代理路由器，支持并行竞速、域名缓存、HTTP GET 缓存和本机直连"""
 
     def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False):
         self.proxy_store = proxy_store
@@ -61,6 +64,9 @@ class Router:
         """)
         self._db.commit()
         self._now_utc = lambda: datetime.now(timezone.utc).isoformat()
+        # HTTP GET 响应缓存（内存，TTL 60s）
+        self._http_cache: dict[str, dict] = {}
+        self._http_cache_ttl = 60
 
     def _save_domain_stats(self, domain: str, pid: str):
         self._db.execute(
@@ -78,6 +84,7 @@ class Router:
         return result
 
     def _update_domain_meta(self, domain: str, pid: str):
+        """记录该域名当前默认使用哪个代理"""
         self._db.execute(
             "INSERT INTO domain_meta (domain, default_proxy, updated_at) VALUES (?, ?, ?) "
             "ON CONFLICT(domain) DO UPDATE SET default_proxy = excluded.default_proxy, updated_at = excluded.updated_at",
@@ -90,6 +97,7 @@ class Router:
         return {domain: {"default_proxy": dp, "updated_at": ua} for domain, dp, ua in rows}
 
     def _get_fresh_proxy(self, domain: str) -> Optional[str]:
+        """若域名缓存在 cache_ttl 内，返回缓存代理 ID，否则触发重新竞速"""
         from datetime import datetime, timezone
         row = self._db.execute(
             "SELECT default_proxy, updated_at FROM domain_meta WHERE domain = ?",
@@ -106,14 +114,61 @@ class Router:
             pass
         return None
 
+    @staticmethod
+    def _set_nodelay(writer):
+        """为 TCP socket 禁用 Nagle 算法并启用 Quick ACK，降低小包延迟"""
+        sock = writer.get_extra_info('socket')
+        if sock:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
+            except (OSError, AttributeError):
+                pass
+
+    def _http_cache_key(self, method: str, url: str) -> str:
+        return f"{method}:{url}"
+
+    def _http_cache_get(self, method: str, url: str) -> Optional[dict]:
+        """T 返回缓存的 GET 响应（未过期则返回，否则删除）"""
+        if method != 'GET':
+            return None
+        key = self._http_cache_key(method, url)
+        entry = self._http_cache.get(key)
+        if not entry:
+            return None
+        if time.time() - entry['cached_at'] > self._http_cache_ttl:
+            del self._http_cache[key]
+            return None
+        return entry
+
+    def _http_cache_set(self, method: str, url: str, resp) -> None:
+        """缓存 GET 响应的状态行、响应头和正文，跳过不含 Content-Length 或禁止缓存的响应"""
+        if method != 'GET':
+            return
+        cl = resp.headers.get('content-length')
+        if not cl:
+            cc = resp.headers.get('cache-control', '')
+            if 'no-cache' in cc or 'no-store' in cc or 'private' in cc:
+                return
+        key = self._http_cache_key(method, url)
+        self._http_cache[key] = {
+            'status_code': resp.status_code,
+            'reason_phrase': resp.reason_phrase,
+            'headers': dict(resp.headers.items()),
+            'content': resp.content,
+            'cached_at': time.time(),
+        }
+
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         peer = writer.get_extra_info('peername')
         logger.info("client connected %s", peer)
+        self._set_nodelay(writer)
         try:
             line = await reader.readline()
             if not line:
                 return
             first = line.decode('latin-1').strip()
+            # 读取完整的请求头
             headers = b''
             while True:
                 h = await reader.readline()
@@ -125,6 +180,7 @@ class Router:
                 target = first.split(' ')[1]
                 await self._handle_connect(target, reader, writer)
             else:
+                # 解析 Content-Length 以确定请求体长度
                 body = b''
                 cl = None
                 for h in headers.decode('latin-1').split('\r\n'):
@@ -147,6 +203,7 @@ class Router:
                 pass
 
     async def _try_proxy(self, pid: str, request_bytes: bytes, update_meta: bool = True):
+        """通过上游代理发送 HTTP 请求，竞速获胜后返回 (pid, method, url, resp, client)"""
         proxy = self.proxy_store.get(pid)
         if not proxy:
             raise ValueError(f"proxy {pid} not found")
@@ -156,7 +213,7 @@ class Router:
             proxy_url = f"http://{user}:{pw}@{proxy.host}:{proxy.port}"
         else:
             proxy_url = f"http://{proxy.host}:{proxy.port}"
-        client = httpx.AsyncClient(proxy=proxy_url, limits=httpx.Limits(max_connections=1, max_keepalive_connections=0))
+        client = httpx.AsyncClient(proxy=proxy_url, limits=httpx.Limits(max_keepalive_connections=10, max_connections=50, keepalive_expiry=30))
         try:
             self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
             text = request_bytes.decode('latin-1', errors='ignore')
@@ -192,7 +249,8 @@ class Router:
             raise
 
     async def _try_direct(self, request_bytes: bytes, update_meta: bool = True):
-        client = httpx.AsyncClient(limits=httpx.Limits(max_connections=1, max_keepalive_connections=0))
+        """不经过上游代理，直接从本机发出 HTTP 请求（参与竞速时 pid='local'）"""
+        client = httpx.AsyncClient(limits=httpx.Limits(max_keepalive_connections=10, max_connections=50, keepalive_expiry=30))
         try:
             pid = 'local'
             self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
@@ -232,7 +290,26 @@ class Router:
         text = request_bytes.decode('latin-1', errors='ignore')
         first_line = text.split('\r\n')[0]
         parts = first_line.split(' ')
-        domain = urllib.parse.urlparse(parts[1]).hostname if len(parts) >= 3 else None
+        method = parts[0] if len(parts) >= 3 else ''
+        url = parts[1] if len(parts) >= 3 else ''
+        domain = urllib.parse.urlparse(url).hostname if url else None
+        # 先查 HTTP GET 缓存
+        cached_entry = self._http_cache_get(method, url)
+        if cached_entry:
+            logger.info("HTTP cache hit %s %s", method, url)
+            try:
+                status_line = f"HTTP/1.1 {cached_entry['status_code']} {cached_entry['reason_phrase']}\r\n"
+                writer.write(status_line.encode('latin-1'))
+                for k, v in cached_entry['headers'].items():
+                    writer.write(f"{k}: {v}\r\n".encode('latin-1'))
+                writer.write(f"Content-Length: {len(cached_entry['content'])}\r\n".encode('latin-1'))
+                writer.write(b"\r\n")
+                writer.write(cached_entry['content'])
+                await writer.drain()
+            except (BrokenPipeError, ConnectionError, OSError):
+                pass
+            return
+        # 再查域名缓存（cache_ttl 内免竞速）
         if domain:
             cached_pid = self._get_fresh_proxy(domain)
             if cached_pid:
@@ -255,10 +332,13 @@ class Router:
                         await client.aclose()
                     except (BrokenPipeError, ConnectionError, OSError):
                         pass
+                    if resp.status_code >= 200 and resp.status_code < 300:
+                        self._http_cache_set(method, url, resp)
                     return
                 except Exception:
                     logger.debug("cached proxy %s failed for %s", cached_pid, domain)
 
+        # 无缓存命中，进入竞速模式
         proxies = self.selector.ordered_proxies()
         if not proxies and not self.enable_local_racing:
             try:
@@ -273,6 +353,7 @@ class Router:
                 pass
             return
 
+        # 第一轮：取 top N 代理 + 本机直连（如启用）
         tasks = set()
         for pid in proxies[:self.max_retries]:
             tasks.add(asyncio.create_task(self._try_proxy(pid, request_bytes)))
@@ -295,6 +376,7 @@ class Router:
                 await asyncio.gather(*tasks, return_exceptions=True)
                 break
 
+        # 第一轮全部失败，退回到剩余代理再竞速
         if not winner_resp and len(proxies) > self.max_retries:
             remaining = proxies[self.max_retries:]
             tasks = set()
@@ -317,6 +399,7 @@ class Router:
                     await asyncio.gather(*tasks, return_exceptions=True)
                     break
 
+        # 将获胜结果写回客户端
         if winner_resp:
             pid, method, url, resp, client = winner_resp
             logger.info("proxy %s racing win %s %s", pid, method, url)
@@ -339,6 +422,8 @@ class Router:
                 await client.aclose()
             except (BrokenPipeError, ConnectionError, OSError):
                 pass
+            if resp.status_code >= 200 and resp.status_code < 300:
+                self._http_cache_set(method, url, resp)
             return
 
         logger.error("all proxies failed for HTTP request")
@@ -353,6 +438,7 @@ class Router:
         except Exception:
             pass
     async def _try_connect(self, pid: str, target: str, update_meta: bool = True):
+        """通过上游代理建立 CONNECT 隧道，竞速获胜后返回 (pid, reader, writer)"""
         proxy = self.proxy_store.get(pid)
         if not proxy:
             raise ValueError(f"proxy {pid} not found")
@@ -387,16 +473,16 @@ class Router:
             if update_meta:
                 self._update_domain_meta(target, pid)
             return pid, up_reader, up_writer
-        except Exception as e:
+        except BaseException:
             try:
                 up_writer.close()
                 await up_writer.wait_closed()
             except Exception:
                 pass
-            logger.debug("_try_connect exception: %s", e)
             raise
 
     async def _connect_direct(self, target: str, update_meta: bool = True):
+        """直连目标网站建立 CONNECT 隧道（不经过上游代理）"""
         pid = 'local'
         if ':' not in target:
             raise ValueError(f'Invalid CONNECT target: {target}')
@@ -433,27 +519,29 @@ class Router:
             if update_meta:
                 self._update_domain_meta(target, pid)
             return pid, up_reader, up_writer
-        except Exception as e:
+        except BaseException:
             try:
                 up_writer.close()
                 await up_writer.wait_closed()
             except Exception:
                 pass
-            logger.debug("_connect_direct exception: %s", e)
             raise
 
     async def _handle_connect(self, target: str, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter):
+        """处理 CONNECT 请求：先查域名缓存，再竞速，最后建立双向 pipe 转发"""
         cached_pid = self._get_fresh_proxy(target)
         if cached_pid:
             try:
                 pid, up_reader, up_writer = await self._try_connect(cached_pid, target, update_meta=False)
                 logger.info("proxy %s cache hit CONNECT %s", pid, target)
+                self._set_nodelay(client_writer)
+                self._set_nodelay(up_writer)
                 client_writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
                 await client_writer.drain()
                 async def pipe(reader, writer):
                     try:
                         while True:
-                            data = await asyncio.wait_for(reader.read(4096), timeout=300)
+                            data = await asyncio.wait_for(reader.read(65536), timeout=300)
                             if not data:
                                 break
                             writer.write(data)
@@ -475,6 +563,7 @@ class Router:
             except Exception:
                 logger.debug("cached proxy %s failed CONNECT %s", cached_pid, target)
 
+        # 竞速：同时尝试上游代理和本机直连，谁先建立隧道谁赢
         proxies = self.selector.ordered_proxies()
         if not proxies and not self.enable_local_racing:
             try:
@@ -532,13 +621,15 @@ class Router:
             pid, up_reader, up_writer = winner
             client_peer = client_writer.get_extra_info('peername')
             logger.info("proxy %s racing CONNECT to %s for client %s", pid, target, client_peer)
+            self._set_nodelay(client_writer)
+            self._set_nodelay(up_writer)
             client_writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
             await client_writer.drain()
 
             async def pipe(reader, writer):
                 try:
                     while True:
-                        data = await asyncio.wait_for(reader.read(4096), timeout=300)
+                        data = await asyncio.wait_for(reader.read(65536), timeout=300)
                         if not data:
                             break
                         writer.write(data)
