@@ -4,12 +4,15 @@ import logging
 import random
 import socket
 import sqlite3
+import threading
 import time
 import urllib.parse
 from typing import Optional, List
+from datetime import datetime, timezone
 import httpx
 
 from .proxy_store import ProxyStore
+from .policy_engine import PolicyEngine
 
 logger = logging.getLogger(__name__)
 
@@ -38,12 +41,12 @@ class Router:
         self.max_retries = max_retries
         self.enable_local_racing = enable_local_racing
         self._server: Optional[asyncio.AbstractServer] = None
+        self._running_tasks: set[asyncio.Task] = set()
         self.request_counts: dict[str, int] = {}
         self.attempted_counts: dict[str, int] = {}
         self.domain_stats: dict[str, dict[str, int]] = {}
         self.cache_ttl = cache_ttl
         self._db = sqlite3.connect(db_path, check_same_thread=False)
-        from datetime import datetime, timezone
         self._db.execute("""
             CREATE TABLE IF NOT EXISTS domain_stats (
                 domain TEXT NOT NULL,
@@ -59,20 +62,36 @@ class Router:
                 updated_at TEXT NOT NULL
             )
         """)
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS policy_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rule_type TEXT NOT NULL,
+                domain_pattern TEXT NOT NULL,
+                target_type TEXT NOT NULL,
+                target_proxy TEXT,
+                tag_key TEXT,
+                tag_value TEXT,
+                priority INTEGER NOT NULL DEFAULT 0,
+                enabled INTEGER NOT NULL DEFAULT 1
+            )
+        """)
         self._db.commit()
         self._now_utc = lambda: datetime.now(timezone.utc).isoformat()
         self._http_cache: dict[str, dict] = {}
         self._http_cache_ttl = 60
+        self._db_lock = threading.Lock()
+        self.policy_engine = PolicyEngine(self._db, proxy_store)
 
     # ── DB helpers ──────────────────────────────────────────────
 
     def _save_domain_stats(self, domain: str, pid: str):
-        self._db.execute(
-            "INSERT INTO domain_stats (domain, proxy_id, wins) VALUES (?, ?, 1) "
-            "ON CONFLICT(domain, proxy_id) DO UPDATE SET wins = wins + 1",
-            (domain, pid),
-        )
-        self._db.commit()
+        with self._db_lock:
+            self._db.execute(
+                "INSERT INTO domain_stats (domain, proxy_id, wins) VALUES (?, ?, 1) "
+                "ON CONFLICT(domain, proxy_id) DO UPDATE SET wins = wins + 1",
+                (domain, pid),
+            )
+            self._db.commit()
 
     def get_domain_stats_from_db(self) -> dict[str, dict[str, int]]:
         rows = self._db.execute("SELECT domain, proxy_id, wins FROM domain_stats").fetchall()
@@ -82,19 +101,19 @@ class Router:
         return result
 
     def _update_domain_meta(self, domain: str, pid: str):
-        self._db.execute(
-            "INSERT INTO domain_meta (domain, default_proxy, updated_at) VALUES (?, ?, ?) "
-            "ON CONFLICT(domain) DO UPDATE SET default_proxy = excluded.default_proxy, updated_at = excluded.updated_at",
-            (domain, pid, self._now_utc()),
-        )
-        self._db.commit()
+        with self._db_lock:
+            self._db.execute(
+                "INSERT INTO domain_meta (domain, default_proxy, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(domain) DO UPDATE SET default_proxy = excluded.default_proxy, updated_at = excluded.updated_at",
+                (domain, pid, self._now_utc()),
+            )
+            self._db.commit()
 
     def get_domain_meta_from_db(self) -> dict[str, dict[str, str]]:
         rows = self._db.execute("SELECT domain, default_proxy, updated_at FROM domain_meta").fetchall()
         return {domain: {"default_proxy": dp, "updated_at": ua} for domain, dp, ua in rows}
 
     def _get_fresh_proxy(self, domain: str) -> Optional[str]:
-        from datetime import datetime, timezone
         row = self._db.execute(
             "SELECT default_proxy, updated_at FROM domain_meta WHERE domain = ?",
             (domain,)
@@ -143,7 +162,7 @@ class Router:
         if method != 'GET':
             return
         cl = resp.headers.get('content-length')
-        if not cl:
+        if cl is None:
             cc = resp.headers.get('cache-control', '')
             if 'no-cache' in cc or 'no-store' in cc or 'private' in cc:
                 return
@@ -245,19 +264,25 @@ class Router:
             raise
 
     async def _try_tunnel(self, pid: str, target: str, proxy_host: Optional[str], proxy_port: Optional[int], proxy_auth: Optional[dict], update_meta: bool = True):
-        if proxy_host is not None:
-            up_reader, up_writer = await asyncio.open_connection(proxy_host, proxy_port)
-        else:
-            if ':' not in target:
-                raise ValueError(f'Invalid CONNECT target: {target}')
-            if target.startswith('['):
-                host_end = target.find(']')
-                host = target[1:host_end]
-                port = int(target[host_end + 2:])
+        connect_timeout = 15
+        try:
+            if proxy_host is not None:
+                up_reader, up_writer = await asyncio.wait_for(
+                    asyncio.open_connection(proxy_host, proxy_port), timeout=connect_timeout)
             else:
-                host, port_str = target.rsplit(':', 1)
-                port = int(port_str)
-            up_reader, up_writer = await asyncio.open_connection(host, port)
+                if ':' not in target:
+                    raise ValueError(f'Invalid CONNECT target: {target}')
+                if target.startswith('['):
+                    host_end = target.find(']')
+                    host = target[1:host_end]
+                    port = int(target[host_end + 2:])
+                else:
+                    host, port_str = target.rsplit(':', 1)
+                    port = int(port_str)
+                up_reader, up_writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port), timeout=connect_timeout)
+        except (asyncio.TimeoutError, OSError, ConnectionError) as e:
+            raise RuntimeError(f'connect to {proxy_host or host}:{proxy_port or port} timed out: {e}')
         try:
             auth_hdr = ""
             if proxy_auth:
@@ -267,7 +292,7 @@ class Router:
             up_writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n{auth_hdr}\r\n".encode('latin-1'))
             await up_writer.drain()
             self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
-            status = await up_reader.readline()
+            status = await asyncio.wait_for(up_reader.readline(), timeout=connect_timeout)
             if not status:
                 raise RuntimeError('no response from upstream')
             status_text = status.decode('latin-1')
@@ -299,6 +324,8 @@ class Router:
     # ── 客户端入口 ──────────────────────────────────────────────
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        task = asyncio.current_task()
+        self._running_tasks.add(task)
         peer = writer.get_extra_info('peername')
         logger.info("client connected %s", peer)
         self._set_nodelay(writer)
@@ -327,7 +354,17 @@ class Router:
                 if cl and cl > 0:
                     body = await reader.readexactly(cl)
                 elif not cl and first.upper().split(' ')[0] in ('POST', 'PUT', 'PATCH'):
-                    body = await reader.read(-1)
+                    MAX_BODY = 10 * 1024 * 1024
+                    body = b''
+                    while len(body) < MAX_BODY:
+                        chunk = await reader.read(MAX_BODY - len(body))
+                        if not chunk:
+                            break
+                        body += chunk
+                    if len(body) >= MAX_BODY:
+                        writer.write(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 15\r\n\r\nPayload Too Large")
+                        await writer.drain()
+                        return
                 request_bytes = (first + '\r\n').encode('latin-1') + headers + b'\r\n' + body
                 await self._handle_http_request(request_bytes, writer)
         except Exception:
@@ -338,6 +375,7 @@ class Router:
                 await writer.wait_closed()
             except Exception:
                 pass
+            self._running_tasks.discard(task)
 
     # ── HTTP 请求处理 ──────────────────────────────────────────
 
@@ -376,6 +414,28 @@ class Router:
             i += 1
         body = '\r\n'.join(lines[i+1:]).encode('latin-1') if i+1 < len(lines) else None
 
+        # 策略引擎：force 规则短路
+        if self.policy_engine:
+            forced_pid = self.policy_engine.resolve_force(domain)
+            if forced_pid:
+                proxy = self.proxy_store.get(forced_pid)
+                if proxy:
+                    try:
+                        pid, method, url, resp, client = await self._try_http(
+                            forced_pid, self._build_proxy_url(proxy), method, url, hdrs, body, update_meta=False)
+                        logger.info("policy force %s for %s via %s", forced_pid, domain, forced_pid)
+                        await self._write_response(writer, resp.status_code, resp.reason_phrase,
+                                                   dict(resp.headers.items()), resp.content)
+                        try:
+                            await client.aclose()
+                        except (BrokenPipeError, ConnectionError, OSError):
+                            pass
+                        if resp.status_code >= 200 and resp.status_code < 300:
+                            self._http_cache_set(method, url, resp)
+                        return
+                    except Exception:
+                        logger.debug("forced proxy %s failed for %s", forced_pid, domain)
+
         # HTTP GET 缓存
         cached_entry = self._http_cache_get(method, url)
         if cached_entry:
@@ -407,6 +467,11 @@ class Router:
 
         # 竞速
         proxies = self.selector.ordered_proxies()
+        # 策略引擎：deny + prefer 过滤/排序
+        if self.policy_engine:
+            if domain:
+                proxies = self.policy_engine.evaluate_denies(domain, proxies)
+                proxies = self.policy_engine.apply_prefers(domain, proxies)
         if not proxies and not self.enable_local_racing:
             await self._write_response(writer, 502, 'Bad Gateway', {'Content-Type': 'text/plain'}, b'Bad Gateway')
             return
@@ -449,6 +514,33 @@ class Router:
         return tasks
 
     async def _handle_connect(self, target: str, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter):
+        # 提取域名用于策略匹配
+        domain = target.rsplit(':', 1)[0] if ':' in target else target
+
+        # 策略引擎：force 规则短路
+        if self.policy_engine:
+            forced_pid = self.policy_engine.resolve_force(domain)
+            if forced_pid:
+                proxy = self.proxy_store.get(forced_pid)
+                if proxy:
+                    try:
+                        pid, up_reader, up_writer = await self._try_tunnel(
+                            forced_pid, target, proxy.host, proxy.port, proxy.auth, update_meta=False)
+                        logger.info("policy force CONNECT %s via %s", target, pid)
+                        self._set_nodelay(client_writer)
+                        self._set_nodelay(up_writer)
+                        client_writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                        await client_writer.drain()
+                        await asyncio.gather(self._pipe(client_reader, up_writer), self._pipe(up_reader, client_writer))
+                        try:
+                            up_writer.close()
+                            await up_writer.wait_closed()
+                        except Exception:
+                            pass
+                        return
+                    except Exception:
+                        logger.debug("forced proxy %s failed CONNECT %s", forced_pid, target)
+
         cached_pid = self._get_fresh_proxy(target)
         if cached_pid:
             try:
@@ -470,6 +562,10 @@ class Router:
                 logger.debug("cached proxy %s failed CONNECT %s", cached_pid, target)
 
         proxies = self.selector.ordered_proxies()
+        # 策略引擎：deny + prefer 过滤/排序
+        if self.policy_engine:
+            proxies = self.policy_engine.evaluate_denies(domain, proxies)
+            proxies = self.policy_engine.apply_prefers(domain, proxies)
         if not proxies and not self.enable_local_racing:
             try:
                 client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n\r\nBad Gateway")
@@ -522,4 +618,9 @@ class Router:
         if self._server:
             self._server.close()
             await self._server.wait_closed()
+        for t in list(self._running_tasks):
+            t.cancel()
+        if self._running_tasks:
+            await asyncio.gather(*self._running_tasks, return_exceptions=True)
+            self._running_tasks.clear()
         self._db.close()
