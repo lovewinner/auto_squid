@@ -4,7 +4,6 @@ from pydantic import BaseModel
 from typing import List
 
 from .proxy_store import ProxyStore
-from .probe_engine import ProbeEngine
 from .router import Router
 from .config_schema import ProxyInfo
 
@@ -12,7 +11,6 @@ app = FastAPI(title="auto_squid API")
 
 # these will be set by CLI on startup
 _proxy_store: ProxyStore | None = None
-_probe_engine: ProbeEngine | None = None
 _router: Router | None = None
 
 
@@ -45,44 +43,12 @@ async def list_proxies():
     return [ProxyIn(**p.model_dump()) for p in _proxy_store.list()]
 
 
-@app.get("/score")
-async def scores():
-    if not _probe_engine:
-        return {}
-    return _probe_engine.get_scores()
-
-
-@app.get("/probe/status")
-async def probe_status():
-    if not _probe_engine:
-        return {"running": False}
-    return {"running": getattr(_probe_engine, '_running', False)}
-
-
-@app.get("/probe/history")
-async def probe_history():
-    if not _probe_engine:
-        return {}
-    return _probe_engine.get_history()
-
-
-@app.get("/probe/states")
-async def probe_states():
-    if not _probe_engine:
-        return {}
-    return _probe_engine.get_states()
-
-
 @app.get("/metrics")
 async def metrics():
-    if not _probe_engine:
-        return {}
-    scores = _probe_engine.get_scores()
-    states = _probe_engine.get_states()
     counts = _router.request_counts if _router else {}
     attempts = _router.attempted_counts if _router else {}
     domain_stats = _router.get_domain_stats_from_db() if _router else {}
-    return {"scores_count": len(scores), "states": states, "request_counts": counts, "attempted_counts": attempts, "domain_stats": domain_stats}
+    return {"request_counts": counts, "attempted_counts": attempts, "domain_stats": domain_stats}
 
 
 @app.get("/stats")
@@ -91,6 +57,12 @@ async def stats():
     attempts = _router.attempted_counts if _router else {}
     return {"request_counts": counts, "attempted_counts": attempts}
 
+
+@app.get("/config")
+async def router_config():
+    if not _router:
+        return {"enable_local_racing": False}
+    return {"enable_local_racing": _router.enable_local_racing}
 
 @app.get("/domains")
 async def domains():
@@ -175,6 +147,7 @@ let data = {}, meta = {}, proxyIds = [];
 let page = 0, pageSize = 20;
 let refreshTimer = null;
 let refreshInterval = 30;
+let cfg = {};
 
 function onIntervalChange(sel) {
   refreshInterval = parseInt(sel.value);
@@ -190,10 +163,12 @@ function onIntervalChange(sel) {
 }
 
 async function fetchData() {
-  const [r1, r2] = await Promise.all([fetch('/domains'), fetch('/domains/meta')]);
+  const [r1, r2, r3] = await Promise.all([fetch('/domains'), fetch('/domains/meta'), fetch('/config')]);
   data = await r1.json();
   meta = await r2.json();
+  cfg = await r3.json();
   proxyIds = [...new Set(Object.values(data).flatMap(v => Object.keys(v)))].sort();
+  if (cfg.enable_local_racing && !proxyIds.includes('local')) proxyIds.unshift('local');
   const entries = Object.entries(data);
   entries.sort((a,b) => {
     const ua = (meta[a[0]]||{}).updated_at||'';
@@ -324,8 +299,7 @@ onIntervalChange(document.getElementById('interval'));
 </body>
 </html>""")
 
-def mount(proxy_store: ProxyStore, probe_engine: ProbeEngine, router: Router | None = None):
-    global _proxy_store, _probe_engine, _router
+def mount(proxy_store: ProxyStore, router: Router | None = None):
+    global _proxy_store, _router
     _proxy_store = proxy_store
-    _probe_engine = probe_engine
     _router = router

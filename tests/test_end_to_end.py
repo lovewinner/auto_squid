@@ -1,13 +1,10 @@
 import asyncio
-import socket
-import time
 
 import pytest
 
 from auto_squid.proxy_store import ProxyStore
-from auto_squid.probe_engine import ProbeEngine
 from auto_squid.router import Router
-from auto_squid.config_schema import Config, ProxyInfo
+from auto_squid.config_schema import ProxyInfo
 
 
 async def run_mock_proxy(host, port):
@@ -64,13 +61,8 @@ async def test_end_to_end_http_forwarding():
     proxy_store = ProxyStore()
     proxy_store.add(ProxyInfo(id='mock1', host=host, port=proxy_port))
 
-    # probe engine (do one probe cycle)
-    probe_engine = ProbeEngine(proxy_store)
-    # run one probe iteration (non-blocking)
-    await probe_engine._probe_cycle()
-
     # start router
-    router = Router(proxy_store, probe_engine, listen_host=host, listen_port=router_port)
+    router = Router(proxy_store, listen_host=host, listen_port=router_port)
     await router.start()
 
     # connect as client to router and send a simple HTTP GET

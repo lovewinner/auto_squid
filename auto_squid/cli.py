@@ -6,7 +6,6 @@ import sys
 from pathlib import Path
 
 from .proxy_store import ProxyStore
-from .probe_engine import ProbeEngine
 from .router import Router
 from .api import mount as mount_api
 from .config_schema import Config
@@ -45,17 +44,17 @@ def start(config: str = "", proxies: str = "", db: str = "auto_squid.db"):
     if config:
         import yaml
         cfg = Config(**yaml.safe_load(Path(config).read_text()))
+    elif Path("config.yaml").exists():
+        import yaml
+        cfg = Config(**yaml.safe_load(Path("config.yaml").read_text()))
     else:
         cfg = Config()
     setup_logging(cfg)
     proxy_store = ProxyStore(proxies if proxies else "proxies.yaml")
-    probe_engine = ProbeEngine(proxy_store, probe_cfg=cfg.probe, score_cfg=cfg.score)
-    router = Router(proxy_store, probe_engine, listen_host=cfg.listen.host, listen_port=cfg.listen.port, db_path=db, cache_ttl=cfg.router.cache_ttl)
-    mount_api(proxy_store, probe_engine, router)
+    router = Router(proxy_store, listen_host=cfg.listen.host, listen_port=cfg.listen.port, db_path=db, cache_ttl=cfg.router.cache_ttl, enable_local_racing=cfg.router.enable_local_racing)
+    mount_api(proxy_store, router)
 
     async def _main():
-        # start probe loop
-        probe_task = asyncio.create_task(probe_engine.run_loop())
         await router.start()
         # start API server in background
         config_uv = uvicorn.Config("auto_squid.api:app", host=cfg.api.host, port=cfg.api.port, log_level="info")
@@ -64,9 +63,6 @@ def start(config: str = "", proxies: str = "", db: str = "auto_squid.db"):
         try:
             await api_task
         finally:
-            probe_engine.stop()
-            probe_task.cancel()
-            await asyncio.gather(probe_task, return_exceptions=True)
             await router.stop()
 
     asyncio.run(_main())

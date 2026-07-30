@@ -8,23 +8,19 @@ from typing import Optional, List
 import httpx
 
 from .proxy_store import ProxyStore
-from .probe_engine import ProbeEngine
 
 logger = logging.getLogger(__name__)
 
 
 class ProxySelector:
-    def __init__(self, probe_engine: ProbeEngine, proxy_store: ProxyStore):
-        self.probe_engine = probe_engine
+    def __init__(self, proxy_store: ProxyStore):
         self.proxy_store = proxy_store
 
     def ordered_proxies(self) -> List[str]:
-        scores = self.probe_engine.get_scores()
         proxies = self.proxy_store.list()
         enabled = [p for p in proxies if p.enabled]
-        scored = [(p.id, max(0.1, scores.get(p.id, 50.0))) for p in enabled]
-        scored.sort(key=lambda t: -random.random() * t[1])
-        return [pid for (pid, _) in scored]
+        random.shuffle(enabled)
+        return [p.id for p in enabled]
 
     def best_proxy(self) -> Optional[str]:
         lst = self.ordered_proxies()
@@ -34,13 +30,13 @@ class ProxySelector:
 class Router:
     """Router with retry/failover policy: try top N proxies on failure."""
 
-    def __init__(self, proxy_store: ProxyStore, probe_engine: ProbeEngine, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600):
+    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False):
         self.proxy_store = proxy_store
-        self.probe_engine = probe_engine
-        self.selector = ProxySelector(probe_engine, proxy_store)
+        self.selector = ProxySelector(proxy_store)
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.max_retries = max_retries
+        self.enable_local_racing = enable_local_racing
         self._server: Optional[asyncio.AbstractServer] = None
         self.request_counts: dict[str, int] = {}
         self.attempted_counts: dict[str, int] = {}
@@ -195,6 +191,43 @@ class Router:
                 pass
             raise
 
+    async def _try_direct(self, request_bytes: bytes, update_meta: bool = True):
+        client = httpx.AsyncClient(limits=httpx.Limits(max_connections=1, max_keepalive_connections=0))
+        try:
+            pid = 'local'
+            self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
+            text = request_bytes.decode('latin-1', errors='ignore')
+            lines = text.split('\r\n')
+            req_line = lines[0]
+            parts = req_line.split(' ')
+            if len(parts) < 3:
+                raise ValueError('invalid request line')
+            method, url, _ = parts
+            hdrs = {}
+            i = 1
+            while i < len(lines) and lines[i]:
+                h = lines[i]
+                if ':' in h:
+                    k, v = h.split(':', 1)
+                    hdrs[k.strip()] = v.strip()
+                i += 1
+            body = '\r\n'.join(lines[i + 1:]).encode('latin-1') if i + 1 < len(lines) else None
+            resp = await client.request(method, url, headers=hdrs, content=body, timeout=10)
+            self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
+            domain = urllib.parse.urlparse(url).hostname or url
+            per_domain = self.domain_stats.setdefault(domain, {})
+            per_domain[pid] = per_domain.get(pid, 0) + 1
+            self._save_domain_stats(domain, pid)
+            if update_meta:
+                self._update_domain_meta(domain, pid)
+            return pid, method, url, resp, client
+        except BaseException:
+            try:
+                await client.aclose()
+            except (BrokenPipeError, ConnectionError, OSError):
+                pass
+            raise
+
     async def _handle_http_request(self, request_bytes: bytes, writer: asyncio.StreamWriter):
         text = request_bytes.decode('latin-1', errors='ignore')
         first_line = text.split('\r\n')[0]
@@ -227,7 +260,7 @@ class Router:
                     logger.debug("cached proxy %s failed for %s", cached_pid, domain)
 
         proxies = self.selector.ordered_proxies()
-        if not proxies:
+        if not proxies and not self.enable_local_racing:
             try:
                 writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n\r\nBad Gateway")
                 await writer.drain()
@@ -243,6 +276,8 @@ class Router:
         tasks = set()
         for pid in proxies[:self.max_retries]:
             tasks.add(asyncio.create_task(self._try_proxy(pid, request_bytes)))
+        if self.enable_local_racing:
+            tasks.add(asyncio.create_task(self._try_direct(request_bytes)))
 
         winner_resp = None
         while tasks:
@@ -265,6 +300,8 @@ class Router:
             tasks = set()
             for pid in remaining:
                 tasks.add(asyncio.create_task(self._try_proxy(pid, request_bytes)))
+            if self.enable_local_racing:
+                tasks.add(asyncio.create_task(self._try_direct(request_bytes)))
             while tasks:
                 done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 for t in done:
@@ -359,6 +396,52 @@ class Router:
             logger.debug("_try_connect exception: %s", e)
             raise
 
+    async def _connect_direct(self, target: str, update_meta: bool = True):
+        pid = 'local'
+        if ':' not in target:
+            raise ValueError(f'Invalid CONNECT target: {target}')
+        if target.startswith('['):
+            host_end = target.find(']')
+            host = target[1:host_end]
+            port = int(target[host_end + 2:])
+        else:
+            host, port_str = target.rsplit(':', 1)
+            port = int(port_str)
+        up_reader, up_writer = await asyncio.open_connection(host, port)
+        try:
+            up_writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode('latin-1'))
+            await up_writer.drain()
+            self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
+            status = await up_reader.readline()
+            if not status:
+                raise RuntimeError('no response from target')
+            status_text = status.decode('latin-1')
+            if '200' not in status_text:
+                while True:
+                    h = await up_reader.readline()
+                    if not h or h in (b"\r\n", b"\n"):
+                        break
+                raise RuntimeError(f'target returned non-200 for CONNECT: {status_text.strip()}')
+            while True:
+                h = await up_reader.readline()
+                if not h or h in (b"\r\n", b"\n"):
+                    break
+            self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
+            per_domain = self.domain_stats.setdefault(target, {})
+            per_domain[pid] = per_domain.get(pid, 0) + 1
+            self._save_domain_stats(target, pid)
+            if update_meta:
+                self._update_domain_meta(target, pid)
+            return pid, up_reader, up_writer
+        except Exception as e:
+            try:
+                up_writer.close()
+                await up_writer.wait_closed()
+            except Exception:
+                pass
+            logger.debug("_connect_direct exception: %s", e)
+            raise
+
     async def _handle_connect(self, target: str, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter):
         cached_pid = self._get_fresh_proxy(target)
         if cached_pid:
@@ -370,7 +453,7 @@ class Router:
                 async def pipe(reader, writer):
                     try:
                         while True:
-                            data = await reader.read(4096)
+                            data = await asyncio.wait_for(reader.read(4096), timeout=300)
                             if not data:
                                 break
                             writer.write(data)
@@ -393,7 +476,7 @@ class Router:
                 logger.debug("cached proxy %s failed CONNECT %s", cached_pid, target)
 
         proxies = self.selector.ordered_proxies()
-        if not proxies:
+        if not proxies and not self.enable_local_racing:
             try:
                 client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n\r\nBad Gateway")
                 await client_writer.drain()
@@ -404,6 +487,8 @@ class Router:
         tasks = set()
         for pid in proxies[:self.max_retries]:
             tasks.add(asyncio.create_task(self._try_connect(pid, target)))
+        if self.enable_local_racing:
+            tasks.add(asyncio.create_task(self._connect_direct(target)))
 
         winner = None
         while tasks:
@@ -426,6 +511,8 @@ class Router:
             tasks = set()
             for pid in remaining:
                 tasks.add(asyncio.create_task(self._try_connect(pid, target)))
+            if self.enable_local_racing:
+                tasks.add(asyncio.create_task(self._connect_direct(target)))
             while tasks:
                 done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 for t in done:
@@ -451,7 +538,7 @@ class Router:
             async def pipe(reader, writer):
                 try:
                     while True:
-                        data = await reader.read(4096)
+                        data = await asyncio.wait_for(reader.read(4096), timeout=300)
                         if not data:
                             break
                         writer.write(data)
