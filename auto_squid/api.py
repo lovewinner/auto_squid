@@ -122,6 +122,11 @@ td.updated-at{font-size:11px;color:#888;white-space:nowrap}
 select{padding:6px 10px;border:1px solid #333;border-radius:6px;background:#16213e;color:#e0e0e0;font-size:13px;outline:none;cursor:pointer}
 select:focus{border-color:#e94560}
 .autorefresh-label{font-size:12px;color:#555;min-width:70px;text-align:right}
+.stats{display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap}
+.stat-card{padding:10px 18px;border-radius:8px;background:#0f3460;text-align:center;min-width:100px}
+.stat-card .pid{font-size:15px;font-weight:600;color:#a8d8ea}
+.stat-card .count{font-size:20px;font-weight:700;color:#e94560;margin-top:2px}
+.stat-card .label{font-size:10px;color:#666;margin-top:1px}
 </style>
 </head>
 <body>
@@ -141,6 +146,7 @@ select:focus{border-color:#e94560}
 <button onclick="fetchData()">Refresh</button>
 <span id="autorefresh-label" class="autorefresh-label"></span>
 </div>
+<div id="stats" class="stats"></div>
 <div id="table-wrap"></div>
 <div id="pager" class="pager"></div>
 <div id="footer" class="footer"></div>
@@ -182,6 +188,7 @@ async function fetchData() {
   data = Object.fromEntries(entries);
   page = 0;
   render();
+  renderStats();
   if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = setInterval(fetchData, refreshInterval * 1000); }
 }
 
@@ -269,6 +276,15 @@ function render() {
 }
 
 function goPage(n) { page = n; render(); }
+
+function renderStats() {
+  const cnt = {};
+  for (const d in meta) { const p = meta[d].default_proxy; if (p) cnt[p] = (cnt[p]||0) + 1; }
+  const sorted = Object.entries(cnt).sort((a,b) => b[1]-a[1]);
+  let html = '';
+  for (const [pid, n] of sorted) html += `<div class="stat-card"><div class="pid">${pid}</div><div class="count">${n}</div><div class="label">default proxy</div></div>`;
+  document.getElementById('stats').innerHTML = html || '<div class="stat-card" style="color:#666;font-size:13px;padding:10px 18px">No data</div>';
+}
 
 let sortDir = {}, sortCol = 2;
 sortDir[2] = 'desc';
