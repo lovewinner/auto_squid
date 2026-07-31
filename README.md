@@ -1,34 +1,44 @@
 # auto_squid
 
-Lightweight forward proxy with parallel racing, domain-based stats, and SQLite persistence.
+Lightweight forward proxy with parallel racing, domain-based caching, an HTTP response cache, and SQLite-persisted stats.
 
 > [中文说明 →](README_cn.md)
 
 ## Overview
 
 - Runs on a gateway host, accepts HTTP/HTTPS proxy traffic, and forwards each request through upstream proxies
-- **Parallel racing**: sends each request to all upstream proxies simultaneously, uses the first successful response
-- **Probe engine**: periodically probes proxies, computes scores (latency, throughput, reliability) for selection
-- **Domain stats**: per-domain win counts tracked in SQLite, survives restarts
+- **Parallel racing**: sends each request to several upstream proxies simultaneously and uses the first successful response; the rest are cancelled and their connections released
+- **Domain cache**: once a proxy wins a race for a domain, it is reused for that domain until `cache_ttl` expires — avoids racing every request
+- **HTTP response cache**: idempotent `GET` responses are cached in memory (TTL 60s, respects `Cache-Control`)
+- **Local racing**: optionally lets the gateway host itself race as a proxy node (direct, no upstream)
+- **Domain stats**: per-domain win counts tracked in SQLite, survive restarts
+- **Web UI**: a built-in dashboard at `/` for browsing domain stats, default proxies, and win counts with auto-refresh
 
 ## Features
 
-- HTTP and HTTPS (CONNECT) forwarding with parallel racing across upstream proxies
-- Weighted random proxy ordering via probe scores
-- Hop-by-hop header filtering (`transfer-encoding`, `content-encoding`, etc.) + `Content-Length` rewrite
-- Runtime ProxyStore with YAML persistence, CRUD via Management API
-- Probe engine: TCP connect + HTTP GET, throughput measurement, IQR outlier filtering, time-decay scoring
+- HTTP and HTTPS (`CONNECT`) forwarding with parallel racing across upstream proxies
+- Domain-level caching (`cache_ttl`) of the winning proxy per domain
+- In-memory HTTP `GET` response cache with `Cache-Control` awareness
+- Optional local racing node (gateway races directly alongside upstreams)
+- Hop-by-hop header filtering (`transfer-encoding`, `content-encoding`, `content-length`, etc.) with `Content-Length` rewritten to the actual body length
+- Request body handling with a 10 MB cap (returns `413` on overflow); `Content-Length: 0` is handled correctly (no hang)
+- CONNECT tunnels with connect/read timeouts so a stuck upstream cannot hold a race slot forever
+- SQLite access serialized with a lock (safe under the FastAPI/uvicorn thread pool)
+- Graceful shutdown: in-flight connections are cancelled and drained before the DB is closed
+- Runtime `ProxyStore` with YAML persistence; CRUD via the Management API
 - Domain-level win statistics persisted to SQLite (`auto_squid.db`)
-- Management API: `/health`, `/proxies`, `/score`, `/probe/*`, `/stats`, `/domains`, `/metrics`
-- CLI to start router, probe loop and API server
+- Management API + single-page web UI
 
 ## Quickstart
 
-1. Create a virtualenv:
+1. Create a virtualenv and install dependencies:
 
    ```bash
    uv venv .venv --seed && uv sync
    ```
+
+   Runtime dependencies: `fastapi`, `uvicorn[standard]`, `httpx`, `pydantic`, `typer`, `pyyaml`.
+   Dev: `pytest`, `pytest-asyncio` (`asyncio_mode = "auto"`).
 
 2. Prepare `proxies.yaml`:
 
@@ -48,6 +58,8 @@ Lightweight forward proxy with parallel racing, domain-based stats, and SQLite p
 
    ```bash
    python -m auto_squid.cli
+   # or the installed entry point:
+   auto-squid
    ```
 
    Options: `--proxies ./proxies.yaml` `--db ./auto_squid.db` `--config ./config.yaml`
@@ -61,7 +73,9 @@ Lightweight forward proxy with parallel racing, domain-based stats, and SQLite p
    curl http://127.0.0.1:18080/domains
    ```
 
-5. Use as proxy:
+   Open the dashboard in a browser: `http://127.0.0.1:18080/`
+
+5. Use as a proxy:
 
    ```bash
    curl -x http://127.0.0.1:10808 http://www.baidu.com
@@ -71,34 +85,37 @@ Lightweight forward proxy with parallel racing, domain-based stats, and SQLite p
 ## Architecture
 
 ```
-Client ──HTTP/S──> auto_squid (B:10808)
+Client ──HTTP/S──> auto_squid (proxy :10808)
                       │
-                      ├── parallel ──> upstream proxy 1 (squid)
-                      ├── parallel ──> upstream proxy 2 (squid)
-                      └── parallel ──> upstream proxy 3 (squid)
+                      ├── race ──> upstream proxy 1 (squid)
+                      ├── race ──> upstream proxy 2 (squid)
+                      ├── race ──> upstream proxy 3 (squid)
+                      └── race ──> local (optional, direct)
                       │
-                      ▼ fastest response wins, rest cancelled
+                      ▼ fastest success wins; losers cancelled + closed
+                      │
+                      ▼ default proxy cached per domain (cache_ttl)
 ```
 
-- **HTTP requests**: raced via `httpx.AsyncClient` with per-request clients
-- **CONNECT requests**: raced via raw `asyncio.open_connection` tunnels
-- **Scoring**: probe engine periodically tests each proxy; `ProxySelector.ordered_proxies()` returns weighted random ordering (ignored in racing mode since all proxies are tried)
+- **HTTP requests**: raced via `httpx.AsyncClient` (one client per attempt); winning response is written back, loser clients are closed
+- **CONNECT requests**: raced via raw `asyncio.open_connection` tunnels with connect/read timeouts
+- **Selection**: `ProxySelector.ordered_proxies()` returns a randomly shuffled list of enabled proxies; the first `max_retries` race, then any remaining proxies race as a fallback
+- **Domain cache**: after a win, the winning proxy is recorded in `domain_meta` and reused for the domain until `cache_ttl` expires
 - **Stats**: `request_counts` (wins), `attempted_counts` (total attempts) per proxy; `domain_stats` (wins per domain per proxy) in SQLite
 
 ## API Endpoints
 
 | Endpoint | Description |
 |----------|-------------|
+| `GET /` | Web UI dashboard (domain stats, default proxies, auto-refresh) |
 | `GET /health` | Health check |
 | `GET /proxies` | List configured proxies |
 | `POST /proxies` | Add a proxy (JSON body) |
-| `GET /score` | Current probe scores per proxy |
-| `GET /probe/status` | Probe loop running status |
-| `GET /probe/history` | Probe history samples |
-| `GET /probe/states` | Proxy states (warming/normal/degraded) |
 | `GET /stats` | `request_counts` + `attempted_counts` |
+| `GET /metrics` | `request_counts`, `attempted_counts`, and domain stats |
+| `GET /config` | Router config (`enable_local_racing`) |
 | `GET /domains` | Per-domain win stats from SQLite |
-| `GET /metrics` | Combined scores, states, counts, domain stats |
+| `GET /domains/meta` | Per-domain default proxy + last-updated time |
 
 ## Config
 
@@ -111,21 +128,25 @@ listen:
 api:
   host: "0.0.0.0"
   port: 18080
-probe:
-  url: "http://www.baidu.com"
-  interval: 60
-  timeout: 10
-  concurrency: 5
-  history_minutes: 60
-  min_samples: 10
+router:
+  enable_local_racing: false   # let the gateway host race as a proxy node
+  cache_ttl: 600               # domain cache TTL in seconds
 logging:
   file: "auto_squid.log"
 ```
 
+## Testing
+
+```bash
+.venv/bin/python -m pytest -q
+```
+
+The suite covers HTTP/CONNECT forwarding, the HTTP response cache, the domain cache, local racing, `ProxyStore` CRUD, the API, and binary-safe request body handling.
+
 ## Limitations
 
 - HTTP parsing is MVP-level; large streaming responses may have edge cases
-- Management API has no auth — protect port 18080 with firewall before production
+- Management API has no auth — protect port 18080 with a firewall before production
 - CONNECT tunnel uses raw pipes (no TLS interception)
 
 ## License
