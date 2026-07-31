@@ -53,7 +53,7 @@ def start(config: str = "", proxies: str = "", db: str = "auto_squid.db"):
         cfg = Config()
     setup_logging(cfg)
     proxy_store = ProxyStore(proxies if proxies else "proxies.yaml")
-    router = Router(proxy_store, listen_host=cfg.listen.host, listen_port=cfg.listen.port, db_path=db, cache_ttl=cfg.router.cache_ttl, enable_local_racing=cfg.router.enable_local_racing)
+    router = Router(proxy_store, listen_host=cfg.listen.host, listen_port=cfg.listen.port, db_path=db, cache_ttl=cfg.router.cache_ttl, enable_local_racing=cfg.router.enable_local_racing, auth_enabled=cfg.router.auth.enabled, auth_username=cfg.router.auth.username, auth_password=cfg.router.auth.password)
     mount_api(proxy_store, router)
 
     async def _main():

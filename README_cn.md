@@ -20,7 +20,7 @@
 - 域名级缓存（`cache_ttl`），按域名复用胜出代理
 - 内存级 HTTP `GET` 响应缓存，遵循 `Cache-Control`
 - 可选本机竞速节点（网关与上游一同竞速）
-- Hop-by-hop 响应头过滤（`transfer-encoding`、`content-encoding`、`content-length` 等），并按实际 body 长度重写 `Content-Length`
+- Hop-by-hop 头双向过滤：请求头（`proxy-authorization`、`connection` 等）在转发上游前剔除，避免客户端访问本代理的凭据泄漏到下一跳；响应头（`transfer-encoding`、`content-encoding`、`content-length` 等）剔除并按实际 body 长度重写 `Content-Length`
 - 请求体处理设有 10 MB 上限（超限返回 `413`）；`Content-Length: 0` 处理正确（不会卡死）
 - CONNECT 隧道设有连接/读取超时，挂死的上游不会永久占用竞速槽位
 - SQLite 访问加锁串行化，在 FastAPI/uvicorn 线程池下安全
@@ -28,6 +28,29 @@
 - 运行时 ProxyStore（YAML 加载/保存），管理 API CRUD
 - 域名级胜出统计持久化到 SQLite（`auto_squid.db`）
 - 管理 API + 单页 Web 界面
+
+## 客户端认证
+
+代理端口（`:10808`）可要求客户端通过 HTTP Basic 认证。**默认关闭**，在 `config.yaml` 中开启：
+
+```yaml
+router:
+  auth:
+    enabled: true
+    username: "admin"
+    password: "secret"
+```
+
+开启后，每个请求（HTTP 与 `CONNECT`）都需携带 `Proxy-Authorization: Basic <base64(用户名:密码)>` 头（客户端可回退到 `Authorization`）。缺失或凭据错误时返回 `407 Proxy Authentication Required`，并带 `Proxy-Authenticate: Basic realm="auto_squid"`，**不会进行任何上游请求**。
+
+```bash
+# 被拒绝（无凭据）
+curl -x http://127.0.0.1:10808 http://example.com        # → 407
+# 被接受
+curl -x http://admin:secret@127.0.0.1:10808 http://example.com
+```
+
+> 认证仅保护**代理端口**。管理 API（`:18080`）仍为开放状态，请按"限制"一节用防火墙保护。
 
 ## 快速开始
 

@@ -11,12 +11,22 @@ from typing import Optional, List, Any
 import httpx
 
 from .proxy_store import ProxyStore
+from .auth import check_auth
 
 logger = logging.getLogger(__name__)
 
 # 单个 HTTP 请求体的最大字节数。超过则返回 413，避免无 Content-Length 的
 # 请求靠 read(-1) 读到 EOF 才返回（会破坏 keep-alive）及无界内存占用。
 MAX_BODY = 10 * 1024 * 1024
+
+# Hop-by-hop 请求头：只服务于"客户端→本代理"这一跳，绝不能转发给上游。
+# 特别是 Proxy-Authorization——若把客户端访问本代理的凭据透传到上游，
+# 上游 Squid 会用它校验缓存对象访问权限（ERR_CACHE_ACCESS_DENIED），
+# 误返回 407 + Proxy-Authenticate，导致浏览器弹用户名密码框。
+_HOP_BY_HOP_REQUEST_HEADERS = frozenset({
+    'proxy-authorization', 'connection', 'proxy-connection', 'keep-alive',
+    'te', 'trailer', 'transfer-encoding', 'upgrade',
+})
 
 
 class ProxySelector:
@@ -35,13 +45,16 @@ class ProxySelector:
 
 
 class Router:
-    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False):
+    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = ""):
         self.proxy_store = proxy_store
         self.selector = ProxySelector(proxy_store)
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.max_retries = max_retries
         self.enable_local_racing = enable_local_racing
+        self.auth_enabled = auth_enabled
+        self.auth_username = auth_username
+        self.auth_password = auth_password
         self._server: Optional[asyncio.AbstractServer] = None
         # 跟踪所有正在处理的客户端连接 task，供 stop() 在关闭 DB 前取消并等待。
         self._running_tasks: set[asyncio.Task] = set()
@@ -384,6 +397,22 @@ class Router:
                     break
                 headers += h
             logger.debug("first line: %s", first)
+            # 客户端认证：在 CONNECT/HTTP 分流前统一校验，未通过则返回 407，
+            # 不进行任何上游连接/竞速/DB 写入。auth_enabled=False 时放行。
+            if self.auth_enabled:
+                client_hdrs = {}
+                for h in headers.decode('latin-1').split('\r\n'):
+                    if ':' in h:
+                        k, v = h.split(':', 1)
+                        client_hdrs[k.strip()] = v.strip()
+                ok, reason = check_auth(client_hdrs, self.auth_enabled, self.auth_username, self.auth_password)
+                if not ok:
+                    logger.info("auth rejected for %s: %s", peer, reason)
+                    await self._write_response(writer, 407, 'Proxy Authentication Required',
+                                               {'Proxy-Authenticate': 'Basic realm="auto_squid"',
+                                                'Content-Type': 'text/plain'},
+                                               (reason or 'Authentication required').encode('latin-1'))
+                    return
             if first.upper().startswith('CONNECT'):
                 target = first.split(' ')[1]
                 await self._handle_connect(target, reader, writer)
@@ -468,6 +497,9 @@ class Router:
                 hdrs[k.strip()] = v.strip()
             i += 1
         body = body or None
+        # 剔除 hop-by-hop 请求头，避免把客户端访问本代理的凭据
+        # （Proxy-Authorization）等透传给上游。
+        hdrs = {k: v for k, v in hdrs.items() if k.lower() not in _HOP_BY_HOP_REQUEST_HEADERS}
 
         # HTTP GET 缓存
         cached_entry = self._http_cache_get(method, url)

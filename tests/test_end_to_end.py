@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import tempfile
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from fastapi.testclient import TestClient
 from auto_squid.proxy_store import ProxyStore
 from auto_squid.router import Router
 from auto_squid.config_schema import ProxyInfo
+from auto_squid.auth import check_auth
 from auto_squid.api import app as api_app, mount
 
 # ── test ports ───────────────────────────────────────────────────
@@ -127,6 +129,40 @@ async def send_connect(host, port, target=b"example.com:443", payload=b"hello"):
     return echo
 
 
+def _basic_auth_header(userpass: str | None) -> bytes:
+    """Build a `Proxy-Authorization: Basic ...` header line (without trailing CRLF)."""
+    if userpass is None:
+        return b''
+    token = base64.b64encode(userpass.encode()).decode()
+    return f"Proxy-Authorization: Basic {token}\r\n".encode()
+
+
+async def send_http_get_status(host, port, url=b"http://example.com/", userpass=None):
+    """Like send_http_get but returns the raw status line and does not assert 200.
+    Injects a Proxy-Authorization header when userpass is provided."""
+    reader, writer = await asyncio.open_connection(host, port)
+    auth = _basic_auth_header(userpass)
+    req = b"GET " + url + b" HTTP/1.1\r\nHost: example.com\r\n" + auth + b"\r\n"
+    writer.write(req)
+    await writer.drain()
+    status = await reader.readline()
+    writer.close()
+    await writer.wait_closed()
+    return status
+
+
+async def send_connect_status(host, port, target=b"example.com:443", userpass=None):
+    """Like send_connect but returns the raw status line and does not assert 200."""
+    reader, writer = await asyncio.open_connection(host, port)
+    auth = _basic_auth_header(userpass)
+    writer.write(b"CONNECT " + target + b" HTTP/1.1\r\nHost: " + target + b"\r\n" + auth + b"\r\n")
+    await writer.drain()
+    status = await reader.readline()
+    writer.close()
+    await writer.wait_closed()
+    return status
+
+
 # ── tests ─────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -225,6 +261,215 @@ async def test_local_racing_http():
         await router.stop()
         local_srv.close()
         await local_srv.wait_closed()
+
+
+# ── client auth tests ─────────────────────────────────────────────
+
+def _authed_router(user='user', pw='pass'):
+    """A Router with client auth enabled, backed by the mock proxy."""
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    return Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                  db_path=tempfile.mktemp(suffix='.db'),
+                  auth_enabled=True, auth_username=user, auth_password=pw)
+
+
+@pytest.mark.asyncio
+async def test_auth_rejects_missing():
+    hit = []
+    proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=hit)
+    router = _authed_router()
+    await router.start()
+    try:
+        status = await send_http_get_status(HOST, ROUTER_PORT)
+        assert b'407' in status, f"expected 407, got {status}"
+        assert len(hit) == 0, "no upstream call should happen on auth failure"
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_auth_accepts_valid():
+    hit = []
+    proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=hit)
+    router = _authed_router()
+    await router.start()
+    try:
+        status = await send_http_get_status(HOST, ROUTER_PORT, userpass='user:pass')
+        assert b'200' in status, f"expected 200, got {status}"
+        assert len(hit) == 1
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_auth_rejects_wrong():
+    hit = []
+    proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=hit)
+    router = _authed_router()
+    await router.start()
+    try:
+        status = await send_http_get_status(HOST, ROUTER_PORT, userpass='user:wrong')
+        assert b'407' in status, f"expected 407, got {status}"
+        assert len(hit) == 0
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_auth_connect():
+    hit = []
+    proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=hit)
+    router = _authed_router()
+    await router.start()
+    try:
+        # no creds → 407
+        status = await send_connect_status(HOST, ROUTER_PORT)
+        assert b'407' in status, f"expected 407, got {status}"
+        assert len(hit) == 0
+        # valid creds → 200 Connection established
+        status = await send_connect_status(HOST, ROUTER_PORT, userpass='user:pass')
+        assert b'200' in status, f"expected 200, got {status}"
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_auth_disabled_allows_all():
+    hit = []
+    proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=hit)
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT, db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        status = await send_http_get_status(HOST, ROUTER_PORT)  # no creds
+        assert b'200' in status, f"expected 200 with auth disabled, got {status}"
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
+
+async def run_header_echo_proxy(host, port):
+    """HTTP mock proxy that echoes the request headers it received as the body,
+    so a test can assert which headers were forwarded upstream."""
+    async def handle(reader, writer):
+        try:
+            line = await reader.readline()
+            echoed = line
+            while True:
+                h = await reader.readline()
+                echoed += h
+                if not h or h in (b"\r\n", b"\n"):
+                    break
+            # drain any body via Content-Length if present
+            cl = 0
+            for hl in echoed.split(b'\r\n'):
+                if hl.lower().startswith(b'content-length:'):
+                    cl = int(hl.split(b':', 1)[1].strip())
+            if cl:
+                await reader.readexactly(cl)
+            body = echoed
+            writer.write(b"HTTP/1.1 200 OK\r\n")
+            writer.write(f"Content-Length: {len(body)}\r\n".encode())
+            writer.write(b"Content-Type: text/plain\r\nConnection: close\r\n\r\n")
+            writer.write(body)
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+    server = await asyncio.start_server(handle, host=host, port=port)
+    return server
+
+
+@pytest.mark.asyncio
+async def test_hop_by_hop_request_headers_not_forwarded():
+    """Regression: the client's Proxy-Authorization (and other hop-by-hop
+    request headers) must NOT be forwarded to the upstream proxy. Forwarding
+    it caused upstream Squid to return 407 ERR_CACHE_ACCESS_DENIED."""
+    proxy_srv = await run_header_echo_proxy(HOST, PROXY_PORT)
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                    auth_enabled=True, auth_username='asuser', auth_password='s3cretRRxc68a',
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        reader, writer = await asyncio.open_connection(HOST, ROUTER_PORT)
+        tok = base64.b64encode(b'asuser:s3cretRRxc68a').decode()
+        req = (f"GET http://hop.test.example.com/ HTTP/1.1\r\n"
+               f"Host: hop.test.example.com\r\n"
+               f"Proxy-Authorization: Basic {tok}\r\n"
+               f"Connection: keep-alive\r\n"
+               f"X-Custom: keepme\r\n\r\n").encode()
+        writer.write(req)
+        await writer.drain()
+        status = await reader.readline()
+        assert b'200' in status, f"expected 200, got {status}"
+        cl = 0
+        while True:
+            h = await reader.readline()
+            if not h or h in (b"\r\n", b"\n"):
+                break
+            if h.lower().startswith(b'content-length:'):
+                cl = int(h.split(b':', 1)[1].strip())
+        echoed = await reader.readexactly(cl) if cl else b''
+        writer.close()
+        await writer.wait_closed()
+
+        # the non-hop-by-hop custom header must survive
+        assert b'x-custom: keepme' in echoed.lower(), f"custom header dropped: {echoed!r}"
+        # hop-by-hop headers the client sent to OUR proxy must NOT reach the upstream
+        assert b'proxy-authorization:' not in echoed.lower(), \
+            f"Proxy-Authorization leaked to upstream: {echoed!r}"
+        assert b'proxy-connection:' not in echoed.lower()
+        # the request line + Host should still be present
+        assert b'GET http://hop.test.example.com/' in echoed
+        assert b'host: hop.test.example.com' in echoed.lower()
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
+
+class TestCheckAuth:
+    def test_disabled_allows(self):
+        assert check_auth({}, False, 'u', 'p') == (True, None)
+
+    def test_missing_header(self):
+        assert check_auth({}, True, 'u', 'p')[0] is False
+
+    def test_valid_credentials(self):
+        token = base64.b64encode(b'u:p').decode()
+        assert check_auth({'Proxy-Authorization': f'Basic {token}'}, True, 'u', 'p') == (True, None)
+
+    def test_authorization_fallback(self):
+        token = base64.b64encode(b'u:p').decode()
+        assert check_auth({'Authorization': f'Basic {token}'}, True, 'u', 'p') == (True, None)
+
+    def test_wrong_password(self):
+        token = base64.b64encode(b'u:wrong').decode()
+        assert check_auth({'Proxy-Authorization': f'Basic {token}'}, True, 'u', 'p')[0] is False
+
+    def test_unsupported_scheme(self):
+        assert check_auth({'Proxy-Authorization': 'Bearer xyz'}, True, 'u', 'p')[0] is False
+
+    def test_malformed_header(self):
+        assert check_auth({'Proxy-Authorization': 'Basic not-base64!!'}, True, 'u', 'p')[0] is False
 
 
 async def run_echo_proxy(host, port):

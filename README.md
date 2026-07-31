@@ -20,7 +20,7 @@ Lightweight forward proxy with parallel racing, domain-based caching, an HTTP re
 - Domain-level caching (`cache_ttl`) of the winning proxy per domain
 - In-memory HTTP `GET` response cache with `Cache-Control` awareness
 - Optional local racing node (gateway races directly alongside upstreams)
-- Hop-by-hop header filtering (`transfer-encoding`, `content-encoding`, `content-length`, etc.) with `Content-Length` rewritten to the actual body length
+- Hop-by-hop header filtering in both directions: request headers (`proxy-authorization`, `connection`, etc.) are stripped before forwarding upstream so client-to-proxy credentials never leak to the next hop; response headers (`transfer-encoding`, `content-encoding`, `content-length`, etc.) are stripped and `Content-Length` is rewritten to the actual body length
 - Request body handling with a 10 MB cap (returns `413` on overflow); `Content-Length: 0` is handled correctly (no hang)
 - CONNECT tunnels with connect/read timeouts so a stuck upstream cannot hold a race slot forever
 - SQLite access serialized with a lock (safe under the FastAPI/uvicorn thread pool)
@@ -28,6 +28,29 @@ Lightweight forward proxy with parallel racing, domain-based caching, an HTTP re
 - Runtime `ProxyStore` with YAML persistence; CRUD via the Management API
 - Domain-level win statistics persisted to SQLite (`auto_squid.db`)
 - Management API + single-page web UI
+
+## Client authentication
+
+The proxy port (`:10808`) can require HTTP Basic auth from clients. It is **off by default** — enable it in `config.yaml`:
+
+```yaml
+router:
+  auth:
+    enabled: true
+    username: "admin"
+    password: "secret"
+```
+
+When enabled, every request (HTTP and `CONNECT`) must carry a `Proxy-Authorization: Basic <base64(user:pass)>` header (clients fall back to `Authorization`). Missing or wrong credentials get a `407 Proxy Authentication Required` with `Proxy-Authenticate: Basic realm="auto_squid"`, and **no upstream work happens**.
+
+```bash
+# rejected (no credentials)
+curl -x http://127.0.0.1:10808 http://example.com        # → 407
+# accepted
+curl -x http://admin:secret@127.0.0.1:10808 http://example.com
+```
+
+> Auth gates the **proxy port only**. The management API on `:18080` stays open — protect it with a firewall as noted in Limitations.
 
 ## Quickstart
 
