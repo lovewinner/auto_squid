@@ -70,10 +70,12 @@ class RouterConfig(BaseModel):
     cache_ttl:           域名缓存有效期(秒)。某代理为某域名竞速胜出后,
                          在该有效期内复用同一代理,避免每请求都竞速。
     enable_local_racing: 让网关主机自身作为代理节点直接参与竞速(不走上游)。
+    max_retries:         竞速首批并行的代理数量;全失败后对剩余代理再竞速兜底。
     auth:                客户端认证配置(AuthConfig)。
     """
     cache_ttl: int = Field(600, description="域名缓存有效期(秒)，过期后重新竞速")
     enable_local_racing: bool = Field(False, description="将本机作为代理节点参与竞速")
+    max_retries: int = Field(3, description="竞速首批并行的代理数量")
     auth: AuthConfig = Field(default_factory=AuthConfig, description="客户端认证配置")
 
 

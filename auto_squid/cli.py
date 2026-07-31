@@ -71,7 +71,7 @@ def start(config: str = "", proxies: str = "", db: str = "auto_squid.db"):
     # 加载上游代理列表(未指定 --proxies 时用当前目录 proxies.yaml)。
     proxy_store = ProxyStore(proxies if proxies else "proxies.yaml")
     # 构造 Router 并注入配置;客户端认证参数从 cfg.router.auth 取。
-    router = Router(proxy_store, listen_host=cfg.listen.host, listen_port=cfg.listen.port, db_path=db, cache_ttl=cfg.router.cache_ttl, enable_local_racing=cfg.router.enable_local_racing, auth_enabled=cfg.router.auth.enabled, auth_username=cfg.router.auth.username, auth_password=cfg.router.auth.password)
+    router = Router(proxy_store, listen_host=cfg.listen.host, listen_port=cfg.listen.port, max_retries=cfg.router.max_retries, db_path=db, cache_ttl=cfg.router.cache_ttl, enable_local_racing=cfg.router.enable_local_racing, auth_enabled=cfg.router.auth.enabled, auth_username=cfg.router.auth.username, auth_password=cfg.router.auth.password)
     # 把 store/router 注入 FastAPI app 的模块级全局,供各端点使用。
     mount_api(proxy_store, router)
 
