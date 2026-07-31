@@ -1,3 +1,12 @@
+"""命令行入口(Typer)。
+
+默认行为(无子命令)是启动代理路由器 + 管理 API 服务。支持通过可选参数
+指定 `config.yaml`(路由/认证/日志等配置)与 `proxies.yaml`(上游代理列表)。
+
+入口点在 `pyproject.toml` 注册为 `auto-squid` 脚本,也可用
+`python -m auto_squid.cli` 运行。
+"""
+
 import asyncio
 import uvicorn
 import typer
@@ -12,22 +21,29 @@ from .config_schema import Config
 
 
 def setup_logging(cfg: Config):
-    """控制台只输出 WARNING 级别，文件日志输出 INFO 级别"""
+    """配置根日志:控制台只输出 WARNING 及以上,文件输出 INFO 及以上。
+
+    之所以压低控制台级别:代理转发量大,INFO 会刷屏;但文件保留 INFO
+    便于事后排查(竞速命中、认证拒绝等)。
+    """
     root = logging.getLogger()
+    # 根 logger 设为 DEBUG,让各 handler 各自按级别过滤。
     root.setLevel(logging.DEBUG)
 
+    # 控制台:WARNING 起,精简格式,只看错误与警告。
     console = logging.StreamHandler(sys.stderr)
     console.setLevel(logging.WARNING)
     console.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
     root.addHandler(console)
 
+    # 文件:INFO 起,带时间戳,追加模式。cfg.logging.file 为 None 时用默认文件名。
     log_path = cfg.logging.file or "auto_squid.log"
     fh = logging.FileHandler(log_path, mode="a")
     fh.setLevel(logging.INFO)
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s:%(name)s:%(message)s"))
     root.addHandler(fh)
 
-    # 压制 httpx/uvicorn 的控制台输出
+    # 压制 httpx/uvicorn 等依赖库的嘈杂输出(它们默认 INFO 会刷屏)。
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("uvicorn").setLevel(logging.WARNING)
@@ -41,8 +57,8 @@ app = typer.Typer()
 @app.callback(invoke_without_command=True)
 def start(config: str = "", proxies: str = "", db: str = "auto_squid.db"):
     """启动代理路由器和 API 服务。支持可选的 config.yaml / proxies.yaml 参数。"""
+    # 配置加载优先级:命令行 --config > 当前目录 config.yaml > 全默认 Config()。
     cfg = None
-    # 优先使用命令行指定 config 路径，其次尝试当前目录 config.yaml
     if config:
         import yaml
         cfg = Config(**yaml.safe_load(Path(config).read_text()))
@@ -52,19 +68,24 @@ def start(config: str = "", proxies: str = "", db: str = "auto_squid.db"):
     else:
         cfg = Config()
     setup_logging(cfg)
+    # 加载上游代理列表(未指定 --proxies 时用当前目录 proxies.yaml)。
     proxy_store = ProxyStore(proxies if proxies else "proxies.yaml")
+    # 构造 Router 并注入配置;客户端认证参数从 cfg.router.auth 取。
     router = Router(proxy_store, listen_host=cfg.listen.host, listen_port=cfg.listen.port, db_path=db, cache_ttl=cfg.router.cache_ttl, enable_local_racing=cfg.router.enable_local_racing, auth_enabled=cfg.router.auth.enabled, auth_username=cfg.router.auth.username, auth_password=cfg.router.auth.password)
+    # 把 store/router 注入 FastAPI app 的模块级全局,供各端点使用。
     mount_api(proxy_store, router)
 
     async def _main():
+        # 先启动代理端口(接受客户端 HTTP/CONNECT),再后台跑管理 API。
         await router.start()
-        # 后台启动 FastAPI 服务
         config_uv = uvicorn.Config("auto_squid.api:app", host=cfg.api.host, port=cfg.api.port, log_level="info")
         server = uvicorn.Server(config_uv)
         api_task = asyncio.create_task(server.serve())
         try:
+            # 阻塞在 API 服务上;API 退出(被信号中断等)后才停止路由器。
             await api_task
         finally:
+            # 优雅关闭:停止接受新连接、取消在途连接、关闭 DB(见 router.stop)。
             await router.stop()
 
     asyncio.run(_main())
