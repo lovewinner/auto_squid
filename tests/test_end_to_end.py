@@ -227,6 +227,81 @@ async def test_local_racing_http():
         await local_srv.wait_closed()
 
 
+async def run_echo_proxy(host, port):
+    """HTTP mock proxy that echoes the request body back verbatim (binary-safe)."""
+    async def handle(reader, writer):
+        try:
+            line = await reader.readline()
+            if not line:
+                writer.close()
+                await writer.wait_closed()
+                return
+            cl = 0
+            while True:
+                h = await reader.readline()
+                if not h or h in (b"\r\n", b"\n"):
+                    break
+                if h.lower().startswith(b'content-length:'):
+                    cl = int(h.split(b':', 1)[1].strip())
+            body = await reader.readexactly(cl) if cl > 0 else b''
+            writer.write(b"HTTP/1.1 200 OK\r\n")
+            writer.write(f"Content-Length: {len(body)}\r\n".encode())
+            writer.write(b"Content-Type: application/octet-stream\r\nConnection: close\r\n\r\n")
+            writer.write(body)
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+    server = await asyncio.start_server(handle, host=host, port=port)
+    return server
+
+
+async def send_http_post(host, port, url, body):
+    reader, writer = await asyncio.open_connection(host, port)
+    req = b"POST " + url + b" HTTP/1.1\r\nHost: example.com\r\n"
+    req += b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+    writer.write(req)
+    await writer.drain()
+    status = await reader.readline()
+    assert b'200' in status, f"expected 200, got {status}"
+    resp_cl = 0
+    while True:
+        h = await reader.readline()
+        if not h or h in (b"\r\n", b"\n"):
+            break
+        if h.lower().startswith(b'content-length:'):
+            resp_cl = int(h.split(b':', 1)[1].strip())
+    resp_body = await reader.readexactly(resp_cl) if resp_cl > 0 else b''
+    writer.close()
+    await writer.wait_closed()
+    return resp_body
+
+
+@pytest.mark.asyncio
+async def test_binary_body_preserved():
+    """Regression for #3: the request body must survive the router's header
+    parsing byte-for-byte, including all 256 byte values and an embedded
+    blank line (CRLFCRLF) which historically broke line-split body re-derivation."""
+    echo_srv = await run_echo_proxy(HOST, PROXY_PORT)
+    proxy_store = ProxyStore()
+    proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT, db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        for payload in (bytes(range(256)), b'part1\r\n\r\npart2', b'', b'\r\n', b'X' * 4096):
+            resp = await send_http_post(HOST, ROUTER_PORT, b"http://bintest.example.com/", payload)
+            assert resp == payload, f"body corrupted for payload {payload!r}: got {resp!r}"
+    finally:
+        await router.stop()
+        echo_srv.close()
+        await echo_srv.wait_closed()
+
+
 # ── unit tests ────────────────────────────────────────────────────
 
 class TestProxyStore:

@@ -43,6 +43,8 @@ class Router:
         self.max_retries = max_retries
         self.enable_local_racing = enable_local_racing
         self._server: Optional[asyncio.AbstractServer] = None
+        # 跟踪所有正在处理的客户端连接 task，供 stop() 在关闭 DB 前取消并等待。
+        self._running_tasks: set[asyncio.Task] = set()
         self.request_counts: dict[str, int] = {}
         self.attempted_counts: dict[str, int] = {}
         self.domain_stats: dict[str, dict[str, int]] = {}
@@ -157,7 +159,10 @@ class Router:
         if method != 'GET':
             return
         cl = resp.headers.get('content-length')
-        if not cl:
+        # 仅当上游未提供 Content-Length 时，才退而依据 Cache-Control 决定
+        # 是否缓存。注意用 is None 而非 not cl：Content-Length: 0 时
+        # cl == "0" 为真值字符串，不应进入此分支。
+        if cl is None:
             cc = resp.headers.get('cache-control', '')
             if 'no-cache' in cc or 'no-store' in cc or 'private' in cc:
                 return
@@ -362,6 +367,8 @@ class Router:
     # ── 客户端入口 ──────────────────────────────────────────────
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        task = asyncio.current_task()
+        self._running_tasks.add(task)
         peer = writer.get_extra_info('peername')
         logger.info("client connected %s", peer)
         self._set_nodelay(writer)
@@ -387,15 +394,16 @@ class Router:
                     if h.lower().startswith('content-length:'):
                         cl = int(h.split(':', 1)[1].strip())
                         break
-                if cl and cl > 0:
+                if cl is not None and cl > 0:
                     if cl > MAX_BODY:
                         writer.write(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 15\r\n\r\nPayload Too Large")
                         await writer.drain()
                         return
                     body = await reader.readexactly(cl)
-                elif not cl and first.upper().split(' ')[0] in ('POST', 'PUT', 'PATCH'):
-                    # 无 Content-Length：分块读取至上限，避免 read(-1) 阻塞到
-                    # 客户端关闭连接而破坏 HTTP keep-alive。
+                elif cl is None and first.upper().split(' ')[0] in ('POST', 'PUT', 'PATCH'):
+                    # 无 Content-Length 头：分块读取至上限，避免 read(-1) 阻塞到
+                    # 客户端关闭连接而破坏 HTTP keep-alive。注意 cl is None 与
+                    # cl == 0 不同——后者表示头部存在但 body 为空，应直接用 b''。
                     body = b''
                     while len(body) < MAX_BODY:
                         chunk = await reader.read(MAX_BODY - len(body))
@@ -411,6 +419,7 @@ class Router:
         except Exception:
             logger.exception("error handling client")
         finally:
+            self._running_tasks.discard(task)
             try:
                 writer.close()
                 await writer.wait_closed()
@@ -431,7 +440,13 @@ class Router:
         return tasks
 
     async def _handle_http_request(self, request_bytes: bytes, writer: asyncio.StreamWriter):
-        text = request_bytes.decode('latin-1', errors='ignore')
+        # 以字节边界解析请求头，避免把整个请求（含二进制 body）解码为
+        # latin-1 再往返编码——那会破坏 0x100 以上的字节。头部用 latin-1
+        # 解码是安全的（HTTP 头字段为 ASCII），body 则直接取原始字节。
+        header_end = request_bytes.find(b'\r\n\r\n')
+        head_part = request_bytes[:header_end if header_end != -1 else len(request_bytes)]
+        body = request_bytes[header_end + 4:] if header_end != -1 else b''
+        text = head_part.decode('latin-1', errors='ignore')
         first_line = text.split('\r\n')[0]
         parts = first_line.split(' ')
         if len(parts) < 3:
@@ -452,7 +467,7 @@ class Router:
                 k, v = h.split(':', 1)
                 hdrs[k.strip()] = v.strip()
             i += 1
-        body = '\r\n'.join(lines[i+1:]).encode('latin-1') if i+1 < len(lines) else None
+        body = body or None
 
         # HTTP GET 缓存
         cached_entry = self._http_cache_get(method, url)
@@ -600,4 +615,11 @@ class Router:
         if self._server:
             self._server.close()
             await self._server.wait_closed()
+        # 停止接受新连接后，取消仍在处理的客户端连接 task 并等待它们退出，
+        # 避免在 _db.close() 之后还有在途请求尝试写 DB 而报错。
+        for t in list(self._running_tasks):
+            t.cancel()
+        if self._running_tasks:
+            await asyncio.gather(*self._running_tasks, return_exceptions=True)
+            self._running_tasks.clear()
         self._db.close()
