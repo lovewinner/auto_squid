@@ -4,6 +4,7 @@ import logging
 import random
 import socket
 import sqlite3
+import threading
 import time
 import urllib.parse
 from typing import Optional, List
@@ -12,6 +13,10 @@ import httpx
 from .proxy_store import ProxyStore
 
 logger = logging.getLogger(__name__)
+
+# 单个 HTTP 请求体的最大字节数。超过则返回 413，避免无 Content-Length 的
+# 请求靠 read(-1) 读到 EOF 才返回（会破坏 keep-alive）及无界内存占用。
+MAX_BODY = 10 * 1024 * 1024
 
 
 class ProxySelector:
@@ -43,6 +48,10 @@ class Router:
         self.domain_stats: dict[str, dict[str, int]] = {}
         self.cache_ttl = cache_ttl
         self._db = sqlite3.connect(db_path, check_same_thread=False)
+        # 连接以 check_same_thread=False 跨线程共享，但 sqlite3 对同一连接
+        # 的并发使用不是线程安全的；用一个锁串行化所有 DB 访问，避免
+        # "database is locked" 与并发游标导致的 RecursiveCursor 错误。
+        self._db_lock = threading.Lock()
         from datetime import datetime, timezone
         self._db.execute("""
             CREATE TABLE IF NOT EXISTS domain_stats (
@@ -67,38 +76,43 @@ class Router:
     # ── DB helpers ──────────────────────────────────────────────
 
     def _save_domain_stats(self, domain: str, pid: str):
-        self._db.execute(
-            "INSERT INTO domain_stats (domain, proxy_id, wins) VALUES (?, ?, 1) "
-            "ON CONFLICT(domain, proxy_id) DO UPDATE SET wins = wins + 1",
-            (domain, pid),
-        )
-        self._db.commit()
+        with self._db_lock:
+            self._db.execute(
+                "INSERT INTO domain_stats (domain, proxy_id, wins) VALUES (?, ?, 1) "
+                "ON CONFLICT(domain, proxy_id) DO UPDATE SET wins = wins + 1",
+                (domain, pid),
+            )
+            self._db.commit()
 
     def get_domain_stats_from_db(self) -> dict[str, dict[str, int]]:
-        rows = self._db.execute("SELECT domain, proxy_id, wins FROM domain_stats").fetchall()
+        with self._db_lock:
+            rows = self._db.execute("SELECT domain, proxy_id, wins FROM domain_stats").fetchall()
         result: dict[str, dict[str, int]] = {}
         for domain, pid, wins in rows:
             result.setdefault(domain, {})[pid] = wins
         return result
 
     def _update_domain_meta(self, domain: str, pid: str):
-        self._db.execute(
-            "INSERT INTO domain_meta (domain, default_proxy, updated_at) VALUES (?, ?, ?) "
-            "ON CONFLICT(domain) DO UPDATE SET default_proxy = excluded.default_proxy, updated_at = excluded.updated_at",
-            (domain, pid, self._now_utc()),
-        )
-        self._db.commit()
+        with self._db_lock:
+            self._db.execute(
+                "INSERT INTO domain_meta (domain, default_proxy, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(domain) DO UPDATE SET default_proxy = excluded.default_proxy, updated_at = excluded.updated_at",
+                (domain, pid, self._now_utc()),
+            )
+            self._db.commit()
 
     def get_domain_meta_from_db(self) -> dict[str, dict[str, str]]:
-        rows = self._db.execute("SELECT domain, default_proxy, updated_at FROM domain_meta").fetchall()
+        with self._db_lock:
+            rows = self._db.execute("SELECT domain, default_proxy, updated_at FROM domain_meta").fetchall()
         return {domain: {"default_proxy": dp, "updated_at": ua} for domain, dp, ua in rows}
 
     def _get_fresh_proxy(self, domain: str) -> Optional[str]:
         from datetime import datetime, timezone
-        row = self._db.execute(
-            "SELECT default_proxy, updated_at FROM domain_meta WHERE domain = ?",
-            (domain,)
-        ).fetchone()
+        with self._db_lock:
+            row = self._db.execute(
+                "SELECT default_proxy, updated_at FROM domain_meta WHERE domain = ?",
+                (domain,)
+            ).fetchone()
         if not row:
             return None
         pid, updated_at_str = row
@@ -159,7 +173,13 @@ class Router:
     # ── 通用竞速 / pipe / 响应写入 ──────────────────────────────
 
     @staticmethod
-    async def _race(tasks: set) -> Optional[any]:
+    async def _race(tasks: set, cleanup=None) -> Optional[any]:
+        """取最先成功完成的 task 的结果；取消并清理其余 task。
+
+        cleanup(result) 用于释放「已完成但未获胜」的 task 持有的资源
+        （如 httpx client、上游连接）。被 cancel 的 task 由其自身的
+        except BaseException 分支关闭资源，无需在这里调用 cleanup。
+        """
         winner = None
         while tasks:
             done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -170,11 +190,44 @@ class Router:
                 except Exception:
                     pass
             if winner:
+                # 先取消尚未完成的 task，再统一等待；对已成功完成但未获胜的
+                # task（不在 cancelled 状态）调用 cleanup 释放其资源。
                 for t in tasks:
                     t.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
+                for t in tasks:
+                    if t.done() and not t.cancelled() and cleanup:
+                        try:
+                            await cleanup(t.result())
+                        except Exception:
+                            pass
                 break
         return winner
+
+    @staticmethod
+    async def _cleanup_http_result(result):
+        """关闭竞速中已完成但未获胜的 HTTP task 持有的 httpx client。"""
+        if not result:
+            return
+        client = result[-1]
+        try:
+            await client.aclose()
+        except (BrokenPipeError, ConnectionError, OSError):
+            pass
+        except Exception:
+            pass
+
+    @staticmethod
+    async def _cleanup_tunnel_result(result):
+        """关闭竞速中已完成但未获胜的 CONNECT task 持有的上游连接。"""
+        if not result:
+            return
+        up_writer = result[-1]
+        try:
+            up_writer.close()
+            await up_writer.wait_closed()
+        except Exception:
+            pass
 
     @staticmethod
     async def _pipe(reader, writer):
@@ -195,8 +248,11 @@ class Router:
 
     @staticmethod
     async def _write_response(writer, status_code, reason_phrase, headers, body):
-        hop_by_hop = {'transfer-encoding', 'content-encoding', 'keep-alive',
-                      'proxy-connection', 'te', 'trailer', 'upgrade'}
+        # hop-by-hop 头由代理自身管理，不能透传；content-length 也剔除，
+        # 因为我们按实际写入的 body 长度重新计算，避免与上游头重复或与
+        # chunked 编码后的长度不一致。
+        hop_by_hop = {'transfer-encoding', 'content-encoding', 'content-length',
+                      'keep-alive', 'proxy-connection', 'te', 'trailer', 'upgrade'}
         try:
             writer.write(f"HTTP/1.1 {status_code} {reason_phrase}\r\n".encode('latin-1'))
             for k, v in headers.items():
@@ -245,19 +301,26 @@ class Router:
             raise
 
     async def _try_tunnel(self, pid: str, target: str, proxy_host: Optional[str], proxy_port: Optional[int], proxy_auth: Optional[dict], update_meta: bool = True):
-        if proxy_host is not None:
-            up_reader, up_writer = await asyncio.open_connection(proxy_host, proxy_port)
-        else:
-            if ':' not in target:
-                raise ValueError(f'Invalid CONNECT target: {target}')
-            if target.startswith('['):
-                host_end = target.find(']')
-                host = target[1:host_end]
-                port = int(target[host_end + 2:])
+        # 建立 CONNECT 与读取响应均设超时，避免挂死的上游无限占用竞速 task 与连接。
+        connect_timeout = 15
+        try:
+            if proxy_host is not None:
+                up_reader, up_writer = await asyncio.wait_for(
+                    asyncio.open_connection(proxy_host, proxy_port), timeout=connect_timeout)
             else:
-                host, port_str = target.rsplit(':', 1)
-                port = int(port_str)
-            up_reader, up_writer = await asyncio.open_connection(host, port)
+                if ':' not in target:
+                    raise ValueError(f'Invalid CONNECT target: {target}')
+                if target.startswith('['):
+                    host_end = target.find(']')
+                    host = target[1:host_end]
+                    port = int(target[host_end + 2:])
+                else:
+                    host, port_str = target.rsplit(':', 1)
+                    port = int(port_str)
+                up_reader, up_writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port), timeout=connect_timeout)
+        except (asyncio.TimeoutError, OSError, ConnectionError) as e:
+            raise RuntimeError(f'connect to {proxy_host or target} timed out or failed: {e}') from e
         try:
             auth_hdr = ""
             if proxy_auth:
@@ -267,7 +330,7 @@ class Router:
             up_writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n{auth_hdr}\r\n".encode('latin-1'))
             await up_writer.drain()
             self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
-            status = await up_reader.readline()
+            status = await asyncio.wait_for(up_reader.readline(), timeout=connect_timeout)
             if not status:
                 raise RuntimeError('no response from upstream')
             status_text = status.decode('latin-1')
@@ -325,9 +388,24 @@ class Router:
                         cl = int(h.split(':', 1)[1].strip())
                         break
                 if cl and cl > 0:
+                    if cl > MAX_BODY:
+                        writer.write(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 15\r\n\r\nPayload Too Large")
+                        await writer.drain()
+                        return
                     body = await reader.readexactly(cl)
                 elif not cl and first.upper().split(' ')[0] in ('POST', 'PUT', 'PATCH'):
-                    body = await reader.read(-1)
+                    # 无 Content-Length：分块读取至上限，避免 read(-1) 阻塞到
+                    # 客户端关闭连接而破坏 HTTP keep-alive。
+                    body = b''
+                    while len(body) < MAX_BODY:
+                        chunk = await reader.read(MAX_BODY - len(body))
+                        if not chunk:
+                            break
+                        body += chunk
+                    if len(body) >= MAX_BODY:
+                        writer.write(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 15\r\n\r\nPayload Too Large")
+                        await writer.drain()
+                        return
                 request_bytes = (first + '\r\n').encode('latin-1') + headers + b'\r\n' + body
                 await self._handle_http_request(request_bytes, writer)
         except Exception:
@@ -412,12 +490,12 @@ class Router:
             return
 
         tasks = await self._build_racing_tasks_http(proxies, method, url, hdrs, body)
-        winner_resp = await self._race(tasks)
+        winner_resp = await self._race(tasks, cleanup=self._cleanup_http_result)
 
         if not winner_resp and len(proxies) > self.max_retries:
             remaining = proxies[self.max_retries:]
             tasks = await self._build_racing_tasks_http(remaining, method, url, hdrs, body)
-            winner_resp = await self._race(tasks)
+            winner_resp = await self._race(tasks, cleanup=self._cleanup_http_result)
 
         if winner_resp:
             pid, method, url, resp, client = winner_resp
@@ -479,12 +557,12 @@ class Router:
             return
 
         tasks = await self._build_racing_tasks_connect(proxies, target)
-        winner = await self._race(tasks)
+        winner = await self._race(tasks, cleanup=self._cleanup_tunnel_result)
 
         if not winner and len(proxies) > self.max_retries:
             remaining = proxies[self.max_retries:]
             tasks = await self._build_racing_tasks_connect(remaining, target)
-            winner = await self._race(tasks)
+            winner = await self._race(tasks, cleanup=self._cleanup_tunnel_result)
 
         if winner:
             pid, up_reader, up_writer = winner
