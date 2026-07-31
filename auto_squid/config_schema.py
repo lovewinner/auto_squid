@@ -1,4 +1,4 @@
-from typing import Dict, Optional, List
+from typing import Dict, Optional
 from pydantic import BaseModel, Field
 
 
@@ -10,7 +10,6 @@ class ListenConfig(BaseModel):
 class APIConfig(BaseModel):
     host: str = Field("0.0.0.0")
     port: int = Field(18080)
-    bind_remote: bool = Field(True)
 
 
 class LoggingConfig(BaseModel):
@@ -40,4 +39,3 @@ class Config(BaseModel):
     api: APIConfig = Field(default_factory=APIConfig)
     router: RouterConfig = Field(default_factory=RouterConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
-    proxies: Optional[List[ProxyInfo]] = None

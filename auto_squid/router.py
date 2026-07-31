@@ -7,7 +7,7 @@ import sqlite3
 import threading
 import time
 import urllib.parse
-from typing import Optional, List
+from typing import Optional, List, Any
 import httpx
 
 from .proxy_store import ProxyStore
@@ -178,7 +178,7 @@ class Router:
     # ── 通用竞速 / pipe / 响应写入 ──────────────────────────────
 
     @staticmethod
-    async def _race(tasks: set, cleanup=None) -> Optional[any]:
+    async def _race(tasks: set, cleanup=None) -> Optional[Any]:
         """取最先成功完成的 task 的结果；取消并清理其余 task。
 
         cleanup(result) 用于释放「已完成但未获胜」的 task 持有的资源
