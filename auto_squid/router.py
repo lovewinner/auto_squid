@@ -141,6 +141,12 @@ class Router:
         # ── 数据持久化 ──────────────────────────────────────────
         self._db_path = db_path
         self._db = sqlite3.connect(db_path, check_same_thread=False)
+        # WAL 模式 + synchronous=NORMAL:热路径已不 commit,后台 flush 是低频
+        # 单写者;WAL 让 commit 只追加 -wal 文件、把 fsync 推迟到 checkpoint,
+        # 缩短 _flush_to_db 持锁时长。NORMAL 在 WAL 下安全(仅断电可能丢最后
+        # 一次 flush,而 flush 是幂等全量覆盖,下次启动可补齐)。
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA synchronous=NORMAL")
         # 后台 flush task 与 FastAPI 线程池都可能触达 DB;同一连接的并发使用
         # 非线程安全,用锁串行化所有 DB 写入,避免 "database is locked"。
         # 热路径(转发)只读写下方内存缓存,不经此锁。
@@ -539,6 +545,7 @@ class Router:
         """
         key = self._client_key(pid, proxy_url)
         client = await self._get_client(key, proxy_url)
+        resp = None
         try:
             self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
             resp = await client.send(
@@ -549,10 +556,14 @@ class Router:
             self._record_win(domain, pid, update_meta=update_meta)
             return pid, method, url, resp, client
         except BaseException:
-            try:
-                await resp.aclose()
-            except Exception:
-                pass
+            # 仅在确实取得流式 resp 时才 aclose;client.build_request / client.send
+            # 在赋值前抛错时 resp 仍为 None,无条件 aclose 会抛 UnboundLocalError
+            # 被吞掉并掩盖根因。client 始终留在连接池,不在此关闭。
+            if resp is not None:
+                try:
+                    await resp.aclose()
+                except Exception:
+                    pass
             raise
 
     async def _try_tunnel(self, pid: str, target: str, proxy_host: Optional[str], proxy_port: Optional[int], proxy_auth: Optional[dict], update_meta: bool = True):
@@ -644,15 +655,18 @@ class Router:
                     break
                 headers += h
             logger.debug("first line: %s", first)
+            # 一次性把请求头字节解析成 dict(键保留原大小写),auth 与 body
+            # 长度判定及下游转发共用此 dict,不再各自重新 decode+split 头部。
+            # HTTP 头字段为 ASCII,latin-1 解码安全;body 不在此解码(见下)。
+            req_headers = {}
+            for h in headers.decode('latin-1').split('\r\n'):
+                if ':' in h:
+                    k, v = h.split(':', 1)
+                    req_headers[k.strip()] = v.strip()
             # 客户端认证：在 CONNECT/HTTP 分流前统一校验，未通过则返回 407，
             # 不进行任何上游连接/竞速/DB 写入。auth_enabled=False 时放行。
             if self.auth_enabled:
-                client_hdrs = {}
-                for h in headers.decode('latin-1').split('\r\n'):
-                    if ':' in h:
-                        k, v = h.split(':', 1)
-                        client_hdrs[k.strip()] = v.strip()
-                ok, reason = check_auth(client_hdrs, self.auth_enabled, self.auth_username, self.auth_password)
+                ok, reason = check_auth(req_headers, self.auth_enabled, self.auth_username, self.auth_password)
                 if not ok:
                     logger.info("auth rejected for %s: %s", peer, reason)
                     await self._write_cached_response(writer, 407, 'Proxy Authentication Required',
@@ -664,11 +678,19 @@ class Router:
                 target = first.split(' ')[1]
                 await self._handle_connect(target, reader, writer)
             else:
+                # 首行合法性提前校验(原由 _handle_http_request 做):缺方法/URL
+                # 直接 400,不必再拼包传下去重新解析。
+                parts = first.split(' ')
+                if len(parts) < 3:
+                    writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nBad Request")
+                    await writer.drain()
+                    return
+                method, url = parts[0], parts[1]
                 body = b''
                 cl = None
-                for h in headers.decode('latin-1').split('\r\n'):
-                    if h.lower().startswith('content-length:'):
-                        cl = int(h.split(':', 1)[1].strip())
+                for k, v in req_headers.items():
+                    if k.lower() == 'content-length':
+                        cl = int(v)
                         break
                 if cl is not None and cl > 0:
                     if cl > MAX_BODY:
@@ -676,7 +698,7 @@ class Router:
                         await writer.drain()
                         return
                     body = await reader.readexactly(cl)
-                elif cl is None and first.upper().split(' ')[0] in ('POST', 'PUT', 'PATCH'):
+                elif cl is None and method.upper() in ('POST', 'PUT', 'PATCH'):
                     # 无 Content-Length 头：分块读取至上限，避免 read(-1) 阻塞到
                     # 客户端关闭连接而破坏 HTTP keep-alive。注意 cl is None 与
                     # cl == 0 不同——后者表示头部存在但 body 为空，应直接用 b''。
@@ -690,8 +712,9 @@ class Router:
                         writer.write(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 15\r\n\r\nPayload Too Large")
                         await writer.drain()
                         return
-                request_bytes = (first + '\r\n').encode('latin-1') + headers + b'\r\n' + body
-                await self._handle_http_request(request_bytes, writer)
+                # 直接传已解析的 method/url/headers/body,不再拼回 request_bytes
+                # 让下游重新 find+decode+split(消除双重解析)。
+                await self._handle_http_request(method, url, req_headers, body, writer)
         except Exception:
             logger.exception("error handling client")
         finally:
@@ -720,8 +743,8 @@ class Router:
             tasks.add(asyncio.create_task(self._try_http('local', None, method, url, headers, body)))
         return tasks
 
-    async def _handle_http_request(self, request_bytes: bytes, writer: asyncio.StreamWriter):
-        """处理一个完整 HTTP 请求(已含首行+头+body),按优先级回写响应。
+    async def _handle_http_request(self, method: str, url: str, headers: dict, body: bytes, writer: asyncio.StreamWriter):
+        """处理一个完整 HTTP 请求(已解析好的 method/url/headers/body),按优先级回写响应。
 
         决策顺序(命中即返回):
         1. HTTP 响应缓存命中 → 直接回写缓存响应(整包在内存)。
@@ -730,40 +753,17 @@ class Router:
         4. 全失败 → 502。成功 2xx 顺带写入响应缓存(流式边转边缓冲)。
 
         竞速采用首字节判胜:某候选拿到响应头即获胜,其余取消;获胜者 body
-        由 _stream_upstream_response 边收边转发。请求头转发前已剔除
-        hop-by-hop 头(见调用方)。
+        由 _stream_upstream_response 边收边转发。请求头转发前剔除
+        hop-by-hop 头(下方),避免把客户端访问本代理的凭据
+        (Proxy-Authorization)等透传给上游。
+
+        解析已在 handle_client 一次性完成并传入,此处不再重复 find+decode+split。
+        body 为原始字节(未解码),保留二进制安全。
         """
-        # 以字节边界解析请求头，避免把整个请求（含二进制 body）解码为
-        # latin-1 再往返编码——那会破坏 0x100 以上的字节。头部用 latin-1
-        # 解码是安全的（HTTP 头字段为 ASCII），body 则直接取原始字节。
-        header_end = request_bytes.find(b'\r\n\r\n')
-        head_part = request_bytes[:header_end if header_end != -1 else len(request_bytes)]
-        body = request_bytes[header_end + 4:] if header_end != -1 else b''
-        text = head_part.decode('latin-1', errors='ignore')
-        first_line = text.split('\r\n')[0]
-        parts = first_line.split(' ')
-        if len(parts) < 3:
-            try:
-                writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nBad Request")
-                await writer.drain()
-            except Exception:
-                pass
-            return
-        method, url, _ = parts
         domain = urllib.parse.urlparse(url).hostname or url
-        hdrs = {}
-        lines = text.split('\r\n')
-        i = 1
-        while i < len(lines) and lines[i]:
-            h = lines[i]
-            if ':' in h:
-                k, v = h.split(':', 1)
-                hdrs[k.strip()] = v.strip()
-            i += 1
+        # 剔除 hop-by-hop 请求头:只服务"客户端→本代理"这一跳,不透传上游。
+        hdrs = {k: v for k, v in headers.items() if k.lower() not in _HOP_BY_HOP_REQUEST_HEADERS}
         body = body or None
-        # 剔除 hop-by-hop 请求头，避免把客户端访问本代理的凭据
-        # （Proxy-Authorization）等透传给上游。
-        hdrs = {k: v for k, v in hdrs.items() if k.lower() not in _HOP_BY_HOP_REQUEST_HEADERS}
 
         # 1) HTTP 响应缓存:GET 幂等响应直接命中,完全不经上游。
         cached_entry = self._http_cache_get(method, url)

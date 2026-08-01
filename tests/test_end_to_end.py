@@ -806,6 +806,47 @@ async def test_upstream_client_pool_reused():
 
 
 @pytest.mark.asyncio
+async def test_try_http_send_failure_does_not_mask_error():
+    """When client.send raises before a streaming resp is assigned, _try_http
+    must re-raise the original error (not a swallowed UnboundLocalError from
+    `await resp.aclose()`) and leave the pooled client intact for reuse."""
+    proxy_store = ProxyStore()
+    proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+                    db_path=tempfile.mktemp(suffix='.db'))
+
+    class _Boom(Exception):
+        pass
+
+    # Pre-seed the pool with a client whose .send always fails. This exercises
+    # the `except BaseException` branch of _try_http with resp still unassigned.
+    pool_key = f"http://{HOST}:{PROXY_PORT}"
+
+    class _FailingClient:
+        is_closed = False
+
+        def build_request(self, *a, **k):
+            return object()  # request object; never actually used
+
+        async def send(self, *a, **k):
+            raise _Boom("send-time failure before resp assigned")
+
+        async def aclose(self):
+            self.is_closed = True
+
+    router._client_pool[pool_key] = _FailingClient()
+    try:
+        with pytest.raises(_Boom):
+            await router._try_http(
+                'mock1', pool_key, 'GET', 'http://boom.example.com/', {}, None)
+        # The failing client must remain in the pool, unclosed, for reuse.
+        assert pool_key in router._client_pool
+        assert not router._client_pool[pool_key].is_closed
+    finally:
+        await router.stop()
+
+
+@pytest.mark.asyncio
 async def test_db_batching_durability_across_restart():
     """Stats accumulated in memory must persist after stop() (final flush)
     and be reloadable by a fresh Router on the same db file."""
