@@ -166,6 +166,47 @@ logging:
 
 测试套件覆盖 HTTP/CONNECT 转发、HTTP 响应缓存、域名缓存、本机竞速、`ProxyStore` CRUD、API，以及二进制安全的请求体处理。
 
+## 性能压测
+
+`bench/` 提供一套**可控、可重复、可归因**的压测工具。它启动一组**受控 mock 上游代理**(延迟/响应大小/chunked/失败率可配,每个实例带命中计数器),排除真实网络抖动,再驱动 `Router` 承载负载,输出吞吐、延迟分位、缓存命中率、racing 放大率与资源占用。
+
+> 完整说明见 [`bench/README.md`](bench/README.md)。速查:
+
+```bash
+# 默认:mock 上游,并发阶梯(找饱和点)
+python -m bench.stress
+
+# 快速冒烟(~10s,小规模)
+python -m bench.stress --quick
+
+# 禁用 HTTP 响应缓存,测纯路由性能
+# (开/关各跑一次,对照即缓存收益)
+python -m bench.stress --no-http-cache
+
+# 四种模式全跑(阶梯 / 速率 / 混合 / 长时)
+python -m bench.stress --mode all
+
+# 长时稳定性 + 泄漏检查(默认 60s)
+python -m bench.stress --mode soak --duration 120
+
+# cProfile 覆盖(输出 bench_profile.txt)
+python -m bench.stress --profile
+
+# 指向真实上游代理(替代 mock 集群)
+python -m bench.stress --upstream real --proxies proxies.yaml
+```
+
+模式:
+
+| 模式 | 负载形态 | 回答什么问题 |
+|------|---------|------------|
+| `staircase` | 并发数 1→200,每级固定请求数 | 吞吐/延迟随并发的变化 → **饱和点** |
+| `rate` | 目标 RPS 100→2000,持续发 | 延迟/错误率随负载的变化 → **容量上限** |
+| `mixed` | 30%热 + 20%大响应 + 20%chunked + 20%冷 + 10%CONNECT | 贴近真实流量的**混合画像** |
+| `soak` | 固定并发长时持续(默认 60s) | **稳定性与资源泄漏** |
+
+关键指标:吞吐(req/s)、TTFB 与 total 的 P50/P95/P99、错误率(按类型分类)、**缓存命中率**与 **racing 放大率**(由 mock 命中计数器推导)、以及资源采样(RSS、文件描述符数、连接池大小、HTTP 缓存条目数)。结果在终端以表格输出,并写入 `bench_report.json`(带 git 版本号,跨版本可 diff)。
+
 ## 限制
 
 - HTTP 解析为 MVP 级别，大流量流式响应可能有边界情况

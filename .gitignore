@@ -11,3 +11,4 @@ config.yaml
 *.log
 uv.lock
 *.egg-info/
+bench_report.json

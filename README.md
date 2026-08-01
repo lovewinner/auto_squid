@@ -166,6 +166,47 @@ logging:
 
 The suite covers HTTP/CONNECT forwarding, the HTTP response cache, the domain cache, local racing, `ProxyStore` CRUD, the API, and binary-safe request body handling.
 
+## Benchmarking
+
+A controlled, repeatable, attributable benchmark harness lives in `bench/`. It spins up **mock upstream proxies** (with configurable latency / response size / chunked / failure rate, each carrying a hit counter) so results are not dominated by real-network jitter, then drives the `Router` under load and reports throughput, latency percentiles, cache hit rate, racing amplification, and resource usage.
+
+> See [`bench/README.md`](bench/README.md) for full details. Quick reference:
+
+```bash
+# Default: mock upstreams, concurrency staircase (find the saturation point)
+python -m bench.stress
+
+# Smoke run (~10s, small scale)
+python -m bench.stress --quick
+
+# Disable the HTTP response cache to measure raw routing performance
+# (run with and without to isolate the cache's benefit)
+python -m bench.stress --no-http-cache
+
+# All four modes (staircase / rate / mixed / soak)
+python -m bench.stress --mode all
+
+# Long-run stability + leak check (default 60s)
+python -m bench.stress --mode soak --duration 120
+
+# Profile with cProfile (writes bench_profile.txt)
+python -m bench.stress --profile
+
+# Point at real upstream proxies instead of the mock cluster
+python -m bench.stress --upstream real --proxies proxies.yaml
+```
+
+Modes:
+
+| Mode | Load shape | Answers |
+|------|-----------|---------|
+| `staircase` | concurrency 1→200, fixed requests per level | throughput/latency vs. concurrency → **saturation point** |
+| `rate` | target RPS 100→2000, sustained | latency/error vs. load → **capacity ceiling** |
+| `mixed` | 30% hot + 20% large + 20% chunked + 20% cold + 10% CONNECT | a **realistic mixed profile** |
+| `soak` | fixed concurrency, sustained (default 60s) | **stability / resource leaks** |
+
+Key metrics: throughput (req/s), TTFB & total at P50/P95/P99, error rate by category, **cache hit rate** and **racing amplification** (derived from the mock hit counters), and resource samples (RSS, fd count, connection-pool size, HTTP-cache entries). Results print to the terminal and are written to `bench_report.json` (tagged with the git revision, so runs are diffable across versions).
+
 ## Limitations
 
 - HTTP parsing is MVP-level; large streaming responses may have edge cases

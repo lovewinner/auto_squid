@@ -99,7 +99,7 @@ class Router:
     生命周期:start() 开始监听 → handle_client 处理每个连接 → stop() 优雅关闭。
     """
 
-    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = ""):
+    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True):
         """构造路由器。
 
         参数:
@@ -118,6 +118,7 @@ class Router:
         self.listen_port = listen_port
         self.max_retries = max_retries
         self.enable_local_racing = enable_local_racing
+        self.enable_http_cache = enable_http_cache
         self.auth_enabled = auth_enabled
         self.auth_username = auth_username
         self.auth_password = auth_password
@@ -317,8 +318,11 @@ class Router:
         return f"{method}:{url}"
 
     def _http_cache_get(self, method: str, url: str) -> Optional[dict]:
-        """取 GET 的缓存响应;非 GET 或未命中或已过期返回 None。过期项顺便清除。"""
-        if method != 'GET':
+        """取 GET 的缓存响应;非 GET 或未命中或已过期返回 None。过期项顺便清除。
+
+        enable_http_cache=False 时一律未命中(用于压测隔离缓存层,测纯路由性能)。
+        """
+        if not self.enable_http_cache or method != 'GET':
             return None
         key = self._http_cache_key(method, url)
         entry = self._http_cache.get(key)
