@@ -42,12 +42,28 @@ python -m bench.stress --profile
 ## 关键指标(准确性设计)
 
 - **吞吐** (req/s)、**TTFB** 与 **total** 的 P50/P95/P99 —— 客户端用 raw socket 精确到读到状态行的时间。
-- **错误率与分类** (conn / timeout / http / echo-mismatch)。
+- **错误率与分类** (conn / timeout / `http:<状态码>` / echo-mismatch)。`http:` 类按上游实际状态码细分(如 `{'503': 12}`),一眼看出 DNS 失败(503)还是别的根因。
+- **状态码分布** —— 所有结果(含成功)的状态码分布。real 模式下尤其关键:揭示"成功"背后的真实状态码(如全是 503 = 上游 DNS 失败,数据无效)。
 - **缓存命中率** = 被缓存吸收(未触达上游)的请求占比。用 mock 命中计数器测,**区分于上游自身缓存**。
 - **racing 放大率** = 上游命中 / 客户端请求。>1 表示竞速扇出超过单发(冷请求竞速);<1 表示缓存吸收了部分请求。
 - **资源采样**:进程 RSS、文件描述符数、Router 连接池大小、HTTP 缓存条目数(峰值 + 末值)。
 
 > mock 模式可测缓存命中率/放大率;`--upstream real` 模式无法测(上游不计命中),记为 N/A。
+
+## 真实上游模式(`--upstream real`)
+
+指向 `proxies.yaml` 里的真实上游代理,贴近生产。与 mock 模式有几处关键差异:
+
+- **主机名**:真实代理会真正解析主机名,故压测打向**内置默认大站池**(www.baidu.com 等,可被 `--real-hosts host1,host2,...` 覆盖)。主机名必须可被上游代理解析,否则全部 503(看状态码分布即可发现)。
+- **成功判定**:真实站点对压测用的路径(`/p0` 等)常返回 3xx/4xx,但这不代表代理失败——代理已成功转发,源站状态码与代理性能无关。故 real 模式把"收到任何 HTTP 响应"都记为成功(仅 conn/timeout 算真失败)。**务必看状态码分布**确认响应不是全 503。
+- **CONNECT**:真实 TLS 隧道会加密 payload,无法原样回显,故 real 模式 CONNECT"建隧道即成功"(不做 echo 校验),只测隧道建立。
+- **缓存指标**:真实上游无命中计数器,缓存命中率/放大率记 N/A。要测缓存收益请用 mock 模式。
+- **超时**:real 模式客户端超时上调到 20s(上游延迟高),避免把"慢"误判为 timeout。
+
+```bash
+python -m bench.stress --upstream real --mode all --duration 120
+python -m bench.stress --upstream real --real-hosts www.baidu.com,www.qq.com
+```
 
 ## 隔离缓存层
 
