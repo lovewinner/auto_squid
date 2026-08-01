@@ -52,6 +52,17 @@ STREAM_CACHE_LIMIT = 1 * 1024 * 1024  # 1 MiB
 # 后台 flush 周期(秒):把内存里累积的胜出统计/元数据批量落盘。
 FLUSH_INTERVAL = 5.0
 
+# 可缓存的响应状态码。除 2xx 外,纳入幂等的 3xx 重定向(301/302/304)与
+# 404/410——这些对象在真实流量中占比高且高度幂等:真实源站对随机路径常回
+# 301/302/404,原"仅 2xx"策略使 HTTP 响应缓存对真实流量几乎完全失效
+# (压测见 http_cache_entries_end 恒为 0)。5xx/4xx 中仅 404/410 安全可缓存
+# (其余如 502 可能瞬态,缓存会放大故障)。
+CACHEABLE_STATUS = frozenset({200, 203, 300, 301, 302, 304, 404, 410})
+
+# 败者清理后台 task 的软上限。超过则在 _race 里就地排空一次,防止持续高吞吐
+# 下 _pending_cleanups 无界堆积(soak 模式曾观测 fd_peak 冲到 569)。
+_MAX_PENDING_CLEANUPS = 64
+
 # Hop-by-hop 请求头：只服务于"客户端→本代理"这一跳，绝不能转发给上游。
 # 特别是 Proxy-Authorization——若把客户端访问本代理的凭据透传到上游，
 # 上游 Squid 会用它校验缓存对象访问权限（ERR_CACHE_ACCESS_DENIED），
@@ -357,21 +368,22 @@ class Router:
         return entry
 
     def _http_cache_set(self, method: str, url: str, status_code, reason_phrase, headers, content) -> None:
-        """缓存一个 GET 成功响应(状态码、原因、头、body、时间戳)。
+        """缓存一个 GET 可缓存响应(状态码、原因、头、body、时间戳)。
 
-        仅缓存 2xx(调用方判断)。当上游未给 Content-Length 时,依据
-        Cache-Control 的 no-cache/no-store/private 跳过缓存。
+        可缓存状态码由调用方按 CACHEABLE_STATUS 判断。无论上游是否给出
+        Content-Length,都遵循 Cache-Control 的 no-store/no-cache/private:
+        本代理是共享缓存(为多客户端服务),private 明确禁止共享缓存存储,
+        no-store/no-cache 同理。原实现仅在缺 Content-Length 时查 Cache-Control,
+        扩展到 3xx/404 后必须无条件查,否则会把源站标 private 的 302 也缓存。
         """
         if method != 'GET':
             return
-        cl = headers.get('content-length')
-        # 仅当上游未提供 Content-Length 时，才退而依据 Cache-Control 决定
-        # 是否缓存。注意用 is None 而非 not cl：Content-Length: 0 时
-        # cl == "0" 为真值字符串，不应进入此分支。
-        if cl is None:
-            cc = headers.get('cache-control', '')
-            if 'no-cache' in cc or 'no-store' in cc or 'private' in cc:
-                return
+        # 共享缓存必须尊重源站的 Cache-Control 禁存指令(无论是否有
+        # Content-Length)。no-cache 在此保守按"不存"处理:本代理不做再校验
+        # (发条件请求),存了也只是徒增一次过期清除,不如直接不存。
+        cc = headers.get('cache-control', '')
+        if 'no-store' in cc or 'no-cache' in cc or 'private' in cc:
+            return
         key = self._http_cache_key(method, url)
         self._http_cache[key] = {
             'status_code': status_code,
@@ -405,8 +417,16 @@ class Router:
             return client
         kw: dict[str, Any] = {
             "timeout": self._upstream_timeout,
+            # 连接池上限按"单代理"计。压测 staircase 在 concurrency=200 时,
+            # 冷请求(30%)向 4 个代理竞速 + 热请求单发,瞬时并发上游 socket
+            # ~380(fd_peak 实测 358≈池打满)。原 max_connections=100/代理虽
+            # 总量够,但 max_keepalive=20 偏小:突发过后大部分连接被回收,
+            # 下一突发又得重建到上游代理的 CONNECT 隧道(含 TLS 握手),正是
+            # staircase p95≈1300ms 长尾的主因。调大 keepalive 与总量,并把
+            # 过期延长到 120s,让突发间复用连接、减少隧道重建。
             "limits": httpx.Limits(
-                max_keepalive_connections=20, max_connections=100, keepalive_expiry=60),
+                max_keepalive_connections=50, max_connections=200,
+                keepalive_expiry=120),
         }
         if proxy_url:
             kw['proxy'] = proxy_url
@@ -467,6 +487,15 @@ class Router:
                 for t in tasks:
                     t.cancel()
                 if losers and cleanup is not None:
+                    # 软上限:持续高吞吐下败者清理 task 会堆积(soak 曾观测
+                    # fd_peak 569)。超过阈值则就地排空已完成的清理 task,
+                    # 释放其持有的流式 resp / 上游连接,避免无界增长。就地
+                    # gather 只等已完成的清理(多为秒级 aclose),不阻塞赢家
+                    # 首字节——此刻赢家早已返回,这是下一轮竞速前的间隙。
+                    if len(self._pending_cleanups) >= _MAX_PENDING_CLEANUPS:
+                        stale = self._pending_cleanups
+                        self._pending_cleanups = set()
+                        await asyncio.gather(*stale, return_exceptions=True)
                     cleanup_task = asyncio.create_task(
                         self._drain_losers(losers, cleanup))
                     self._pending_cleanups.add(cleanup_task)
@@ -693,7 +722,7 @@ class Router:
         task = asyncio.current_task()
         self._running_tasks.add(task)
         peer = writer.get_extra_info('peername')
-        logger.info("client connected %s", peer)
+        logger.debug("client connected %s", peer)
         self._set_nodelay(writer)
         try:
             line = await reader.readline()
@@ -820,7 +849,7 @@ class Router:
         # 1) HTTP 响应缓存:GET 幂等响应直接命中,完全不经上游。
         cached_entry = self._http_cache_get(method, url)
         if cached_entry:
-            logger.info("HTTP cache hit %s %s", method, url)
+            logger.debug("HTTP cache hit %s %s", method, url)
             await self._write_cached_response(writer, cached_entry['status_code'], cached_entry['reason_phrase'],
                                        cached_entry['headers'], cached_entry['content'])
             return
@@ -834,10 +863,10 @@ class Router:
                     proxy = self.proxy_store.get(cached_pid)
                     pid, method, url, resp, client = await self._try_http(
                         cached_pid, self._build_proxy_url(proxy), method, url, hdrs, body)
-                    logger.info("proxy %s cache hit %s %s", pid, method, url)
+                    logger.debug("proxy %s cache hit %s %s", pid, method, url)
                     buffered = await self._stream_upstream_response(writer, resp, method, url)
                     await resp.aclose()
-                    if buffered is not None and 200 <= resp.status_code < 300:
+                    if buffered is not None and resp.status_code in CACHEABLE_STATUS:
                         self._http_cache_set(method, url, resp.status_code, resp.reason_phrase,
                                              dict(resp.headers.items()), buffered)
                     return
@@ -861,7 +890,7 @@ class Router:
 
         if winner_resp:
             pid, method, url, resp, client = winner_resp
-            logger.info("proxy %s racing win %s %s", pid, method, url)
+            logger.debug("proxy %s racing win %s %s", pid, method, url)
             # 仅赢家更新域名缓存 meta:竞速中败者只记了 _record_attempt,不会污染
             # _meta_cache。domain 在上方 :763 已算好(同一次 urlparse)。
             self._record_win_meta(domain, pid)
@@ -870,7 +899,7 @@ class Router:
                 await resp.aclose()
             except Exception:
                 pass
-            if buffered is not None and 200 <= resp.status_code < 300:
+            if buffered is not None and resp.status_code in CACHEABLE_STATUS:
                 self._http_cache_set(method, url, resp.status_code, resp.reason_phrase,
                                      dict(resp.headers.items()), buffered)
             return
@@ -982,7 +1011,7 @@ class Router:
             try:
                 proxy = self.proxy_store.get(cached_pid)
                 pid, up_reader, up_writer = await self._try_tunnel(cached_pid, target, proxy.host, proxy.port, proxy.auth)
-                logger.info("proxy %s cache hit CONNECT %s", pid, target)
+                logger.debug("proxy %s cache hit CONNECT %s", pid, target)
                 self._set_nodelay(client_writer)
                 self._set_nodelay(up_writer)
                 client_writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
@@ -1020,7 +1049,7 @@ class Router:
         if winner:
             pid, up_reader, up_writer = winner
             client_peer = client_writer.get_extra_info('peername')
-            logger.info("proxy %s racing CONNECT to %s for client %s", pid, target, client_peer)
+            logger.debug("proxy %s racing CONNECT to %s for client %s", pid, target, client_peer)
             # 仅赢家更新域名缓存 meta(用 target 作 domain key);败者只记了尝试统计。
             self._record_win_meta(target, pid)
             self._set_nodelay(client_writer)

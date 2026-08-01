@@ -49,6 +49,11 @@ def setup_logging(cfg: Config):
     logging.getLogger("uvicorn").setLevel(logging.WARNING)
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     logging.getLogger("asyncio").setLevel(logging.ERROR)
+    # router 的每请求日志(client connected / cache hit / racing win)已降级为
+    # DEBUG。把 auto_squid logger 置于 INFO,DEBUG 在 logger 层即被短路,不再
+    # 构造格式化参数——250 rps 下每秒数百次 log 调用的隐藏成本由此消除。
+    # 启动(Router listening)与认证拒绝仍为 INFO,文件里保留审计轨迹。
+    logging.getLogger("auto_squid").setLevel(logging.INFO)
 
 
 app = typer.Typer()
