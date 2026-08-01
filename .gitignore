@@ -14,3 +14,4 @@ uv.lock
 bench_report.json
 *.db-shm
 *.db-wal
+bench_report_*.json

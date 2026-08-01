@@ -220,6 +220,102 @@ async def test_http_cache():
         await proxy_srv.wait_closed()
 
 
+async def run_mock_proxy_tagged(host, port, tag, pre_header_delay=0.0):
+    """HTTP mock proxy returning a distinctive body `tag` (so the caller can
+    tell which upstream won the race). Optionally sleeps `pre_header_delay`
+    before sending response headers — a "slow but still returns headers"
+    upstream that should LOSE the race yet, before the cache-poisoning fix,
+    could still overwrite the domain→proxy cache.
+    """
+    async def handle(reader, writer):
+        try:
+            line = await reader.readline()
+            if not line:
+                writer.close()
+                return
+            while True:
+                h = await reader.readline()
+                if not h or h in (b"\r\n", b"\n"):
+                    break
+            if pre_header_delay:
+                await asyncio.sleep(pre_header_delay)
+            body = tag.encode('latin-1')
+            writer.write(b"HTTP/1.1 200 OK\r\n")
+            writer.write(f"Content-Length: {len(body)}\r\n".encode())
+            writer.write(b"Content-Type: text/plain\r\n\r\n")
+            writer.write(body)
+            await writer.drain()
+            writer.close()
+        except Exception:
+            try:
+                writer.close()
+            except Exception:
+                pass
+    server = await asyncio.start_server(handle, host=host, port=port)
+    return server
+
+
+@pytest.mark.asyncio
+async def test_meta_cache_holds_winner_pid():
+    """竞速败者不应污染域名缓存:只有确认赢家写 _meta_cache。
+
+    断言不变式:在 _try_http / _try_tunnel 内部只调 _record_attempt(统计),
+    不调 _record_win_meta(meta);_record_win_meta 只在 _handle_http_request /
+    _handle_connect 判定赢家后调一次。用一个 spy 包住 _record_win_meta 记录
+    调用栈来源,跑一轮真实竞速(fast 无延迟 / slow 有延迟),断言:
+      1) 至少一次竞速触发 _record_win_meta(赢家写了一次);
+      2) 竞速中 _try_http 的调用栈不出现(败者没写 meta)。
+    这直接锁定"meta 只由赢家写"的契约,不依赖竞速时序的非确定性。
+    """
+    import traceback
+
+    fast_port = 31391
+    slow_port = 31392
+    fast_srv = await run_mock_proxy_tagged(HOST, fast_port, 'FAST', pre_header_delay=0.0)
+    slow_srv = await run_mock_proxy_tagged(HOST, slow_port, 'SLOW', pre_header_delay=0.05)
+    proxy_store = ProxyStore()
+    proxy_store.add(ProxyInfo(id='fast', host=HOST, port=fast_port))
+    proxy_store.add(ProxyInfo(id='slow', host=HOST, port=slow_port))
+    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+                    max_retries=2, enable_http_cache=False,
+                    db_path=tempfile.mktemp(suffix='.db'))
+
+    # spy:记录每次 _record_win_meta 的调用栈,看它是否从 _try_http 内部被调。
+    meta_calls = []
+    orig = router._record_win_meta
+
+    def spy(domain, pid):
+        stack = ''.join(traceback.format_stack())
+        meta_calls.append((pid, stack))
+        return orig(domain, pid)
+
+    router._record_win_meta = spy
+    await router.start()
+    try:
+        domain = 'racepoison.example.com'
+        for i in range(5):
+            url = f"http://{domain}/p{i}".encode()
+            body = await send_http_get(HOST, ROUTER_PORT, url=url)
+            assert b'FAST' in body, f"round {i}: winner body should be FAST, got {body!r}"
+        # 赢家路径应至少写过一次 meta。
+        assert meta_calls, "expected the confirmed winner to write meta at least once"
+        assert all(pid == 'fast' for pid, _ in meta_calls), (
+            f"meta written by non-winner pid: {meta_calls}")
+        # 关键契约:没有任何 _record_win_meta 调用源自 _try_http 内部
+        # (败者只应调 _record_attempt,不碰 meta)。
+        for pid, stack in meta_calls:
+            assert '_try_http' not in stack, (
+                f"_record_win_meta called from within _try_http (loser would "
+                f"poison cache); call stack:\n{stack}")
+    finally:
+        router._record_win_meta = orig
+        await router.stop()
+        fast_srv.close()
+        await fast_srv.wait_closed()
+        slow_srv.close()
+        await slow_srv.wait_closed()
+
+
 @pytest.mark.asyncio
 async def test_domain_cache():
     hit = []

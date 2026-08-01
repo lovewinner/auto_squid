@@ -136,6 +136,10 @@ class Router:
         # 读写(_flush_loop 是另一个 task,只碰 DB 缓存,不碰 client 池)。
         self._client_pool: dict[str, httpx.AsyncClient] = {}
         # 每请求整体超时(秒):连接/池获取设短以快速判负,读首字节给 10s。
+        # 注:曾尝试用 _RACE_HEADER_TIMEOUT + asyncio.wait_for 包裹 send 来独立
+        # 收紧 header 等待,但 real-upstream 压测四份对比证明它在 p50 与 p95 间是
+        # 权衡而非净赢(且有坏点:5s 配置引爆 soak p99 + fd 堆积),故回退,保留
+        # 原超时。尾延迟治理改由 Phase 2a(败者清理下放后台)承担,不带超时权衡。
         self._upstream_timeout = httpx.Timeout(10.0, connect=5.0, pool=5.0, read=10.0, write=10.0)
 
         # ── 数据持久化 ──────────────────────────────────────────
@@ -180,6 +184,9 @@ class Router:
         self._stats_dirty = False
         self._meta_dirty = False
         self._flush_task: Optional[asyncio.Task] = None
+        # 竞速中"败者清理"(aclose 流式 resp / 关上游裸连接)被下放到后台 task,
+        # 不阻塞赢家首字节(见 _race / _drain_losers)。stop() 收尾时排空,防泄漏。
+        self._pending_cleanups: set = set()
 
         # ── HTTP 响应缓存 ───────────────────────────────────────
         self._http_cache: dict[str, dict] = {}
@@ -206,21 +213,31 @@ class Router:
             for domain, dp, ua in meta_rows
         }
 
-    def _record_win(self, domain: str, pid: str, update_meta: bool = True):
-        """记录一次"代理 pid 为域名 domain 胜出"。
+    def _record_attempt(self, domain: str, pid: str):
+        """记录一次"代理 pid 对域名 domain 的尝试"(竞速扇出统计)。
 
-        仅更新内存镜像并置脏,由后台 _flush_loop 周期批量落盘。热路径无
-        逐请求 INSERT/commit,避免 fsync 阻塞事件循环。
+        每个竞速候选每次尝试都调:统计的是上游命中扇出,不是"胜出"。仅更新
+        内存镜像 _stats_cache 并置脏,由后台 _flush_loop 周期批量落盘。热路径
+        无逐请求 INSERT/commit,避免 fsync 阻塞事件循环。不动 _meta_cache——
+        meta 只应由 _record_win_meta 在确认赢家后写一次(见下),否则竞速中
+        多个候选都收到响应头时会互相覆写,把域名缓存污染成被取消的败者。
         """
         per_domain = self._stats_cache.setdefault(domain, {})
         per_domain[pid] = per_domain.get(pid, 0) + 1
         self._stats_dirty = True
-        if update_meta:
-            self._meta_cache[domain] = {
-                "default_proxy": pid,
-                "updated_at": self._now_utc(),
-            }
-            self._meta_dirty = True
+
+    def _record_win_meta(self, domain: str, pid: str):
+        """记录某域名确认的"赢家代理",更新 _meta_cache(域名→首选代理)。
+
+        仅在竞速判定赢家(或域名缓存命中复用)后调一次。这样 _meta_cache 反映
+        真正被采用的上游,而非竞速中"最后收到响应头的候选"(可能被取消)。
+        更新内存镜像并置脏,由后台 _flush_loop 落盘。
+        """
+        self._meta_cache[domain] = {
+            "default_proxy": pid,
+            "updated_at": self._now_utc(),
+        }
+        self._meta_dirty = True
 
     def _flush_to_db(self):
         """把内存里累积的统计/元数据一次性落盘(单事务)。
@@ -409,38 +426,70 @@ class Router:
 
     # ── 通用竞速 / pipe / 响应写入 ──────────────────────────────
 
-    @staticmethod
-    async def _race(tasks: set, cleanup=None) -> Optional[Any]:
-        """取最先成功完成的 task 的结果；取消并清理其余 task。
+    async def _race(self, tasks: set, cleanup=None) -> Optional[Any]:
+        """取最先成功完成的 task 的结果;败者清理下放后台,立即返回赢家。
 
-        cleanup(result) 用于释放「已完成但未获胜」的 task 持有的资源
-        （如流式 resp 的 aclose；上游连接池化后 client 不在此关闭）。
-        被 cancel 的 task 由其自身的 except BaseException 分支关闭资源,
-        无需在这里调用 cleanup。
+        竞速判胜取 FIRST_COMPLETED:某 task 返回结果即判其获胜。注意同一 tick
+        可能有多个 task 完成(asyncio.wait 的 done 集合可含多个),此时取遍历到的
+        第一个非异常者为 winner,其余**已完成但未获胜**的 task 连同尚未完成的
+        task 一起作为败者。
+
+        关键:败者清理(对已完成者调 cleanup 释放流式 resp / 关上游裸连接;
+        对未完成者 cancel 后由其自身 except 分支关资源)被打包成后台 task
+        (_drain_losers),_race 不等待其完成即返回赢家——这把败者清理移出
+        首字节关键路径,降低赢家 TTFB。后台 task 存入 _pending_cleanups,
+        stop() 收尾排空,防连接泄漏。
+
+        cleanup(result) 仅对"已完成且非取消"的败者调用(它们持有需要显式释放
+        的资源,如流式 resp);被 cancel 的败者由其 _try_http/_try_tunnel 的
+        except BaseException 分支自行关闭。
         """
         winner = None
         while tasks:
             done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            winner_task = None
             for t in done:
                 try:
                     winner = t.result()
+                    winner_task = t
                     break
                 except Exception:
                     pass
             if winner:
-                # 先取消尚未完成的 task，再统一等待；对已成功完成但未获胜的
-                # task（不在 cancelled 状态）调用 cleanup 释放其资源。
+                # 败者 = 未完成者(tasks) ∪ 已完成但未获胜者(done 去掉 winner_task)。
+                # 旧实现只清理 tasks,漏掉 done 里的其余完成者 → 它们的 resp 泄漏。
+                losers = set(tasks)
+                for t in done:
+                    if t is not winner_task:
+                        losers.add(t)
+                # 立即取消未完成者(停止读 body、释放竞速槽/连接池);已完成者
+                # 无需 cancel,直接进 _drain_losers 由 cleanup 释放资源。
                 for t in tasks:
                     t.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                for t in tasks:
-                    if t.done() and not t.cancelled() and cleanup:
-                        try:
-                            await cleanup(t.result())
-                        except Exception:
-                            pass
+                if losers and cleanup is not None:
+                    cleanup_task = asyncio.create_task(
+                        self._drain_losers(losers, cleanup))
+                    self._pending_cleanups.add(cleanup_task)
+                    cleanup_task.add_done_callback(self._pending_cleanups.discard)
                 break
         return winner
+
+    async def _drain_losers(self, losers: set, cleanup):
+        """后台清理竞速败者:等未完成者取消结束,对已完成者调 cleanup。
+
+        由 _race 下放,不阻塞赢家首字节。完成后从 _pending_cleanups 自移除
+        (经 add_done_callback)。任何异常静默——败者清理失败不影响赢家。
+        """
+        try:
+            await asyncio.gather(*losers, return_exceptions=True)
+            for t in losers:
+                if t.done() and not t.cancelled():
+                    try:
+                        await cleanup(t.result())
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     @staticmethod
     async def _cleanup_http_result(result):
@@ -531,7 +580,7 @@ class Router:
             return f"http://{user}:{pw}@{proxy.host}:{proxy.port}"
         return f"http://{proxy.host}:{proxy.port}"
 
-    async def _try_http(self, pid: str, proxy_url: Optional[str], method: str, url: str, headers: dict, body: Optional[bytes], update_meta: bool = True):
+    async def _try_http(self, pid: str, proxy_url: Optional[str], method: str, url: str, headers: dict, body: Optional[bytes]):
         """经某上游代理尝试一次 HTTP 请求,作为竞速的一个候选(流式)。
 
         从连接池取长驻 client,以 stream=True 发送——收到响应头即返回(resp
@@ -553,7 +602,9 @@ class Router:
                 stream=True)
             self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
             domain = urllib.parse.urlparse(url).hostname or url
-            self._record_win(domain, pid, update_meta=update_meta)
+            # 仅记尝试统计(竞速扇出);meta 由 _handle_http_request 在确认赢家后
+            # 调 _record_win_meta 写一次,避免败者覆写域名缓存。
+            self._record_attempt(domain, pid)
             return pid, method, url, resp, client
         except BaseException:
             # 仅在确实取得流式 resp 时才 aclose;client.build_request / client.send
@@ -566,7 +617,7 @@ class Router:
                     pass
             raise
 
-    async def _try_tunnel(self, pid: str, target: str, proxy_host: Optional[str], proxy_port: Optional[int], proxy_auth: Optional[dict], update_meta: bool = True):
+    async def _try_tunnel(self, pid: str, target: str, proxy_host: Optional[str], proxy_port: Optional[int], proxy_auth: Optional[dict]):
         """尝试建立一条 CONNECT 隧道,作为竞速的一个候选。
 
         - proxy_host 给定:经该上游代理发起 CONNECT(带上游 Proxy-Authorization)。
@@ -619,7 +670,8 @@ class Router:
                 if not h or h in (b"\r\n", b"\n"):
                     break
             self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
-            self._record_win(target, pid, update_meta=update_meta)
+            # 仅记尝试统计;meta 由 _handle_connect 在确认赢家后调 _record_win_meta。
+            self._record_attempt(target, pid)
             return pid, up_reader, up_writer
         except BaseException:
             try:
@@ -773,15 +825,15 @@ class Router:
                                        cached_entry['headers'], cached_entry['content'])
             return
 
-        # 2) 域名缓存:用上次胜出的代理单发请求(update_meta=False 不重复更新),
-        #    失败则回退到竞速。单发路径同样流式转发。
+        # 2) 域名缓存:用上次胜出的代理单发请求(不重复更新 meta——_try_http
+        #    内部只记尝试统计),失败则回退到竞速。单发路径同样流式转发。
         if domain:
             cached_pid = self._get_fresh_proxy(domain)
             if cached_pid:
                 try:
                     proxy = self.proxy_store.get(cached_pid)
                     pid, method, url, resp, client = await self._try_http(
-                        cached_pid, self._build_proxy_url(proxy), method, url, hdrs, body, update_meta=False)
+                        cached_pid, self._build_proxy_url(proxy), method, url, hdrs, body)
                     logger.info("proxy %s cache hit %s %s", pid, method, url)
                     buffered = await self._stream_upstream_response(writer, resp, method, url)
                     await resp.aclose()
@@ -810,6 +862,9 @@ class Router:
         if winner_resp:
             pid, method, url, resp, client = winner_resp
             logger.info("proxy %s racing win %s %s", pid, method, url)
+            # 仅赢家更新域名缓存 meta:竞速中败者只记了 _record_attempt,不会污染
+            # _meta_cache。domain 在上方 :763 已算好(同一次 urlparse)。
+            self._record_win_meta(domain, pid)
             buffered = await self._stream_upstream_response(writer, resp, method, url)
             try:
                 await resp.aclose()
@@ -921,12 +976,12 @@ class Router:
         用两个反向 _pipe 做客户端↔上游的双向透传,任一方向结束即关闭。
         全失败回写 502。认证已在 handle_client 完成,此处不再校验。
         """
-        # 1) 域名缓存命中:用上次胜出的代理单发隧道(update_meta=False),失败回退竞速。
+        # 1) 域名缓存命中:用上次胜出的代理单发隧道(只记尝试统计),失败回退竞速。
         cached_pid = self._get_fresh_proxy(target)
         if cached_pid:
             try:
                 proxy = self.proxy_store.get(cached_pid)
-                pid, up_reader, up_writer = await self._try_tunnel(cached_pid, target, proxy.host, proxy.port, proxy.auth, update_meta=False)
+                pid, up_reader, up_writer = await self._try_tunnel(cached_pid, target, proxy.host, proxy.port, proxy.auth)
                 logger.info("proxy %s cache hit CONNECT %s", pid, target)
                 self._set_nodelay(client_writer)
                 self._set_nodelay(up_writer)
@@ -966,6 +1021,8 @@ class Router:
             pid, up_reader, up_writer = winner
             client_peer = client_writer.get_extra_info('peername')
             logger.info("proxy %s racing CONNECT to %s for client %s", pid, target, client_peer)
+            # 仅赢家更新域名缓存 meta(用 target 作 domain key);败者只记了尝试统计。
+            self._record_win_meta(target, pid)
             self._set_nodelay(client_writer)
             self._set_nodelay(up_writer)
             client_writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
@@ -1020,6 +1077,11 @@ class Router:
             logger.exception("final flush failed")
         # 关闭上游连接池(归还所有 keep-alive 连接)。
         await self._aclose_all_clients()
+        # 排空竞速败者的后台清理 task:它们正在 aclose 流式 resp / 关上游裸连接,
+        # 必须在 _db.close() 前完成,否则连接泄漏(ResourceWarning)。
+        if self._pending_cleanups:
+            await asyncio.gather(*self._pending_cleanups, return_exceptions=True)
+            self._pending_cleanups.clear()
         # 停止接受新连接后，取消仍在处理的客户端连接 task 并等待它们退出，
         # 避免在 _db.close() 之后还有在途请求尝试写库而报错。
         for t in list(self._running_tasks):
