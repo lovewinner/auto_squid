@@ -5,14 +5,23 @@
 
 - 并行竞速:同一请求同时发往多个上游,最先成功者获胜,其余取消并释放资源
   (_race / _try_http / _try_tunnel)。
+- 流式转发 + 首字节判胜:HTTP 响应经 httpx 流式拉取,收到响应头即判胜,
+  随后边收边转发 body 给客户端,降低首字节延迟(TTFB);落败者在判胜后即被
+  取消,不再下载整包,省带宽(_stream_upstream_response / _tee_to_cache)。
+- 上游连接池化:每个上游代理维护一个长驻 httpx.AsyncClient,跨请求复用
+  keep-alive 连接,避免每请求重建 TCP/CONNECT(_get_client / _client_pool)。
 - 域名缓存:某代理为某域名胜出后,在 cache_ttl 内复用该代理,避免每请求竞速
-  (domain_meta 表 + _get_fresh_proxy)。
+  (内存镜像 _meta_cache + _get_fresh_proxy)。
 - HTTP 响应缓存:幂等 GET 的成功响应在内存缓存 60s(_http_cache_*),遵循
-  Cache-Control。
+  Cache-Control;流式转发时边转边缓冲(带上限),缓冲满或响应过大则放弃缓存。
+- 数据持久化用 SQLite(domain_stats / domain_meta):内存累加 + 后台周期批量
+  落盘(_stats_cache / _meta_dirty / _flush_loop),热路径无逐请求 fsync。
 - 客户端认证:可选 HTTP Basic,在 handle_client 分流前统一校验(auth.check_auth)。
-- 优雅关闭:stop() 先停服务、再取消并等待在途连接,最后关 DB(_running_tasks)。
+- 优雅关闭:stop() 先停服务、flush 残留统计、关闭连接池、再取消并等待在途连接,
+  最后关 DB(_running_tasks)。
 
-数据持久化用 SQLite(domain_stats / domain_meta),跨线程访问经 _db_lock 串行化。
+跨线程 DB 访问经 _db_lock 串行化(仅后台 flush 线程与 API 线程会触达);
+事件循环热路径(转发)只读写内存,不经锁、不经 fsync。
 """
 
 import asyncio
@@ -24,7 +33,7 @@ import sqlite3
 import threading
 import time
 import urllib.parse
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Dict, Tuple
 import httpx
 
 from .proxy_store import ProxyStore
@@ -36,6 +45,13 @@ logger = logging.getLogger(__name__)
 # 请求靠 read(-1) 读到 EOF 才返回（会破坏 keep-alive）及无界内存占用。
 MAX_BODY = 10 * 1024 * 1024
 
+# 流式转发时为响应缓存缓冲的 body 上限。超过此大小不再缓冲(放弃缓存该响应),
+# 避免大响应把内存撑爆。缓存的目的是命中幂等小响应,大文件本就不该缓存。
+STREAM_CACHE_LIMIT = 1 * 1024 * 1024  # 1 MiB
+
+# 后台 flush 周期(秒):把内存里累积的胜出统计/元数据批量落盘。
+FLUSH_INTERVAL = 5.0
+
 # Hop-by-hop 请求头：只服务于"客户端→本代理"这一跳，绝不能转发给上游。
 # 特别是 Proxy-Authorization——若把客户端访问本代理的凭据透传到上游，
 # 上游 Squid 会用它校验缓存对象访问权限（ERR_CACHE_ACCESS_DENIED），
@@ -43,6 +59,14 @@ MAX_BODY = 10 * 1024 * 1024
 _HOP_BY_HOP_REQUEST_HEADERS = frozenset({
     'proxy-authorization', 'connection', 'proxy-connection', 'keep-alive',
     'te', 'trailer', 'transfer-encoding', 'upgrade',
+})
+
+# 响应侧需剔除/重写的头:hop-by-hop 头由代理自身管理;content-length 因流式
+# 转发按实际写入字节数重算而剔除;content-encoding 保留(aiter_raw 给的是
+# 已编码的原始字节,与上游 Content-Length 语义一致,故保留编码头更安全)。
+_HOP_BY_HOP_RESPONSE_HEADERS = frozenset({
+    'transfer-encoding', 'content-length', 'connection', 'keep-alive',
+    'proxy-connection', 'te', 'trailer', 'upgrade',
 })
 
 
@@ -102,12 +126,23 @@ class Router:
         self._running_tasks: set[asyncio.Task] = set()
         self.request_counts: dict[str, int] = {}
         self.attempted_counts: dict[str, int] = {}
-        self.domain_stats: dict[str, dict[str, int]] = {}
         self.cache_ttl = cache_ttl
+
+        # ── 上游连接池 ──────────────────────────────────────────
+        # 每个"代理标识"维护一个长驻 httpx.AsyncClient,跨请求复用 keep-alive
+        # 连接。键为 pid(含 'local'),故同一上游代理在所有请求间共享一个池。
+        # 连接以 check_same_thread=False 跨线程共享,但实际只在事件循环线程
+        # 读写(_flush_loop 是另一个 task,只碰 DB 缓存,不碰 client 池)。
+        self._client_pool: dict[str, httpx.AsyncClient] = {}
+        # 每请求整体超时(秒):连接/池获取设短以快速判负,读首字节给 10s。
+        self._upstream_timeout = httpx.Timeout(10.0, connect=5.0, pool=5.0, read=10.0, write=10.0)
+
+        # ── 数据持久化 ──────────────────────────────────────────
+        self._db_path = db_path
         self._db = sqlite3.connect(db_path, check_same_thread=False)
-        # 连接以 check_same_thread=False 跨线程共享，但 sqlite3 对同一连接
-        # 的并发使用不是线程安全的；用一个锁串行化所有 DB 访问，避免
-        # "database is locked" 与并发游标导致的 RecursiveCursor 错误。
+        # 后台 flush task 与 FastAPI 线程池都可能触达 DB;同一连接的并发使用
+        # 非线程安全,用锁串行化所有 DB 写入,避免 "database is locked"。
+        # 热路径(转发)只读写下方内存缓存,不经此锁。
         self._db_lock = threading.Lock()
         from datetime import datetime, timezone
         self._db.execute("""
@@ -127,67 +162,130 @@ class Router:
         """)
         self._db.commit()
         self._now_utc = lambda: datetime.now(timezone.utc).isoformat()
+
+        # 内存镜像:热路径(每请求查域名缓存)只读这两份内存,不经 DB/锁。
+        # _meta_cache: {domain: {'default_proxy': pid, 'updated_at': ts}}
+        # _stats_cache: {domain: {pid: wins}}(内存累加,后台 flush 落盘)
+        self._meta_cache: dict[str, dict[str, str]] = {}
+        self._stats_cache: dict[str, dict[str, int]] = {}
+        self._load_caches_from_db()
+        # _stats_dirty / _meta_dirty 标记自上次 flush 后是否有变更。
+        self._stats_dirty = False
+        self._meta_dirty = False
+        self._flush_task: Optional[asyncio.Task] = None
+
+        # ── HTTP 响应缓存 ───────────────────────────────────────
         self._http_cache: dict[str, dict] = {}
         self._http_cache_ttl = 60
 
     # ── DB helpers ──────────────────────────────────────────────
 
-    def _save_domain_stats(self, domain: str, pid: str):
-        """记录一次"代理 pid 为域名 domain 胜出"的事件,win 计数 +1。
+    def _load_caches_from_db(self):
+        """启动时一次性把 domain_stats / domain_meta 载入内存镜像。
 
-        使用 UPSERT:存在则累加,不存在则插入。写操作全程持 _db_lock。
+        之后热路径只读写内存,不再每请求查 DB。载入在构造期同步完成,此时
+        事件循环尚未启动,无需异步化。
         """
         with self._db_lock:
-            self._db.execute(
-                "INSERT INTO domain_stats (domain, proxy_id, wins) VALUES (?, ?, 1) "
-                "ON CONFLICT(domain, proxy_id) DO UPDATE SET wins = wins + 1",
-                (domain, pid),
-            )
+            stats_rows = self._db.execute(
+                "SELECT domain, proxy_id, wins FROM domain_stats").fetchall()
+            meta_rows = self._db.execute(
+                "SELECT domain, default_proxy, updated_at FROM domain_meta").fetchall()
+        self._stats_cache = {}
+        for domain, pid, wins in stats_rows:
+            self._stats_cache.setdefault(domain, {})[pid] = wins
+        self._meta_cache = {
+            domain: {"default_proxy": dp, "updated_at": ua}
+            for domain, dp, ua in meta_rows
+        }
+
+    def _record_win(self, domain: str, pid: str, update_meta: bool = True):
+        """记录一次"代理 pid 为域名 domain 胜出"。
+
+        仅更新内存镜像并置脏,由后台 _flush_loop 周期批量落盘。热路径无
+        逐请求 INSERT/commit,避免 fsync 阻塞事件循环。
+        """
+        per_domain = self._stats_cache.setdefault(domain, {})
+        per_domain[pid] = per_domain.get(pid, 0) + 1
+        self._stats_dirty = True
+        if update_meta:
+            self._meta_cache[domain] = {
+                "default_proxy": pid,
+                "updated_at": self._now_utc(),
+            }
+            self._meta_dirty = True
+
+    def _flush_to_db(self):
+        """把内存里累积的统计/元数据一次性落盘(单事务)。
+
+        由后台 _flush_loop 周期调用,以及 stop() 收尾调用。持 _db_lock 写库。
+        注意:这里是幂等的全量覆盖——把内存当前值写回,而非增量累加,因此
+        多次 flush 结果一致;即使中间 flush 丢失,下一次 flush 仍能补齐。
+        """
+        if not (self._stats_dirty or self._meta_dirty):
+            return
+        with self._db_lock:
+            if self._stats_dirty:
+                # 全量重建 domain_stats:内存是权威源(已含历史累加)。
+                self._db.execute("DELETE FROM domain_stats")
+                self._db.executemany(
+                    "INSERT INTO domain_stats (domain, proxy_id, wins) VALUES (?, ?, ?)",
+                    [(d, pid, w) for d, m in self._stats_cache.items()
+                     for pid, w in m.items()],
+                )
+                self._stats_dirty = False
+            if self._meta_dirty:
+                self._db.execute("DELETE FROM domain_meta")
+                self._db.executemany(
+                    "INSERT INTO domain_meta (domain, default_proxy, updated_at) VALUES (?, ?, ?)",
+                    [(d, m["default_proxy"], m["updated_at"])
+                     for d, m in self._meta_cache.items()],
+                )
+                self._meta_dirty = False
             self._db.commit()
+
+    async def _flush_loop(self):
+        """后台周期 flush:把内存统计批量落盘,周期 FLUSH_INTERVAL 秒。
+
+        捕获异常不退出循环(单次 flush 失败不影响后续);被取消时静默退出
+        (stop() 会做最终 flush)。
+        """
+        try:
+            while True:
+                await asyncio.sleep(FLUSH_INTERVAL)
+                try:
+                    self._flush_to_db()
+                except Exception:
+                    logger.exception("background flush failed")
+        except asyncio.CancelledError:
+            pass
 
     def get_domain_stats_from_db(self) -> dict[str, dict[str, int]]:
-        """读取全量域名胜出统计,组织为 {domain: {proxy_id: wins}}。"""
-        with self._db_lock:
-            rows = self._db.execute("SELECT domain, proxy_id, wins FROM domain_stats").fetchall()
-        result: dict[str, dict[str, int]] = {}
-        for domain, pid, wins in rows:
-            result.setdefault(domain, {})[pid] = wins
-        return result
+        """读取全量域名胜出统计,组织为 {domain: {proxy_id: wins}}。
 
-    def _update_domain_meta(self, domain: str, pid: str):
-        """更新某域名的"默认代理"为 pid,并刷新 updated_at 时间戳。
-
-        域名缓存(_get_fresh_proxy)据此在 cache_ttl 内复用该代理。
+        读内存镜像(权威源),供管理 API / 仪表盘使用。无需触 DB/锁。
         """
-        with self._db_lock:
-            self._db.execute(
-                "INSERT INTO domain_meta (domain, default_proxy, updated_at) VALUES (?, ?, ?) "
-                "ON CONFLICT(domain) DO UPDATE SET default_proxy = excluded.default_proxy, updated_at = excluded.updated_at",
-                (domain, pid, self._now_utc()),
-            )
-            self._db.commit()
+        return {d: dict(m) for d, m in self._stats_cache.items()}
 
     def get_domain_meta_from_db(self) -> dict[str, dict[str, str]]:
-        """读取全量域名元数据 {domain: {default_proxy, updated_at}}。"""
-        with self._db_lock:
-            rows = self._db.execute("SELECT domain, default_proxy, updated_at FROM domain_meta").fetchall()
-        return {domain: {"default_proxy": dp, "updated_at": ua} for domain, dp, ua in rows}
+        """读取全量域名元数据 {domain: {default_proxy, updated_at}}。
+
+        读内存镜像(权威源),供管理 API / 仪表盘使用。无需触 DB/锁。
+        """
+        return {d: dict(m) for d, m in self._meta_cache.items()}
 
     def _get_fresh_proxy(self, domain: str) -> Optional[str]:
         """返回某域名在 cache_ttl 内的缓存代理 id;过期或无记录返回 None。
 
-        用于域名缓存:命中则直接复用该代理,跳过竞速。
+        用于域名缓存:命中则直接复用该代理,跳过竞速。纯内存读取,无 DB/锁。
         """
-        from datetime import datetime, timezone
-        with self._db_lock:
-            row = self._db.execute(
-                "SELECT default_proxy, updated_at FROM domain_meta WHERE domain = ?",
-                (domain,)
-            ).fetchone()
-        if not row:
+        entry = self._meta_cache.get(domain)
+        if not entry:
             return None
-        pid, updated_at_str = row
+        pid = entry["default_proxy"]
+        updated_at_str = entry["updated_at"]
         try:
+            from datetime import datetime, timezone
             dt = datetime.fromisoformat(updated_at_str)
             if (datetime.now(timezone.utc) - dt).total_seconds() < self.cache_ttl:
                 return pid
@@ -231,7 +329,7 @@ class Router:
             return None
         return entry
 
-    def _http_cache_set(self, method: str, url: str, resp) -> None:
+    def _http_cache_set(self, method: str, url: str, status_code, reason_phrase, headers, content) -> None:
         """缓存一个 GET 成功响应(状态码、原因、头、body、时间戳)。
 
         仅缓存 2xx(调用方判断)。当上游未给 Content-Length 时,依据
@@ -239,22 +337,65 @@ class Router:
         """
         if method != 'GET':
             return
-        cl = resp.headers.get('content-length')
+        cl = headers.get('content-length')
         # 仅当上游未提供 Content-Length 时，才退而依据 Cache-Control 决定
         # 是否缓存。注意用 is None 而非 not cl：Content-Length: 0 时
         # cl == "0" 为真值字符串，不应进入此分支。
         if cl is None:
-            cc = resp.headers.get('cache-control', '')
+            cc = headers.get('cache-control', '')
             if 'no-cache' in cc or 'no-store' in cc or 'private' in cc:
                 return
         key = self._http_cache_key(method, url)
         self._http_cache[key] = {
-            'status_code': resp.status_code,
-            'reason_phrase': resp.reason_phrase,
-            'headers': dict(resp.headers.items()),
-            'content': resp.content,
+            'status_code': status_code,
+            'reason_phrase': reason_phrase,
+            'headers': headers,
+            'content': content,
             'cached_at': time.time(),
         }
+
+    # ── 上游连接池 ──────────────────────────────────────────────
+
+    def _client_key(self, pid: str, proxy_url: Optional[str]) -> str:
+        """连接池键:用 proxy_url 区分"同一 pid 不同上游凭据/地址"的情形。
+
+        local(无上游)用固定键 'local';走上游的用 proxy_url(已含凭据)。
+        实际上 pid↔proxy_url 一一对应,但用 proxy_url 作键更稳健。
+        """
+        if proxy_url is None:
+            return 'local'
+        return proxy_url
+
+    async def _get_client(self, key: str, proxy_url: Optional[str]) -> httpx.AsyncClient:
+        """从池中取(或按需创建)某上游的长驻 httpx.AsyncClient。
+
+        池化跨请求复用 keep-alive 连接,避免每请求重建到上游代理的 TCP
+        (HTTPS 经 CONNECT 还多一次握手)。client 不随单请求关闭,仅在
+        stop() 时统一 aclose。
+        """
+        client = self._client_pool.get(key)
+        if client is not None and not client.is_closed:
+            return client
+        kw: dict[str, Any] = {
+            "timeout": self._upstream_timeout,
+            "limits": httpx.Limits(
+                max_keepalive_connections=20, max_connections=100, keepalive_expiry=60),
+        }
+        if proxy_url:
+            kw['proxy'] = proxy_url
+        client = httpx.AsyncClient(**kw)
+        self._client_pool[key] = client
+        return client
+
+    async def _aclose_all_clients(self):
+        """关闭所有长驻上游 client(仅在 stop 时调用)。"""
+        clients = list(self._client_pool.values())
+        self._client_pool.clear()
+        for c in clients:
+            try:
+                await c.aclose()
+            except Exception:
+                pass
 
     # ── 通用竞速 / pipe / 响应写入 ──────────────────────────────
 
@@ -263,8 +404,9 @@ class Router:
         """取最先成功完成的 task 的结果；取消并清理其余 task。
 
         cleanup(result) 用于释放「已完成但未获胜」的 task 持有的资源
-        （如 httpx client、上游连接）。被 cancel 的 task 由其自身的
-        except BaseException 分支关闭资源，无需在这里调用 cleanup。
+        （如流式 resp 的 aclose；上游连接池化后 client 不在此关闭）。
+        被 cancel 的 task 由其自身的 except BaseException 分支关闭资源,
+        无需在这里调用 cleanup。
         """
         winner = None
         while tasks:
@@ -292,20 +434,26 @@ class Router:
 
     @staticmethod
     async def _cleanup_http_result(result):
-        """关闭竞速中已完成但未获胜的 HTTP task 持有的 httpx client。"""
+        """关闭竞速中已完成但未获胜的 HTTP task 持有的流式 resp。
+
+        池化后 client 不关闭(留给后续请求复用),只 aclose 流式响应,释放
+        其占用的上游连接归还到池中。
+        """
         if not result:
             return
-        client = result[-1]
+        # result = (pid, method, url, resp, client)
+        resp = result[3]
         try:
-            await client.aclose()
-        except (BrokenPipeError, ConnectionError, OSError):
-            pass
+            await resp.aclose()
         except Exception:
             pass
 
     @staticmethod
     async def _cleanup_tunnel_result(result):
-        """关闭竞速中已完成但未获胜的 CONNECT task 持有的上游连接。"""
+        """关闭竞速中已完成但未获胜的 CONNECT task 持有的上游连接。
+
+        CONNECT 走裸 socket(无连接池),连接不可跨请求复用,故直接关闭。
+        """
         if not result:
             return
         up_writer = result[-1]
@@ -338,18 +486,12 @@ class Router:
             pass
 
     @staticmethod
-    async def _write_response(writer, status_code, reason_phrase, headers, body):
-        """把一个 HTTP 响应写回客户端(用于代理自身生成的响应与转发的上游响应)。
+    async def _write_cached_response(writer, status_code, reason_phrase, headers, body):
+        """把缓存的整包响应写回客户端(状态行+头+body 已在内存)。
 
-        剔除 hop-by-hop 响应头(transfer-encoding/content-encoding/content-length 等),
-        再按实际 body 长度重写 Content-Length——避免与上游头重复或与 chunked
-        编码后的长度不一致。客户端已断开时静默忽略(BrokenPipe 等)。
+        与流式路径不同:缓存命中时 body 已完整在内存,直接整体写出即可。
         """
-        # hop-by-hop 头由代理自身管理，不能透传；content-length 也剔除，
-        # 因为我们按实际写入的 body 长度重新计算，避免与上游头重复或与
-        # chunked 编码后的长度不一致。
-        hop_by_hop = {'transfer-encoding', 'content-encoding', 'content-length',
-                      'keep-alive', 'proxy-connection', 'te', 'trailer', 'upgrade'}
+        hop_by_hop = _HOP_BY_HOP_RESPONSE_HEADERS
         try:
             writer.write(f"HTTP/1.1 {status_code} {reason_phrase}\r\n".encode('latin-1'))
             for k, v in headers.items():
@@ -379,34 +521,33 @@ class Router:
             return f"http://{user}:{pw}@{proxy.host}:{proxy.port}"
         return f"http://{proxy.host}:{proxy.port}"
 
-    async def _try_http(self, pid: str, proxy_url: Optional[str], method: str, url: str, headers: dict, body: bytes, update_meta: bool = True):
-        """经某上游代理尝试一次 HTTP 请求,作为竞速的一个候选。
+    async def _try_http(self, pid: str, proxy_url: Optional[str], method: str, url: str, headers: dict, body: Optional[bytes], update_meta: bool = True):
+        """经某上游代理尝试一次 HTTP 请求,作为竞速的一个候选(流式)。
 
-        每次新建独立 httpx.AsyncClient(连接池隔离,便于胜出/落败后单独关闭)。
-        成功则记录统计、更新域名元数据(除非 update_meta=False,如域名缓存命中
-        不重复更新),返回 (pid, method, url, resp, client)——client 留给调用方关闭。
-        失败(BaseException,含 CancelledError)自行关闭 client 并向上抛出,
-        让 _race 的清理逻辑处理。
+        从连接池取长驻 client,以 stream=True 发送——收到响应头即返回(resp
+        尚未读 body)。这是"首字节判胜"的基础:_race 在某候选返回响应头时
+        即判其获胜,其余候选随即取消、其流式 resp 被 aclose(见 _cleanup),
+        不再下载整包。获胜者的 body 由调用方在 _stream_upstream_response 中
+        边收边转发,client 用完归还连接池(不关闭)。
+
+        成功返回 (pid, method, url, resp, client);失败(BaseException,含
+        CancelledError)关闭 resp 并向上抛出,让 _race 的清理逻辑处理。
         """
-        kw = {}
-        if proxy_url:
-            kw['proxy'] = proxy_url
-        client = httpx.AsyncClient(**kw, limits=httpx.Limits(max_keepalive_connections=10, max_connections=50, keepalive_expiry=30))
+        key = self._client_key(pid, proxy_url)
+        client = await self._get_client(key, proxy_url)
         try:
             self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
-            resp = await client.request(method, url, headers=headers, content=body, timeout=10)
+            resp = await client.send(
+                client.build_request(method, url, headers=headers, content=body),
+                stream=True)
             self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
             domain = urllib.parse.urlparse(url).hostname or url
-            per_domain = self.domain_stats.setdefault(domain, {})
-            per_domain[pid] = per_domain.get(pid, 0) + 1
-            self._save_domain_stats(domain, pid)
-            if update_meta:
-                self._update_domain_meta(domain, pid)
+            self._record_win(domain, pid, update_meta=update_meta)
             return pid, method, url, resp, client
         except BaseException:
             try:
-                await client.aclose()
-            except (BrokenPipeError, ConnectionError, OSError):
+                await resp.aclose()
+            except Exception:
                 pass
             raise
 
@@ -463,11 +604,7 @@ class Router:
                 if not h or h in (b"\r\n", b"\n"):
                     break
             self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
-            per_domain = self.domain_stats.setdefault(target, {})
-            per_domain[pid] = per_domain.get(pid, 0) + 1
-            self._save_domain_stats(target, pid)
-            if update_meta:
-                self._update_domain_meta(target, pid)
+            self._record_win(target, pid, update_meta=update_meta)
             return pid, up_reader, up_writer
         except BaseException:
             try:
@@ -514,7 +651,7 @@ class Router:
                 ok, reason = check_auth(client_hdrs, self.auth_enabled, self.auth_username, self.auth_password)
                 if not ok:
                     logger.info("auth rejected for %s: %s", peer, reason)
-                    await self._write_response(writer, 407, 'Proxy Authentication Required',
+                    await self._write_cached_response(writer, 407, 'Proxy Authentication Required',
                                                {'Proxy-Authenticate': 'Basic realm="auto_squid"',
                                                 'Content-Type': 'text/plain'},
                                                (reason or 'Authentication required').encode('latin-1'))
@@ -563,7 +700,7 @@ class Router:
 
     # ── HTTP 请求处理 ──────────────────────────────────────────
 
-    async def _build_racing_tasks_http(self, proxies: List[str], method: str, url: str, headers: dict, body: bytes) -> set:
+    async def _build_racing_tasks_http(self, proxies: List[str], method: str, url: str, headers: dict, body: Optional[bytes]) -> set:
         """为一组代理创建竞速 task 集合:前 N 个上游各一个 _try_http task。
 
         N 由 max_retries 限制(本批只竞速前 N 个)。开启本机竞速时追加一个
@@ -583,11 +720,14 @@ class Router:
         """处理一个完整 HTTP 请求(已含首行+头+body),按优先级回写响应。
 
         决策顺序(命中即返回):
-        1. HTTP 响应缓存命中 → 直接回写缓存响应。
+        1. HTTP 响应缓存命中 → 直接回写缓存响应(整包在内存)。
         2. 域名缓存命中 → 用该代理单发请求(不竞速);失败则继续。
         3. 竞速:首批 max_retries 个代理并行,全失败且有剩余则对剩余再竞速。
-        4. 全失败 → 502。成功 2xx 顺带写入响应缓存。
-        请求头转发前已剔除 hop-by-hop 头(见调用方)。
+        4. 全失败 → 502。成功 2xx 顺带写入响应缓存(流式边转边缓冲)。
+
+        竞速采用首字节判胜:某候选拿到响应头即获胜,其余取消;获胜者 body
+        由 _stream_upstream_response 边收边转发。请求头转发前已剔除
+        hop-by-hop 头(见调用方)。
         """
         # 以字节边界解析请求头，避免把整个请求（含二进制 body）解码为
         # latin-1 再往返编码——那会破坏 0x100 以上的字节。头部用 latin-1
@@ -625,12 +765,12 @@ class Router:
         cached_entry = self._http_cache_get(method, url)
         if cached_entry:
             logger.info("HTTP cache hit %s %s", method, url)
-            await self._write_response(writer, cached_entry['status_code'], cached_entry['reason_phrase'],
+            await self._write_cached_response(writer, cached_entry['status_code'], cached_entry['reason_phrase'],
                                        cached_entry['headers'], cached_entry['content'])
             return
 
         # 2) 域名缓存:用上次胜出的代理单发请求(update_meta=False 不重复更新),
-        #    失败则回退到竞速。
+        #    失败则回退到竞速。单发路径同样流式转发。
         if domain:
             cached_pid = self._get_fresh_proxy(domain)
             if cached_pid:
@@ -639,14 +779,11 @@ class Router:
                     pid, method, url, resp, client = await self._try_http(
                         cached_pid, self._build_proxy_url(proxy), method, url, hdrs, body, update_meta=False)
                     logger.info("proxy %s cache hit %s %s", pid, method, url)
-                    await self._write_response(writer, resp.status_code, resp.reason_phrase,
-                                               dict(resp.headers.items()), resp.content)
-                    try:
-                        await client.aclose()
-                    except (BrokenPipeError, ConnectionError, OSError):
-                        pass
-                    if resp.status_code >= 200 and resp.status_code < 300:
-                        self._http_cache_set(method, url, resp)
+                    buffered = await self._stream_upstream_response(writer, resp, method, url)
+                    await resp.aclose()
+                    if buffered is not None and 200 <= resp.status_code < 300:
+                        self._http_cache_set(method, url, resp.status_code, resp.reason_phrase,
+                                             dict(resp.headers.items()), buffered)
                     return
                 except Exception:
                     logger.debug("cached proxy %s failed for %s", cached_pid, domain)
@@ -654,7 +791,7 @@ class Router:
         # 3) 竞速:首批并行 max_retries 个代理,全失败且还有剩余则对剩余再竞速。
         proxies = self.selector.ordered_proxies()
         if not proxies and not self.enable_local_racing:
-            await self._write_response(writer, 502, 'Bad Gateway', {'Content-Type': 'text/plain'}, b'Bad Gateway')
+            await self._write_cached_response(writer, 502, 'Bad Gateway', {'Content-Type': 'text/plain'}, b'Bad Gateway')
             return
 
         tasks = await self._build_racing_tasks_http(proxies, method, url, hdrs, body)
@@ -669,18 +806,91 @@ class Router:
         if winner_resp:
             pid, method, url, resp, client = winner_resp
             logger.info("proxy %s racing win %s %s", pid, method, url)
-            await self._write_response(writer, resp.status_code, resp.reason_phrase,
-                                       dict(resp.headers.items()), resp.content)
+            buffered = await self._stream_upstream_response(writer, resp, method, url)
             try:
-                await client.aclose()
-            except (BrokenPipeError, ConnectionError, OSError):
+                await resp.aclose()
+            except Exception:
                 pass
-            if resp.status_code >= 200 and resp.status_code < 300:
-                self._http_cache_set(method, url, resp)
+            if buffered is not None and 200 <= resp.status_code < 300:
+                self._http_cache_set(method, url, resp.status_code, resp.reason_phrase,
+                                     dict(resp.headers.items()), buffered)
             return
 
         logger.error("all proxies failed for HTTP request")
-        await self._write_response(writer, 502, 'Bad Gateway', {'Content-Type': 'text/plain'}, b'Bad Gateway')
+        await self._write_cached_response(writer, 502, 'Bad Gateway', {'Content-Type': 'text/plain'}, b'Bad Gateway')
+
+    async def _stream_upstream_response(self, client_writer, resp, method: str, url: str) -> Optional[bytes]:
+        """把上游流式响应转发给客户端,同时边收边缓冲(供响应缓存)。
+
+        关键:首字节判胜后,获胜者的 body 在这里逐块转发,客户端无需等待
+        整包到达代理即可拿到首字节(TTFB 下降)。同时把已转发的字节缓冲到
+        内存(上限 STREAM_CACHE_LIMIT),收齐且为 2xx 时写入响应缓存——这样
+        流式路径仍能命中缓存,无需把整包读进内存才缓存。
+
+        长度策略:若上游提供 content-length,转发头时剔除它(避免与 chunked
+        重复)但单独按上游原值重写一条 content-length(aiter_raw 给的是已编码
+        原始字节,与该值语义一致,长度正确);否则用 HTTP/1.1 chunked 传输编码
+        逐块写出。两种方式都保证客户端能正确界定 body 边界,且不破坏流式收益。
+
+        返回缓冲的 body(若未超上限);超过上限返回 None 表示放弃缓存。
+        客户端断开时静默,但仍尽量把已读字节丢弃以释放上游连接。
+        """
+        client_disconnected = False
+        # 先决定 body 的定界方式。
+        upstream_cl = resp.headers.get('content-length')
+        use_chunked = upstream_cl is None
+        try:
+            # 状态行 + 转发头(剔除 hop-by-hop,含 content-length)。
+            client_writer.write(f"HTTP/1.1 {resp.status_code} {resp.reason_phrase}\r\n".encode('latin-1'))
+            for k, v in resp.headers.items():
+                if k.lower() in _HOP_BY_HOP_RESPONSE_HEADERS:
+                    continue
+                client_writer.write(f"{k}: {v}\r\n".encode('latin-1'))
+            if use_chunked:
+                client_writer.write(b"Transfer-Encoding: chunked\r\n")
+            else:
+                # 上游给了 content-length:按其原值重写(aiter_raw 字节数与之等长)。
+                client_writer.write(f"Content-Length: {upstream_cl}\r\n".encode('latin-1'))
+            client_writer.write(b"\r\n")
+            await client_writer.drain()
+        except (BrokenPipeError, ConnectionError, OSError):
+            client_disconnected = True
+
+        buffered = bytearray()
+        buffering = True
+        try:
+            async for chunk in resp.aiter_raw():
+                if buffering:
+                    if len(buffered) + len(chunk) <= STREAM_CACHE_LIMIT:
+                        buffered.extend(chunk)
+                    else:
+                        # 超过缓存上限:放弃缓存,丢弃已缓冲的部分省内存。
+                        buffering = False
+                        buffered = bytearray()
+                if not client_disconnected:
+                    try:
+                        if use_chunked:
+                            client_writer.write(f"{len(chunk):X}\r\n".encode('latin-1'))
+                            client_writer.write(chunk)
+                            client_writer.write(b"\r\n")
+                        else:
+                            client_writer.write(chunk)
+                        await client_writer.drain()
+                    except (BrokenPipeError, ConnectionError, OSError):
+                        client_disconnected = True
+            if use_chunked and not client_disconnected:
+                try:
+                    client_writer.write(b"0\r\n\r\n")
+                    await client_writer.drain()
+                except (BrokenPipeError, ConnectionError, OSError):
+                    client_disconnected = True
+        except Exception:
+            # 上游读取异常:尽量关闭,客户端会得到截断响应。
+            client_disconnected = True
+        # 返回缓冲:仅当未超上限且仍在 buffering 状态。
+        if buffering:
+            return bytes(buffered)
+        return None
 
     # ── CONNECT 处理 ──────────────────────────────────────────
 
@@ -779,24 +989,45 @@ class Router:
             pass
 
     async def start(self):
-        """开始监听代理端口,接受客户端连接(非阻塞,返回后服务在后台运行)。"""
+        """开始监听代理端口,接受客户端连接(非阻塞,返回后服务在后台运行)。
+
+        同时启动后台 flush task,周期把内存统计批量落盘。
+        """
         self._server = await asyncio.start_server(self.handle_client, host=self.listen_host, port=self.listen_port)
+        if self._flush_task is None or self._flush_task.done():
+            self._flush_task = asyncio.create_task(self._flush_loop())
         logger.info("Router listening on %s:%s", self.listen_host, self.listen_port)
 
     async def stop(self):
-        """优雅关闭:停止接受新连接 → 取消并等待在途连接 → 关闭 DB。
+        """优雅关闭:停止接受新连接 → 最终 flush 落盘 → 关闭连接池 →
+        取消并等待在途连接 → 取消 flush task → 关闭 DB。
 
-        先关 _server(不再接受新连接),再取消所有正在处理的 handle_client task
-        并等待它们退出,最后才 _db.close()——避免在 DB 关闭后仍有在途请求写库报错。
+        先关 _server(不再接受新连接),做一次最终 flush 把残留统计落盘,
+        关闭上游连接池;再取消所有正在处理的 handle_client task 并等待其退出
+        (此时它们已无法再写库);最后停止 flush task 并 _db.close()。
         """
         if self._server:
             self._server.close()
             await self._server.wait_closed()
+        # 最终 flush:把内存里尚未落盘的统计/元数据写库。
+        try:
+            self._flush_to_db()
+        except Exception:
+            logger.exception("final flush failed")
+        # 关闭上游连接池(归还所有 keep-alive 连接)。
+        await self._aclose_all_clients()
         # 停止接受新连接后，取消仍在处理的客户端连接 task 并等待它们退出，
-        # 避免在 _db.close() 之后还有在途请求尝试写 DB 而报错。
+        # 避免在 _db.close() 之后还有在途请求尝试写库而报错。
         for t in list(self._running_tasks):
             t.cancel()
         if self._running_tasks:
             await asyncio.gather(*self._running_tasks, return_exceptions=True)
             self._running_tasks.clear()
+        if self._flush_task and not self._flush_task.done():
+            self._flush_task.cancel()
+            try:
+                await self._flush_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._flush_task = None
         self._db.close()

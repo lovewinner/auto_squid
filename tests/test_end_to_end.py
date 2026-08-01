@@ -604,3 +604,267 @@ class TestAPI:
         data = r.json()
         assert "request_counts" in data
         assert "attempted_counts" in data
+
+
+# ── streaming / pooling / DB-batching tests ───────────────────────
+
+
+async def run_chunked_proxy(host, port):
+    """HTTP mock proxy that returns a body WITHOUT Content-Length, using
+    HTTP/1.1 chunked transfer encoding — exercises the streaming path's
+    chunked framing (upstream_cl is None → use_chunked)."""
+    async def handle(reader, writer):
+        try:
+            line = await reader.readline()
+            while True:
+                h = await reader.readline()
+                if not h or h in (b"\r\n", b"\n"):
+                    break
+            # A body larger than STREAM_CACHE_LIMIT so caching is also skipped.
+            payload = b"A" * (2 * 1024 * 1024)
+            writer.write(b"HTTP/1.1 200 OK\r\n")
+            writer.write(b"Content-Type: application/octet-stream\r\n")
+            writer.write(b"Transfer-Encoding: chunked\r\n\r\n")
+            chunk_size = 65536
+            for i in range(0, len(payload), chunk_size):
+                piece = payload[i:i + chunk_size]
+                writer.write(f"{len(piece):X}\r\n".encode())
+                writer.write(piece)
+                writer.write(b"\r\n")
+                await writer.drain()
+            writer.write(b"0\r\n\r\n")
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+    server = await asyncio.start_server(handle, host=host, port=port)
+    return server
+
+
+@pytest.mark.asyncio
+async def test_stream_chunked_upstream():
+    """A chunked upstream response (no Content-Length) must be re-framed
+    correctly to the client and delivered byte-for-byte."""
+    proxy_srv = await run_chunked_proxy(HOST, PROXY_PORT)
+    proxy_store = ProxyStore()
+    proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        reader, writer = await asyncio.open_connection(HOST, ROUTER_PORT)
+        req = b"GET http://chunk.example.com/ HTTP/1.1\r\nHost: chunk.example.com\r\n\r\n"
+        writer.write(req)
+        await writer.drain()
+        status = await reader.readline()
+        assert b'200' in status
+        saw_chunked = False
+        cl = None
+        while True:
+            h = await reader.readline()
+            if not h or h in (b"\r\n", b"\n"):
+                break
+            if h.lower().startswith(b'transfer-encoding:'):
+                saw_chunked = True
+            if h.lower().startswith(b'content-length:'):
+                cl = h.split(b':', 1)[1].strip()
+        assert saw_chunked, "client must receive chunked framing"
+        assert cl is None, "chunked response must not also carry content-length"
+        # Dechunk the body and verify length.
+        body = bytearray()
+        while True:
+            size_line = await reader.readline()
+            size = int(size_line.strip(), 16)
+            if size == 0:
+                # trailing CRLF
+                await reader.readline()
+                break
+            body.extend(await reader.readexactly(size))
+            await reader.readexactly(2)  # CRLF
+        writer.close()
+        await writer.wait_closed()
+        assert len(body) == 2 * 1024 * 1024
+        assert body == b"A" * (2 * 1024 * 1024)
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_stream_large_response_with_content_length():
+    """A large upstream response with Content-Length must stream through
+    byte-for-byte without being fully buffered server-side (content-length
+    path)."""
+    payload = b"B" * (3 * 1024 * 1024)
+
+    async def handle(reader, writer):
+        try:
+            await reader.readline()
+            while True:
+                h = await reader.readline()
+                if not h or h in (b"\r\n", b"\n"):
+                    break
+            writer.write(b"HTTP/1.1 200 OK\r\n")
+            writer.write(f"Content-Length: {len(payload)}\r\n".encode())
+            writer.write(b"Content-Type: application/octet-stream\r\nConnection: close\r\n\r\n")
+            for i in range(0, len(payload), 65536):
+                writer.write(payload[i:i + 65536])
+                await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    srv = await asyncio.start_server(handle, host=HOST, port=PROXY_PORT)
+    proxy_store = ProxyStore()
+    proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        reader, writer = await asyncio.open_connection(HOST, ROUTER_PORT)
+        writer.write(b"GET http://large.example.com/ HTTP/1.1\r\nHost: large.example.com\r\n\r\n")
+        await writer.drain()
+        assert b'200' in (await reader.readline())
+        cl = 0
+        while True:
+            h = await reader.readline()
+            if not h or h in (b"\r\n", b"\n"):
+                break
+            if h.lower().startswith(b'content-length:'):
+                cl = int(h.split(b':', 1)[1].strip())
+        assert cl == len(payload)
+        body = await reader.readexactly(cl)
+        writer.close()
+        await writer.wait_closed()
+        assert body == payload
+    finally:
+        await router.stop()
+        srv.close()
+        await srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_upstream_client_pool_reused():
+    """Two sequential HTTP requests through the same upstream must reuse the
+    pooled httpx.AsyncClient (no new client created for the second request).
+    Verified by tracking new-connection counts on the mock proxy."""
+    conns = []
+
+    async def handle(reader, writer):
+        conns.append(1)
+        try:
+            await reader.readline()
+            while True:
+                h = await reader.readline()
+                if not h or h in (b"\r\n", b"\n"):
+                    break
+            body = b"ok"
+            writer.write(b"HTTP/1.1 200 OK\r\n")
+            writer.write(f"Content-Length: {len(body)}\r\n".encode())
+            writer.write(b"Connection: keep-alive\r\n\r\n")
+            writer.write(body)
+            await writer.drain()
+            # keep the connection open briefly so keep-alive is honored
+            await asyncio.sleep(0.2)
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    srv = await asyncio.start_server(handle, host=HOST, port=PROXY_PORT)
+    proxy_store = ProxyStore()
+    proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        await send_http_get(HOST, ROUTER_PORT, url=b"http://pool.example.com/a")
+        await send_http_get(HOST, ROUTER_PORT, url=b"http://pool.example.com/b")
+        # Pooled client must exist and be the single shared instance.
+        assert len(router._client_pool) == 1, f"expected 1 pooled client, got {router._client_pool}"
+        client = next(iter(router._client_pool.values()))
+        assert not client.is_closed
+    finally:
+        await router.stop()
+        srv.close()
+        await srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_db_batching_durability_across_restart():
+    """Stats accumulated in memory must persist after stop() (final flush)
+    and be reloadable by a fresh Router on the same db file."""
+    db = tempfile.mktemp(suffix='.db')
+    proxy_srv = await run_mock_proxy(HOST, PROXY_PORT)
+    proxy_store = ProxyStore()
+    proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+                    cache_ttl=300, db_path=db)
+    await router.start()
+    try:
+        await send_http_get(HOST, ROUTER_PORT, url=b"http://persist.example.com/p1")
+        await send_http_get(HOST, ROUTER_PORT, url=b"http://persist.example.com/p2")
+        # In-memory stats reflect two wins for mock1 on this domain.
+        stats = router.get_domain_stats_from_db()
+        assert stats.get('persist.example.com', {}).get('mock1') == 2
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+    # New Router on the same DB must reload the persisted stats.
+    proxy_store2 = ProxyStore()
+    proxy_store2.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router2 = Router(proxy_store2, listen_host=HOST, listen_port=ROUTER_PORT,
+                     cache_ttl=300, db_path=db)
+    try:
+        stats2 = router2.get_domain_stats_from_db()
+        assert stats2.get('persist.example.com', {}).get('mock1') == 2, \
+            f"stats not persisted across restart: {stats2}"
+        meta2 = router2.get_domain_meta_from_db()
+        assert meta2.get('persist.example.com', {}).get('default_proxy') == 'mock1'
+    finally:
+        await router2.stop()
+
+
+@pytest.mark.asyncio
+async def test_db_batching_background_flush():
+    """A forced background flush (via _flush_to_db) must write in-memory
+    stats to SQLite without waiting for stop()."""
+    import sqlite3
+    db = tempfile.mktemp(suffix='.db')
+    proxy_srv = await run_mock_proxy(HOST, PROXY_PORT)
+    proxy_store = ProxyStore()
+    proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+                    cache_ttl=300, db_path=db)
+    await router.start()
+    try:
+        await send_http_get(HOST, ROUTER_PORT, url=b"http://flush.example.com/x")
+        # Before flush, the on-disk table is empty (stats only in memory).
+        with sqlite3.connect(db) as conn:
+            rows = conn.execute("SELECT wins FROM domain_stats WHERE domain='flush.example.com'").fetchall()
+        assert rows == [], f"expected no on-disk stats before flush, got {rows}"
+        # Force a flush and verify it landed on disk.
+        router._flush_to_db()
+        with sqlite3.connect(db) as conn:
+            rows = conn.execute("SELECT wins FROM domain_stats WHERE domain='flush.example.com'").fetchall()
+        assert rows == [(1,)], f"expected on-disk win=1 after flush, got {rows}"
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
