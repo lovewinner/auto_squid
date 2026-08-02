@@ -1005,3 +1005,92 @@ async def test_db_batching_background_flush():
         await router.stop()
         proxy_srv.close()
         await proxy_srv.wait_closed()
+
+
+# ── server-side counter tests ────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_http_cache_counters_hit_and_miss():
+    """响应缓存命中 +1 http_cache_hits;未命中 +1 http_cache_misses。
+
+    同一 GET URL 两次:首次 miss(并因 200 缓存),第二次 hit。断言计数器差值。
+    """
+    hit = []
+    proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=hit)
+    proxy_store = ProxyStore()
+    proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        before = router.snapshot_counters()
+        await send_http_get(HOST, ROUTER_PORT, url=b"http://cnt.example.com/")
+        await send_http_get(HOST, ROUTER_PORT, url=b"http://cnt.example.com/")
+        after = router.snapshot_counters()
+        # 第二次必命中响应缓存 → hits>=1;首次 miss → misses>=1。
+        assert after["http_cache_hits"] - before["http_cache_hits"] >= 1, \
+            f"http_cache_hits not incremented: {before} -> {after}"
+        assert after["http_cache_misses"] - before["http_cache_misses"] >= 1, \
+            f"http_cache_misses not incremented: {before} -> {after}"
+        # 命中后上游只被打了 1 次(第二次走缓存)。
+        assert len(hit) == 1, f"upstream hit twice (cache should serve 2nd): {hit}"
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_upstream_attempts_and_racing_counters():
+    """冷域名(无域名缓存)触发竞速 → racing_invocations + upstream_attempts 增长。
+
+    用一个全新域名首请求:必走竞速(域名缓存空),单代理扇出 1 次。断言
+    racing_invocations 与 upstream_attempts 都 +1。
+    """
+    proxy_srv = await run_mock_proxy(HOST, PROXY_PORT)
+    proxy_store = ProxyStore()
+    proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+                    max_retries=1, enable_http_cache=False,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        before = router.snapshot_counters()
+        await send_http_get(HOST, ROUTER_PORT, url=b"http://race-cnt.example.com/p0")
+        after = router.snapshot_counters()
+        assert after["racing_invocations"] - before["racing_invocations"] >= 1, \
+            f"racing_invocations not incremented: {before} -> {after}"
+        assert after["upstream_attempts"] - before["upstream_attempts"] >= 1, \
+            f"upstream_attempts not incremented: {before} -> {after}"
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_domain_cache_hit_counter():
+    """域名缓存命中(同域名第二次请求单发)→ domain_cache_hits +1。
+
+    enable_http_cache=False 避免响应缓存抢先命中,确保走域名缓存单发路径。
+    同域名两次请求:首次竞速建立域名缓存,第二次单发命中。
+    """
+    proxy_srv = await run_mock_proxy(HOST, PROXY_PORT)
+    proxy_store = ProxyStore()
+    proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+                    cache_ttl=300, max_retries=1, enable_http_cache=False,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        before = router.snapshot_counters()
+        # 同域名两次:首次竞速(写域名缓存),第二次域名缓存命中单发。
+        await send_http_get(HOST, ROUTER_PORT, url=b"http://dom-cnt.example.com/a")
+        await send_http_get(HOST, ROUTER_PORT, url=b"http://dom-cnt.example.com/b")
+        after = router.snapshot_counters()
+        assert after["domain_cache_hits"] - before["domain_cache_hits"] >= 1, \
+            f"domain_cache_hits not incremented: {before} -> {after}"
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()

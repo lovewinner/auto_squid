@@ -139,6 +139,15 @@ class Router:
         self.request_counts: dict[str, int] = {}
         self.attempted_counts: dict[str, int] = {}
         self.cache_ttl = cache_ttl
+        # ── 服务端性能计数器 ────────────────────────────────────
+        # 供压测经 /metrics 跨进程读取,在两种上游模式(mock/real)下统一计算
+        # 缓存命中率与竞速放大率——不再依赖 mock 上游的 hit_count(那只对 mock
+        # 模式有效)。纯内存整数,热路径 +1,无锁无 I/O。
+        self.http_cache_hits = 0       # 响应缓存命中(完全不经上游)
+        self.http_cache_misses = 0     # 进入 HTTP 处理但未命中响应缓存
+        self.domain_cache_hits = 0     # 域名缓存命中(单发上游,跳过竞速)
+        self.racing_invocations = 0    # 触发竞速的请求数(含首批 + 兜底批)
+        self.upstream_attempts = 0     # 竞速扇出总尝试数(每个 _try_http/_try_tunnel +1)
 
         # ── 上游连接池 ──────────────────────────────────────────
         # 每个"代理标识"维护一个长驻 httpx.AsyncClient,跨请求复用 keep-alive
@@ -308,6 +317,24 @@ class Router:
         读内存镜像(权威源),供管理 API / 仪表盘使用。无需触 DB/锁。
         """
         return {d: dict(m) for d, m in self._meta_cache.items()}
+
+    def snapshot_counters(self) -> dict:
+        """快照服务端性能计数器 + 池/缓存规模,供 /metrics 跨进程读取。
+
+        压测在每个场景开始/结束各取一次快照,差值即该场景的缓存命中/竞速扇出。
+        纯内存读取,无锁无 I/O。返回 dict 可直接 JSON 序列化。
+        """
+        return {
+            "http_cache_hits": self.http_cache_hits,
+            "http_cache_misses": self.http_cache_misses,
+            "domain_cache_hits": self.domain_cache_hits,
+            "racing_invocations": self.racing_invocations,
+            "upstream_attempts": self.upstream_attempts,
+            "http_cache_entries": len(self._http_cache),
+            "client_pool_size": len(self._client_pool),
+            "request_counts": dict(self.request_counts),
+            "attempted_counts": dict(self.attempted_counts),
+        }
 
     def _get_fresh_proxy(self, domain: str) -> Optional[str]:
         """返回某域名在 cache_ttl 内的缓存代理 id;过期或无记录返回 None。
@@ -626,6 +653,7 @@ class Router:
         resp = None
         try:
             self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
+            self.upstream_attempts += 1  # 聚合竞速扇出总数(供 /metrics 算放大率)
             resp = await client.send(
                 client.build_request(method, url, headers=headers, content=body),
                 stream=True)
@@ -684,6 +712,7 @@ class Router:
             up_writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n{auth_hdr}\r\n".encode('latin-1'))
             await up_writer.drain()
             self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
+            self.upstream_attempts += 1  # 聚合竞速扇出总数(供 /metrics 算放大率)
             status = await asyncio.wait_for(up_reader.readline(), timeout=connect_timeout)
             if not status:
                 raise RuntimeError('no response from upstream')
@@ -846,9 +875,16 @@ class Router:
         hdrs = {k: v for k, v in headers.items() if k.lower() not in _HOP_BY_HOP_REQUEST_HEADERS}
         body = body or None
 
+        # 计数:进入 HTTP 处理先记一次 miss;响应缓存命中分支会把它翻成 hit。
+        # 入口先记 miss 是为避免漏计多条 return 路径(竞速成功/全失败/域名缓存命中)。
+        self.http_cache_misses += 1
+
         # 1) HTTP 响应缓存:GET 幂等响应直接命中,完全不经上游。
         cached_entry = self._http_cache_get(method, url)
         if cached_entry:
+            # 翻转:命中响应缓存,把入口记的 miss 撤回、改记 hit。
+            self.http_cache_misses -= 1
+            self.http_cache_hits += 1
             logger.debug("HTTP cache hit %s %s", method, url)
             await self._write_cached_response(writer, cached_entry['status_code'], cached_entry['reason_phrase'],
                                        cached_entry['headers'], cached_entry['content'])
@@ -864,6 +900,8 @@ class Router:
                     pid, method, url, resp, client = await self._try_http(
                         cached_pid, self._build_proxy_url(proxy), method, url, hdrs, body)
                     logger.debug("proxy %s cache hit %s %s", pid, method, url)
+                    # 域名缓存命中且单发成功 → 记一次(单发失败回退竞速的不算)。
+                    self.domain_cache_hits += 1
                     buffered = await self._stream_upstream_response(writer, resp, method, url)
                     await resp.aclose()
                     if buffered is not None and resp.status_code in CACHEABLE_STATUS:
@@ -879,11 +917,14 @@ class Router:
             await self._write_cached_response(writer, 502, 'Bad Gateway', {'Content-Type': 'text/plain'}, b'Bad Gateway')
             return
 
+        # 计数:进入竞速(首批)。兜底批单独再 +1,故 invocations 可能 > 请求数。
+        self.racing_invocations += 1
         tasks = await self._build_racing_tasks_http(proxies, method, url, hdrs, body)
         winner_resp = await self._race(tasks, cleanup=self._cleanup_http_result)
 
         # 首批全失败且代理数超过 max_retries:对剩余代理再竞速兜底。
         if not winner_resp and len(proxies) > self.max_retries:
+            self.racing_invocations += 1
             remaining = proxies[self.max_retries:]
             tasks = await self._build_racing_tasks_http(remaining, method, url, hdrs, body)
             winner_resp = await self._race(tasks, cleanup=self._cleanup_http_result)

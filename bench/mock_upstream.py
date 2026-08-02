@@ -74,6 +74,9 @@ class MockUpstream:
     server: Optional[asyncio.AbstractServer] = None
     hit_count: int = 0
     connect_count: int = 0
+    # 新建连接计数(每接受一个连接 +1)。压测连接复用场景据此算 keepalive
+    # 复用率 = (请求数 - 新建连接数) / 请求数;>0 表示连接被复用。
+    new_conn_count: int = 0
 
     def profile_for(self, host_header: str) -> ResponseProfile:
         """按 host 选响应画像;无匹配则用默认。"""
@@ -140,6 +143,8 @@ async def _send_body(writer, body: bytes, chunked: bool, chunk_delay: float):
 
 async def _handle(reader, writer, upstream: MockUpstream):
     """单连接处理:CONNECT → 隧道回显;否则 → HTTP 代理响应。一连接一请求。"""
+    # 每接受一个新连接 +1,供连接复用压测算 keepalive 复用率。
+    upstream.new_conn_count += 1
     try:
         first, headers, _ = await _read_request_head(reader)
         if not first:
@@ -234,7 +239,11 @@ class UpstreamCluster:
     def total_connects(self) -> int:
         return sum(u.connect_count for u in self.upstreams)
 
+    def total_new_conns(self) -> int:
+        return sum(u.new_conn_count for u in self.upstreams)
+
     def reset_counts(self):
         for u in self.upstreams:
             u.hit_count = 0
             u.connect_count = 0
+            u.new_conn_count = 0

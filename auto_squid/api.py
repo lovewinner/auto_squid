@@ -13,6 +13,10 @@ app = FastAPI(title="auto_squid API")
 _proxy_store: ProxyStore | None = None
 _router: Router | None = None
 
+# 由 bench 压测子进程(server_proc)周期填充:服务端 CPU 与事件循环延迟采样。
+# 非压测启动(CLI 正常运行)时为空 dict,/server-stats 返回空快照。
+_server_stats: dict = {}
+
 
 class ProxyIn(BaseModel):
     id: str
@@ -48,7 +52,20 @@ async def metrics():
     counts = _router.request_counts if _router else {}
     attempts = _router.attempted_counts if _router else {}
     domain_stats = _router.get_domain_stats_from_db() if _router else {}
-    return {"request_counts": counts, "attempted_counts": attempts, "domain_stats": domain_stats}
+    # 服务端性能计数器(缓存命中/竞速扇出),供压测跨进程读取算命中率/放大率。
+    counters = _router.snapshot_counters() if _router else {}
+    return {"request_counts": counts, "attempted_counts": attempts, "domain_stats": domain_stats,
+            "counters": counters}
+
+
+@app.get("/server-stats")
+async def server_stats():
+    """压测子进程的服务端资源采样:CPU 占用与事件循环延迟(由 server_proc 填充)。
+
+    非压测启动时返回空快照。压测主进程周期拉取,记进场景的资源指标——
+    反映被测 Router 自身(而非客户端)的 CPU 饱和度与同步阻塞情况。
+    """
+    return _server_stats
 
 
 @app.get("/stats")

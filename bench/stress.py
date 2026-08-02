@@ -1,4 +1,4 @@
-"""auto_squid 性能压测主驱动。
+"""auto_squid 性能压测主驱动(进程隔离版)。
 
 用法:
     python -m bench.stress                    # 默认:受控 mock 上游,staircase 模式
@@ -6,20 +6,31 @@
     python -m bench.stress --mode rate        # 恒定速率(测容量上限)
     python -m bench.stress --mode mixed       # 混合负载(冷热域名+大小响应+CONNECT)
     python -m bench.stress --mode soak --duration 120  # 长时稳定性
+    python -m bench.stress --mode conn-reuse  # 连接复用率(测 keepalive)
     python -m bench.stress --upstream real    # 用真实 proxies.yaml 上游(需可达)
     python -m bench.stress --quick            # 快速冒烟(小规模)
-    python -m bench.stress --profile          # cProfile 覆盖(定位瓶颈)
+    python -m bench.stress --profile          # cProfile 覆盖(仅客户端进程)
+    python -m bench.stress --mode soak --open-loop  # 开环 soak(不限速,测真实上限)
 
-指标(准确性设计):
-- 吞吐(req/s)、TTFB 与 total 的 P50/P95/P99(客户端 raw socket 精确到状态行)
-- 错误率与分类(连接错误 / 非 200 / 超时)
-- **真实缓存命中率** = (客户端请求 - 上游命中) / 客户端请求
-  (用 mock 上游的 hit 计数器;真实上游模式无法测,记为 N/A)
-- **racing 放大率** = 上游命中 / 客户端请求 (竞速扇出开销)
-- 资源采样:进程 RSS、文件描述符数、Router 连接池大小、HTTP 缓存条目数
-- 报告:终端表格 + 结构化 JSON(带 git 版本,便于跨版本 diff)
+进程隔离(本版核心改进):
+- 被测 Router(+ mock 上游)跑在**独立子进程**(bench.server_proc),有自己的事件循环。
+- 本进程只跑压测客户端,经 127.0.0.1 回环打过去——客户端开销不再污染被测方,
+  消除旧版"客户端与服务端同循环争抢"导致的吞吐/延迟测量失真。
+- 服务端计数器(缓存命中/竞速扇出)经子进程的 /metrics 跨进程拉取,
+  在 mock 与 real 两种模式下**统一**计算缓存命中率/放大率(real 模式不再 N/A)。
+
+指标(分组报告):
+- requests: 客户端请求/注入/预热/成功/失败
+- throughput: completed_rps(完成)、injected_rps(注入,soak 区分主动限速 vs 被动撑不住)
+- latency: TTFB 与 total 的 P50/P95/P99(客户端 raw socket 精确到状态行)
+- cache: http_hit_rate / domain_hit_rate(服务端计数器,两种模式通用)
+- racing: amplification(上游扇出/客户端请求)、upstream_attempts、invocations
+- resources: RSS/fd/连接池/缓存条目 + 服务端 CPU% 与事件循环延迟(子进程采样)
+- correctness: mock 模式响应体校验(body 大小/内容,缓存命中字节一致);real 模式 N/A
+- attribution: upstream_throttled(是否 429/503)、bottleneck(proxy/upstream)
 
 可比性:同一 mock 配置 + 同一 Router 代码,多次跑结果可重复(延迟确定性高)。
+报告 JSON 带 git 版本,便于跨版本 diff(注:本版结构已重新分组,旧报告不兼容)。
 """
 
 import argparse
@@ -32,15 +43,14 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import httpx
+
 from bench.mock_upstream import UpstreamCluster, ResponseProfile
-from auto_squid.proxy_store import ProxyStore
-from auto_squid.router import Router
-from auto_squid.config_schema import ProxyInfo
 
 
 # ── git 版本(写入报告,便于跨版本 diff) ──────────────────────────
@@ -63,7 +73,8 @@ class RequestResult:
     ttfb: float          # 首字节延迟(秒);失败为 0
     total: float         # 总耗时(秒)
     error: str = ""      # 失败原因分类(conn/timeout/echo-mismatch/http:<code>)
-    status_code: str = ""  # 上游/Router 返回的 HTTP 状态码(如 "200"/"503");失败时仍可能记录
+    status_code: str = ""  # 上游/Router 返回的 HTTP 状态码;失败时仍可能记录
+    body: bytes = b""    # 响应 body(capture_body=True 时填,供正确性校验)
 
 
 # ── 主机名空间:mock 伪域名 vs 真实可解析域名 ──────────────────
@@ -78,8 +89,16 @@ _MOCK_HOSTS = {
     "connect": "echo.example.com:443",
 }
 
+# mock 模式下各 host 前缀对应的预期响应 body 大小(镜像 default_mock_cluster 的 profile)。
+# 正确性校验据此断言 len(body)==size 且 body==b"x"*size(mock body 见 mock_upstream._handle)。
+_MOCK_EXPECTED_BODY_BYTES = {
+    "hot": 2048,
+    "cold": 1024,
+    "big": 512 * 1024,
+    "chunked": 64 * 1024,
+}
+
 # real 模式:内置默认大站池,经真实上游代理可解析可达(www.baidu.com 已实测 200)。
-# 热域名用前几个固定站点(命中域名/响应缓存);冷域名用全部轮换(制造缓存未命中)。
 _DEFAULT_REAL_HOSTS = [
     "www.baidu.com", "www.qq.com", "www.163.com",
     "www.sina.com.cn", "www.taobao.com",
@@ -98,12 +117,7 @@ class HostSet:
     """
     mode: str = "mock"
     real_hosts: list = field(default_factory=lambda: list(_DEFAULT_REAL_HOSTS))
-    # 真实上游延迟远高于 mock,客户端超时上调,避免把"上游慢"误判为 timeout。
-    # 在 __post_init__ 里按 mode 设定(字段默认值表达式无法引用其他字段)。
     timeout: float = 15.0
-    # real 模式:真实站点对任意路径(/p0 等)常返回 3xx/4xx,但这不代表代理失败——
-    # 代理已成功转发并回传源站响应,源站状态码与代理性能无关。故 real 模式把
-    # "收到任何 HTTP 响应"都记为成功(仅 conn/timeout 算真失败)。mock 模式仍要求 200。
     success_any_status: bool = False
 
     def __post_init__(self):
@@ -114,17 +128,14 @@ class HostSet:
     def hot(self, i: int) -> str:
         if self.mode == "mock":
             return _MOCK_HOSTS["hot"]
-        # real:固定用前 2 个站点做热域名,最大化域名/响应缓存命中
         return self.real_hosts[i % min(2, len(self.real_hosts))]
 
     def cold(self, i: int) -> str:
         if self.mode == "mock":
             return _MOCK_HOSTS["cold"] % (i % 20)
-        # real:轮换全部站点,加随机路径制造缓存未命中(走竞速)
         return self.real_hosts[i % len(self.real_hosts)]
 
     def big(self, i: int) -> str:
-        # mock:特定大响应 host(命中 big profile);real:无大响应控制,退化为普通 GET
         if self.mode == "mock":
             return _MOCK_HOSTS["big"]
         return self.real_hosts[i % len(self.real_hosts)]
@@ -137,10 +148,39 @@ class HostSet:
     def connect(self) -> str:
         if self.mode == "mock":
             return _MOCK_HOSTS["connect"]
-        # real:用真实 443 站点建立隧道(不做 echo 校验,见 do_connect_request)
         return f"{self.real_hosts[0]}:443"
 
 
+# ── mock 集群规格序列化(供子进程重建 + 客户端预期 body) ─────────
+
+def default_mock_specs(quick: bool) -> list:
+    """生成 mock 集群规格(可 JSON 序列化),供子进程 _build_mock_cluster 重建。
+
+    与旧 default_mock_cluster 同构:4 个上游(quick=2),快/中/慢/不稳定,
+    最后一个带 0.3 失败率。规格为 [[base_delay, [profile_dict,...]], ...]。
+    """
+    n_upstream = 2 if quick else 4
+    delays = [0.0, 0.05, 0.15, 0.3][:n_upstream]
+    specs = []
+    for i, d in enumerate(delays):
+        profs = [
+            {"host_prefix": "hot", "first_byte_delay": 0.01, "body_size": 2048,
+             "chunked": False, "chunk_delay": 0.0, "fail_rate": 0.0},
+            {"host_prefix": "cold", "first_byte_delay": 0.02, "body_size": 1024,
+             "chunked": False, "chunk_delay": 0.0, "fail_rate": 0.0},
+            {"host_prefix": "big", "first_byte_delay": 0.02, "body_size": 512 * 1024,
+             "chunked": False, "chunk_delay": 0.005, "fail_rate": 0.0},
+            {"host_prefix": "chunked", "first_byte_delay": 0.02, "body_size": 64 * 1024,
+             "chunked": True, "chunk_delay": 0.003, "fail_rate": 0.0},
+        ]
+        fr = 0.3 if (i == n_upstream - 1 and not quick) else 0.0
+        for p in profs:
+            p["fail_rate"] = fr
+        specs.append((d, profs))
+    return specs
+
+
+# ── 结果容器(场景级) ────────────────────────────────────────
 
 @dataclass
 class ScenarioResult:
@@ -148,82 +188,144 @@ class ScenarioResult:
     duration: float
     client_requests: int
     results: list = field(default_factory=list)
+    injected_requests: int = 0      # 实际创建的 task 数(run_rate 用,区分注入 vs 完成)
+    warmup_requests: int = 0        # 预热请求数(不计入 results)
+    # 服务端计数器快照:场景开始/结束各一次 /metrics 快照,差值算缓存/竞速。
+    counters_before: dict = field(default_factory=dict)
+    counters_after: dict = field(default_factory=dict)
+    # mock 上游计数(交叉验证;real 模式无):连接复用场景用 new_conns。
     upstream_hits: int = 0
-    upstream_connects: int = 0
-    # 资源采样(峰值/末值)
+    upstream_new_conns: int = 0
+    # 服务端资源(子进程经 /server-stats 拉取)
+    server_stats: dict = field(default_factory=dict)
+    # 客户端进程资源(峰值/末值)
     rss_peak_mb: float = 0.0
     fd_peak: int = 0
-    pool_size_end: int = 0
-    http_cache_entries_end: int = 0
+    # 正确性校验(mock 模式)
+    correctness_checked: bool = False
+    correctness_failures: list = field(default_factory=list)
+    # 计数器拉取是否失败(失败则 cache/racing 组记 null)
+    counter_fetch_failed: bool = False
 
     def metrics(self) -> dict:
         ok = [r for r in self.results if r.ok]
         ttfs = [r.ttfb for r in ok]
         tots = [r.total for r in ok]
         errs = [r for r in self.results if not r.ok]
-        # 错误细分:http:<code> 按状态码单独计数(如 {'503': 980, '502': 20}),
-        # conn/timeout/echo-mismatch 维持原分类。这样 100% 失败时一眼看出是
-        # "全部 503(DNS 失败)" 还是别的根因。
         err_kinds: dict[str, int] = {}
         for r in errs:
             key = r.error if r.error.startswith("http:") else r.error
             err_kinds[key] = err_kinds.get(key, 0) + 1
-        # 状态码分布(含成功):real 模式 success_any_status 下,"成功"可能全是 3xx/4xx/5xx
-        # (代理的盲区)。统计所有结果的状态码,一眼看出"100% 成功但全是 503"这类问题。
         status_dist: dict[str, int] = {}
         for r in self.results:
             if r.status_code:
                 status_dist[r.status_code] = status_dist.get(r.status_code, 0) + 1
+
         def pct(vals, p):
             if not vals:
                 return 0.0
             s = sorted(vals)
             k = max(0, min(len(s) - 1, int(len(s) * p)))
             return s[k]
+
         total_reqs = len(self.results)
-        # 放大率:上游命中 / 客户端请求。>1 表示竞速扇出超过单发(冷请求竞速);
-        # <1 表示缓存吸收了部分请求(域名缓存命中仍单发;HTTP 响应缓存命中则 0 命中)。
-        amplification = self.upstream_hits / total_reqs if total_reqs else 0.0
-        # 缓存命中率:被缓存吸收(未触达上游)的请求占比。竞速扇出使 hits 可能
-        # 超过请求数,此时命中率为 0(没有请求被缓存吸收,反而被放大)。
-        absorbed = max(0, total_reqs - self.upstream_hits)
-        cache_hit_rate = absorbed / total_reqs if total_reqs else 0.0
+
+        # 服务端计数器差值(两种模式统一)。拉取失败则全 null。
+        if self.counter_fetch_failed or not self.counters_before or not self.counters_after:
+            cache_group = {"http_hit_rate": None, "domain_hit_rate": None,
+                           "http_hits": None, "http_misses": None,
+                           "http_cache_entries_end": None}
+            racing_group = {"amplification": None, "upstream_attempts": None,
+                            "invocations": None}
+        else:
+            cb, ca = self.counters_before, self.counters_after
+            hits = ca.get("http_cache_hits", 0) - cb.get("http_cache_hits", 0)
+            misses = ca.get("http_cache_misses", 0) - cb.get("http_cache_misses", 0)
+            dom_hits = ca.get("domain_cache_hits", 0) - cb.get("domain_cache_hits", 0)
+            attempts = ca.get("upstream_attempts", 0) - cb.get("upstream_attempts", 0)
+            invocs = ca.get("racing_invocations", 0) - cb.get("racing_invocations", 0)
+            denom = hits + misses
+            cache_group = {
+                "http_hit_rate": (hits / denom) if denom else 0.0,
+                "domain_hit_rate": (dom_hits / total_reqs) if total_reqs else 0.0,
+                "http_hits": hits, "http_misses": misses,
+                "http_cache_entries_end": ca.get("http_cache_entries", 0),
+            }
+            racing_group = {
+                "amplification": (attempts / total_reqs) if total_reqs else 0.0,
+                "upstream_attempts": attempts, "invocations": invocs,
+            }
+
+        # 瓶颈归因:状态分布含 429/503 → 上游触顶;否则 proxy。
+        throttled = any(code in status_dist for code in ("429", "503"))
+        bottleneck = "upstream" if (throttled and cache_group["http_hit_rate"] is not None
+                                    and cache_group["http_hit_rate"] > 0.1) else "proxy"
+
+        # 正确性(mock 模式):统计通过/失败。
+        if self.correctness_checked:
+            correctness = {
+                "checked": True,
+                "passed": total_reqs - len(self.correctness_failures),
+                "failed": len(self.correctness_failures),
+                "failures_sample": self.correctness_failures[:5],
+            }
+        else:
+            correctness = {"checked": False, "passed": 0, "failed": 0, "failures_sample": []}
+
+        # 服务端资源(子进程 CPU/loop-lag)。
+        ss = self.server_stats or {}
+
         return {
             "name": self.name,
-            "client_requests": total_reqs,
-            "success": len(ok),
-            "errors": len(errs),
-            "error_breakdown": err_kinds,
+            "requests": {
+                "client": total_reqs,
+                "injected": self.injected_requests or total_reqs,
+                "warmup": self.warmup_requests,
+                "success": len(ok),
+                "errors": len(errs),
+            },
+            "throughput": {
+                "completed_rps": len(ok) / self.duration if self.duration else 0.0,
+                # 注入速率:run_rate 记录了实际创建的 task 数;未记(阶梯/混合)则等于完成数。
+                "injected_rps": ((self.injected_requests or total_reqs) / self.duration) if self.duration else 0.0,
+            },
+            "latency": {
+                "ttfb_ms": {
+                    "p50": pct(ttfs, 0.50) * 1000,
+                    "p95": pct(ttfs, 0.95) * 1000,
+                    "p99": pct(ttfs, 0.99) * 1000,
+                    "mean": (statistics.mean(ttfs) * 1000) if ttfs else 0.0,
+                },
+                "total_ms": {
+                    "p50": pct(tots, 0.50) * 1000,
+                    "p95": pct(tots, 0.95) * 1000,
+                    "p99": pct(tots, 0.99) * 1000,
+                    "mean": (statistics.mean(tots) * 1000) if tots else 0.0,
+                },
+            },
+            "errors": {"breakdown": err_kinds, "rate": len(errs) / total_reqs if total_reqs else 0.0},
             "status_distribution": status_dist,
-            "error_rate": len(errs) / total_reqs if total_reqs else 0.0,
-            "throughput_rps": len(ok) / self.duration if self.duration else 0.0,
-            "ttfb_ms": {
-                "p50": pct(ttfs, 0.50) * 1000,
-                "p95": pct(ttfs, 0.95) * 1000,
-                "p99": pct(ttfs, 0.99) * 1000,
-                "mean": (statistics.mean(ttfs) * 1000) if ttfs else 0.0,
+            "cache": cache_group,
+            "racing": racing_group,
+            "resources": {
+                "rss_peak_mb": self.rss_peak_mb,
+                "fd_peak": self.fd_peak,
+                "pool_size_end": self.counters_after.get("client_pool_size", 0) if self.counters_after else 0,
+                "server_cpu_pct": ss.get("cpu_pct", 0.0),
+                "server_loop_lag_ms": ss.get("loop_lag_ms", {"p50": 0.0, "p95": 0.0, "max": 0.0}),
             },
-            "total_ms": {
-                "p50": pct(tots, 0.50) * 1000,
-                "p95": pct(tots, 0.95) * 1000,
-                "p99": pct(tots, 0.99) * 1000,
-                "mean": (statistics.mean(tots) * 1000) if tots else 0.0,
-            },
-            "cache_hit_rate": cache_hit_rate,
-            "racing_amplification": amplification,
-            "upstream_hits": self.upstream_hits,
-            "upstream_connects": self.upstream_connects,
-            "rss_peak_mb": self.rss_peak_mb,
-            "fd_peak": self.fd_peak,
-            "pool_size_end": self.pool_size_end,
-            "http_cache_entries_end": self.http_cache_entries_end,
+            "correctness": correctness,
+            "attribution": {"upstream_throttled": throttled, "bottleneck": bottleneck},
+            "counter_fetch_failed": self.counter_fetch_failed,
+            # mock 交叉验证字段(real 模式为 0/不适用)。
+            "mock_upstream_hits": self.upstream_hits,
+            "mock_upstream_new_conns": self.upstream_new_conns,
         }
 
 
 # ── 客户端:raw socket,精确测 TTFB(读到状态行) ────────────────
 
 def _status_code(status_line: bytes) -> str:
-    """从状态行提取 3 位状态码;解析失败返回 '000'。如 b'HTTP/1.1 503 ...' -> '503'。"""
     try:
         parts = status_line.split(b' ')
         code = parts[1].decode('latin-1').strip()
@@ -233,7 +335,6 @@ def _status_code(status_line: bytes) -> str:
 
 
 def _host_of(url: bytes) -> bytes:
-    """从绝对 URL(b'http://host/path')取 host,用于 Host 头(而非硬编码 example.com)。"""
     try:
         s = url.decode('latin-1')
         after = s.split('://', 1)[1] if '://' in s else s
@@ -243,14 +344,12 @@ def _host_of(url: bytes) -> bytes:
 
 
 async def do_http_request(host: str, port: int, url: bytes, timeout: float = 15.0,
-                          success_any_status: bool = False) -> RequestResult:
+                          success_any_status: bool = False,
+                          capture_body: bool = False) -> RequestResult:
     """发一个 GET,返回 TTFB(读到状态行)与 total。失败分类:timeout/conn/http:<code>。
 
-    非 200 时记录上游/Router 实际状态码(如 http:503),供 error_breakdown 细分,
-    一眼看出是 DNS 失败(503)还是别的根因。Host 头取自 URL 主机名(非硬编码)。
-
-    success_any_status=True(real 模式):收到任何 HTTP 响应即记成功——代理已成功
-    转发,源站 3xx/4xx 与代理性能无关;仅 conn/timeout 算真失败。
+    capture_body=True 时把响应 body 存进 RequestResult.body,供 mock 模式正确性校验
+    (body 大小/内容,缓存命中字节一致)。real 模式 body 不可预测,不校验。
     """
     t0 = time.monotonic()
     try:
@@ -271,16 +370,14 @@ async def do_http_request(host: str, port: int, url: bytes, timeout: float = 15.
         code = _status_code(status)
         if not success_any_status and b"200" not in status:
             return RequestResult(False, ttfb, time.monotonic() - t0, f"http:{code}", code)
-        # 读头部到空行
         while True:
             h = await asyncio.wait_for(reader.readline(), timeout=timeout)
             if not h or h in (b"\r\n", b"\n"):
                 break
-        # 读 body 到 EOF(Connection: close)
-        await asyncio.wait_for(reader.read(-1), timeout=timeout)
+        body = await asyncio.wait_for(reader.read(-1), timeout=timeout)
         total = time.monotonic() - t0
-        # real 模式记成功,但仍把状态码记下供统计(非 200 记入 error_breakdown 的非 http: 前缀)。
-        return RequestResult(True, ttfb, total, "", code)
+        return RequestResult(True, ttfb, total, "", code,
+                             body=body if capture_body else b"")
     except asyncio.TimeoutError:
         return RequestResult(False, 0, time.monotonic() - t0, "timeout")
     except (OSError, asyncio.IncompleteReadError):
@@ -297,10 +394,8 @@ async def do_connect_request(host: str, port: int, target: bytes, payload: bytes
                               timeout: float = 15.0, echo_check: bool = True) -> RequestResult:
     """发一个 CONNECT。TTFB = 读到 '200' 响应行的时间。
 
-    echo_check=True(mock 模式):建隧道后发 payload,校验上游原样回显(隧道透明)。
-    echo_check=False(real 模式):真实 TLS 隧道会加密 payload,无法原样回显,故
-    **收到 200 Connection established 即记成功**,不再 echo 校验——只测隧道建立,
-    不测隧道内容(真实 TLS 内容无法在代理层校验)。
+    echo_check=True(mock):建隧道后发 payload,校验上游原样回显。
+    echo_check=False(real):收到 200 即成功,不校验回显(真实 TLS 加密无法校验)。
     """
     t0 = time.monotonic()
     try:
@@ -324,7 +419,6 @@ async def do_connect_request(host: str, port: int, target: bytes, payload: bytes
             if not h or h in (b"\r\n", b"\n"):
                 break
         if not echo_check:
-            # real 模式:隧道建立即成功,不校验回显。
             total = time.monotonic() - t0
             return RequestResult(True, ttfb, total, "", code)
         writer.write(payload)
@@ -346,54 +440,63 @@ async def do_connect_request(host: str, port: int, target: bytes, payload: bytes
             pass
 
 
-# ── 资源采样 ──────────────────────────────────────────────────
+# ── 资源采样(客户端进程) + 服务端计数器拉取 ────────────────────
 
 def rss_mb() -> float:
-    """当前进程 RSS(MB)。"""
     try:
-        # ru_maxrss: Linux 上单位 KB
         return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
     except Exception:
         return 0.0
 
 
 def fd_count() -> int:
-    """当前进程打开的文件描述符数。"""
     try:
         return len(os.listdir("/proc/self/fd"))
     except Exception:
         return 0
 
 
-async def sample_resources(router: Router, result: ScenarioResult, stop_evt: asyncio.Event,
+async def sample_resources(metrics_base: str, result: ScenarioResult, stop_evt: asyncio.Event,
                            interval: float = 1.0):
-    """周期采样 RSS / fd / 连接池 / 缓存条目,记录峰值。"""
-    while not stop_evt.is_set():
-        try:
-            result.rss_peak_mb = max(result.rss_peak_mb, rss_mb())
-            result.fd_peak = max(result.fd_peak, fd_count())
-        except Exception:
-            pass
-        try:
-            await asyncio.wait_for(stop_evt.wait(), timeout=interval)
-        except asyncio.TimeoutError:
-            pass
-    # 末值
+    """周期采样客户端 RSS/fd + 拉取子进程 /server-stats(服务端 CPU/loop-lag)。
+
+    metrics_base: 子进程管理 API 的 base URL(如 http://127.0.0.1:port)。
+    """
+    async with httpx.AsyncClient(timeout=2.0) as client:
+        while not stop_evt.is_set():
+            try:
+                result.rss_peak_mb = max(result.rss_peak_mb, rss_mb())
+                result.fd_peak = max(result.fd_peak, fd_count())
+            except Exception:
+                pass
+            try:
+                r = await client.get(f"{metrics_base}/server-stats")
+                if r.status_code == 200:
+                    result.server_stats = r.json()
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(stop_evt.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+
+
+async def fetch_counters(metrics_base: str) -> Optional[dict]:
+    """从子进程 /metrics 拉服务端计数器快照。失败返回 None。"""
     try:
-        result.pool_size_end = len(router._client_pool)
-        result.http_cache_entries_end = len(router._http_cache)
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            r = await client.get(f"{metrics_base}/metrics")
+            if r.status_code == 200:
+                return r.json().get("counters")
     except Exception:
         pass
+    return None
 
 
 # ── 负载模式 ──────────────────────────────────────────────────
 
-async def run_concurrent(router_host: str, router_port: int, make_request, total: int,
-                          concurrency: int) -> list:
-    """以固定并发数跑 total 个请求(阶梯模式用)。
-
-    make_request(i) -> RequestResult。用一个共享 semaphore 限制并发。
-    """
+async def run_concurrent(make_request, total: int, concurrency: int) -> list:
+    """以固定并发数跑 total 个请求(阶梯/混合/连接复用用)。返回结果列表。"""
     sem = asyncio.Semaphore(concurrency)
     results: list = []
 
@@ -407,12 +510,11 @@ async def run_concurrent(router_host: str, router_port: int, make_request, total
     return results
 
 
-async def run_rate(router_host: str, router_port: int, make_request, target_rps: float,
-                   duration: float) -> list:
-    """以固定速率 target_rps 持续 duration 秒发请求(恒定速率模式用)。
+async def run_rate(make_request, target_rps: float, duration: float) -> tuple[list, int]:
+    """以固定速率 target_rps 持续 duration 秒发请求。返回 (结果列表, 注入数)。
 
-    用令牌桶控制注入节奏;并发自然产生(取决于响应延迟)。超量时适度丢弃以
-    守住速率,避免无限堆积。
+    注入数 = 实际创建的 task 数;与完成数(=len(results))的差 = 被丢弃/超时。
+    soak 据此区分"主动限速"与"被动撑不住"。
     """
     results: list = []
     interval = 1.0 / target_rps if target_rps > 0 else 0
@@ -429,108 +531,128 @@ async def run_rate(router_host: str, router_port: int, make_request, target_rps:
         sleep = next_send - loop.time()
         if sleep > 0:
             await asyncio.sleep(sleep)
-    # 等待在途完成(带总超时,防卡死)
     if pending:
         try:
             await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=30)
         except asyncio.TimeoutError:
             for t in pending:
                 t.cancel()
+    return results, i
+
+
+async def run_open_loop(make_request, concurrency: int, stop_evt: asyncio.Event) -> list:
+    """开环:固定并发 worker 持续拉请求,直到 stop_evt 置位。
+
+    与 run_concurrent 不同,不预先创建 total 个 task(避免 10**9 这类总量爆炸),
+    而是起 concurrency 个 worker 各自循环 await make_request(i),共享一个递增计数器。
+    stop_evt 置位后 worker 退出,收集所有结果。用于开环 soak 与连接复用场景。
+    """
+    results: list = []
+    counter = 0
+
+    async def worker():
+        nonlocal counter
+        while not stop_evt.is_set():
+            i = counter
+            counter += 1
+            try:
+                r = await make_request(i)
+                results.append(r)
+            except Exception:
+                pass
+
+    workers = [asyncio.create_task(worker()) for _ in range(concurrency)]
+    await stop_evt.wait()
+    for w in workers:
+        w.cancel()
+    await asyncio.gather(*workers, return_exceptions=True)
     return results
+
+
+# ── 正确性校验(mock 模式) ─────────────────────────────────────
+
+def _check_correctness(result: ScenarioResult, host_kind: str, url: bytes):
+    """对单个 mock 请求的 body 做正确性校验,失败记入 result.correctness_failures。
+
+    host_kind: "hot"/"cold"/"big"/"chunked"(决定预期 body 大小)。
+    mock body = b"x" * size(见 mock_upstream._handle),故校验大小与内容。
+    big/chunked 的 body 可能超 STREAM_CACHE_LIMIT 不被代理缓冲,但仍应完整转发到客户端。
+    """
+    expected = _MOCK_EXPECTED_BODY_BYTES.get(host_kind)
+    if expected is None:
+        return
+    # 找最近一条成功结果(调用方在 make_request 后立即校验,取 results 末尾)。
+    if not result.results or not result.results[-1].ok:
+        return
+    body = result.results[-1].body
+    if len(body) != expected:
+        result.correctness_failures.append(
+            f"{host_kind} {url.decode('latin-1','replace')}: size {len(body)} != {expected}")
+        return
+    if body != b"x" * expected:
+        result.correctness_failures.append(
+            f"{host_kind} {url.decode('latin-1','replace')}: content mismatch")
 
 
 # ── 场景定义 ──────────────────────────────────────────────────
 
-def default_mock_cluster(quick: bool) -> UpstreamCluster:
-    """默认 mock 集群:4 个上游,快/中/慢/不稳定,模拟真实异构代理。"""
-    n_upstream = 2 if quick else 4
-    # base_delay 递增模拟快→慢;最后一个带失败率模拟不稳定代理
-    specs = []
-    delays = [0.0, 0.05, 0.15, 0.3][:n_upstream]
-    for i, d in enumerate(delays):
-        profs = [ResponseProfile("hot", first_byte_delay=0.01, body_size=2048),
-                 ResponseProfile("cold", first_byte_delay=0.02, body_size=1024),
-                 ResponseProfile("big", first_byte_delay=0.02, body_size=512 * 1024, chunk_delay=0.005),
-                 ResponseProfile("chunked", first_byte_delay=0.02, body_size=64 * 1024, chunked=True, chunk_delay=0.003)]
-        fr = 0.3 if (i == n_upstream - 1 and not quick) else 0.0
-        specs.append((d, [ResponseProfile(p.host_prefix, p.first_byte_delay, p.body_size,
-                                          p.chunked, p.chunk_delay, fr) for p in profs]))
-    return UpstreamCluster(specs, start_port=31200)
-
-
-async def build_router(cluster: Optional[UpstreamCluster], real_proxies_path: str,
-                       listen_port: int, max_retries: int, cache_ttl: int,
-                       enable_http_cache: bool = True) -> Router:
-    """构造并启动 Router。mock 模式用集群;real 模式从 proxies.yaml 加载。"""
-    ps = ProxyStore()
-    if cluster is not None:
-        for i, u in enumerate(cluster.upstreams):
-            ps.add(ProxyInfo(id=f"u{i}", host=u.host, port=u.port))
-    else:
-        ps = ProxyStore(real_proxies_path)
-    router = Router(ps, listen_host="127.0.0.1", listen_port=listen_port,
-                    max_retries=max_retries, cache_ttl=cache_ttl,
-                    enable_http_cache=enable_http_cache,
-                    db_path=tempfile.mktemp(suffix=".db"))
-    await router.start()
-    return router
-
-
-async def scenario_staircase(router: Router, cluster: Optional[UpstreamCluster],
-                             router_host: str, router_port: int, host_set: HostSet,
-                             quick: bool) -> ScenarioResult:
+async def scenario_staircase(router_host: str, router_port: int, host_set: HostSet,
+                             quick: bool, metrics_base: str) -> ScenarioResult:
     """并发阶梯:并发数 1→N,每级固定请求数,测吞吐与延迟随并发的变化,找饱和点。"""
     levels = [1, 10, 50, 100, 200] if not quick else [1, 10, 50]
     per_level = 200 if not quick else 50
-    # 汇总成一个 scenario(分级别记录);此处合并为单一结果,各级在报告里细分
     result = ScenarioResult(name="staircase", duration=0.0, client_requests=0)
-    # 用热域名集中竞争(测连接池/事件循环),混合少量冷域名
     stop_evt = asyncio.Event()
-    sampler = asyncio.create_task(sample_resources(router, result, stop_evt))
+    sampler = asyncio.create_task(sample_resources(metrics_base, result, stop_evt))
+    capture = (host_set.mode == "mock")  # mock 模式校验 body
 
     async def make(i):
-        # 70% 热(命中域名/响应缓存),30% 冷
         if i % 10 < 7:
             url = f"http://{host_set.hot(i)}/p{i % 4}".encode()
         else:
             url = f"http://{host_set.cold(i)}/p{i % 3}".encode()
         return await do_http_request(router_host, router_port, url,
                                      timeout=host_set.timeout,
-                                     success_any_status=host_set.success_any_status)
+                                     success_any_status=host_set.success_any_status,
+                                     capture_body=capture)
 
+    result.counters_before = await fetch_counters(metrics_base) or {}
     t_start = time.monotonic()
     for c in levels:
-        if cluster:
-            cluster.reset_counts()
-        hits_before = cluster.total_hits() if cluster else -1
-        res = await run_concurrent(router_host, router_port, make, per_level, c)
+        # 预热:每级并发前发 per_level//5 个请求填缓存,不计入统计。
+        warmup_n = max(1, per_level // 5)
+        await run_concurrent(make, warmup_n, c)
+        result.warmup_requests += warmup_n
+        res = await run_concurrent(make, per_level, c)
         result.results.extend(res)
         result.client_requests += len(res)
-        dur = time.monotonic() - t_start
         ok = sum(1 for r in res if r.ok)
-        hits = (cluster.total_hits() - hits_before) if cluster else -1
-        amp = (hits / len(res)) if (cluster and len(res)) else 0.0
-        chit = (max(0, len(res) - hits) / len(res) * 100) if (cluster and hits >= 0 and len(res)) else 0.0
         print(f"  concurrency={c:>4}  ok={ok}/{len(res)}  "
-              f"rps={ok / (sum(r.total for r in res) or 1):.0f}(wall)  "
-              f"upstream_hits={hits}  amp={amp:.2f}x  cache_hit={chit:.0f}%")
+              f"rps={ok / (sum(r.total for r in res) or 1):.0f}(wall)")
+    # mock 正确性:校验所有成功结果的 body 大小(粗粒度,抓截断/错乱回归)。
+    if capture:
+        result.correctness_checked = True
+        for r in result.results:
+            if r.ok and r.body:
+                if len(r.body) not in _MOCK_EXPECTED_BODY_BYTES.values():
+                    result.correctness_failures.append(f"unexpected body size {len(r.body)}")
     result.duration = time.monotonic() - t_start
+    result.counters_after = await fetch_counters(metrics_base) or {}
+    if not result.counters_after:
+        result.counter_fetch_failed = True
     stop_evt.set()
     await sampler
-    if cluster:
-        result.upstream_hits = cluster.total_hits()
     return result
 
 
-async def scenario_rate(router: Router, cluster: Optional[UpstreamCluster],
-                        router_host: str, router_port: int, host_set: HostSet,
-                        quick: bool) -> ScenarioResult:
+async def scenario_rate(router_host: str, router_port: int, host_set: HostSet,
+                        quick: bool, metrics_base: str) -> ScenarioResult:
     """恒定速率:目标 RPS 阶梯上升,测延迟/错误率随负载的变化,找容量上限。"""
     rates = [100, 500, 1000, 2000] if not quick else [100, 500]
     per_rate_dur = 8.0 if not quick else 3.0
     result = ScenarioResult(name="rate", duration=0.0, client_requests=0)
     stop_evt = asyncio.Event()
-    sampler = asyncio.create_task(sample_resources(router, result, stop_evt))
+    sampler = asyncio.create_task(sample_resources(metrics_base, result, stop_evt))
 
     async def make(i):
         if i % 10 < 7:
@@ -541,96 +663,107 @@ async def scenario_rate(router: Router, cluster: Optional[UpstreamCluster],
                                      timeout=host_set.timeout,
                                      success_any_status=host_set.success_any_status)
 
+    result.counters_before = await fetch_counters(metrics_base) or {}
     t_start = time.monotonic()
     for rps in rates:
-        if cluster:
-            cluster.reset_counts()
-        hits_before = cluster.total_hits() if cluster else -1
-        res = await run_rate(router_host, router_port, make, rps, per_rate_dur)
+        res, injected = await run_rate(make, rps, per_rate_dur)
         result.results.extend(res)
         result.client_requests += len(res)
+        result.injected_requests += injected
         ok = sum(1 for r in res if r.ok)
-        hits = (cluster.total_hits() - hits_before) if cluster else -1
-        amp = (hits / len(res)) if (cluster and len(res)) else 0.0
-        chit = (max(0, len(res) - hits) / len(res) * 100) if (cluster and hits >= 0 and len(res)) else 0.0
-        print(f"  target_rps={rps:>5}  ok={ok}  "
-              f"actual_rps={ok/per_rate_dur:.0f}  err={len(res)-ok}  "
-              f"upstream_hits={hits}  amp={amp:.2f}x  cache_hit={chit:.0f}%")
+        print(f"  target_rps={rps:>5}  ok={ok}  actual_rps={ok/per_rate_dur:.0f}  "
+              f"injected={injected}  err={len(res)-ok}")
     result.duration = time.monotonic() - t_start
+    result.counters_after = await fetch_counters(metrics_base) or {}
+    if not result.counters_after:
+        result.counter_fetch_failed = True
     stop_evt.set()
     await sampler
-    if cluster:
-        result.upstream_hits = cluster.total_hits()
     return result
 
 
-async def scenario_mixed(router: Router, cluster: Optional[UpstreamCluster],
-                         router_host: str, router_port: int, host_set: HostSet,
-                         quick: bool) -> ScenarioResult:
+async def scenario_mixed(router_host: str, router_port: int, host_set: HostSet,
+                         quick: bool, metrics_base: str) -> ScenarioResult:
     """混合负载:冷热域名 + 大小响应 + CONNECT 隧道,贴近真实流量结构。"""
     total = 2000 if not quick else 300
     concurrency = 100 if not quick else 30
     result = ScenarioResult(name="mixed", duration=0.0, client_requests=0)
     stop_evt = asyncio.Event()
-    sampler = asyncio.create_task(sample_resources(router, result, stop_evt))
-    # real 模式:真实 TLS 隧道无法原样回显 payload,故建隧道即成功(不 echo 校验);
-    # mock 模式:隧道透明,做 echo 校验。
-    echo_check = cluster is not None
+    sampler = asyncio.create_task(sample_resources(metrics_base, result, stop_evt))
+    echo_check = (host_set.mode == "mock")
     sas = host_set.success_any_status
+    capture = (host_set.mode == "mock")
 
     async def make(i):
         r = i % 10
         if r < 3:
-            # 30% 热域名小响应(命中域名+响应缓存)
             return await do_http_request(router_host, router_port,
                                          f"http://{host_set.hot(i)}/p{i % 4}".encode(),
-                                         timeout=host_set.timeout, success_any_status=sas)
+                                         timeout=host_set.timeout, success_any_status=sas,
+                                         capture_body=capture)
         elif r < 5:
-            # 20% 大响应(content-length 流式;real 模式退化为普通 GET)
             return await do_http_request(router_host, router_port,
                                          f"http://{host_set.big(i)}/p{i % 2}".encode(),
-                                         timeout=host_set.timeout, success_any_status=sas)
+                                         timeout=host_set.timeout, success_any_status=sas,
+                                         capture_body=capture)
         elif r < 7:
-            # 20% chunked 响应(测流式 chunked 路径;real 模式退化为普通 GET)
             return await do_http_request(router_host, router_port,
                                          f"http://{host_set.chunked(i)}/p{i % 2}".encode(),
-                                         timeout=host_set.timeout, success_any_status=sas)
+                                         timeout=host_set.timeout, success_any_status=sas,
+                                         capture_body=capture)
         elif r < 9:
-            # 20% 冷域名(每次竞速,不命中缓存)
             return await do_http_request(router_host, router_port,
                                          f"http://{host_set.cold(i)}/p{i % 5}".encode(),
-                                         timeout=host_set.timeout, success_any_status=sas)
+                                         timeout=host_set.timeout, success_any_status=sas,
+                                         capture_body=capture)
         else:
-            # 10% CONNECT 隧道
             return await do_connect_request(router_host, router_port,
                                             host_set.connect().encode(),
                                             timeout=host_set.timeout, echo_check=echo_check)
 
-    if cluster:
-        cluster.reset_counts()
+    # 预热:mock 50 个 / real 20 个(避免 hammer 真实源站)。
+    warmup_n = 50 if host_set.mode == "mock" else 20
+    await run_concurrent(make, warmup_n, min(concurrency, 20))
+    result.warmup_requests += warmup_n
+
+    result.counters_before = await fetch_counters(metrics_base) or {}
     t_start = time.monotonic()
-    res = await run_concurrent(router_host, router_port, make, total, concurrency)
+    res = await run_concurrent(make, total, concurrency)
     result.results = res
     result.client_requests = len(res)
+    result.injected_requests = len(res)
     result.duration = time.monotonic() - t_start
+    result.counters_after = await fetch_counters(metrics_base) or {}
+    if not result.counters_after:
+        result.counter_fetch_failed = True
+    # mock 正确性:校验所有成功 GET 的 body 大小。
+    if capture:
+        result.correctness_checked = True
+        for r in res:
+            if r.ok and r.body:
+                size = len(r.body)
+                # 反查预期大小:任一已知大小匹配即通过(粗粒度,抓截断/错乱回归)。
+                if size not in _MOCK_EXPECTED_BODY_BYTES.values():
+                    result.correctness_failures.append(f"unexpected body size {size}")
     stop_evt.set()
     await sampler
-    if cluster:
-        result.upstream_hits = cluster.total_hits()
-        result.upstream_connects = cluster.total_connects()
     return result
 
 
-async def scenario_soak(router: Router, cluster: Optional[UpstreamCluster],
-                        router_host: str, router_port: int, host_set: HostSet,
-                        duration: float, quick: bool) -> ScenarioResult:
-    """长时稳定性:固定并发持续跑,周期打印资源趋势,抓内存/fd/缓存泄漏。"""
+async def scenario_soak(router_host: str, router_port: int, host_set: HostSet,
+                        duration: float, quick: bool, metrics_base: str,
+                        open_loop: bool = False) -> ScenarioResult:
+    """长时稳定性:固定速率(或开环固定并发)持续跑,抓内存/fd/缓存泄漏与 CPU 趋势。
+
+    open_loop=False(默认):run_rate(target_rps),限速;报告区分注入/完成速率。
+    open_loop=True:run_concurrent(固定并发,不限速),让 Router 尽力跑,测真实上限。
+    """
     duration = duration if not quick else min(duration, 20.0)
     concurrency = 100
     target_rps = 300
     result = ScenarioResult(name="soak", duration=duration, client_requests=0)
     stop_evt = asyncio.Event()
-    sampler = asyncio.create_task(sample_resources(router, result, stop_evt, interval=2.0))
+    sampler = asyncio.create_task(sample_resources(metrics_base, result, stop_evt, interval=2.0))
 
     async def make(i):
         if i % 10 < 7:
@@ -641,88 +774,248 @@ async def scenario_soak(router: Router, cluster: Optional[UpstreamCluster],
                                      timeout=host_set.timeout,
                                      success_any_status=host_set.success_any_status)
 
-    if cluster:
-        cluster.reset_counts()
-    # 恒定速率跑指定时长
+    result.counters_before = await fetch_counters(metrics_base) or {}
     t_start = time.monotonic()
     last_print = t_start
-    res_task = asyncio.create_task(run_rate(router_host, router_port, make, target_rps, duration))
-    # 进度打印
-    while time.monotonic() - t_start < duration:
-        await asyncio.sleep(2.0)
-        if time.monotonic() - last_print > 5.0:
-            print(f"  t={time.monotonic()-t_start:.0f}s  "
-                  f"rss={rss_mb():.0f}MB  fd={fd_count()}  "
-                  f"pool={len(router._client_pool)}  http_cache={len(router._http_cache)}")
-            last_print = time.monotonic()
-    res = await res_task
-    result.results = res
-    result.client_requests = len(res)
+    if open_loop:
+        # 开环:固定并发 worker 持续跑,到 duration 置位 stop_evt 后退出。
+        loop_stop = asyncio.Event()
+
+        async def _stopper():
+            await asyncio.sleep(duration)
+            loop_stop.set()
+        asyncio.create_task(_stopper())
+        res = await run_open_loop(make, concurrency, loop_stop)
+        result.results = res
+        result.client_requests = len(res)
+        result.injected_requests = len(res)
+    else:
+        while time.monotonic() - t_start < duration:
+            remain = duration - (time.monotonic() - t_start)
+            chunk = min(remain, 2.0)
+            res, injected = await run_rate(make, target_rps, chunk)
+            result.results.extend(res)
+            result.client_requests += len(res)
+            result.injected_requests += injected
+            if time.monotonic() - last_print > 5.0:
+                print(f"  t={time.monotonic()-t_start:.0f}s  rss={rss_mb():.0f}MB  "
+                      f"fd={fd_count()}  done={result.client_requests}")
+                last_print = time.monotonic()
     result.duration = time.monotonic() - t_start
+    result.counters_after = await fetch_counters(metrics_base) or {}
+    if not result.counters_after:
+        result.counter_fetch_failed = True
     stop_evt.set()
     await sampler
-    if cluster:
-        result.upstream_hits = cluster.total_hits()
+    return result
+
+
+async def scenario_conn_reuse(router_host: str, router_port: int, host_set: HostSet,
+                              metrics_base: str) -> ScenarioResult:
+    """连接复用:固定小并发、长时、同域名(命中域名缓存→单发上游→复用连接池)。
+
+    报告 reuse_ratio = (请求 - 新建连接) / 请求(mock 上游 new_conn_count 计数)。
+    >0 表示 keepalive 复用生效。仅 mock 模式有意义(real 无法读上游新连接数)。
+    """
+    duration = 20.0
+    concurrency = 10
+    result = ScenarioResult(name="conn-reuse", duration=duration, client_requests=0)
+    stop_evt = asyncio.Event()
+    sampler = asyncio.create_task(sample_resources(metrics_base, result, stop_evt, interval=2.0))
+
+    async def make(i):
+        # 同一热域名反复请求 → 域名缓存命中 → 单发同一上游 → 复用 keepalive 连接。
+        url = f"http://{host_set.hot(0)}/p{i % 4}".encode()
+        return await do_http_request(router_host, router_port, url,
+                                     timeout=host_set.timeout,
+                                     success_any_status=host_set.success_any_status)
+
+    result.counters_before = await fetch_counters(metrics_base) or {}
+    t_start = time.monotonic()
+    # 开环:固定并发 worker 跑满 duration,到时置位 stop 后退出。
+    loop_stop = asyncio.Event()
+
+    async def _stopper():
+        await asyncio.sleep(duration)
+        loop_stop.set()
+    asyncio.create_task(_stopper())
+    res = await run_open_loop(make, concurrency, loop_stop)
+    result.results = res
+    result.client_requests = len(res)
+    result.injected_requests = len(res)
+    result.duration = time.monotonic() - t_start
+    result.counters_after = await fetch_counters(metrics_base) or {}
+    if not result.counters_after:
+        result.counter_fetch_failed = True
+    stop_evt.set()
+    await sampler
+    # 从子进程 /server-stats 取 mock 上游新建连接数(连接复用率 = (请求-新连接)/请求)。
+    mock = (result.server_stats or {}).get("mock") or {}
+    result.upstream_new_conns = mock.get("new_conns", 0)
     return result
 
 
 # ── 报告输出 ──────────────────────────────────────────────────
 
-def print_report(metrics_list: list, git_ver: str, upstream_mode: str = "mock"):
+def print_report(metrics_list: list, git_ver: str, upstream_mode: str):
     print("\n" + "=" * 78)
-    print(f" auto_squid 压测报告  (git: {git_ver})  [上游: {upstream_mode}]")
+    print(f" auto_squid 压测报告  (git: {git_ver})  [上游: {upstream_mode}]  [进程隔离]")
     print("=" * 78)
-    is_real = upstream_mode == "real"
     for m in metrics_list:
         print(f"\n■ 场景: {m['name']}")
-        print(f"  请求数        : {m['client_requests']}  (成功 {m['success']}, 失败 {m['errors']})")
-        if m['errors']:
-            print(f"  错误分类      : {m['error_breakdown']}  (错误率 {m['error_rate']*100:.2f}%)")
+        rq = m['requests']
+        print(f"  请求          : 客户端 {rq['client']} (成功 {rq['success']}, 失败 {rq['errors']}, "
+              f"注入 {rq['injected']}, 预热 {rq['warmup']})")
+        if m['errors']['breakdown']:
+            print(f"  错误分类      : {m['errors']['breakdown']}  (错误率 {m['errors']['rate']*100:.2f}%)")
         if m.get('status_distribution'):
-            # real 模式下尤其关键:揭示"成功"背后的真实状态码分布(如全是 503)
             print(f"  状态码分布    : {m['status_distribution']}")
-        print(f"  吞吐          : {m['throughput_rps']:.1f} req/s")
-        print(f"  TTFB (ms)     : P50={m['ttfb_ms']['p50']:.1f}  P95={m['ttfb_ms']['p95']:.1f}  "
-              f"P99={m['ttfb_ms']['p99']:.1f}  mean={m['ttfb_ms']['mean']:.1f}")
-        print(f"  Total (ms)    : P50={m['total_ms']['p50']:.1f}  P95={m['total_ms']['p95']:.1f}  "
-              f"P99={m['total_ms']['p99']:.1f}  mean={m['total_ms']['mean']:.1f}")
-        if is_real:
-            # 真实上游无命中计数器,缓存命中率/放大率无法测(并非 100% 命中)。
-            print(f"  缓存命中率    : N/A (真实上游模式无法测)")
-            print(f"  racing 放大率 : N/A (真实上游模式无法测)")
+        tp = m['throughput']
+        print(f"  吞吐          : 完成 {tp['completed_rps']:.1f} req/s  注入 {tp['injected_rps']:.1f} req/s")
+        lat = m['latency']
+        print(f"  TTFB (ms)     : P50={lat['ttfb_ms']['p50']:.1f}  P95={lat['ttfb_ms']['p95']:.1f}  "
+              f"P99={lat['ttfb_ms']['p99']:.1f}  mean={lat['ttfb_ms']['mean']:.1f}")
+        print(f"  Total (ms)    : P50={lat['total_ms']['p50']:.1f}  P95={lat['total_ms']['p95']:.1f}  "
+              f"P99={lat['total_ms']['p99']:.1f}  mean={lat['total_ms']['mean']:.1f}")
+        c = m['cache']
+        if c['http_hit_rate'] is not None:
+            print(f"  缓存          : HTTP命中 {c['http_hit_rate']*100:.1f}%  域名命中 {c['domain_hit_rate']*100:.1f}%  "
+                  f"(hits={c['http_hits']} misses={c['http_misses']} 条目末值={c['http_cache_entries_end']})")
         else:
-            print(f"  缓存命中率    : {m['cache_hit_rate']*100:.1f}%  (上游命中 {m['upstream_hits']})")
-            print(f"  racing 放大率 : {m['racing_amplification']:.2f}x  "
-                  f"(每客户端请求扇出到 {m['racing_amplification']:.2f} 个上游)")
-        print(f"  资源峰值      : RSS={m['rss_peak_mb']:.0f}MB  fd={m['fd_peak']}  "
-              f"连接池末值={m['pool_size_end']}  HTTP缓存条目末值={m['http_cache_entries_end']}")
+            print(f"  缓存          : N/A (计数器拉取失败)")
+        r = m['racing']
+        if r['amplification'] is not None:
+            print(f"  竞速          : 放大率 {r['amplification']:.2f}x  上游尝试 {r['upstream_attempts']}  竞速触发 {r['invocations']}")
+        res = m['resources']
+        lag = res['server_loop_lag_ms']
+        print(f"  资源          : RSS={res['rss_peak_mb']:.0f}MB  fd={res['fd_peak']}  池末值={res['pool_size_end']}  "
+              f"服务端CPU={res['server_cpu_pct']:.0f}%  loop-lag p95={lag['p95']:.2f}ms max={lag['max']:.2f}ms")
+        # 连接复用场景:展示 reuse_ratio(mock 上游新建连接数)。
+        if m['name'] == 'conn-reuse' and m.get('mock_upstream_new_conns') is not None:
+            new_conns = m['mock_upstream_new_conns']
+            total = m['requests']['client']
+            reuse = (total - new_conns) / total if total else 0.0
+            print(f"  连接复用      : 新建连接 {new_conns} / 请求 {total}  reuse_ratio={reuse:.2f} "
+                  f"({'keepalive 生效' if reuse > 0 else '未复用'})")
+        cor = m['correctness']
+        if cor['checked']:
+            tag = "✓" if cor['failed'] == 0 else "✗"
+            print(f"  正确性        : {tag} 校验 {cor['passed']} 通过 / {cor['failed']} 失败")
+        else:
+            print(f"  正确性        : 未校验 (real 模式或该场景不捕获 body)")
+        print(f"  归因          : 上游触顶={m['attribution']['upstream_throttled']}  瓶颈={m['attribution']['bottleneck']}")
     print("\n" + "=" * 78)
+
+
+# ── 子进程管理 ────────────────────────────────────────────────
+
+class ServerProcess:
+    """管理被测方子进程:启动、读 READY 握手、终止。
+
+    子进程(bench.server_proc)在独立事件循环跑 Router + mock + 管理 API。
+    主进程经 metrics_base(http://127.0.0.1:<metrics_port>)拉 /metrics /server-stats。
+    """
+
+    def __init__(self, config: dict):
+        self.config = config
+        self.proc: Optional[subprocess.Popen] = None
+        self.router_port: int = 0
+        self.metrics_port: int = 0
+        self.metrics_base: str = ""
+        self._config_path: Optional[str] = None
+
+    async def start(self, timeout: float = 15.0):
+        """启动子进程并等待 READY 握手。超时或失败抛异常。"""
+        # 配置写临时文件,子进程命令行 --config 读。
+        fd, self._config_path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            json.dump(self.config, f)
+        self.proc = subprocess.Popen(
+            [sys.executable, "-m", "bench.server_proc", "--config", self._config_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        # 读 stdout 第一行拿 READY <router_port> <metrics_port>。
+        loop = asyncio.get_event_loop()
+        try:
+            line = await asyncio.wait_for(
+                loop.run_in_executor(None, self.proc.stdout.readline), timeout=timeout)
+        except asyncio.TimeoutError:
+            self._kill()
+            raise RuntimeError("子进程 READY 握手超时")
+        line = line.strip()
+        if not line.startswith("READY"):
+            stderr = ""
+            try:
+                stderr = self.proc.stderr.read() or ""
+            except Exception:
+                pass
+            self._kill()
+            raise RuntimeError(f"子进程未就绪: {line!r} stderr={stderr[:500]}")
+        _, rp, mp = line.split()
+        self.router_port = int(rp)
+        self.metrics_port = int(mp)
+        self.metrics_base = f"http://127.0.0.1:{self.metrics_port}"
+
+    def _kill(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except Exception:
+                self.proc.kill()
+
+    def stop(self):
+        """优雅终止:SIGTERM → 等 STOPPED/退出 → 超时 SIGKILL。清理临时配置。"""
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except Exception:
+                self.proc.kill()
+        if self._config_path:
+            try:
+                os.unlink(self._config_path)
+            except Exception:
+                pass
 
 
 # ── 主入口 ────────────────────────────────────────────────────
 
 async def amain(args):
     git_ver = git_version()
-    print(f"auto_squid 压测  git={git_ver}  mode={args.mode}  upstream={args.upstream}  quick={args.quick}")
-    cluster: Optional[UpstreamCluster] = None
-    try:
-        # 主机名空间:mock 用伪域名(供 mock ResponseProfile 匹配),real 用真实可解析域名。
-        real_hosts = args.real_hosts.split(",") if args.real_hosts else list(_DEFAULT_REAL_HOSTS)
-        host_set = HostSet(mode=args.upstream, real_hosts=[h.strip() for h in real_hosts if h.strip()])
-        if args.upstream == "mock":
-            cluster = default_mock_cluster(args.quick)
-            await cluster.start()
-            n = len(cluster.upstreams)
-            print(f"mock 上游: {n} 个实例 (端口 31200..{31200+n-1})")
-        else:
-            print(f"真实上游: 从 {args.proxies} 加载  (压测主机名池: {len(host_set.real_hosts)} 个)")
+    print(f"auto_squid 压测  git={git_ver}  mode={args.mode}  upstream={args.upstream}  "
+          f"quick={args.quick}  open_loop={args.open_loop}  [进程隔离]")
+    real_hosts = args.real_hosts.split(",") if args.real_hosts else list(_DEFAULT_REAL_HOSTS)
+    host_set = HostSet(mode=args.upstream, real_hosts=[h.strip() for h in real_hosts if h.strip()])
 
-        router = await build_router(cluster, args.proxies, args.router_port,
-                                    max_retries=args.max_retries, cache_ttl=args.cache_ttl,
-                                    enable_http_cache=not args.no_http_cache)
-        print(f"Router 监听 127.0.0.1:{args.router_port}  max_retries={args.max_retries}  "
+    # 构造子进程配置。
+    db_path = tempfile.mktemp(suffix=".db")
+    config = {
+        "upstream": args.upstream,
+        "router_port": args.router_port,
+        "metrics_port": 0,  # 0 = uvicorn 随机选端口(实际由子进程绑定后回传 READY)
+        "max_retries": args.max_retries,
+        "cache_ttl": args.cache_ttl,
+        "enable_http_cache": not args.no_http_cache,
+        "proxies_path": args.proxies,
+        "mock_specs": default_mock_specs(args.quick) if args.upstream == "mock" else [],
+        "db_path": db_path,
+    }
+    # metrics_port=0 时 uvicorn 绑定随机端口;但子进程需先知道端口才能 print READY。
+    # 改为主进程预选一个空闲端口,避免子进程内探测端口的复杂度。
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    config["metrics_port"] = s.getsockname()[1]
+    s.close()
+
+    server = ServerProcess(config)
+    try:
+        await server.start()
+        print(f"子进程就绪: Router 127.0.0.1:{server.router_port}  "
+              f"管理API {server.metrics_base}  max_retries={args.max_retries}  "
               f"cache_ttl={args.cache_ttl}  http_cache={'on' if not args.no_http_cache else 'off'}")
 
+        rh, rp, mb = "127.0.0.1", server.router_port, server.metrics_base
         results: list = []
         if args.profile:
             import cProfile, pstats, io
@@ -731,87 +1024,76 @@ async def amain(args):
 
         if args.mode == "staircase":
             print("\n[staircase] 并发阶梯,测饱和点")
-            results.append(await scenario_staircase(router, cluster, "127.0.0.1", args.router_port, host_set, args.quick))
+            results.append(await scenario_staircase(rh, rp, host_set, args.quick, mb))
         elif args.mode == "rate":
             print("\n[rate] 恒定速率阶梯,测容量上限")
-            results.append(await scenario_rate(router, cluster, "127.0.0.1", args.router_port, host_set, args.quick))
+            results.append(await scenario_rate(rh, rp, host_set, args.quick, mb))
         elif args.mode == "mixed":
             print("\n[mixed] 混合负载(冷热+大小+CONNECT)")
-            results.append(await scenario_mixed(router, cluster, "127.0.0.1", args.router_port, host_set, args.quick))
+            results.append(await scenario_mixed(rh, rp, host_set, args.quick, mb))
         elif args.mode == "soak":
-            print(f"\n[soak] 长时稳定性 {args.duration}s")
-            results.append(await scenario_soak(router, cluster, "127.0.0.1", args.router_port, host_set,
-                                                args.duration, args.quick))
+            print(f"\n[soak] 长时稳定性 {args.duration}s" + (" [开环]" if args.open_loop else ""))
+            results.append(await scenario_soak(rh, rp, host_set, args.duration, args.quick, mb,
+                                               open_loop=args.open_loop))
+        elif args.mode == "conn-reuse":
+            print("\n[conn-reuse] 连接复用率(测 keepalive)")
+            results.append(await scenario_conn_reuse(rh, rp, host_set, mb))
         elif args.mode == "all":
             print("\n[staircase] 并发阶梯")
-            results.append(await scenario_staircase(router, cluster, "127.0.0.1", args.router_port, host_set, args.quick))
+            results.append(await scenario_staircase(rh, rp, host_set, args.quick, mb))
             print("\n[rate] 恒定速率")
-            results.append(await scenario_rate(router, cluster, "127.0.0.1", args.router_port, host_set, args.quick))
+            results.append(await scenario_rate(rh, rp, host_set, args.quick, mb))
             print("\n[mixed] 混合负载")
-            results.append(await scenario_mixed(router, cluster, "127.0.0.1", args.router_port, host_set, args.quick))
+            results.append(await scenario_mixed(rh, rp, host_set, args.quick, mb))
             print(f"\n[soak] 长时 {args.duration}s")
-            results.append(await scenario_soak(router, cluster, "127.0.0.1", args.router_port, host_set,
-                                                args.duration, args.quick))
+            results.append(await scenario_soak(rh, rp, host_set, args.duration, args.quick, mb))
 
         if args.profile:
             pr.disable()
-            s = io.StringIO()
-            pstats.Stats(pr, stream=s).sort_stats("cumulative").print_stats(25)
-            print("\n[cProfile top 25 by cumulative]")
-            print(s.getvalue())
+            s_io = io.StringIO()
+            pstats.Stats(pr, stream=s_io).sort_stats("cumulative").print_stats(25)
+            print("\n[cProfile top 25 by cumulative (客户端进程)]")
+            print(s_io.getvalue())
             with open("bench_profile.txt", "w") as f:
                 pstats.Stats(pr, stream=f).sort_stats("cumulative").print_stats(40)
 
-        # 汇总指标 + 报告
         metrics_list = [r.metrics() for r in results]
-        # 真实上游无命中计数器:把缓存命中率/放大率置 null,避免 JSON 误导读者。
-        if args.upstream == "real":
-            for m in metrics_list:
-                m["cache_hit_rate"] = None
-                m["racing_amplification"] = None
+        # mock 模式:补连接复用场景的 new_conns(从子进程无法读 mock 计数,
+        # 故 conn-reuse 场景依赖服务端计数器;此处仅透传)。
         print_report(metrics_list, git_ver, args.upstream)
 
-        # 结构化 JSON
         report = {
-            "git": git_ver,
-            "mode": args.mode,
-            "upstream": args.upstream,
-            "quick": args.quick,
-            "max_retries": args.max_retries,
-            "cache_ttl": args.cache_ttl,
-            "http_cache_enabled": not args.no_http_cache,
+            "git": git_ver, "mode": args.mode, "upstream": args.upstream,
+            "quick": args.quick, "max_retries": args.max_retries, "cache_ttl": args.cache_ttl,
+            "http_cache_enabled": not args.no_http_cache, "open_loop": args.open_loop,
+            "isolated_process": True,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "scenarios": metrics_list,
         }
-        out_path = args.output
-        with open(out_path, "w") as f:
+        with open(args.output, "w") as f:
             json.dump(report, f, indent=2, ensure_ascii=False)
-        print(f"\n结构化报告已写入: {out_path}")
-
-        await router.stop()
+        print(f"\n结构化报告已写入: {args.output}")
     finally:
-        if cluster:
-            await cluster.stop()
+        server.stop()
 
 
 def main():
-    p = argparse.ArgumentParser(description="auto_squid 性能压测")
-    p.add_argument("--mode", choices=["staircase", "rate", "mixed", "soak", "all"],
+    p = argparse.ArgumentParser(description="auto_squid 性能压测(进程隔离版)")
+    p.add_argument("--mode", choices=["staircase", "rate", "mixed", "soak", "conn-reuse", "all"],
                    default="staircase", help="压测模式")
     p.add_argument("--upstream", choices=["mock", "real"], default="mock",
                    help="上游:mock(受控本地) 或 real(真实 proxies.yaml)")
     p.add_argument("--proxies", default="proxies.yaml", help="真实模式下的代理列表文件")
     p.add_argument("--real-hosts", default="",
-                   help="真实模式下压测的主机名(逗号分隔);默认内置大站池"
-                        "(www.baidu.com,www.qq.com,...)。主机名需可被上游代理解析")
+                   help="真实模式下压测的主机名(逗号分隔);默认内置大站池")
     p.add_argument("--router-port", type=int, default=10820, help="被测 Router 监听端口")
     p.add_argument("--max-retries", type=int, default=3, help="竞速首批并行数")
     p.add_argument("--cache-ttl", type=int, default=300, help="域名缓存 TTL(秒)")
-    p.add_argument("--no-http-cache", action="store_true",
-                   help="禁用 HTTP 响应缓存(测纯路由性能,隔离缓存层)")
+    p.add_argument("--no-http-cache", action="store_true", help="禁用 HTTP 响应缓存")
     p.add_argument("--duration", type=float, default=60.0, help="soak 模式时长(秒)")
+    p.add_argument("--open-loop", action="store_true", help="soak 开环模式(不限速,测真实上限)")
     p.add_argument("--quick", action="store_true", help="快速冒烟(小规模,~10s)")
-    p.add_argument("--profile", action="store_true", help="启用 cProfile 覆盖")
+    p.add_argument("--profile", action="store_true", help="启用 cProfile(仅客户端进程)")
     p.add_argument("--output", default="bench_report.json", help="JSON 报告输出路径")
     args = p.parse_args()
     try:
