@@ -8,11 +8,13 @@
 """
 
 import asyncio
-import uvicorn
-import typer
 import logging
 import sys
 from pathlib import Path
+
+import typer
+import uvicorn
+import yaml
 
 # uvloop 以约 2× 加速 asyncio 事件循环(任务调度、socket I/O),显著降低
 # CPU 开销与 P99 延时。已随 uvicorn[standard] 间接安装,此处用 try 兜底。
@@ -26,6 +28,19 @@ from .proxy_store import ProxyStore
 from .router import Router
 from .api import mount as mount_api
 from .config_schema import Config
+
+
+def _load_config(config_path: str) -> Config:
+    """加载配置:显式 --config > 当前目录 config.yaml > 全默认 Config()。
+
+    用 YAML 文件时按顶层键构造 Config(缺省字段走默认值)。
+    """
+    if config_path:
+        return Config(**yaml.safe_load(Path(config_path).read_text()))
+    default_yaml = Path("config.yaml")
+    if default_yaml.exists():
+        return Config(**yaml.safe_load(default_yaml.read_text()))
+    return Config()
 
 
 def setup_logging(cfg: Config):
@@ -70,21 +85,21 @@ app = typer.Typer()
 @app.callback(invoke_without_command=True)
 def start(config: str = "", proxies: str = "", db: str = "auto_squid.db"):
     """启动代理路由器和 API 服务。支持可选的 config.yaml / proxies.yaml 参数。"""
-    # 配置加载优先级:命令行 --config > 当前目录 config.yaml > 全默认 Config()。
-    cfg = None
-    if config:
-        import yaml
-        cfg = Config(**yaml.safe_load(Path(config).read_text()))
-    elif Path("config.yaml").exists():
-        import yaml
-        cfg = Config(**yaml.safe_load(Path("config.yaml").read_text()))
-    else:
-        cfg = Config()
+    cfg = _load_config(config)
     setup_logging(cfg)
     # 加载上游代理列表(未指定 --proxies 时用当前目录 proxies.yaml)。
     proxy_store = ProxyStore(proxies if proxies else "proxies.yaml")
     # 构造 Router 并注入配置;客户端认证参数从 cfg.router.auth 取。
-    router = Router(proxy_store, listen_host=cfg.listen.host, listen_port=cfg.listen.port, max_retries=cfg.router.max_retries, db_path=db, cache_ttl=cfg.router.cache_ttl, enable_local_racing=cfg.router.enable_local_racing, auth_enabled=cfg.router.auth.enabled, auth_username=cfg.router.auth.username, auth_password=cfg.router.auth.password)
+    router = Router(
+        proxy_store,
+        listen_host=cfg.listen.host, listen_port=cfg.listen.port,
+        max_retries=cfg.router.max_retries, db_path=db,
+        cache_ttl=cfg.router.cache_ttl,
+        enable_local_racing=cfg.router.enable_local_racing,
+        auth_enabled=cfg.router.auth.enabled,
+        auth_username=cfg.router.auth.username,
+        auth_password=cfg.router.auth.password,
+    )
     # 把 store/router 注入 FastAPI app 的模块级全局,供各端点使用。
     mount_api(proxy_store, router)
 

@@ -8,10 +8,12 @@
 (见 router._db_lock)。
 """
 
-from typing import Dict, List, Optional
-from .config_schema import ProxyInfo
-import yaml
 from pathlib import Path
+from typing import Dict, List, Optional
+
+import yaml
+
+from .config_schema import ProxyInfo
 
 
 class ProxyStore:

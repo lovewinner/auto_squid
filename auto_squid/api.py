@@ -3,9 +3,9 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import List
 
+from .config_schema import ProxyInfo
 from .proxy_store import ProxyStore
 from .router import Router
-from .config_schema import ProxyInfo
 
 app = FastAPI(title="auto_squid API")
 
@@ -80,6 +80,7 @@ async def router_config():
     if not _router:
         return {"enable_local_racing": False}
     return {"enable_local_racing": _router.enable_local_racing}
+
 
 @app.get("/domains")
 async def domains():

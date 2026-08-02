@@ -35,6 +35,7 @@ import sqlite3
 import threading
 import time
 import urllib.parse
+from datetime import datetime, timezone
 from typing import Optional, List, Any, Dict, Tuple
 import httpx
 
@@ -190,7 +191,6 @@ class Router:
         # 非线程安全,用锁串行化所有 DB 写入,避免 "database is locked"。
         # 热路径(转发)只读写下方内存缓存,不经此锁。
         self._db_lock = threading.Lock()
-        from datetime import datetime, timezone
         self._db.execute("""
             CREATE TABLE IF NOT EXISTS domain_stats (
                 domain TEXT NOT NULL,
@@ -207,7 +207,6 @@ class Router:
             )
         """)
         self._db.commit()
-        self._now_utc = lambda: datetime.now(timezone.utc).isoformat()
 
         # 内存镜像:热路径(每请求查域名缓存)只读这两份内存,不经 DB/锁。
         # _meta_cache: {domain: {'default_proxy': pid, 'updated_at': ts}}
@@ -237,6 +236,11 @@ class Router:
         self._inflight_futures: dict[str, asyncio.Future] = {}
 
     # ── DB helpers ──────────────────────────────────────────────
+
+    @staticmethod
+    def _now_utc() -> str:
+        """当前 UTC 时间的 ISO-8601 字符串(用于 domain_meta.updated_at)。"""
+        return datetime.now(timezone.utc).isoformat()
 
     def _load_caches_from_db(self):
         """启动时一次性把 domain_stats / domain_meta 载入内存镜像。
@@ -371,7 +375,6 @@ class Router:
         pid = entry["default_proxy"]
         updated_at_str = entry["updated_at"]
         try:
-            from datetime import datetime, timezone
             dt = datetime.fromisoformat(updated_at_str)
             if (datetime.now(timezone.utc) - dt).total_seconds() < self.cache_ttl:
                 return pid
@@ -1000,6 +1003,37 @@ class Router:
                     else:
                         agg_fut.set_result(None)
 
+    async def _forward_single(self, writer, method: str, url: str, hdrs: dict, body, domain: str,
+                             pid: str | None = None, instantiated=None):
+        """流式转发一个已取得胜利的响应并视情写入响应缓存,作为统一收尾。
+
+        供域名缓存命中单发 与 竞速赢家两条路径共用:流式转发 body → 关闭上游
+        流式 resp(内存),2xx/可缓存 且 body 未超上限则写响应缓存。
+        instantiated=(pid, resp) 表示已由竞速拿到的流式响应(不再 _try_http);
+        pid 非 None 表示域名缓存单发的代理 id(内部 _try_http,失败抛出让调用方回退)。
+        """
+        if pid is not None:
+            try:
+                proxy = self.proxy_store.get(pid)
+                _pid, method, url, resp, client = await self._try_http(
+                    pid, self._build_proxy_url(proxy), method, url, hdrs, body)
+            except Exception:
+                raise  # 域名缓存单发失败:让调用方回退到竞速
+        else:
+            pid, resp = instantiated
+        # 域名缓存命中单发成功 → 记一次(单发失败回退竞速的不算)。
+        if instantiated is None:
+            self.domain_cache_hits += 1
+        buffered = await self._stream_upstream_response(writer, resp, method, url)
+        try:
+            await resp.aclose()
+        except Exception:
+            pass
+        if buffered is not None and resp.status_code in CACHEABLE_STATUS:
+            self._http_cache_set(method, url, resp.status_code, resp.reason_phrase,
+                                 dict(resp.headers.items()), buffered)
+        return None
+
     async def _forward_upstream(self, writer, method: str, url: str, hdrs: dict, body, domain: str):
         """把请求转发上游(域名缓存单发 → 竞速 → 兜底竞速 → 502)。
 
@@ -1015,18 +1049,8 @@ class Router:
             cached_pid = self._get_fresh_proxy(domain)
             if cached_pid:
                 try:
-                    proxy = self.proxy_store.get(cached_pid)
-                    pid, method, url, resp, client = await self._try_http(
-                        cached_pid, self._build_proxy_url(proxy), method, url, hdrs, body)
-                    logger.debug("proxy %s cache hit %s %s", pid, method, url)
-                    # 域名缓存命中且单发成功 → 记一次(单发失败回退竞速的不算)。
-                    self.domain_cache_hits += 1
-                    buffered = await self._stream_upstream_response(writer, resp, method, url)
-                    await resp.aclose()
-                    if buffered is not None and resp.status_code in CACHEABLE_STATUS:
-                        self._http_cache_set(method, url, resp.status_code, resp.reason_phrase,
-                                             dict(resp.headers.items()), buffered)
-                    return
+                    return await self._forward_single(
+                        writer, method, url, hdrs, body, domain, cached_pid)
                 except Exception:
                     logger.debug("cached proxy %s failed for %s", cached_pid, domain)
 
@@ -1051,18 +1075,10 @@ class Router:
         if winner_resp:
             pid, method, url, resp, client = winner_resp
             logger.debug("proxy %s racing win %s %s", pid, method, url)
-            # 仅赢家更新域名缓存 meta:竞速中败者只记了 _record_attempt,不会污染
-            # _meta_cache。domain 在上方 :763 已算好(同一次 urlparse)。
+            # 仅赢家更新域名缓存 meta:竞速中败者只记了 _record_attempt,不会反被
+            # 覆写 _meta_cache;domain 在上方已算好(同一 urlparse)。
             self._record_win_meta(domain, pid)
-            buffered = await self._stream_upstream_response(writer, resp, method, url)
-            try:
-                await resp.aclose()
-            except Exception:
-                pass
-            if buffered is not None and resp.status_code in CACHEABLE_STATUS:
-                self._http_cache_set(method, url, resp.status_code, resp.reason_phrase,
-                                     dict(resp.headers.items()), buffered)
-            return
+            return await self._forward_single(writer, method, url, hdrs, body, domain, instantiated=(pid, resp))
 
         logger.error("all proxies failed for HTTP request")
         await self._write_cached_response(writer, 502, 'Bad Gateway', {'Content-Type': 'text/plain'}, b'Bad Gateway')
@@ -1157,32 +1173,44 @@ class Router:
             tasks.add(asyncio.create_task(self._try_tunnel('local', target, None, None, None)))
         return tasks
 
+    async def _connect_established(self, client_writer, up_writer):
+        """回写 CONNECT 200 并对客户端与上游连接设 TCP_NODELAY。"""
+        self._set_nodelay(client_writer)
+        self._set_nodelay(up_writer)
+        client_writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        await client_writer.drain()
+
+    @staticmethod
+    async def _relay_tunnel(client_reader, up_writer, up_reader, client_writer):
+        """双向透传一个已建立的隧道,任一方向结束即关闭上游连接。"""
+        try:
+            await asyncio.gather(
+                Router._pipe(client_reader, up_writer),
+                Router._pipe(up_reader, client_writer))
+        finally:
+            try:
+                up_writer.close()
+                await up_writer.wait_closed()
+            except Exception:
+                pass
+
     async def _handle_connect(self, target: str, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter):
         """处理 CONNECT 请求:建立到 target 的隧道并双向透传数据。
 
         决策顺序与 HTTP 类似:域名缓存命中 → 单发隧道;否则竞速(首批
-        max_retries,失败对剩余兜底)。胜出后回写 "200 Connection established",
-        用两个反向 _pipe 做客户端↔上游的双向透传,任一方向结束即关闭。
-        全失败回写 502。认证已在 handle_client 完成,此处不再校验。
+        max_retries,失败对剩余兜底)。胜出后回 200,用两个反向 _pipe
+        双向透传,任一方向结束即关闭。全失败回写 502。认证已在
+        handle_client 完成,此处不再校验。
         """
         # 1) 域名缓存命中:用上次胜出的代理单发隧道(只记尝试统计),失败回退竞速。
         cached_pid = self._get_fresh_proxy(target)
         if cached_pid:
+            proxy = self.proxy_store.get(cached_pid)
             try:
-                proxy = self.proxy_store.get(cached_pid)
                 pid, up_reader, up_writer = await self._try_tunnel(cached_pid, target, proxy.host, proxy.port, proxy.auth)
                 logger.debug("proxy %s cache hit CONNECT %s", pid, target)
-                self._set_nodelay(client_writer)
-                self._set_nodelay(up_writer)
-                client_writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
-                await client_writer.drain()
-                # 双向透传:客户端→上游 与 上游→客户端 同时搬运,任一结束即终止。
-                await asyncio.gather(self._pipe(client_reader, up_writer), self._pipe(up_reader, client_writer))
-                try:
-                    up_writer.close()
-                    await up_writer.wait_closed()
-                except Exception:
-                    pass
+                await self._connect_established(client_writer, up_writer)
+                await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer)
                 return
             except Exception:
                 logger.debug("cached proxy %s failed CONNECT %s", cached_pid, target)
@@ -1212,17 +1240,8 @@ class Router:
             logger.debug("proxy %s racing CONNECT to %s for client %s", pid, target, client_peer)
             # 仅赢家更新域名缓存 meta(用 target 作 domain key);败者只记了尝试统计。
             self._record_win_meta(target, pid)
-            self._set_nodelay(client_writer)
-            self._set_nodelay(up_writer)
-            client_writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
-            await client_writer.drain()
-            # 双向透传(同上)。
-            await asyncio.gather(self._pipe(client_reader, up_writer), self._pipe(up_reader, client_writer))
-            try:
-                up_writer.close()
-                await up_writer.wait_closed()
-            except Exception:
-                pass
+            await self._connect_established(client_writer, up_writer)
+            await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer)
             return
 
         # 3) 全失败:回写 502 并关闭客户端连接。

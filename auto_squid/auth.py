@@ -58,8 +58,7 @@ def check_auth(headers: dict[str, str], auth_enabled: bool,
         # 用常量时间比较,避免通过响应耗时推断用户名/密码的逐字符差异。
         if hmac.compare_digest(username, expected_username) and hmac.compare_digest(password, expected_password):
             return True, None
-        else:
-            return False, "Authentication failed"
+        return False, "Authentication failed"
     except Exception as e:
         # base64 解码失败、缺冒号、缺空格等任意格式异常都归为格式错误,
         # 记录日志便于排查,但不向客户端暴露具体异常细节。
