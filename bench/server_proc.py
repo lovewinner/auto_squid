@@ -212,22 +212,24 @@ async def _serve(config: dict):
 
     finally:
         # 优雅关闭:停 uvicorn → 停采样 → router.stop → cluster.stop。
-        if server is not None:
+        # 启动中途失败时这些变量可能未绑定,全部防御性处理,避免掩盖真实错误。
+        if 'server_task' in locals() and server_task is not None:
             server.should_exit = True
             try:
                 await asyncio.wait_for(server_task, timeout=3.0)
             except (asyncio.TimeoutError, Exception):
                 pass
-        if sampler_task is not None:
+        if 'sampler_task' in locals() and sampler_task is not None:
             sampler_task.cancel()
             try:
                 await sampler_task
             except (asyncio.CancelledError, Exception):
                 pass
-        try:
-            await router.stop()
-        except Exception as e:
-            print(f"ERROR router stop: {e}", file=sys.stderr, flush=True)
+        if 'router' in locals():
+            try:
+                await router.stop()
+            except Exception as e:
+                print(f"ERROR router stop: {e}", file=sys.stderr, flush=True)
         if cluster is not None:
             try:
                 await cluster.stop()

@@ -571,14 +571,15 @@ async def run_concurrent(make_request, total: int, concurrency: int,
                          progress_interval: float = 0.0) -> list:
     """以固定并发数跑 total 个请求(阶梯/混合/连接复用用)。返回结果列表。
 
-    progress_interval > 0 时,每隔该秒数打印一次完成进度(混合等长跑场景用,
-    避免全程无输出);默认 0 关闭。
+    progress_interval > 0 时,按进度里程碑打印完成数(混合等长跑场景用,避免
+    全程无输出)。打印按时间节流:同一秒内只打一次,避免快速跑刷屏。默认 0 关闭。
     """
     sem = asyncio.Semaphore(concurrency)
     results: list = []
     done = 0
-    last_print = time.monotonic()
+    last_print = -1.0
     t0 = time.monotonic()
+    milestone = max(1, total // 10)  # 每 10% 一档
 
     async def one(i):
         async with sem:
@@ -588,9 +589,11 @@ async def run_concurrent(make_request, total: int, concurrency: int,
     for t in asyncio.as_completed(tasks):
         results.append(await t)
         done += 1
-        if progress_interval and time.monotonic() - last_print >= progress_interval:
-            print(f"  t={time.monotonic()-t0:.0f}s  done={done}/{total}")
-            last_print = time.monotonic()
+        if progress_interval:
+            now = time.monotonic() - t0
+            if done % milestone == 0 and now - last_print >= 1.0:
+                print(f"  t={now:.0f}s  done={done}/{total}  ({done*100//total}%)")
+                last_print = now
     return results
 
 
@@ -683,7 +686,7 @@ def _check_correctness(result: ScenarioResult, host_kind: str, url: bytes):
 async def scenario_staircase(router_host: str, router_port: int, host_set: HostSet,
                              quick: bool, metrics_base: str) -> ScenarioResult:
     """并发阶梯:并发数 1→N,每级固定请求数,测吞吐与延迟随并发的变化,找饱和点。"""
-    levels = [1, 10, 50, 100, 200] if not quick else [1, 10, 50]
+    levels = [1, 10, 50, 100, 200, 400, 800] if not quick else [1, 10, 50, 100]
     per_level = 200 if not quick else 50
     result = ScenarioResult(name="staircase", duration=0.0, client_requests=0)
     stop_evt = asyncio.Event()
