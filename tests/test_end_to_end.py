@@ -1145,3 +1145,82 @@ async def test_http_cache_invalidated_by_write_method():
         await router.stop()
         proxy_srv.close()
         await proxy_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_thundering_herd_avoided():
+    """并发 GET 同一 URL 应去重聚合,上游只命中 1 次(Cache Stampede Protection)。
+
+    无聚合时,N 个并发 GET 到同一未缓存 URL 会全部触发上游竞速(放大 N 倍)。
+    引入 _inflight_futures 后,首个请求在途时其余请求 await 其 Future,复用结果,
+    上游只被命中 1 次。断言:10 个并发 GET 全部成功返回相同 body,且上游仅命中 1。
+    """
+    hit = []
+    proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=hit)
+    proxy_store = ProxyStore()
+    proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        url = b"http://herd.example.com/api/items"
+
+        async def one_get():
+            return await send_http_get(HOST, ROUTER_PORT, url=url)
+
+        # 10 个并发 GET 同一 URL。
+        bodies = await asyncio.gather(*[one_get() for _ in range(10)])
+        assert all(b == b"proxied" for b in bodies), "all responses should be identical"
+        assert len(hit) == 1, \
+            f"thundering herd: 10 concurrent GETs should hit upstream once, got {len(hit)}"
+        # 聚合后无缓存命中(首个请求写缓存,后续 waitee 直接走 Future,不计 hit)。
+        counters = router.snapshot_counters()
+        assert counters["http_cache_entries"] == 1, \
+            f"first GET should have cached the response, entries={counters['http_cache_entries']}"
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_coalescing_timeout_falls_back():
+    """聚合等待超时(慢上游)时,waiter 应放弃聚合、自行竞速,不悬挂。
+
+    用延迟 0.5s 的慢上游 mock:首个 GET 在途时,后续并发 GET await Future。
+    若无超时保护,waiter 会无限等待首个请求(慢)完成 → 连接堆积(fd 暴涨)。
+    加固后 waiter 在 _AGG_WAIT_TIMEOUT(0.2s)后放弃聚合、自行竞速。
+    断言:
+    1. 所有并发请求都在有限时间内完成(无悬挂)——整体 < 2s。
+    2. 上游被命中 >1 次(首个请求 + 放弃聚合的 waiter 各自竞速)。
+
+    注意用 2 并发而非更大:慢上游下 httpx 连接池对同一 client 的 HTTP/1.1
+    连接不允许并发复用(首个请求占连接 0.5s 期间,后续请求复用会 ReadError),
+    这是连接池的既有行为,与聚合超时无关,故用 2 并发避开。
+    """
+    proxy_srv = await run_mock_proxy_tagged(HOST, PROXY_PORT, tag='slow',
+                                            pre_header_delay=0.5)
+    proxy_store = ProxyStore()
+    proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        url = b"http://slow-herd.example.com/api/items"
+
+        async def one_get():
+            return await send_http_get(HOST, ROUTER_PORT, url=url)
+
+        import time
+        t0 = time.monotonic()
+        bodies = await asyncio.wait_for(asyncio.gather(*[one_get() for _ in range(2)]),
+                                        timeout=3.0)
+        elapsed = time.monotonic() - t0
+        # 全部成功且 body 正确(慢 mock 返回 'slow')。
+        assert all(b == b"slow" for b in bodies), f"all responses should be 'slow', got {bodies}"
+        # 无悬挂:首个 0.5s,waiter 0.2s 超时后竞速又 0.5s,最坏 ~1.2s;远小于 3s。
+        assert elapsed < 2.0, f"requests hung: took {elapsed:.2f}s"
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()

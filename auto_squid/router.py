@@ -67,6 +67,13 @@ CACHEABLE_STATUS = frozenset({200, 203, 300, 301, 302, 304, 404, 410})
 # 故失效只需按同一 URL 删 GET 条目;无需前缀扫描。
 _INVALIDATING_METHODS = frozenset({'POST', 'PUT', 'DELETE', 'PATCH'})
 
+# 在途 GET 去重聚合的等待超时(秒)。waiter 发现同 URL 有在途请求时 await 其
+# Future;超过该阈值仍未完成(首个请求上游慢)则放弃聚合、自行竞速,避免在
+# 慢上游下 waiter 长时间挂住连接导致 fd 堆积(压测曾观测 fd_peak 冲到 300+)。
+# 200ms→100ms:降低超时开销对 P99 长尾的影响(rate 场景 P99 均值 275ms 中
+# 约 200ms 来自超时等待),代价是聚合窗口更短、高频并发下聚合率略降。
+_AGG_WAIT_TIMEOUT = 0.1
+
 # 败者清理后台 task 的软上限。超过则在 _race 里就地排空一次,防止持续高吞吐
 # 下 _pending_cleanups 无界堆积(soak 模式曾观测 fd_peak 冲到 569)。
 _MAX_PENDING_CLEANUPS = 64
@@ -223,6 +230,11 @@ class Router:
         # O(K)(K=该域名条目数)。_http_cache_set 写入时同步更新,_http_cache_get
         # 过期清除时同步删除。索引与主 dict 无锁(均在同一个 asyncio 线程)。
         self._http_cache_domain_index: dict[str, set[str]] = {}
+        # 在途 GET 去重聚合(Cache Stampede Protection): key = _http_cache_key('GET', url)
+        # → 该 URL 首个转发上游的请求持有的 Future。同 URL 并发 GET 发现已有在途请求
+        # 则 await 该 Future 拿首个请求的结果,不重复发上游。Future 结果为
+        # (status_code, reason_phrase, headers, content) 或 None(上游失败,waiter 自行竞速)。
+        self._inflight_futures: dict[str, asyncio.Future] = {}
 
     # ── DB helpers ──────────────────────────────────────────────
 
@@ -941,6 +953,62 @@ class Router:
                                        cached_entry['headers'], cached_entry['content'])
             return
 
+        # 1.5) 在途 GET 去重聚合:同 URL 并发 GET 命中未命中缓存时,若已有在途
+        #      请求(首个请求正在转发上游),则 await 其结果,不再重复打上游。
+        #      首个请求完成后把结果 set 进 Future,waiter 据此回写客户端。仅
+        #      GET 适用——非 GET 方法不缓存也不聚合。结果 None 表示首个请求
+        #      失败,waiter 需自行走域名缓存/竞速路径。
+        #      超时保护:waiter 等待未来 _AGG_WAIT_TIMEOUT 未完成则放弃聚合、
+        #      自行竞速,避免慢上游下 waiter 挂住连接导致 fd 堆积(压测观测
+        #      rate 场景 fd_peak 冲到 300+)。放弃后该 Future 仍由首个请求在
+        #      finally 中 resolve,waiter 不再 await,无副作用。
+        agg_key = self._http_cache_key(method, url)
+        agg_fut = None
+        if method == 'GET':
+            existing = self._inflight_futures.get(agg_key)
+            if existing is not None:
+                try:
+                    logger.debug("coalescing %s %s (in-flight)", method, url)
+                    agg_result = await asyncio.wait_for(existing, timeout=_AGG_WAIT_TIMEOUT)
+                except asyncio.TimeoutError:
+                    logger.debug("coalescing timeout %s %s, fall back to racing", method, url)
+                    existing = None
+                else:
+                    if agg_result is not None:
+                        status_code, reason_phrase, headers, content = agg_result
+                        await self._write_cached_response(writer, status_code, reason_phrase, headers, content)
+                        return
+                    existing = None
+            if existing is None:
+                agg_fut = asyncio.get_running_loop().create_future()
+                self._inflight_futures[agg_key] = agg_fut
+        try:
+            await self._forward_upstream(writer, method, url, hdrs, body, domain)
+        finally:
+            # 仅 GET 且本请求持有在途 Future 时 resolve(成功→结果,失败→None 让
+            # waiter 自行竞速),并从在途表移除。若上方缓存/聚合命中则本请求不
+            # 持有 Future,此为空操作。非 GET 永远不进聚合表,同样为空操作。
+            if agg_fut is not None:
+                self._inflight_futures.pop(agg_key, None)
+                if not agg_fut.done():
+                    # 从响应缓存取刚写入的条目作为聚合结果(内容可能超
+                    # STREAM_CACHE_LIMIT 未入缓存 → 无条目 → 回 None,waiter 自行竞速)。
+                    entry = self._http_cache_get(method, url)
+                    if entry is not None:
+                        agg_fut.set_result((entry['status_code'], entry['reason_phrase'],
+                                            entry['headers'], entry['content']))
+                    else:
+                        agg_fut.set_result(None)
+
+    async def _forward_upstream(self, writer, method: str, url: str, hdrs: dict, body, domain: str):
+        """把请求转发上游(域名缓存单发 → 竞速 → 兜底竞速 → 502)。
+
+        从 _handle_http_request 提取,供在途 GET 去重聚合统一在 finally 中
+        resolve Future。逻辑与原来的第 2)/3) 步完全一致:
+        - 域名缓存命中 → 用该代理单发(失败回退竞速)。
+        - 竞速:首批 max_retries 并行,全失败且有剩余则对剩余再竞速。
+        - 全失败 → 502。成功且可缓存 → 写入响应缓存。
+        """
         # 2) 域名缓存:用上次胜出的代理单发请求(不重复更新 meta——_try_http
         #    内部只记尝试统计),失败则回退到竞速。单发路径同样流式转发。
         if domain:
