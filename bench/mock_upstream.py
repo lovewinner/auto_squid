@@ -25,11 +25,17 @@ auto_squid 的上游。目的是让压测**可控、可重复、可归因**:延�
 
 import asyncio
 import logging
+import random
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# 分块发送 body 的单块字节数(chunked 的块粒度与 content-length 的分段写共用)。
+_BODY_CHUNK = 65536
+# CONNECT 隧道回显的缓冲读大小。
+_TUNNEL_BUFSIZE = 4096
 
 
 @dataclass
@@ -120,25 +126,34 @@ def _host_from(first: str, headers: dict) -> str:
 
 async def _send_body(writer, body: bytes, chunked: bool, chunk_delay: float):
     """按 chunked 或 content-length 发送 body(分块 + 间隔)。"""
-    if chunked:
-        step = 65536
-        for i in range(0, len(body), step):
-            piece = body[i:i + step]
+    for i in range(0, len(body), _BODY_CHUNK):
+        piece = body[i:i + _BODY_CHUNK]
+        if chunked:
             writer.write(f"{len(piece):X}\r\n".encode())
-            writer.write(piece)
+        writer.write(piece)
+        if chunked:
             writer.write(b"\r\n")
-            await writer.drain()
-            if chunk_delay:
-                await asyncio.sleep(chunk_delay)
+        await writer.drain()
+        if chunk_delay:
+            await asyncio.sleep(chunk_delay)
+    if chunked:
         writer.write(b"0\r\n\r\n")
         await writer.drain()
-    else:
-        step = 65536
-        for i in range(0, len(body), step):
-            writer.write(body[i:i + step])
+
+
+async def _connect_tunnel(reader, writer, upstream: MockUpstream):
+    """CONNECT 隧道:回 200 后原样回显双向数据,直到对端关闭。"""
+    writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+    await writer.drain()
+    try:
+        while True:
+            data = await asyncio.wait_for(reader.read(_TUNNEL_BUFSIZE), timeout=10)
+            if not data:
+                break
+            writer.write(data)
             await writer.drain()
-            if chunk_delay:
-                await asyncio.sleep(chunk_delay)
+    except (asyncio.TimeoutError, Exception):
+        pass
 
 
 async def _handle(reader, writer, upstream: MockUpstream):
@@ -152,17 +167,7 @@ async def _handle(reader, writer, upstream: MockUpstream):
         if first.upper().startswith('CONNECT'):
             upstream.connect_count += 1
             await asyncio.sleep(upstream.base_delay)
-            writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
-            await writer.drain()
-            try:
-                while True:
-                    data = await asyncio.wait_for(reader.read(4096), timeout=10)
-                    if not data:
-                        break
-                    writer.write(data)
-                    await writer.drain()
-            except (asyncio.TimeoutError, Exception):
-                pass
+            await _connect_tunnel(reader, writer, upstream)
             return
         # HTTP 代理路径
         host = _host_from(first, headers)
@@ -170,12 +175,10 @@ async def _handle(reader, writer, upstream: MockUpstream):
         total_delay = prof.first_byte_delay + upstream.base_delay
         if total_delay:
             await asyncio.sleep(total_delay)
-        if prof.fail_rate > 0:
-            import random
-            if random.random() < prof.fail_rate:
-                writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                await writer.drain()
-                return
+        if prof.fail_rate > 0 and random.random() < prof.fail_rate:
+            writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+            return
         upstream.hit_count += 1
         body = b"x" * prof.body_size
         writer.write(b"HTTP/1.1 200 OK\r\n")

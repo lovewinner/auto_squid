@@ -56,9 +56,11 @@ def _build_mock_cluster(mock_specs: list, start_port: int = 31200) -> UpstreamCl
     """
     specs = []
     for base_delay, prof_dicts in mock_specs:
+        # 用关键字参数(而非位置参数)构造,避免 Profile 字段顺序变动的隐式破坏。
         profs = [ResponseProfile(
-            p["host_prefix"], p["first_byte_delay"], p["body_size"],
-            p["chunked"], p["chunk_delay"], p["fail_rate"]) for p in prof_dicts]
+            host_prefix=p["host_prefix"], first_byte_delay=p["first_byte_delay"],
+            body_size=p["body_size"], chunked=p["chunked"],
+            chunk_delay=p["chunk_delay"], fail_rate=p["fail_rate"]) for p in prof_dicts]
         specs.append((base_delay, profs))
     return UpstreamCluster(specs, start_port=start_port)
 
@@ -217,14 +219,14 @@ async def _serve(config: dict):
             server.should_exit = True
             try:
                 await asyncio.wait_for(server_task, timeout=3.0)
-            except (asyncio.TimeoutError, Exception):
-                pass
+            except Exception:
+                pass  # 无论超时还是异常,都让位给后续清理
         if 'sampler_task' in locals() and sampler_task is not None:
             sampler_task.cancel()
             try:
                 await sampler_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            except asyncio.CancelledError:
+                pass  # 取消采样器属预期路径,忽略
         if 'router' in locals():
             try:
                 await router.stop()
