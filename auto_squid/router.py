@@ -14,6 +14,8 @@
   (内存镜像 _meta_cache + _get_fresh_proxy)。
 - HTTP 响应缓存:幂等 GET 的成功响应在内存缓存 60s(_http_cache_*),遵循
   Cache-Control;流式转发时边转边缓冲(带上限),缓冲满或响应过大则放弃缓存。
+  写方法(POST/PUT/DELETE/PATCH)在转发前失效该域名的所有 GET 缓存
+  (_http_cache_invalidate),使变更后的 GET 回源拿新内容,而非 60s 内返回旧响应。
 - 数据持久化用 SQLite(domain_stats / domain_meta):内存累加 + 后台周期批量
   落盘(_stats_cache / _meta_dirty / _flush_loop),热路径无逐请求 fsync。
 - 客户端认证:可选 HTTP Basic,在 handle_client 分流前统一校验(auth.check_auth)。
@@ -58,6 +60,12 @@ FLUSH_INTERVAL = 5.0
 # (压测见 http_cache_entries_end 恒为 0)。5xx/4xx 中仅 404/410 安全可缓存
 # (其余如 502 可能瞬态,缓存会放大故障)。
 CACHEABLE_STATUS = frozenset({200, 203, 300, 301, 302, 304, 404, 410})
+
+# 会改写资源的请求方法。命中即失效该 URL 的 GET 响应缓存,使随后的 GET
+# 回源拿到变更后的内容,而不是 60s TTL 内返回变更前的旧响应体。缓存键为
+# "GET:<url>",写方法不会被缓存(_http_cache_set 对非 GET 直接 return),
+# 故失效只需按同一 URL 删 GET 条目;无需前缀扫描。
+_INVALIDATING_METHODS = frozenset({'POST', 'PUT', 'DELETE', 'PATCH'})
 
 # 败者清理后台 task 的软上限。超过则在 _race 里就地排空一次,防止持续高吞吐
 # 下 _pending_cleanups 无界堆积(soak 模式曾观测 fd_peak 冲到 569)。
@@ -419,6 +427,27 @@ class Router:
             'content': content,
             'cached_at': time.time(),
         }
+
+    def _http_cache_invalidate(self, domain: str) -> None:
+        """清空某域名下所有 GET 响应缓存条目。
+
+        写方法(POST/PUT/DELETE/PATCH)改写资源后调用。按域名而非按 URL 失效:
+        添加动作常打 POST /api/items,而刷新的列表页是 GET /,两者 URL 不同,
+        按 URL 精确失效会漏掉列表页缓存,导致刷新仍返回旧内容。整域清空可覆盖
+        同站任意路径的 GET。缓存键为 "GET:<url>",逐项比对 urlparse(url).hostname
+        与 domain 是否一致,命中即删(边遍历边删需先收集键)。
+        提前(转发前)失效:即便写请求最终失败,后果也仅是下次 GET 多回源一次,
+        不会返回错误内容。enable_http_cache=False 时缓存本就空,此处为空操作。
+        """
+        stale = []
+        for key in self._http_cache:
+            # 缓存键为 "GET:<绝对url>",去掉 "GET:" 前缀还原 url 再取 host。
+            cached_url = key[len('GET:'):] if key.startswith('GET:') else key
+            cached_host = urllib.parse.urlparse(cached_url).hostname or cached_url
+            if cached_host == domain:
+                stale.append(key)
+        for key in stale:
+            del self._http_cache[key]
 
     # ── 上游连接池 ──────────────────────────────────────────────
 
@@ -878,6 +907,15 @@ class Router:
         # 计数:进入 HTTP 处理先记一次 miss;响应缓存命中分支会把它翻成 hit。
         # 入口先记 miss 是为避免漏计多条 return 路径(竞速成功/全失败/域名缓存命中)。
         self.http_cache_misses += 1
+
+        # 0) 写方法失效:POST/PUT/DELETE/PATCH 改写资源,提前清掉该域名的所有
+        #    GET 缓存条目,使随后的 GET 回源拿新内容(否则 60s TTL 内会返回变更
+        #    前旧响应)。按域名失效而非按 URL:添加动作常打 POST /api/items,而
+        #    刷新的列表页是 GET /,URL 不同,按 URL 精确失效会漏掉列表页。放在
+        #    缓存读取前、转发前,覆盖所有后续 return 路径;写请求即便最终失败,
+        #    后果也只是下次 GET 多回源一次。
+        if method.upper() in _INVALIDATING_METHODS:
+            self._http_cache_invalidate(domain)
 
         # 1) HTTP 响应缓存:GET 幂等响应直接命中,完全不经上游。
         cached_entry = self._http_cache_get(method, url)

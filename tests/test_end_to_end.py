@@ -1094,3 +1094,54 @@ async def test_domain_cache_hit_counter():
         await router.stop()
         proxy_srv.close()
         await proxy_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_http_cache_invalidated_by_write_method():
+    """写方法(POST/PUT/DELETE/PATCH)必须失效该域名的 GET 响应缓存。
+
+    覆盖两点:(a) 同 URL 失效——POST 后再 GET 同 URL 应回源;(b) 跨 URL 同域名
+    失效——这是真实场景的核心:添加动作常打 POST /api/items,而刷新的列表页是
+    GET /,两者 URL 不同。按 URL 精确失效会漏掉列表页,导致刷新仍返回旧内容;
+    故失效必须按域名整域清空。
+    """
+    hit = []
+    proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=hit)
+    proxy_store = ProxyStore()
+    proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        list_url = b"http://write-invalidate.example.com/"          # GET 列表页
+        api_url = b"http://write-invalidate.example.com/api/items"  # POST 添加
+
+        # (a) 同 URL 失效:GET 填缓存 → POST 失效 → GET 应回源。
+        await send_http_get(HOST, ROUTER_PORT, url=list_url)   # 上游 1(回源+缓存)
+        await send_http_get(HOST, ROUTER_PORT, url=list_url)   # 命中缓存,上游仍 1
+        assert len(hit) == 1, "second GET should have hit the response cache"
+
+        await send_http_post(HOST, ROUTER_PORT, api_url, b'{"add":"item"}')  # 上游 2
+        assert len(hit) == 2, "POST should have been forwarded upstream"
+        assert router.snapshot_counters()["http_cache_entries"] == 0, \
+            "POST must have invalidated the GET cache entry for its domain"
+
+        await send_http_get(HOST, ROUTER_PORT, url=list_url)  # 缓存已失效,上游 3
+        assert len(hit) == 3, \
+            f"GET after POST should re-hit upstream, got hits={len(hit)} (stale cache served)"
+
+        # (b) 跨 URL 同域名失效:用另一个列表页 /list 填缓存(URL 与 /api/items 不同),
+        #     再 POST /api/items(又是一个不同 URL),应清掉整域缓存 → 再 GET /list 应回源。
+        list_url_b = b"http://write-invalidate.example.com/list"  # 与 api_url 不同的 URL
+        await send_http_get(HOST, ROUTER_PORT, url=list_url_b)   # 上游 4(回源+缓存)
+        assert len(hit) == 4, f"expected 4 upstream hits, got {len(hit)}"
+        await send_http_post(HOST, ROUTER_PORT, api_url, b'{"delete":5}')  # 上游 5,且应失效整域
+        assert len(hit) == 5
+        await send_http_get(HOST, ROUTER_PORT, url=list_url_b)   # 整域已失效,上游 6
+        assert len(hit) == 6, \
+            "GET list page after POST to a different URL must re-hit upstream " \
+            f"(domain-wide invalidation), got hits={len(hit)}"
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
