@@ -2,7 +2,7 @@
 
 Lightweight forward proxy with parallel racing, domain-based caching, an HTTP response cache, and SQLite-persisted stats.
 
-> [中文说明 →](README_cn.md)
+> [中文说明 →](README_CN.md)
 
 ## Overview
 
@@ -130,7 +130,7 @@ Client ──HTTP/S──> auto_squid (proxy :10808)
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /` | Web UI dashboard (domain stats, default proxies, auto-refresh) |
+| `GET /` | Web UI dashboard (domain stats, default proxies, auto-refresh; click a stat card to filter domains by Default Proxy) |
 | `GET /health` | Health check |
 | `GET /proxies` | List configured proxies |
 | `POST /proxies` | Add a proxy (JSON body) |
@@ -194,6 +194,10 @@ python -m bench.stress --profile
 
 # Point at real upstream proxies instead of the mock cluster
 python -m bench.stress --upstream real --proxies proxies.yaml
+
+# Run N rounds of the SAME condition (fresh subprocess + SQLite + caches per round)
+# and report mean±stddev to cancel out environment noise (default 3)
+python -m bench.stress --rounds 5
 ```
 
 Modes:
@@ -206,6 +210,8 @@ Modes:
 | `soak` | fixed concurrency, sustained (default 60s) | **stability / resource leaks** |
 
 Key metrics: throughput (req/s), TTFB & total at P50/P95/P99, error rate by category, **cache hit rate** and **racing amplification** (derived from the mock hit counters), and resource samples (RSS, fd count, connection-pool size, HTTP-cache entries). Results print to the terminal and are written to `bench_report.json` (tagged with the git revision, so runs are diffable across versions).
+
+**Multi-round (`--rounds N`, default 3):** each round runs the same scenario on a fresh `server_proc` subprocess with a fresh SQLite DB, caches, and mock upstreams, so inter-round variance is pure environment noise. The report then gives per-metric **mean ± stddev** (plus `round_results` for per-round data and `aggregates` for min/max/mean/stddev); `--rounds 1` keeps the report byte-identical to the single-round schema.
 
 ## Limitations
 

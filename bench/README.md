@@ -14,6 +14,21 @@
 
 服务端性能计数器(缓存命中/竞速扇出/CPU/事件循环延迟)经子进程的管理 API(`/metrics` `/server-stats`)跨进程拉取,在 mock 与 real **两种模式统一**计算缓存命中率与竞速放大率(real 模式不再记 N/A)。
 
+## 多轮取均值(`--rounds N`)
+
+单次结果易受环境扰动(CPU 争抢、网络抖动等)。`--rounds N`(默认 3)让同一条件跑 N 轮,报告给均值±标准差,规避单次噪声:
+
+- **每轮全新子进程**:独立的 `server_proc`、独立的 tempfile SQLite DB、全新的 Router 缓存与计数、全新的 mock 上游实例。
+- **条件完全一致**:`mock_specs`(mock 集群规格)在循环外只算一次,每轮相同;唯一的跨轮差异是进程启动时机与机器负载——即**纯环境噪声**。
+- **报告结构**:`rounds`(轮数)、`round_results`(每轮完整报告列表)、`aggregates`(每项指标的 min/max/mean/stddev);顶层 `scenarios` 为跨轮**均值视图**,schema 与单轮报告完全一致,旧式跨版本 diff 不受影响。
+- **`--rounds 1`** 时输出与旧版**逐字节兼容**(无 `round_results`/`aggregates`)。
+
+```bash
+python -m bench.stress --quick --rounds 3        # 快速:3 轮,看方差
+python -m bench.stress --mode all --rounds 5     # 全模式 × 5 轮
+python -m bench.stress --rounds 2 --profile      # profile 只覆盖第 1 轮
+```
+
 ## 快速开始
 
 ```bash
@@ -40,6 +55,10 @@ python -m bench.stress --mode soak --open-loop --duration 30
 
 # cProfile 覆盖(仅客户端进程,输出 bench_profile.txt)
 python -m bench.stress --profile
+
+# 同一条件跑 3 轮(默认),每轮全新子进程/SQLite/缓存,取均值去环境噪声
+python -m bench.stress --rounds 3
+python -m bench.stress --rounds 5 --mode all
 ```
 
 ## 压测模式
@@ -100,6 +119,7 @@ HTTP 响应缓存会掩盖路由路径的真实性能(缓存命中后 TTFB 极�
 
 - 同一 mock 配置 + 同一 Router 代码,多次跑结果可重复(延迟确定性高)。
 - JSON 报告带 git 版本,跨提交/跨优化可 diff。**注:本版报告结构已重新分组**(requests/throughput/latency/cache/racing/resources/correctness/attribution),与旧版 `bench_report_*.json` 不兼容,需用同结构报告对比。
+- **多轮报告**:`--rounds N`(N>1)新增顶层 `rounds`/`round_results`/`aggregates`,`scenarios` 仍是跨轮均值视图(字段类型与单轮一致);`--rounds 1` 报告与旧版 schema 完全一致。
 
 ## 输出示例
 
@@ -114,4 +134,17 @@ HTTP 响应缓存会掩盖路由路径的真实性能(缓存命中后 TTFB 极�
   资源          : RSS=40MB  fd=9  池末值=2  服务端CPU=14%  loop-lag p95=0.50ms max=0.50ms
   正确性        : ✓ 校验 300 通过 / 0 失败
   归因          : 上游触顶=False  瓶颈=proxy
+```
+
+多轮(`--rounds 3`)时每个场景先打每轮紧凑表 + 均值±标准差,再打 round 0 详细块:
+
+```
+■ 场景: staircase
+  轮次  完成rps  注入rps  TTFB p50   p95      p99    err%    缓存%
+  [1/3]    151     151    8.5   214.1   342.8   0.00    89.2
+  [2/3]    148     148    8.9   220.0   350.1   0.00    88.9
+  [3/3]    153     153    8.1   209.9   340.2   0.00    89.5
+  均值          150.7±2.5 req/s  TTFB p50 8.5±0.4  p95 214.7±5.1  p99 344.4±5.0  err 0.00%  缓存 89.2%±0.3
+  请求          : 客户端 200 (成功 200, 失败 0, 注入 200, 预热 40)
+  ...
 ```

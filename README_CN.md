@@ -12,7 +12,7 @@
 - **HTTP 响应缓存**：幂等 `GET` 响应在内存中缓存（TTL 60s，遵循 `Cache-Control`）
 - **本机竞速**：可选，让网关主机自身作为代理节点直接参与竞速（不走上游）
 - **域名统计**：各域名胜出次数持久化到 SQLite，重启不丢失
-- **Web 界面**：内置仪表盘 `/`，可浏览域名统计、默认代理、胜出次数，支持自动刷新
+- **Web 界面**：内置仪表盘 `/`，可浏览域名统计、默认代理、胜出次数，支持自动刷新；点击统计卡片可过滤出以该代理为 Default Proxy 的域名
 
 ## 功能
 
@@ -130,7 +130,7 @@ curl -x http://admin:secret@127.0.0.1:10808 http://example.com
 
 | 端点 | 说明 |
 |------|------|
-| `GET /` | Web 仪表盘（域名统计、默认代理、自动刷新） |
+| `GET /` | Web 仪表盘（域名统计、默认代理、自动刷新；点击统计卡片可按 Default Proxy 过滤域名） |
 | `GET /health` | 健康检查 |
 | `GET /proxies` | 列出已配置代理 |
 | `POST /proxies` | 添加代理（JSON body） |
@@ -194,6 +194,9 @@ python -m bench.stress --profile
 
 # 指向真实上游代理(替代 mock 集群)
 python -m bench.stress --upstream real --proxies proxies.yaml
+
+# 同一条件跑 N 轮(每轮全新子进程/SQLite/缓存),取均值±标准差去环境噪声(默认 3)
+python -m bench.stress --rounds 5
 ```
 
 模式:
@@ -206,6 +209,8 @@ python -m bench.stress --upstream real --proxies proxies.yaml
 | `soak` | 固定并发长时持续(默认 60s) | **稳定性与资源泄漏** |
 
 关键指标:吞吐(req/s)、TTFB 与 total 的 P50/P95/P99、错误率(按类型分类)、**缓存命中率**与 **racing 放大率**(由 mock 命中计数器推导)、以及资源采样(RSS、文件描述符数、连接池大小、HTTP 缓存条目数)。结果在终端以表格输出,并写入 `bench_report.json`(带 git 版本号,跨版本可 diff)。
+
+**多轮取均值(`--rounds N`,默认 3)**:每轮在同一条件下跑——全新的 `server_proc` 子进程、新的 SQLite DB、全新的 Router 缓存与计数、全新的 mock 上游实例——轮间方差纯环境噪声。报告给出各指标的**均值 ± 标准差**,并附 `round_results`(每轮完整数据)与 `aggregates`(min/max/mean/stddev);`--rounds 1` 时报告与单轮版 schema 完全一致。
 
 ## 限制
 

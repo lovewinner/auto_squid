@@ -5,8 +5,8 @@ __pycache__/
 .venv/
 /.mypy_cache
 /.pytest_cache
-proxies.yaml
-config.yaml
+/proxies.yaml
+/config.yaml
 *.db
 *.log
 uv.lock

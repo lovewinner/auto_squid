@@ -11,6 +11,7 @@
     python -m bench.stress --quick            # 快速冒烟(小规模)
     python -m bench.stress --profile          # cProfile 覆盖(仅客户端进程)
     python -m bench.stress --mode soak --open-loop  # 开环 soak(不限速,测真实上限)
+    python -m bench.stress --rounds 5         # 同一条件跑 5 轮,每轮全新子进程/缓存,取均值去噪声
 
 进程隔离(本版核心改进):
 - 被测 Router(+ mock 上游)跑在**独立子进程**(bench.server_proc),有自己的事件循环。
@@ -321,6 +322,77 @@ class ScenarioResult:
             "mock_upstream_hits": self.upstream_hits,
             "mock_upstream_new_conns": self.upstream_new_conns,
         }
+
+
+# ── 多轮聚合:同一条件跑 N 轮,取 min/max/mean/stddev 去环境噪声 ──────
+
+def _stats(vals: list) -> dict:
+    """对一组跨轮标量求 {min, max, mean, stddev}。None 感知(cache/racing 组
+    计数器拉取失败时为 None),空列表返回全 0。"""
+    nums = [v for v in vals if v is not None and isinstance(v, (int, float))]
+    n = len(nums)
+    if n == 0:
+        return {"min": 0.0, "max": 0.0, "mean": 0.0, "stddev": 0.0}
+    mean = sum(nums) / n
+    var = sum((x - mean) ** 2 for x in nums) / n if n > 1 else 0.0
+    return {"min": min(nums), "max": max(nums), "mean": mean, "stddev": var ** 0.5}
+
+
+_AGG_PASS_THROUGH = {"name", "breakdown", "failures_sample"}
+_AGG_SCALAR_LEAF = (int, float)
+
+
+def _agg_dict(dicts: list[dict]) -> dict:
+    """把 N 轮的同一 dict(场景 metric)逐键聚合。
+
+    标量叶 → _stats();ttfb_ms/total_ms 等数值子 dict → 递归聚合;
+    bool → any()(如 counter_fetch_failed);name/breakdown/failures_sample →
+    透传第 0 轮;缺失键(某轮 server-stats 未取到)透传第 0 轮。
+    """
+    out = {}
+    for k in dicts[0]:
+        if k in _AGG_PASS_THROUGH:
+            out[k] = dicts[0][k]
+            continue
+        vals = [d.get(k) for d in dicts]
+        if all(isinstance(v, _AGG_SCALAR_LEAF) and not isinstance(v, bool) for v in vals):
+            out[k] = _stats(vals)
+        elif all(isinstance(v, bool) for v in vals):
+            out[k] = any(vals)
+        elif all(isinstance(v, dict) for v in vals):
+            out[k] = _agg_dict(vals)
+        else:
+            out[k] = dicts[0][k]  # 混合/缺失:透传第 0 轮
+    return out
+
+
+def aggregate_scenarios(round_metrics: list[list[dict]]) -> dict:
+    """跨轮聚合场景指标。round_metrics: 外圈=轮次,内圈=场景(按名对齐)。
+
+    返回按场景名分组的聚合树:{name: {min,max,mean,stddev} ...}。
+    每轮场景列表须同名同序(由 run_scenarios 保证);防御性按 name 对齐。
+    """
+    agg: dict = {}
+    if not round_metrics:
+        return agg
+    names = [m["name"] for m in round_metrics[0]]
+    for idx, name in enumerate(names):
+        per_round = [round_metrics[r][idx] for r in range(len(round_metrics))]
+        agg[name] = _agg_dict(per_round)
+    return agg
+
+
+def squash_to_means(tree: dict) -> dict:
+    """把 {min,max,mean,stddev} 叶子递归压成 mean,生成与旧版 schema 一致的均值视图。"""
+    out = {}
+    for k, v in tree.items():
+        if isinstance(v, dict) and "mean" in v and set(v.keys()) == {"min", "max", "mean", "stddev"}:
+            out[k] = v["mean"]
+        elif isinstance(v, dict):
+            out[k] = squash_to_means(v)
+        else:
+            out[k] = v
+    return out
 
 
 # ── 客户端:raw socket,精确测 TTFB(读到状态行) ────────────────
@@ -857,12 +929,75 @@ async def scenario_conn_reuse(router_host: str, router_port: int, host_set: Host
 
 # ── 报告输出 ──────────────────────────────────────────────────
 
-def print_report(metrics_list: list, git_ver: str, upstream_mode: str):
+def _fmt_ms(v: float) -> str:
+    return f"{v:.1f}"
+
+
+def _fmt_rps(v: float) -> str:
+    return f"{v:.0f}"
+
+
+def _agg_val(stats_dict: dict, key: str):
+    """从 {min,max,mean,stddev} 聚合叶取 mean(rounds==1 时为原始标量)。"""
+    v = stats_dict.get(key)
+    return v["mean"] if isinstance(v, dict) and "mean" in v else v
+
+
+def print_report(metrics_list: list, git_ver: str, upstream_mode: str,
+                 rounds: int = 1, round_results: list | None = None,
+                 aggregates: dict | None = None):
+    """输出压测报告。
+
+    rounds==1:维持原有详细格式(零行为变化)。
+    rounds>1:每个场景先打每轮紧凑表 + 均值±stddev 行,再打 round 0 的详细块。
+    """
     print("\n" + "=" * 78)
-    print(f" auto_squid 压测报告  (git: {git_ver})  [上游: {upstream_mode}]  [进程隔离]")
+    hdr = f" auto_squid 压测报告  (git: {git_ver})  [上游: {upstream_mode}]  [进程隔离]"
+    if rounds > 1:
+        hdr += f"  [rounds={rounds}]"
+    print(hdr)
     print("=" * 78)
-    for m in metrics_list:
+    for i, m in enumerate(metrics_list):
         print(f"\n■ 场景: {m['name']}")
+        if rounds > 1:
+            # 每轮紧凑表(数据来自各轮原始报告)。
+            rows = []
+            for r_i, rr in enumerate(round_results or []):
+                mm = rr["scenarios"][i]
+                rq = mm['requests']
+                tp = mm['throughput']
+                lat = mm['latency']
+                cache = mm['cache']
+                hit = (cache['http_hit_rate'] * 100) if cache['http_hit_rate'] is not None else float('nan')
+                err = rq['errors'] / rq['client'] if rq['client'] else 0.0
+                rows.append(
+                    f"[{r_i+1}/{rounds}]  {_fmt_rps(tp['completed_rps']):>6}   {_fmt_rps(tp['injected_rps']):>6}   "
+                    f"{_fmt_ms(lat['ttfb_ms']['p50']):>8}   {_fmt_ms(lat['ttfb_ms']['p95']):>8}   "
+                    f"{_fmt_ms(lat['ttfb_ms']['p99']):>8}  {err*100:5.2f}  {hit:6.1f}")
+            print("  " + "轮次   完成rps  注入rps  TTFB-p50  TTFB-p95  TTFB-p99  err%   缓存%")
+            for row in rows:
+                print("  " + row)
+            # 均值±stddev 行(读 aggregates)。
+            a = (aggregates or {}).get(m['name'], {})
+            tp_a = a.get('throughput', {})
+            lat_a = a.get('latency', {})
+            err_a = a.get('errors', {})
+            cache_a = a.get('cache', {})
+            hrate = _agg_val(cache_a.get('http_hit_rate', {}), 'mean')
+            hit_mean = (hrate * 100) if hrate is not None else float('nan')
+            comp = _agg_val(tp_a.get('completed_rps', {}), 'mean')
+            comp_sd = _agg_val(tp_a.get('completed_rps', {}), 'stddev')
+            tfb = lat_a.get('ttfb_ms', {})
+            p50m = _agg_val(tfb.get('p50', {}), 'mean'); p50s = _agg_val(tfb.get('p50', {}), 'stddev')
+            p95m = _agg_val(tfb.get('p95', {}), 'mean'); p95s = _agg_val(tfb.get('p95', {}), 'stddev')
+            p99m = _agg_val(tfb.get('p99', {}), 'mean'); p99s = _agg_val(tfb.get('p99', {}), 'stddev')
+            errm = _agg_val(err_a.get('rate', {}), 'mean') * 100
+            hsd = _agg_val(cache_a.get('http_hit_rate', {}), 'stddev') * 100
+            print(f"  均值          {comp:.0f}±{comp_sd:.1f} req/s  "
+                  f"TTFB p50 {p50m:.1f}±{p50s:.1f}  p95 {p95m:.1f}±{p95s:.1f}  "
+                  f"p99 {p99m:.1f}±{p99s:.1f}  err {errm:.2f}%  缓存 {hit_mean:.1f}%±{hsd:.1f}")
+            # 详细块(round 0 的丰富字段)。
+            m = round_results[0]["scenarios"][i]
         rq = m['requests']
         print(f"  请求          : 客户端 {rq['client']} (成功 {rq['success']}, 失败 {rq['errors']}, "
               f"注入 {rq['injected']}, 预热 {rq['warmup']})")
@@ -980,101 +1115,137 @@ class ServerProcess:
 
 # ── 主入口 ────────────────────────────────────────────────────
 
+async def run_scenarios(args, host_set, router_host, router_port, metrics_base,
+                        rnd: int = 1, total_rounds: int = 1) -> list:
+    """在一轮的全新子进程上跑(args.mode 指定的)场景,返回 ScenarioResult 列表。
+
+    rnd/total_rounds 仅用于进度标题,标识当前轮次。
+    """
+    results: list = []
+    tag = f"[r{rnd}/{total_rounds}] " if total_rounds > 1 else ""
+    if args.mode == "staircase":
+        print(f"\n{tag}[staircase] 并发阶梯,测饱和点")
+        results.append(await scenario_staircase(router_host, router_port, host_set, args.quick, metrics_base))
+    elif args.mode == "rate":
+        print(f"\n{tag}[rate] 恒定速率阶梯,测容量上限")
+        results.append(await scenario_rate(router_host, router_port, host_set, args.quick, metrics_base))
+    elif args.mode == "mixed":
+        print(f"\n{tag}[mixed] 混合负载(冷热+大小+CONNECT)")
+        results.append(await scenario_mixed(router_host, router_port, host_set, args.quick, metrics_base))
+    elif args.mode == "soak":
+        print(f"\n{tag}[soak] 长时稳定性 {args.duration}s" + (" [开环]" if args.open_loop else ""))
+        results.append(await scenario_soak(router_host, router_port, host_set, args.duration,
+                                           args.quick, metrics_base, open_loop=args.open_loop))
+    elif args.mode == "conn-reuse":
+        print(f"\n{tag}[conn-reuse] 连接复用率(测 keepalive)")
+        results.append(await scenario_conn_reuse(router_host, router_port, host_set, metrics_base))
+    elif args.mode == "all":
+        print(f"\n{tag}[staircase] 并发阶梯")
+        results.append(await scenario_staircase(router_host, router_port, host_set, args.quick, metrics_base))
+        print(f"\n{tag}[rate] 恒定速率")
+        results.append(await scenario_rate(router_host, router_port, host_set, args.quick, metrics_base))
+        print(f"\n{tag}[mixed] 混合负载")
+        results.append(await scenario_mixed(router_host, router_port, host_set, args.quick, metrics_base))
+        print(f"\n{tag}[soak] 长时 {args.duration}s")
+        results.append(await scenario_soak(router_host, router_port, host_set, args.duration,
+                                           args.quick, metrics_base))
+    return results
+
+
 async def amain(args):
     git_ver = git_version()
+    args.rounds = max(1, args.rounds)
     print(f"auto_squid 压测  git={git_ver}  mode={args.mode}  upstream={args.upstream}  "
-          f"quick={args.quick}  open_loop={args.open_loop}  [进程隔离]")
+          f"quick={args.quick}  open_loop={args.open_loop}  rounds={args.rounds}  [进程隔离]")
     real_hosts = args.real_hosts.split(",") if args.real_hosts else list(_DEFAULT_REAL_HOSTS)
     host_set = HostSet(mode=args.upstream, real_hosts=[h.strip() for h in real_hosts if h.strip()])
+    # mock 规格每轮一致 → 相同条件;提升到循环外只算一次。
+    mock_specs = default_mock_specs(args.quick) if args.upstream == "mock" else []
+    run_start = time.strftime("%Y-%m-%dT%H:%M:%S")
 
-    # 构造子进程配置。
-    db_path = tempfile.mktemp(suffix=".db")
-    config = {
-        "upstream": args.upstream,
-        "router_port": args.router_port,
-        "metrics_port": 0,  # 0 = uvicorn 随机选端口(实际由子进程绑定后回传 READY)
-        "max_retries": args.max_retries,
-        "cache_ttl": args.cache_ttl,
-        "enable_http_cache": not args.no_http_cache,
-        "proxies_path": args.proxies,
-        "mock_specs": default_mock_specs(args.quick) if args.upstream == "mock" else [],
-        "db_path": db_path,
-    }
-    # metrics_port=0 时 uvicorn 绑定随机端口;但子进程需先知道端口才能 print READY。
-    # 改为主进程预选一个空闲端口,避免子进程内探测端口的复杂度。
-    import socket
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    config["metrics_port"] = s.getsockname()[1]
-    s.close()
+    round_reports: list = []
+    for rnd in range(1, args.rounds + 1):
+        if args.rounds > 1:
+            print(f"\n{'='*70}\n[round {rnd}/{args.rounds}]  每轮全新子进程/SQLite/缓存\n{'='*70}")
 
-    server = ServerProcess(config)
-    try:
-        await server.start()
-        print(f"子进程就绪: Router 127.0.0.1:{server.router_port}  "
-              f"管理API {server.metrics_base}  max_retries={args.max_retries}  "
-              f"cache_ttl={args.cache_ttl}  http_cache={'on' if not args.no_http_cache else 'off'}")
-
-        rh, rp, mb = "127.0.0.1", server.router_port, server.metrics_base
-        results: list = []
-        if args.profile:
-            import cProfile, pstats, io
-            pr = cProfile.Profile()
-            pr.enable()
-
-        if args.mode == "staircase":
-            print("\n[staircase] 并发阶梯,测饱和点")
-            results.append(await scenario_staircase(rh, rp, host_set, args.quick, mb))
-        elif args.mode == "rate":
-            print("\n[rate] 恒定速率阶梯,测容量上限")
-            results.append(await scenario_rate(rh, rp, host_set, args.quick, mb))
-        elif args.mode == "mixed":
-            print("\n[mixed] 混合负载(冷热+大小+CONNECT)")
-            results.append(await scenario_mixed(rh, rp, host_set, args.quick, mb))
-        elif args.mode == "soak":
-            print(f"\n[soak] 长时稳定性 {args.duration}s" + (" [开环]" if args.open_loop else ""))
-            results.append(await scenario_soak(rh, rp, host_set, args.duration, args.quick, mb,
-                                               open_loop=args.open_loop))
-        elif args.mode == "conn-reuse":
-            print("\n[conn-reuse] 连接复用率(测 keepalive)")
-            results.append(await scenario_conn_reuse(rh, rp, host_set, mb))
-        elif args.mode == "all":
-            print("\n[staircase] 并发阶梯")
-            results.append(await scenario_staircase(rh, rp, host_set, args.quick, mb))
-            print("\n[rate] 恒定速率")
-            results.append(await scenario_rate(rh, rp, host_set, args.quick, mb))
-            print("\n[mixed] 混合负载")
-            results.append(await scenario_mixed(rh, rp, host_set, args.quick, mb))
-            print(f"\n[soak] 长时 {args.duration}s")
-            results.append(await scenario_soak(rh, rp, host_set, args.duration, args.quick, mb))
-
-        if args.profile:
-            pr.disable()
-            s_io = io.StringIO()
-            pstats.Stats(pr, stream=s_io).sort_stats("cumulative").print_stats(25)
-            print("\n[cProfile top 25 by cumulative (客户端进程)]")
-            print(s_io.getvalue())
-            with open("bench_profile.txt", "w") as f:
-                pstats.Stats(pr, stream=f).sort_stats("cumulative").print_stats(40)
-
-        metrics_list = [r.metrics() for r in results]
-        # mock 模式:补连接复用场景的 new_conns(从子进程无法读 mock 计数,
-        # 故 conn-reuse 场景依赖服务端计数器;此处仅透传)。
-        print_report(metrics_list, git_ver, args.upstream)
-
-        report = {
-            "git": git_ver, "mode": args.mode, "upstream": args.upstream,
-            "quick": args.quick, "max_retries": args.max_retries, "cache_ttl": args.cache_ttl,
-            "http_cache_enabled": not args.no_http_cache, "open_loop": args.open_loop,
-            "isolated_process": True,
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "scenarios": metrics_list,
+        # 每轮全新子进程配置:新 db、新 metrics 端口、其余条件一致。
+        db_path = tempfile.mktemp(suffix=".db")
+        config = {
+            "upstream": args.upstream,
+            "router_port": args.router_port,
+            "metrics_port": 0,  # 0 = uvicorn 随机选端口(实际由子进程绑定后回传 READY)
+            "max_retries": args.max_retries,
+            "cache_ttl": args.cache_ttl,
+            "enable_http_cache": not args.no_http_cache,
+            "proxies_path": args.proxies,
+            "mock_specs": mock_specs,
+            "db_path": db_path,
         }
-        with open(args.output, "w") as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
-        print(f"\n结构化报告已写入: {args.output}")
-    finally:
-        server.stop()
+        # metrics_port=0 时 uvicorn 绑定随机端口;但子进程需先知道端口才能 print READY。
+        # 主进程预选一个空闲端口,避免子进程内探测端口的复杂度。
+        import socket
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        config["metrics_port"] = s.getsockname()[1]
+        s.close()
+
+        server = ServerProcess(config)
+        try:
+            await server.start()
+            print(f"[round {rnd}] 子进程就绪: Router 127.0.0.1:{server.router_port}  "
+                  f"管理API {server.metrics_base}  max_retries={args.max_retries}  "
+                  f"cache_ttl={args.cache_ttl}  http_cache={'on' if not args.no_http_cache else 'off'}")
+
+            rh, rp, mb = "127.0.0.1", server.router_port, server.metrics_base
+            pr = None
+            if args.profile and rnd == 1:
+                # profile 只覆盖第 1 轮客户端进程(各轮客户端逻辑相同,避免噪声)。
+                import cProfile, pstats, io
+                pr = cProfile.Profile()
+                pr.enable()
+                if args.rounds > 1:
+                    print("  [profile] 仅覆盖第 1 轮客户端进程")
+            results = await run_scenarios(args, host_set, rh, rp, mb, rnd, args.rounds)
+            if pr is not None:
+                pr.disable()
+                s_io = io.StringIO()
+                pstats.Stats(pr, stream=s_io).sort_stats("cumulative").print_stats(25)
+                print("\n[cProfile top 25 by cumulative (客户端进程)]")
+                print(s_io.getvalue())
+                with open("bench_profile.txt", "w") as f:
+                    pstats.Stats(pr, stream=f).sort_stats("cumulative").print_stats(40)
+
+            metrics_list = [r.metrics() for r in results]
+            round_reports.append({
+                "git": git_ver, "mode": args.mode, "upstream": args.upstream,
+                "quick": args.quick, "max_retries": args.max_retries, "cache_ttl": args.cache_ttl,
+                "http_cache_enabled": not args.no_http_cache, "open_loop": args.open_loop,
+                "isolated_process": True,
+                "timestamp": run_start,
+                "scenarios": metrics_list,
+            })
+        finally:
+            server.stop()
+        if rnd < args.rounds:
+            await asyncio.sleep(0.5)  # 防端口 TIME_WAIT 冲突的便宜保险
+
+    # 汇总:rounds==1 输出与旧版字节兼容;rounds>1 增补 round_results/aggregates。
+    final = dict(round_reports[0])
+    if args.rounds > 1:
+        final["rounds"] = args.rounds
+        round_metrics = [r["scenarios"] for r in round_reports]
+        agg = aggregate_scenarios(round_metrics)
+        final["scenarios"] = [squash_to_means(sc) for sc in agg.values()]
+        final["round_results"] = round_reports
+        final["aggregates"] = agg
+        print_report(final["scenarios"], git_ver, args.upstream, rounds=args.rounds,
+                     round_results=round_reports, aggregates=agg)
+    else:
+        print_report(final["scenarios"], git_ver, args.upstream)
+
+    with open(args.output, "w") as f:
+        json.dump(final, f, indent=2, ensure_ascii=False)
+    print(f"\n结构化报告已写入: {args.output}")
 
 
 def main():
@@ -1093,6 +1264,8 @@ def main():
     p.add_argument("--duration", type=float, default=60.0, help="soak 模式时长(秒)")
     p.add_argument("--open-loop", action="store_true", help="soak 开环模式(不限速,测真实上限)")
     p.add_argument("--quick", action="store_true", help="快速冒烟(小规模,~10s)")
+    p.add_argument("--rounds", type=int, default=3,
+                   help="同一条件跑 N 轮(每轮全新子进程/SQLite/缓存),取均值去环境噪声;默认 3")
     p.add_argument("--profile", action="store_true", help="启用 cProfile(仅客户端进程)")
     p.add_argument("--output", default="bench_report.json", help="JSON 报告输出路径")
     args = p.parse_args()

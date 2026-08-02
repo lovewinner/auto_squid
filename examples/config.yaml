@@ -1,0 +1,38 @@
+# examples/config.yaml
+# auto_squid 配置示例 —— 结构与 config_schema.py 中的 Config 模型一一对应。
+# 通过 `python -m auto_squid.cli --config examples/config.yaml` 加载。
+# 所有字段均有默认值,缺少的配置块按默认行为启动。
+
+# 代理端口监听配置(面向客户端的 HTTP/CONNECT 代理端口)
+listen:
+  host: "0.0.0.0"
+  port: 10808
+
+# 管理 API 监听配置(独立于代理端口)
+# 注意:管理 API 不受客户端认证保护,生产环境请用防火墙限制访问
+api:
+  host: "0.0.0.0"
+  port: 18080
+
+# 路由行为配置
+router:
+  # 域名缓存有效期(秒):某代理为某域名竞速胜出后,在有效期内复用同一代理,
+  # 避免每请求都竞速。过期后重新竞速。
+  cache_ttl: 600
+  # 让网关主机自身作为代理节点直接参与竞速(不走上游),默认关闭
+  enable_local_racing: false
+  # 竞速首批并行的代理数量;全失败后对剩余代理再竞速兜底
+  max_retries: 3
+  # 客户端访问代理端口所需的 HTTP Basic 认证,默认关闭(开放代理)
+  auth:
+    enabled: false
+    username: "admin"
+    password: "changeme"
+
+# 日志配置;file 为 null 时写默认文件 auto_squid.log
+logging:
+  level: "INFO"
+  file: "auto_squid.log"
+
+# 上游代理列表请放独立文件,通过 --proxies examples/proxies.yaml 加载
+# (见 examples/proxies.yaml,结构与 ProxyInfo 模型一致)

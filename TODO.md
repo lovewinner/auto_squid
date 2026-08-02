@@ -1,39 +1,56 @@
 # TODO — Implementation roadmap (prioritized)
 
-目标：把 auto_squid 从设计骨架完善为能在 B 上运行、按域名选择并转发到最优代理的可用原型。
+目标：把 auto_squid 从设计骨架完善为能在 B 上运行、按域名竞速转发到最优代理的可用原型。
 
-优先级 P0 — MVP
-- [x] Implement HTTP/CONNECT forwarding router (auto_squid/router)
-  - Parse Host/CONNECT target, perform proxy selection, forward request/stream.
-- [x] Implement ProxyStore persistence (load from examples/proxies.yaml) and runtime CRUD API.
-- [x] Implement ProbeEngine minimal probes
-  - TCP connect timing
-  - HTTP GET to probe_url (204) for RTT
-  - Store timestamped samples in memory (history window)
-- [x] Implement scoring (latency/throughput/reliability) with time decay and IQR outlier removal.
-  - NOTE: Implemented — time-decayed latency, IQR outlier removal and throughput measurement are implemented; scoring combines latency, throughput and reliability.
-- [x] Expose Management API endpoints: /health, /proxies, /score?domain=, /probe/status.
-- [x] End-to-end smoke test: client -> B (auto_squid) -> selected proxy -> website
+> 架构演进说明：早期路线图基于 ProbeEngine（TCP 探测 + 打分 + 每域选优）。现已用**竞速路由**替换：
+> 请求同时发给多个上游，取最先成功者，胜出代理按域名缓存复用（cache_ttl）。ProbeEngine /
+> scoring / policy_engine 相关模块已移除，不再适用。
 
-优先级 P1 — Robustness & features
-- [x] Add concurrency controls (global semaphore, per-domain/per-proxy limits) in probe engine.
-- [x] Implement cold-start strategy and warming state for proxies/domains.
-- [x] Add logging, metrics endpoints (/metrics) and store probe history for debugging.
-- [x] Add retry/failover policy for request forwarding.
-- [x] Add configuration file parsing and CLI flags.
+## 已完成 — 核心转发（P0，MVP）
 
-优先级 P2 — Ops & Security
-- [ ] Add token-based auth to management API and optional TLS support.
-- [ ] Add systemd unit and docker-compose examples.
-- [ ] Add integration tests with mocked proxy backends and end-to-end integration with Squid.
+- [x] HTTP/CONNECT 转发路由器（auto_squid/router）
+  - 解析 Host/CONNECT 目标，竞速选代理，转发请求/流式响应。
+- [x] ProxyStore 持久化（proxies.yaml 加载 + 运行时 CRUD API）
+- [x] 竞速路由（racing）：首批 max_retries 并行，全失败兜底批，首字节判胜，败者取消并释放连接
+- [x] 域名缓存（domain cache）：胜出代理按域名复用至 cache_ttl，过期自动回退竞速
+- [x] HTTP 响应缓存：幂等 GET 内存缓存（TTL 60s，遵循 Cache-Control；含非 2xx 幂等状态码）
+- [x] 写方法（POST/PUT/DELETE/PATCH）按域名失效 GET 响应缓存（二级索引 O(K)）
+- [x] 并发 GET 去重聚合（cache stampede protection，_AGG_WAIT_TIMEOUT 超时保护）
+- [x] 流式响应转发 + 上游连接池化（每代理长驻 httpx.AsyncClient，keep-alive 复用）
+- [x] SQLite 持久化（domain_stats / domain_meta）：内存镜像 + 后台批量落盘，WAL 模式
+- [x] 客户端认证（可选 HTTP Basic，auth.py，默认关闭，失败 407）
+- [x] 管理 API + 单页 Web UI（域名统计/默认代理/胜出计数，卡片点击按默认代理筛选）
+- [x] 端到端测试：HTTP/CONNECT 转发、HTTP/域名缓存、竞速、ProxyStore、API、二进制安全
 
-优先级 P3 — Enhancements
-- [ ] Throughput probe implementation and measurement aggregation.
-- [ ] Policy engine: per-domain static rules, tag-based routing, geolocation awareness.
-- [ ] Admin UI to display scores and choose manual override for routing.
+## 已完成 — 健壮性与特性（P1）
 
-Workflow notes
-- Work in short iterative branches named feature/<area> (e.g., feature/probe-engine).
-- Add unit tests for each component; keep probe engine tests deterministic by mocking network calls.
+- [x] 并发控制 / 资源上限：MAX_BODY（10 MiB，超限 413）、连接池上限、败者清理积压上限（64）
+- [x] 超时治理：上游 connect/pool/read/write 超时、CONNECT 建连/读首字节超时、聚合等待超时
+- [x] 优雅关闭：在途连接取消排空、_pending_cleanups 排空后再关 DB/连接池
+- [x] hop-by-hop 请求头剔除（Proxy-Authorization 等不透传上游）；响应头剔除 + Content-Length 重写
+- [x] 日志分级（每请求 DEBUG，启动/认证拒绝 INFO）、uvloop 事件循环
+- [x] 压测工具链（bench/）：mock 上游集群 + 进程隔离压测（server_proc 子进程 + 跨进程计数器）
+  - 模式：staircase / rate / mixed / soak（含 --open-loop）/ conn-reuse / all
+  - 指标：吞吐/延迟分位、缓存命中率/竞速放大率（服务端计数器）、资源采样、正确性校验
 
-If helpful, add these TODOs into the repository issue tracker or create tickets from the P0 list. For immediate next step, implement router and proxy_store (P0 first two bullets).
+## 待办 — 运维与安全（P2）
+
+- [ ] 管理 API token 认证 + 可选 TLS（当前管理 API 无认证，靠防火墙保护）
+- [ ] systemd unit 与 docker-compose 示例
+- [ ] 与真实 Squid 的集成测试（bench 已支持 --upstream real，但缺 CI/集成用例）
+
+## 待办 — 增强（P3）
+
+- [ ] 策略引擎：每域静态规则、标签路由、地理感知（曾加过又回退，需重做）
+- [ ] 管理 UI 人工覆盖路由 / 手动指定默认代理
+- [ ] HTTP 解析升级为健壮实现（当前 MVP 级，大流式响应存在边界场景）
+
+## 工作流备注
+
+- 短迭代分支 feature/<area>（如 feature/racing）。
+- 每个组件配单元测试；测试保持确定性（mock 网络调用）。
+
+## 当前测试状态
+
+- `tests/test_end_to_end.py`：38 个用例，覆盖转发/缓存/竞速/聚合/认证/计数器/DB 持久化。
+- 运行：`.venv/bin/python -m pytest -q`
