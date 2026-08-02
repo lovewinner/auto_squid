@@ -36,9 +36,13 @@
 
 import argparse
 import asyncio
+import cProfile
+import io
 import json
 import os
+import pstats
 import resource
+import socket
 import statistics
 import subprocess
 import sys
@@ -51,8 +55,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import httpx
 
-from bench.mock_upstream import UpstreamCluster, ResponseProfile
-
 
 # ── git 版本(写入报告,便于跨版本 diff) ──────────────────────────
 
@@ -64,6 +66,28 @@ def git_version() -> str:
         ).decode().strip()
     except Exception:
         return "unknown"
+
+
+# ── 通用小工具 ─────────────────────────────────────────────────
+
+def _percentile(vals: list[float], p: float) -> float:
+    """计算有序百分位。空列表返回 0.0;索引越界钳制到两端。"""
+    if not vals:
+        return 0.0
+    s = sorted(vals)
+    k = max(0, min(len(s) - 1, int(len(s) * p)))
+    return s[k]
+
+
+def _free_port() -> int:
+    """预选一个空闲本地端口(TCP)。bind 后立即关闭,由调用方尽快使用。"""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+# 服务端 loop-lag 未取到时的空默认值(与 ServerStatsSampler 的快照结构一致)。
+_EMPTY_LOOP_LAG = {"p50": 0.0, "p95": 0.0, "max": 0.0}
 
 
 # ── 结果容器 ──────────────────────────────────────────────────
@@ -164,19 +188,18 @@ def default_mock_specs(quick: bool) -> list:
     delays = [0.0, 0.05, 0.15, 0.3][:n_upstream]
     specs = []
     for i, d in enumerate(delays):
+        # 最后一个上游(仅全量模式)带 0.3 失败率,模拟不稳定上游。
+        fr = 0.3 if (i == n_upstream - 1 and not quick) else 0.0
         profs = [
             {"host_prefix": "hot", "first_byte_delay": 0.01, "body_size": 2048,
-             "chunked": False, "chunk_delay": 0.0, "fail_rate": 0.0},
+             "chunked": False, "chunk_delay": 0.0, "fail_rate": fr},
             {"host_prefix": "cold", "first_byte_delay": 0.02, "body_size": 1024,
-             "chunked": False, "chunk_delay": 0.0, "fail_rate": 0.0},
+             "chunked": False, "chunk_delay": 0.0, "fail_rate": fr},
             {"host_prefix": "big", "first_byte_delay": 0.02, "body_size": 512 * 1024,
-             "chunked": False, "chunk_delay": 0.005, "fail_rate": 0.0},
+             "chunked": False, "chunk_delay": 0.005, "fail_rate": fr},
             {"host_prefix": "chunked", "first_byte_delay": 0.02, "body_size": 64 * 1024,
-             "chunked": True, "chunk_delay": 0.003, "fail_rate": 0.0},
+             "chunked": True, "chunk_delay": 0.003, "fail_rate": fr},
         ]
-        fr = 0.3 if (i == n_upstream - 1 and not quick) else 0.0
-        for p in profs:
-            p["fail_rate"] = fr
         specs.append((d, profs))
     return specs
 
@@ -221,13 +244,6 @@ class ScenarioResult:
         for r in self.results:
             if r.status_code:
                 status_dist[r.status_code] = status_dist.get(r.status_code, 0) + 1
-
-        def pct(vals, p):
-            if not vals:
-                return 0.0
-            s = sorted(vals)
-            k = max(0, min(len(s) - 1, int(len(s) * p)))
-            return s[k]
 
         total_reqs = len(self.results)
 
@@ -292,15 +308,15 @@ class ScenarioResult:
             },
             "latency": {
                 "ttfb_ms": {
-                    "p50": pct(ttfs, 0.50) * 1000,
-                    "p95": pct(ttfs, 0.95) * 1000,
-                    "p99": pct(ttfs, 0.99) * 1000,
+                    "p50": _percentile(ttfs, 0.50) * 1000,
+                    "p95": _percentile(ttfs, 0.95) * 1000,
+                    "p99": _percentile(ttfs, 0.99) * 1000,
                     "mean": (statistics.mean(ttfs) * 1000) if ttfs else 0.0,
                 },
                 "total_ms": {
-                    "p50": pct(tots, 0.50) * 1000,
-                    "p95": pct(tots, 0.95) * 1000,
-                    "p99": pct(tots, 0.99) * 1000,
+                    "p50": _percentile(tots, 0.50) * 1000,
+                    "p95": _percentile(tots, 0.95) * 1000,
+                    "p99": _percentile(tots, 0.99) * 1000,
                     "mean": (statistics.mean(tots) * 1000) if tots else 0.0,
                 },
             },
@@ -313,7 +329,7 @@ class ScenarioResult:
                 "fd_peak": self.fd_peak,
                 "pool_size_end": self.counters_after.get("client_pool_size", 0) if self.counters_after else 0,
                 "server_cpu_pct": ss.get("cpu_pct", 0.0),
-                "server_loop_lag_ms": ss.get("loop_lag_ms", {"p50": 0.0, "p95": 0.0, "max": 0.0}),
+                "server_loop_lag_ms": ss.get("loop_lag_ms", _EMPTY_LOOP_LAG),
             },
             "correctness": correctness,
             "attribution": {"upstream_throttled": throttled, "bottleneck": bottleneck},
@@ -415,10 +431,18 @@ def _host_of(url: bytes) -> bytes:
         return b'example.com'
 
 
+async def _read_headers(reader, timeout: float):
+    """跳过响应头,直到空行。返回后 reader 停留在 body 起始处。"""
+    while True:
+        h = await asyncio.wait_for(reader.readline(), timeout=timeout)
+        if not h or h in (b"\r\n", b"\n"):
+            return
+
+
 async def do_http_request(host: str, port: int, url: bytes, timeout: float = 15.0,
                           success_any_status: bool = False,
                           capture_body: bool = False) -> RequestResult:
-    """发一个 GET,返回 TTFB(读到状态行)与 total。失败分类:timeout/conn/http:<code>。
+    """发一个 GET,返回 TTFB(读到状态行)与 total。失败时分类:timeout / conn / http:<..>。
 
     capture_body=True 时把响应 body 存进 RequestResult.body,供 mock 模式正确性校验
     (body 大小/内容,缓存命中字节一致)。real 模式 body 不可预测,不校验。
@@ -442,10 +466,7 @@ async def do_http_request(host: str, port: int, url: bytes, timeout: float = 15.
         code = _status_code(status)
         if not success_any_status and b"200" not in status:
             return RequestResult(False, ttfb, time.monotonic() - t0, f"http:{code}", code)
-        while True:
-            h = await asyncio.wait_for(reader.readline(), timeout=timeout)
-            if not h or h in (b"\r\n", b"\n"):
-                break
+        await _read_headers(reader, timeout)
         body = await asyncio.wait_for(reader.read(-1), timeout=timeout)
         total = time.monotonic() - t0
         return RequestResult(True, ttfb, total, "", code,
@@ -486,10 +507,7 @@ async def do_connect_request(host: str, port: int, target: bytes, payload: bytes
         code = _status_code(status)
         if b"200" not in status:
             return RequestResult(False, ttfb, time.monotonic() - t0, f"http:{code}", code)
-        while True:
-            h = await asyncio.wait_for(reader.readline(), timeout=timeout)
-            if not h or h in (b"\r\n", b"\n"):
-                break
+        await _read_headers(reader, timeout)
         if not echo_check:
             total = time.monotonic() - t0
             return RequestResult(True, ttfb, total, "", code)
@@ -681,6 +699,41 @@ def _check_correctness(result: ScenarioResult, host_kind: str, url: bytes):
             f"{host_kind} {url.decode('latin-1','replace')}: content mismatch")
 
 
+# ── 场景通用收尾与共享逻辑 ─────────────────────────────────────
+
+def _check_body_sizes(result: ScenarioResult):
+    """粗粒度正确性:所有成功响应的 body 大小必须匹配已知的 mock 预期大小。
+
+    抓截断/错乱回归;不做逐字节比对(mock body = b"x"*size,大小已能区分)。
+    """
+    result.correctness_checked = True
+    for r in result.results:
+        if r.ok and r.body:
+            if len(r.body) not in _MOCK_EXPECTED_BODY_BYTES.values():
+                result.correctness_failures.append(f"unexpected body size {len(r.body)}")
+
+
+async def _finish_scenario(result: ScenarioResult, metrics_base: str,
+                           stop_evt: asyncio.Event, sampler: asyncio.Task):
+    """场景末尾统一收尾:拉结束计数器 → 停采样器。当前场景耗时已写入 result.duration。"""
+    result.counters_after = await fetch_counters(metrics_base) or {}
+    if not result.counters_after:
+        result.counter_fetch_failed = True
+    stop_evt.set()
+    await sampler
+
+
+async def _run_open_loop(make_request, concurrency: int, duration: float) -> list:
+    """固定并发 worker 持续跑满 duration 秒后停止,返回全部结果。"""
+    loop_stop = asyncio.Event()
+
+    async def _stopper():
+        await asyncio.sleep(duration)
+        loop_stop.set()
+    asyncio.create_task(_stopper())
+    return await run_open_loop(make_request, concurrency, loop_stop)
+
+
 # ── 场景定义 ──────────────────────────────────────────────────
 
 async def scenario_staircase(router_host: str, router_port: int, host_set: HostSet,
@@ -716,19 +769,11 @@ async def scenario_staircase(router_host: str, router_port: int, host_set: HostS
         ok = sum(1 for r in res if r.ok)
         print(f"  concurrency={c:>4}  ok={ok}/{len(res)}  "
               f"rps={ok / (sum(r.total for r in res) or 1):.0f}(wall)")
+    result.duration = time.monotonic() - t_start
     # mock 正确性:校验所有成功结果的 body 大小(粗粒度,抓截断/错乱回归)。
     if capture:
-        result.correctness_checked = True
-        for r in result.results:
-            if r.ok and r.body:
-                if len(r.body) not in _MOCK_EXPECTED_BODY_BYTES.values():
-                    result.correctness_failures.append(f"unexpected body size {len(r.body)}")
-    result.duration = time.monotonic() - t_start
-    result.counters_after = await fetch_counters(metrics_base) or {}
-    if not result.counters_after:
-        result.counter_fetch_failed = True
-    stop_evt.set()
-    await sampler
+        _check_body_sizes(result)
+    await _finish_scenario(result, metrics_base, stop_evt, sampler)
     return result
 
 
@@ -761,11 +806,7 @@ async def scenario_rate(router_host: str, router_port: int, host_set: HostSet,
         print(f"  target_rps={rps:>5}  ok={ok}  actual_rps={ok/per_rate_dur:.0f}  "
               f"injected={injected}  err={len(res)-ok}")
     result.duration = time.monotonic() - t_start
-    result.counters_after = await fetch_counters(metrics_base) or {}
-    if not result.counters_after:
-        result.counter_fetch_failed = True
-    stop_evt.set()
-    await sampler
+    await _finish_scenario(result, metrics_base, stop_evt, sampler)
     return result
 
 
@@ -821,20 +862,10 @@ async def scenario_mixed(router_host: str, router_port: int, host_set: HostSet,
     result.client_requests = len(res)
     result.injected_requests = len(res)
     result.duration = time.monotonic() - t_start
-    result.counters_after = await fetch_counters(metrics_base) or {}
-    if not result.counters_after:
-        result.counter_fetch_failed = True
     # mock 正确性:校验所有成功 GET 的 body 大小。
     if capture:
-        result.correctness_checked = True
-        for r in res:
-            if r.ok and r.body:
-                size = len(r.body)
-                # 反查预期大小:任一已知大小匹配即通过(粗粒度,抓截断/错乱回归)。
-                if size not in _MOCK_EXPECTED_BODY_BYTES.values():
-                    result.correctness_failures.append(f"unexpected body size {size}")
-    stop_evt.set()
-    await sampler
+        _check_body_sizes(result)
+    await _finish_scenario(result, metrics_base, stop_evt, sampler)
     return result
 
 
@@ -866,14 +897,8 @@ async def scenario_soak(router_host: str, router_port: int, host_set: HostSet,
     t_start = time.monotonic()
     last_print = t_start
     if open_loop:
-        # 开环:固定并发 worker 持续跑,到 duration 置位 stop_evt 后退出。
-        loop_stop = asyncio.Event()
-
-        async def _stopper():
-            await asyncio.sleep(duration)
-            loop_stop.set()
-        asyncio.create_task(_stopper())
-        res = await run_open_loop(make, concurrency, loop_stop)
+        # 开环:固定并发 worker 持续跑满 duration,测真实容量上限。
+        res = await _run_open_loop(make, concurrency, duration)
         result.results = res
         result.client_requests = len(res)
         result.injected_requests = len(res)
@@ -890,11 +915,7 @@ async def scenario_soak(router_host: str, router_port: int, host_set: HostSet,
                       f"fd={fd_count()}  done={result.client_requests}")
                 last_print = time.monotonic()
     result.duration = time.monotonic() - t_start
-    result.counters_after = await fetch_counters(metrics_base) or {}
-    if not result.counters_after:
-        result.counter_fetch_failed = True
-    stop_evt.set()
-    await sampler
+    await _finish_scenario(result, metrics_base, stop_evt, sampler)
     return result
 
 
@@ -920,23 +941,13 @@ async def scenario_conn_reuse(router_host: str, router_port: int, host_set: Host
 
     result.counters_before = await fetch_counters(metrics_base) or {}
     t_start = time.monotonic()
-    # 开环:固定并发 worker 跑满 duration,到时置位 stop 后退出。
-    loop_stop = asyncio.Event()
-
-    async def _stopper():
-        await asyncio.sleep(duration)
-        loop_stop.set()
-    asyncio.create_task(_stopper())
-    res = await run_open_loop(make, concurrency, loop_stop)
+    # 开环:固定并发 worker 跑满 duration,命中缓存 → 单发上游 → 复用连接池。
+    res = await _run_open_loop(make, concurrency, duration)
     result.results = res
     result.client_requests = len(res)
     result.injected_requests = len(res)
     result.duration = time.monotonic() - t_start
-    result.counters_after = await fetch_counters(metrics_base) or {}
-    if not result.counters_after:
-        result.counter_fetch_failed = True
-    stop_evt.set()
-    await sampler
+    await _finish_scenario(result, metrics_base, stop_evt, sampler)
     # 从子进程 /server-stats 取 mock 上游新建连接数(连接复用率 = (请求-新连接)/请求)。
     mock = (result.server_stats or {}).get("mock") or {}
     result.upstream_new_conns = mock.get("new_conns", 0)
@@ -1136,35 +1147,40 @@ async def run_scenarios(args, host_set, router_host, router_port, metrics_base,
     """在一轮的全新子进程上跑(args.mode 指定的)场景,返回 ScenarioResult 列表。
 
     rnd/total_rounds 仅用于进度标题,标识当前轮次。
+    `all` 依次跑 staircase/rate/mixed/soak(不含 conn-reuse)。
     """
-    results: list = []
     tag = f"[r{rnd}/{total_rounds}] " if total_rounds > 1 else ""
-    if args.mode == "staircase":
-        print(f"\n{tag}[staircase] 并发阶梯,测饱和点")
-        results.append(await scenario_staircase(router_host, router_port, host_set, args.quick, metrics_base))
-    elif args.mode == "rate":
-        print(f"\n{tag}[rate] 恒定速率阶梯,测容量上限")
-        results.append(await scenario_rate(router_host, router_port, host_set, args.quick, metrics_base))
-    elif args.mode == "mixed":
-        print(f"\n{tag}[mixed] 混合负载(冷热+大小+CONNECT)")
-        results.append(await scenario_mixed(router_host, router_port, host_set, args.quick, metrics_base))
-    elif args.mode == "soak":
+    results: list = []
+
+    # 需透传 quick/metrics_base 的常规场景:进度标题 + 场景函数。
+    # soak 需透传 duration/open_loop、conn-reuse 不收 quick,均单独处理。
+    _TITLES = {
+        "staircase": ("[staircase] 并发阶梯,测饱和点", scenario_staircase),
+        "rate": ("[rate] 恒定速率阶梯,测容量上限", scenario_rate),
+        "mixed": ("[mixed] 混合负载(冷热+大小+CONNECT)", scenario_mixed),
+    }
+
+    async def _run_quick(title: str, fn):
+        print(f"\n{tag}{title}")
+        results.append(await fn(router_host, router_port, host_set, args.quick, metrics_base))
+
+    if args.mode == "soak":
         print(f"\n{tag}[soak] 长时稳定性 {args.duration}s" + (" [开环]" if args.open_loop else ""))
         results.append(await scenario_soak(router_host, router_port, host_set, args.duration,
                                            args.quick, metrics_base, open_loop=args.open_loop))
-    elif args.mode == "conn-reuse":
-        print(f"\n{tag}[conn-reuse] 连接复用率(测 keepalive)")
-        results.append(await scenario_conn_reuse(router_host, router_port, host_set, metrics_base))
     elif args.mode == "all":
-        print(f"\n{tag}[staircase] 并发阶梯")
-        results.append(await scenario_staircase(router_host, router_port, host_set, args.quick, metrics_base))
-        print(f"\n{tag}[rate] 恒定速率")
-        results.append(await scenario_rate(router_host, router_port, host_set, args.quick, metrics_base))
-        print(f"\n{tag}[mixed] 混合负载")
-        results.append(await scenario_mixed(router_host, router_port, host_set, args.quick, metrics_base))
+        await _run_quick("[staircase] 并发阶梯", scenario_staircase)
+        await _run_quick("[rate] 恒定速率", scenario_rate)
+        await _run_quick("[mixed] 混合负载", scenario_mixed)
         print(f"\n{tag}[soak] 长时 {args.duration}s")
         results.append(await scenario_soak(router_host, router_port, host_set, args.duration,
                                            args.quick, metrics_base))
+    elif args.mode == "conn-reuse":
+        print(f"\n{tag}[conn-reuse] 连接复用率(测 keepalive)")
+        results.append(await scenario_conn_reuse(router_host, router_port, host_set, metrics_base))
+    else:
+        title, fn = _TITLES[args.mode]
+        await _run_quick(title, fn)
     return results
 
 
@@ -1199,11 +1215,7 @@ async def amain(args):
         }
         # metrics_port=0 时 uvicorn 绑定随机端口;但子进程需先知道端口才能 print READY。
         # 主进程预选一个空闲端口,避免子进程内探测端口的复杂度。
-        import socket
-        s = socket.socket()
-        s.bind(("127.0.0.1", 0))
-        config["metrics_port"] = s.getsockname()[1]
-        s.close()
+        config["metrics_port"] = _free_port()
 
         server = ServerProcess(config)
         try:
@@ -1216,7 +1228,6 @@ async def amain(args):
             pr = None
             if args.profile and rnd == 1:
                 # profile 只覆盖第 1 轮客户端进程(各轮客户端逻辑相同,避免噪声)。
-                import cProfile, pstats, io
                 pr = cProfile.Profile()
                 pr.enable()
                 if args.rounds > 1:
