@@ -14,6 +14,14 @@ import logging
 import sys
 from pathlib import Path
 
+# uvloop 以约 2× 加速 asyncio 事件循环(任务调度、socket I/O),显著降低
+# CPU 开销与 P99 延时。已随 uvicorn[standard] 间接安装,此处用 try 兜底。
+try:
+    import uvloop
+    uvloop.install()
+except ImportError:
+    pass
+
 from .proxy_store import ProxyStore
 from .router import Router
 from .api import mount as mount_api
