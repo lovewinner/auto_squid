@@ -219,6 +219,10 @@ class Router:
         # ── HTTP 响应缓存 ───────────────────────────────────────
         self._http_cache: dict[str, dict] = {}
         self._http_cache_ttl = 60
+        # 二级索引: domain → set[缓存键]。使 _http_cache_invalidate 从 O(N) 降为
+        # O(K)(K=该域名条目数)。_http_cache_set 写入时同步更新,_http_cache_get
+        # 过期清除时同步删除。索引与主 dict 无锁(均在同一个 asyncio 线程)。
+        self._http_cache_domain_index: dict[str, set[str]] = {}
 
     # ── DB helpers ──────────────────────────────────────────────
 
@@ -398,9 +402,21 @@ class Router:
         if not entry:
             return None
         if time.time() - entry['cached_at'] > self._http_cache_ttl:
-            del self._http_cache[key]
+            self._http_cache_del_with_index(key)
             return None
         return entry
+
+    def _http_cache_del_with_index(self, key: str) -> None:
+        """从 _http_cache 删除 key,并同步清除 _http_cache_domain_index 中的引用。"""
+        entry = self._http_cache.pop(key, None)
+        if entry is not None:
+            cached_url = key[len('GET:'):] if key.startswith('GET:') else key
+            cached_host = urllib.parse.urlparse(cached_url).hostname or cached_url
+            idx = self._http_cache_domain_index.get(cached_host)
+            if idx:
+                idx.discard(key)
+                if not idx:
+                    del self._http_cache_domain_index[cached_host]
 
     def _http_cache_set(self, method: str, url: str, status_code, reason_phrase, headers, content) -> None:
         """缓存一个 GET 可缓存响应(状态码、原因、头、body、时间戳)。
@@ -427,27 +443,24 @@ class Router:
             'content': content,
             'cached_at': time.time(),
         }
+        # 同步更新二级索引:缓存键 -> 域名,供 O(1) 域名级批量失效。
+        cached_host = urllib.parse.urlparse(url).hostname or url
+        self._http_cache_domain_index.setdefault(cached_host, set()).add(key)
 
     def _http_cache_invalidate(self, domain: str) -> None:
-        """清空某域名下所有 GET 响应缓存条目。
+        """清空某域名下所有 GET 响应缓存条目(利用二级索引 O(K),K=该域名条目数)。
 
         写方法(POST/PUT/DELETE/PATCH)改写资源后调用。按域名而非按 URL 失效:
         添加动作常打 POST /api/items,而刷新的列表页是 GET /,两者 URL 不同,
         按 URL 精确失效会漏掉列表页缓存,导致刷新仍返回旧内容。整域清空可覆盖
-        同站任意路径的 GET。缓存键为 "GET:<url>",逐项比对 urlparse(url).hostname
-        与 domain 是否一致,命中即删(边遍历边删需先收集键)。
+        同站任意路径的 GET。利用 _http_cache_domain_index 直接取该域名下所有
+        缓存键,避免 O(N) 遍历全量缓存与逐条重复 urlparse。
         提前(转发前)失效:即便写请求最终失败,后果也仅是下次 GET 多回源一次,
         不会返回错误内容。enable_http_cache=False 时缓存本就空,此处为空操作。
         """
-        stale = []
-        for key in self._http_cache:
-            # 缓存键为 "GET:<绝对url>",去掉 "GET:" 前缀还原 url 再取 host。
-            cached_url = key[len('GET:'):] if key.startswith('GET:') else key
-            cached_host = urllib.parse.urlparse(cached_url).hostname or cached_url
-            if cached_host == domain:
-                stale.append(key)
+        stale = self._http_cache_domain_index.pop(domain, set())
         for key in stale:
-            del self._http_cache[key]
+            self._http_cache.pop(key, None)
 
     # ── 上游连接池 ──────────────────────────────────────────────
 
