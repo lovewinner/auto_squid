@@ -800,12 +800,12 @@ class Router:
             if not line:
                 return
             first = line.decode('latin-1').strip()
-            headers = b''
+            headers = bytearray()
             while True:
                 h = await reader.readline()
                 if not h or h in (b"\r\n", b"\n"):
                     break
-                headers += h
+                headers.extend(h)
             logger.debug("first line: %s", first)
             # 一次性把请求头字节解析成 dict(键保留原大小写),auth 与 body
             # 长度判定及下游转发共用此 dict,不再各自重新 decode+split 头部。
@@ -854,19 +854,19 @@ class Router:
                     # 无 Content-Length 头：分块读取至上限，避免 read(-1) 阻塞到
                     # 客户端关闭连接而破坏 HTTP keep-alive。注意 cl is None 与
                     # cl == 0 不同——后者表示头部存在但 body 为空，应直接用 b''。
-                    body = b''
+                    body = bytearray()
                     while len(body) < MAX_BODY:
                         chunk = await reader.read(MAX_BODY - len(body))
                         if not chunk:
                             break
-                        body += chunk
+                        body.extend(chunk)
                     if len(body) >= MAX_BODY:
                         writer.write(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 15\r\n\r\nPayload Too Large")
                         await writer.drain()
                         return
                 # 直接传已解析的 method/url/headers/body,不再拼回 request_bytes
                 # 让下游重新 find+decode+split(消除双重解析)。
-                await self._handle_http_request(method, url, req_headers, body, writer)
+                await self._handle_http_request(method, url, req_headers, bytes(body) if isinstance(body, bytearray) else body, writer)
         except Exception:
             logger.exception("error handling client")
         finally:
