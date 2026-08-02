@@ -120,7 +120,7 @@ curl -x http://admin:secret@127.0.0.1:10808 http://example.com
                       ▼ 按域名缓存默认代理（cache_ttl）
 ```
 
-- **HTTP 请求**：通过 `httpx.AsyncClient` 并行竞速（每次尝试独立 client），胜出响应回写，落败 client 关闭
+- **HTTP 请求**：通过 `httpx.AsyncClient` 并行竞速（流式，每个上游一个长驻池化 client），胜出响应回写，落败响应关闭
 - **CONNECT 请求**：通过 `asyncio.open_connection` 隧道并行竞速，带连接/读取超时
 - **选择**：`ProxySelector.ordered_proxies()` 返回随机打乱的已启用代理列表；前 `max_retries` 个先竞速，失败后再对剩余代理竞速兜底
 - **域名缓存**：胜出后把代理记入 `domain_meta`，在 `cache_ttl` 有效期内对该域名复用
@@ -135,7 +135,8 @@ curl -x http://admin:secret@127.0.0.1:10808 http://example.com
 | `GET /proxies` | 列出已配置代理 |
 | `POST /proxies` | 添加代理（JSON body） |
 | `GET /stats` | `request_counts` + `attempted_counts` |
-| `GET /metrics` | `request_counts`、`attempted_counts` 与域名统计 |
+| `GET /metrics` | `request_counts`、`attempted_counts`、域名统计与服务端性能计数器（缓存命中 / 竞速扇出） |
+| `GET /server-stats` | 服务端资源采样（CPU 占用、事件循环延迟），由压测子进程填充；正常运行返回空快照 |
 | `GET /config` | 路由配置（`enable_local_racing`） |
 | `GET /domains` | 从 SQLite 读取的域名胜出统计 |
 | `GET /domains/meta` | 各域名默认代理 + 最近更新时间 |
@@ -203,12 +204,12 @@ python -m bench.stress --rounds 5
 
 | 模式 | 负载形态 | 回答什么问题 |
 |------|---------|------------|
-| `staircase` | 并发数 1→200,每级固定请求数 | 吞吐/延迟随并发的变化 → **饱和点** |
+| `staircase` | 并发数 1→800,每级固定请求数 | 吞吐/延迟随并发的变化 → **饱和点** |
 | `rate` | 目标 RPS 100→2000,持续发 | 延迟/错误率随负载的变化 → **容量上限** |
 | `mixed` | 30%热 + 20%大响应 + 20%chunked + 20%冷 + 10%CONNECT | 贴近真实流量的**混合画像** |
 | `soak` | 固定并发长时持续(默认 60s) | **稳定性与资源泄漏** |
 
-关键指标:吞吐(req/s)、TTFB 与 total 的 P50/P95/P99、错误率(按类型分类)、**缓存命中率**与 **racing 放大率**(由 mock 命中计数器推导)、以及资源采样(RSS、文件描述符数、连接池大小、HTTP 缓存条目数)。结果在终端以表格输出,并写入 `bench_report.json`(带 git 版本号,跨版本可 diff)。
+关键指标:吞吐(req/s)、TTFB 与 total 的 P50/P95/P99、错误率(按类型分类)、**缓存命中率**与 **racing 放大率**(由服务端 `/metrics` 计数器推导,mock 与 real 两种模式统一)、以及资源采样(RSS、文件描述符数、连接池大小、HTTP 缓存条目数、服务端 CPU 占用与事件循环延迟)。结果在终端以表格输出,并写入 `bench_report.json`(带 git 版本号,跨版本可 diff)。
 
 **多轮取均值(`--rounds N`,默认 3)**:每轮在同一条件下跑——全新的 `server_proc` 子进程、新的 SQLite DB、全新的 Router 缓存与计数、全新的 mock 上游实例——轮间方差纯环境噪声。报告给出各指标的**均值 ± 标准差**,并附 `round_results`(每轮完整数据)与 `aggregates`(min/max/mean/stddev);`--rounds 1` 时报告与单轮版 schema 完全一致。
 

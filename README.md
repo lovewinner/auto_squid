@@ -120,7 +120,7 @@ Client ──HTTP/S──> auto_squid (proxy :10808)
                       ▼ default proxy cached per domain (cache_ttl)
 ```
 
-- **HTTP requests**: raced via `httpx.AsyncClient` (one client per attempt); winning response is written back, loser clients are closed
+- **HTTP requests**: raced via `httpx.AsyncClient` (streaming, one long-lived pooled client per upstream); winning response is written back, loser responses are closed
 - **CONNECT requests**: raced via raw `asyncio.open_connection` tunnels with connect/read timeouts
 - **Selection**: `ProxySelector.ordered_proxies()` returns a randomly shuffled list of enabled proxies; the first `max_retries` race, then any remaining proxies race as a fallback
 - **Domain cache**: after a win, the winning proxy is recorded in `domain_meta` and reused for the domain until `cache_ttl` expires
@@ -135,7 +135,8 @@ Client ──HTTP/S──> auto_squid (proxy :10808)
 | `GET /proxies` | List configured proxies |
 | `POST /proxies` | Add a proxy (JSON body) |
 | `GET /stats` | `request_counts` + `attempted_counts` |
-| `GET /metrics` | `request_counts`, `attempted_counts`, and domain stats |
+| `GET /metrics` | `request_counts`, `attempted_counts`, domain stats, and server perf counters (cache hits / racing fan-out) |
+| `GET /server-stats` | server resource sampling (CPU %, event-loop lag) filled by the bench subprocess; empty in normal runs |
 | `GET /config` | Router config (`enable_local_racing`) |
 | `GET /domains` | Per-domain win stats from SQLite |
 | `GET /domains/meta` | Per-domain default proxy + last-updated time |
@@ -204,12 +205,12 @@ Modes:
 
 | Mode | Load shape | Answers |
 |------|-----------|---------|
-| `staircase` | concurrency 1→200, fixed requests per level | throughput/latency vs. concurrency → **saturation point** |
+| `staircase` | concurrency 1→800, fixed requests per level | throughput/latency vs. concurrency → **saturation point** |
 | `rate` | target RPS 100→2000, sustained | latency/error vs. load → **capacity ceiling** |
 | `mixed` | 30% hot + 20% large + 20% chunked + 20% cold + 10% CONNECT | a **realistic mixed profile** |
 | `soak` | fixed concurrency, sustained (default 60s) | **stability / resource leaks** |
 
-Key metrics: throughput (req/s), TTFB & total at P50/P95/P99, error rate by category, **cache hit rate** and **racing amplification** (derived from the mock hit counters), and resource samples (RSS, fd count, connection-pool size, HTTP-cache entries). Results print to the terminal and are written to `bench_report.json` (tagged with the git revision, so runs are diffable across versions).
+Key metrics: throughput (req/s), TTFB & total at P50/P95/P99, error rate by category, **cache hit rate** and **racing amplification** (derived from the server-side `/metrics` counters, unified across mock and real upstreams), and resource samples (RSS, fd count, connection-pool size, HTTP-cache entries, server CPU % and event-loop lag). Results print to the terminal and are written to `bench_report.json` (tagged with the git revision, so runs are diffable across versions).
 
 **Multi-round (`--rounds N`, default 3):** each round runs the same scenario on a fresh `server_proc` subprocess with a fresh SQLite DB, caches, and mock upstreams, so inter-round variance is pure environment noise. The report then gives per-metric **mean ± stddev** (plus `round_results` for per-round data and `aggregates` for min/max/mean/stddev); `--rounds 1` keeps the report byte-identical to the single-round schema.
 
