@@ -1,0 +1,24 @@
+# 构建上下文排除:保持发送给 Docker 的上下文最小,加速构建并避免把
+# 本地数据/日志/报告/虚拟环境送进镜像。
+
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# 运行时数据、日志与压测产物——都不需要进镜像
+*.db
+*.db-shm
+*.db-wal
+*.log
+bench_report*.json
+bench_profile.txt
+
+# 本地配置可能含敏感信息;镜像内用默认/构建自举配置
+config.yaml
+proxies.yaml
+
+# 上游项目的锁文件在镜像内现场生成(uv.lock 被 gitignore,仓库本就不跟踪)
+uv.lock

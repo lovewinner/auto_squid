@@ -159,6 +159,22 @@ logging:
   file: "auto_squid.log"
 ```
 
+## 容器化部署（Docker / docker compose）
+
+仓库提供多阶段镜像与 compose 示例,一键启动、数据卷持久化、健康检查:
+
+```bash
+docker compose -f examples/docker/docker-compose.yml build
+docker compose -f examples/docker/docker-compose.yml up -d
+curl http://127.0.0.1:18080/health
+curl -x http://127.0.0.1:10808 http://www.baidu.com
+```
+
+- 默认占位上游仅供自举验证;接入真实代理见 [`examples/docker/README.md`](examples/docker/README.md)
+  （挂载自己的 `proxies.yaml` 或构建时注入节点 id）。
+- SQLite 统计持久化在 `./data` 卷;日志走 stdout(`docker compose logs -f`)。
+- 镜像以非 root 用户运行,`EXPOSE 10808 18080`。
+
 ## 测试
 
 ```bash

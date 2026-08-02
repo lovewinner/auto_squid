@@ -159,6 +159,21 @@ logging:
   file: "auto_squid.log"
 ```
 
+## Container deployment (Docker / docker compose)
+
+A multi-stage image and a compose example let you run auto_squid in one command, with a persistent data volume and a health check:
+
+```bash
+docker compose -f examples/docker/docker-compose.yml build
+docker compose -f examples/docker/docker-compose.yml up -d
+curl http://127.0.0.1:18080/health
+curl -x http://127.0.0.1:10808 http://www.baidu.com
+```
+
+- The default upstreams inside the image are placeholders for bootstrap verification — see [`examples/docker/README.md`](examples/docker/README.md) to attach real upstreams (mount your own `proxies.yaml` or inject node ids at build time).
+- SQLite stats persist in the `./data` volume; logs go to stdout (`docker compose logs -f`).
+- The image runs as a non-root user and `EXPOSE`s ports `10808 18080`.
+
 ## Testing
 
 ```bash

@@ -1,0 +1,57 @@
+# auto_squid 容器示例 — docker compose (v2)
+#
+# 用法(在仓库根目录):
+#   docker compose -f examples/docker/docker-compose.yml build
+#   docker compose -f examples/docker/docker-compose.yml up -d
+#   docker compose -f examples/docker/docker-compose.yml down   # 保留数据卷
+#   docker compose -f examples/docker/docker-compose.yml logs -f
+#
+# 默认用镜像内的占位上游(squid-01),只验证自举流程。接入真实代理:
+#   - 方式 A(推荐):挂载自己的 proxies.yaml 并启用下方 volume,见
+#     examples/docker/README.md。
+#   - 方式 B:在 build.args 覆盖 AUTO_SQUID_PROXY_IDS(仅 id 列表,无认证)。
+
+services:
+  auto-squid:
+    build:
+      # 本文件在 examples/docker/ 下,故 ../.. 是仓库根(含 Dockerfile、
+      # pyproject.toml、auto_squid/)。上下文由 .dockerignore 瘦身。
+      context: ../..
+      # 自举占位上游(无认证)。需要真实地址/凭据时用方式 A 挂载文件,或:
+      #   args:
+      #     AUTO_SQUID_PROXY_IDS: squid-01,squid-02
+      args:
+        AUTO_SQUID_PROXY_IDS: squid-01
+    image: auto-squid:dev
+    container_name: auto-squid
+    hostname: auto-squid
+
+    # 无 command 覆盖:走镜像 ENTRYPOINT 的默认 CLI 参数
+    # (--proxies /app/proxies.yaml --db /data/auto_squid.db --config 由 CLI 兜底)。
+    # 挂载外部配置后如需改参数,加:
+    #   command: ["--proxies", "/proxies/proxies.yaml", "--db", "/data/auto_squid.db"]
+    # (注意:compose 的 $VAR 从宿主机环境插值,不读容器 environment,故不用占位符)
+
+    ports:
+      # 代理端口(客户端 HTTP/CONNECT)
+      - "10808:10808"
+      # 管理 API / 仪表盘。生产环境建议只绑定内网:改 "127.0.0.1:18080:18080"
+      - "18080:18080"
+
+    volumes:
+      # SQLite 统计与日志的持久卷(compose down 保留,down -v 清空)
+      - ./data:/data
+      # 方式 A:挂载自己的 proxies.yaml(先 mkdir -p ~/auto_squid 并复制填好)
+      # - ~/auto_squid/proxies.yaml:/proxies/proxies.yaml:ro
+      # 然后取消下面注释,让 CLI 指到挂载文件:
+      # command: ["--proxies", "/proxies/proxies.yaml", "--db", "/data/auto_squid.db"]
+
+    restart: unless-stopped
+
+    # 健康检查:wget 探活管理 API。首次构建后容器状态即可反映服务可用性。
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:18080/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

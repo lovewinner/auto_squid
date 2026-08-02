@@ -36,7 +36,7 @@
 ## 待办 — 运维与安全（P2）
 
 - [ ] 管理 API token 认证 + 可选 TLS（当前管理 API 无认证，靠防火墙保护）
-- [ ] systemd unit 与 docker-compose 示例
+- [x] systemd unit 与 docker-compose 示例（`Dockerfile` + `examples/docker/docker-compose.yml`，见 `examples/docker/README.md`）
 - [ ] 与真实 Squid 的集成测试（bench 已支持 --upstream real，但缺 CI/集成用例）
 
 
