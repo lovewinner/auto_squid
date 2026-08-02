@@ -140,7 +140,14 @@ select{padding:6px 10px;border:1px solid #333;border-radius:6px;background:#1621
 select:focus{border-color:#e94560}
 .autorefresh-label{font-size:12px;color:#555;min-width:70px;text-align:right}
 .stats{display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap}
-.stat-card{padding:10px 18px;border-radius:8px;background:#0f3460;text-align:center;min-width:100px}
+.stat-card{padding:10px 18px;border-radius:8px;background:#0f3460;text-align:center;min-width:100px;cursor:pointer;border:2px solid transparent;transition:border-color .15s,transform .15s}
+.stat-card:hover{border-color:#e94560;transform:translateY(-2px)}
+.stat-card.active{border-color:#e94560;background:#e94560}
+.stat-card.active .pid,.stat-card.active .count{color:#fff}
+.stat-card.active .label{color:#f8d7dd}
+.filter-banner{display:none;margin-bottom:16px;padding:10px 14px;border:1px solid #333;border-radius:6px;background:#16213e;font-size:13px;align-items:center;gap:10px}
+.filter-banner .fb-close{cursor:pointer;color:#e94560;font-weight:700;margin-left:auto;border:none;background:none;font-size:15px;padding:2px 6px}
+.filter-banner .fb-close:hover{background:rgba(233,69,96,0.15);border-radius:4px}
 .stat-card .pid{font-size:15px;font-weight:600;color:#a8d8ea}
 .stat-card .count{font-size:20px;font-weight:700;color:#e94560;margin-top:2px}
 .stat-card .label{font-size:10px;color:#666;margin-top:1px}
@@ -164,6 +171,7 @@ select:focus{border-color:#e94560}
 <span id="autorefresh-label" class="autorefresh-label"></span>
 </div>
 <div id="stats" class="stats"></div>
+<div id="filter-banner" class="filter-banner"></div>
 <div id="table-wrap"></div>
 <div id="pager" class="pager"></div>
 <div id="footer" class="footer"></div>
@@ -173,6 +181,7 @@ let page = 0, pageSize = 20;
 let refreshTimer = null;
 let refreshInterval = 30;
 let cfg = {};
+let activeProxy = new URLSearchParams(location.search).get('default_proxy') || null;
 
 function onIntervalChange(sel) {
   refreshInterval = parseInt(sel.value);
@@ -203,10 +212,26 @@ async function fetchData() {
     return ub.localeCompare(ua);
   });
   data = Object.fromEntries(entries);
+  if (activeProxy && !proxyIds.includes(activeProxy)) { activeProxy = null; history.replaceState({}, '', location.pathname); }
   page = 0;
   render();
+  renderBanner();
   renderStats();
   if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = setInterval(fetchData, refreshInterval * 1000); }
+}
+
+function selectProxy(pid) {
+  activeProxy = pid || null;
+  history.replaceState({}, '', activeProxy ? '?default_proxy=' + encodeURIComponent(activeProxy) : location.pathname);
+  page = 0;
+  scrollTo(0, 0);
+  renderBanner();
+  render();
+  renderStats();
+}
+
+function clearFilter() {
+  selectProxy(null);
 }
 
 function copyDomain(el) {
@@ -234,7 +259,20 @@ function toBeijing(isoStr) {
 
 function getFiltered() {
   const q = document.getElementById('filter').value.toLowerCase();
-  return Object.entries(data).filter(([d]) => d.includes(q));
+  return Object.entries(data).filter(([d]) => {
+    if (q && !d.includes(q)) return false;
+    if (activeProxy) return (meta[d] || {}).default_proxy === activeProxy;
+    return true;
+  });
+}
+
+function renderBanner() {
+  const banner = document.getElementById('filter-banner');
+  if (!activeProxy) { banner.style.display = 'none'; banner.innerHTML = ''; return; }
+  banner.style.display = 'flex';
+  banner.innerHTML = '已筛选：Default Proxy 为 <strong>' + activeProxy + '</strong> 的域名（' +
+    Object.keys(data).filter(d => (meta[d] || {}).default_proxy === activeProxy).length + ' 个）' +
+    '<button class="fb-close" onclick="clearFilter()" title="清除筛选">✕</button>';
 }
 
 function onFilter() { page = 0; render(); }
@@ -298,8 +336,12 @@ function renderStats() {
   const cnt = {};
   for (const d in meta) { const p = meta[d].default_proxy; if (p) cnt[p] = (cnt[p]||0) + 1; }
   const sorted = Object.entries(cnt).sort((a,b) => b[1]-a[1]);
+  const total = sorted.reduce((s,[,n]) => s+n, 0);
   let html = '';
-  for (const [pid, n] of sorted) html += `<div class="stat-card"><div class="pid">${pid}</div><div class="count">${n}</div><div class="label">default proxy</div></div>`;
+  if (total > 0) html += `<div class="stat-card${activeProxy===null?' active':''}" title="全部域名" onclick="selectProxy('')"><div class="pid">全部</div><div class="count">${total}</div><div class="label">default proxy</div></div>`;
+  for (const [pid, n] of sorted) {
+    html += `<div class="stat-card${pid===activeProxy?' active':''}" title="${pid}" onclick="selectProxy('${pid.replace(/'/g, "\\'")}')"><div class="pid">${pid}</div><div class="count">${n}</div><div class="label">default proxy</div></div>`;
+  }
   document.getElementById('stats').innerHTML = html || '<div class="stat-card" style="color:#666;font-size:13px;padding:10px 18px">No data</div>';
 }
 

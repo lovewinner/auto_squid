@@ -12,7 +12,7 @@ Lightweight forward proxy with parallel racing, domain-based caching, an HTTP re
 - **HTTP response cache**: idempotent `GET` responses are cached in memory (TTL 60s, respects `Cache-Control`)
 - **Local racing**: optionally lets the gateway host itself race as a proxy node (direct, no upstream)
 - **Domain stats**: per-domain win counts tracked in SQLite, survive restarts
-- **Web UI**: a built-in dashboard at `/` for browsing domain stats, default proxies, and win counts with auto-refresh
+- **Web UI**: a built-in dashboard at `/` for browsing domain stats, default proxies, and win counts with auto-refresh; clicking a stat card filters the domain table to the domains using that proxy as Default Proxy
 
 ## Features
 
