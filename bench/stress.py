@@ -567,10 +567,18 @@ async def fetch_counters(metrics_base: str) -> Optional[dict]:
 
 # ── 负载模式 ──────────────────────────────────────────────────
 
-async def run_concurrent(make_request, total: int, concurrency: int) -> list:
-    """以固定并发数跑 total 个请求(阶梯/混合/连接复用用)。返回结果列表。"""
+async def run_concurrent(make_request, total: int, concurrency: int,
+                         progress_interval: float = 0.0) -> list:
+    """以固定并发数跑 total 个请求(阶梯/混合/连接复用用)。返回结果列表。
+
+    progress_interval > 0 时,每隔该秒数打印一次完成进度(混合等长跑场景用,
+    避免全程无输出);默认 0 关闭。
+    """
     sem = asyncio.Semaphore(concurrency)
     results: list = []
+    done = 0
+    last_print = time.monotonic()
+    t0 = time.monotonic()
 
     async def one(i):
         async with sem:
@@ -579,6 +587,10 @@ async def run_concurrent(make_request, total: int, concurrency: int) -> list:
     tasks = [asyncio.create_task(one(i)) for i in range(total)]
     for t in asyncio.as_completed(tasks):
         results.append(await t)
+        done += 1
+        if progress_interval and time.monotonic() - last_print >= progress_interval:
+            print(f"  t={time.monotonic()-t0:.0f}s  done={done}/{total}")
+            last_print = time.monotonic()
     return results
 
 
@@ -800,7 +812,8 @@ async def scenario_mixed(router_host: str, router_port: int, host_set: HostSet,
 
     result.counters_before = await fetch_counters(metrics_base) or {}
     t_start = time.monotonic()
-    res = await run_concurrent(make, total, concurrency)
+    # 混合是长跑场景,周期打进度避免全程无输出。
+    res = await run_concurrent(make, total, concurrency, progress_interval=2.0)
     result.results = res
     result.client_requests = len(res)
     result.injected_requests = len(res)
