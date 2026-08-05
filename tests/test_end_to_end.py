@@ -1224,3 +1224,224 @@ async def test_coalescing_timeout_falls_back():
         await router.stop()
         proxy_srv.close()
         await proxy_srv.wait_closed()
+
+
+# ── session stickiness tests ─────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_stickiness_unit_hit_and_eviction():
+    """粘性表基本语义:存取、TTL 过期驱逐、代理失效驱逐、_prune_sticky 清扫。
+
+    单元级直测 _record_sticky / _get_sticky_proxy / _prune_sticky,不依赖
+    网络时序。键为 '客户端IP|域名',纯内存,滑动 TTL。
+    """
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='p1', host=HOST, port=PROXY_PORT))
+    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                    stickiness_enabled=True, stickiness_ttl=1800,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    try:
+        # 无记录 → 未命中。
+        assert router._get_sticky_proxy('1.2.3.4', 'example.com') is None
+        # 记录后可命中。
+        router._record_sticky('1.2.3.4', 'example.com', 'p1')
+        assert router._get_sticky_proxy('1.2.3.4', 'example.com') == 'p1'
+        # 键含客户端与域名,不同客户端/域名不互相污染。
+        assert router._get_sticky_proxy('1.2.3.5', 'example.com') is None
+        assert router._get_sticky_proxy('1.2.3.4', 'other.com') is None
+        assert '1.2.3.4|example.com' in router.get_sticky_cache()
+        # TTL 过期 → 未命中并驱逐条目。
+        router._sticky_cache['1.2.3.4|example.com']['updated_at'] = '2000-01-01T00:00:00+00:00'
+        assert router._get_sticky_proxy('1.2.3.4', 'example.com') is None
+        assert '1.2.3.4|example.com' not in router._sticky_cache
+        # 指向不存在代理的条目 → 取用即失效并驱逐。
+        router._record_sticky('1.2.3.4', 'example.com', 'gone')
+        assert router._get_sticky_proxy('1.2.3.4', 'example.com') is None
+        assert '1.2.3.4|example.com' not in router._sticky_cache
+        # 记录到已删除代理的条目应被 _prune_sticky 清扫。
+        router._record_sticky('9.9.9.9', 'example.com', 'gone')
+        router._prune_sticky()
+        assert '9.9.9.9|example.com' not in router._sticky_cache
+    finally:
+        await router.stop()
+
+
+@pytest.mark.asyncio
+async def test_stickiness_disabled_ignores_records():
+    """stickiness_enabled=False 时:记录为空操作,查询恒 None(默认行为不变)。"""
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='p1', host=HOST, port=PROXY_PORT))
+    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                    stickiness_enabled=False, stickiness_ttl=1800,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    try:
+        router._record_sticky('1.2.3.4', 'example.com', 'p1')
+        assert router._sticky_cache == {}
+        assert router._get_sticky_proxy('1.2.3.4', 'example.com') is None
+    finally:
+        await router.stop()
+
+
+@pytest.mark.asyncio
+async def test_session_stickiness_reuses_proxy():
+    """同一客户端+域名:首次竞速后,后续请求应命中粘性代理单发(不竞速)。
+
+    fast 无延迟、slow 延迟 0.05s:首次竞速 fast 必然胜出并写入粘性表
+    (127.0.0.1|domain → fast)。第二次请求走粘性单发,不再触发竞速——
+    slow 作为竞速候选不会被再次尝试(request_counts['slow'] 恒为 0)。
+    """
+    fast_port, slow_port = 31401, 31402
+    fast_srv = await run_mock_proxy_tagged(HOST, fast_port, 'FAST', pre_header_delay=0.0)
+    slow_srv = await run_mock_proxy_tagged(HOST, slow_port, 'SLOW', pre_header_delay=0.05)
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='fast', host=HOST, port=fast_port))
+    ps.add(ProxyInfo(id='slow', host=HOST, port=slow_port))
+    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                    max_retries=2, enable_http_cache=False,
+                    stickiness_enabled=True, stickiness_ttl=1800,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        domain = 'stickiness.example.com'
+        url = f"http://{domain}/p0".encode()
+        body = await send_http_get(HOST, ROUTER_PORT, url=url)
+        assert b'FAST' in body, f"first request should win via fast, got {body!r}"
+        # 首次竞速 fast 胜出 → 已写粘性表。
+        assert router._get_sticky_proxy('127.0.0.1', domain) == 'fast'
+        # 第二次请求:粘性命中 → 单发 fast,不竞速。
+        body2 = await send_http_get(HOST, ROUTER_PORT, url=url)
+        assert b'FAST' in body2
+        counters = router.snapshot_counters()
+        assert counters['sticky_cache_hits'] >= 1, "second request should be a sticky hit"
+        # 粘性单发跳过竞速:slow 从未作为赢家被记录。
+        assert router.request_counts.get('slow', 0) == 0, \
+            f"sticky single-send should skip racing; request_counts={router.request_counts}"
+    finally:
+        await router.stop()
+        fast_srv.close()
+        await fast_srv.wait_closed()
+        slow_srv.close()
+        await slow_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_stickiness_redispatch_on_proxy_failure():
+    """粘性代理失败 → 驱逐该条目并回落竞速,竞速赢家回填粘性表(redispatch)。
+
+    fast 无延迟、slow 延迟 0.05s:首次竞速 fast 胜出并粘住。停掉 fast 上游后,
+    再次请求 → 粘性单发失败 → 驱逐 → 回落域名缓存(也指向 fast,失败) → 竞速
+    → slow 胜出并回填粘性表;第三次请求直接粘到 slow。
+    """
+    fast_port, slow_port = 31411, 31412
+    fast_srv = await run_mock_proxy_tagged(HOST, fast_port, 'FAST', pre_header_delay=0.0)
+    slow_srv = await run_mock_proxy_tagged(HOST, slow_port, 'SLOW', pre_header_delay=0.05)
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='fast', host=HOST, port=fast_port))
+    ps.add(ProxyInfo(id='slow', host=HOST, port=slow_port))
+    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                    max_retries=2, enable_http_cache=False,
+                    stickiness_enabled=True, stickiness_ttl=1800,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        domain = 'sticky-redispatch.example.com'
+        url = f"http://{domain}/p0".encode()
+        body = await send_http_get(HOST, ROUTER_PORT, url=url)
+        assert b'FAST' in body
+        assert router._get_sticky_proxy('127.0.0.1', domain) == 'fast'
+        # 停掉 fast 上游 → 粘性单发失败 → redispatch 到 slow,并回填粘性表。
+        fast_srv.close()
+        await fast_srv.wait_closed()
+        body2 = await send_http_get(HOST, ROUTER_PORT, url=url)
+        assert b'SLOW' in body2, f"redispatch should land on slow, got {body2!r}"
+        assert router._get_sticky_proxy('127.0.0.1', domain) == 'slow', \
+            "racing winner must repopulate the sticky table"
+        # 第三次请求:已粘到 slow,直接单发不再竞速。
+        body3 = await send_http_get(HOST, ROUTER_PORT, url=url)
+        assert b'SLOW' in body3
+    finally:
+        await router.stop()
+        fast_srv.close()
+        await fast_srv.wait_closed()
+        slow_srv.close()
+        await slow_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_stickiness_connect_reuses_proxy():
+    """CONNECT 路径:同一客户端+target 复用粘性代理,sticky_cache_hits 累计。"""
+    fast_port, slow_port = 31421, 31422
+    fast_srv = await run_mock_proxy(HOST, fast_port, hit_counter=None)
+    slow_srv = await run_mock_proxy(HOST, slow_port, hit_counter=None)
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='fast', host=HOST, port=fast_port))
+    ps.add(ProxyInfo(id='slow', host=HOST, port=slow_port))
+    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                    max_retries=2, enable_http_cache=False,
+                    stickiness_enabled=True, stickiness_ttl=1800,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        target = b"sticky-conn.example.com:443"
+        echo = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"a")
+        assert echo == b"a"
+        # 首次 CONNECT 竞速胜者(非确定性,fast/slow 均无延迟)写入粘性表。
+        sticky_pid = router._get_sticky_proxy('127.0.0.1', 'sticky-conn.example.com:443')
+        assert sticky_pid in ('fast', 'slow'), f"unexpected sticky pid {sticky_pid!r}"
+        # 第二次 CONNECT:粘性命中(命中哪台取决于首次竞速胜者,这里直接看计数)。
+        echo2 = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"b")
+        assert echo2 == b"b"
+        assert router.snapshot_counters()['sticky_cache_hits'] >= 1, \
+            "second CONNECT should be a sticky hit"
+        # 粘性表反映同一胜者(redispatch 未触发,两次 CONNECT 走同一代理)。
+        assert router._get_sticky_proxy('127.0.0.1', 'sticky-conn.example.com:443') == sticky_pid
+    finally:
+        await router.stop()
+        fast_srv.close()
+        await fast_srv.wait_closed()
+        slow_srv.close()
+        await slow_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_stickiness_repopulated_from_domain_cache():
+    """粘性被驱逐后,若域名缓存仍有效,单发成功应回填粘性表。
+
+    场景:首请求竞速 fast 胜出 → 粘性与域名缓存都指向 fast。手动清空粘性
+    (模拟上轮 redispatch 驱逐),域名缓存仍指向 fast(有效)。再次请求应走
+    域名缓存单发成功,并把粘性表回填为 fast——否则该客户端会一直丢粘性
+    直到域名缓存过期(cache_ttl 默认 600s)。
+    """
+    fast_port, slow_port = 31431, 31432
+    fast_srv = await run_mock_proxy_tagged(HOST, fast_port, 'FAST', pre_header_delay=0.0)
+    slow_srv = await run_mock_proxy_tagged(HOST, slow_port, 'SLOW', pre_header_delay=0.05)
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='fast', host=HOST, port=fast_port))
+    ps.add(ProxyInfo(id='slow', host=HOST, port=slow_port))
+    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                    max_retries=2, enable_http_cache=False,
+                    stickiness_enabled=True, stickiness_ttl=1800,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        domain = 'sticky-refill.example.com'
+        url = f"http://{domain}/p0".encode()
+        body = await send_http_get(HOST, ROUTER_PORT, url=url)
+        assert b'FAST' in body
+        # 竞速赢家同时回填粘性与域名缓存。
+        assert router._get_sticky_proxy('127.0.0.1', domain) == 'fast'
+        assert router._get_fresh_proxy(domain) == 'fast'
+        # 模拟粘性被驱逐(redispatch 场景),但域名缓存仍有效。
+        router._evict_sticky('127.0.0.1', domain)
+        assert router._get_sticky_proxy('127.0.0.1', domain) is None
+        # 再次请求:域名缓存单发成功,应把粘性表回填为 fast。
+        body2 = await send_http_get(HOST, ROUTER_PORT, url=url)
+        assert b'FAST' in body2
+        assert router._get_sticky_proxy('127.0.0.1', domain) == 'fast', \
+            "domain-cache single-send must repopulate the sticky table"
+    finally:
+        await router.stop()
+        fast_srv.close()
+        await fast_srv.wait_closed()
+        slow_srv.close()
+        await slow_srv.wait_closed()

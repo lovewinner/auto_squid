@@ -9,6 +9,7 @@ Lightweight forward proxy with parallel racing, domain-based caching, an HTTP re
 - Runs on a gateway host, accepts HTTP/HTTPS proxy traffic, and forwards each request through upstream proxies
 - **Parallel racing**: sends each request to several upstream proxies simultaneously and uses the first successful response; the rest are cancelled and their connections released
 - **Domain cache**: once a proxy wins a race for a domain, it is reused for that domain until `cache_ttl` expires — avoids racing every request
+- **Session stickiness**: optional; the same client IP + domain/target reuses the same proxy (keeps the egress IP stable); a failing sticky proxy falls back to racing (redispatch)
 - **HTTP response cache**: idempotent `GET` responses are cached in memory (TTL 60s, respects `Cache-Control`)
 - **Local racing**: optionally lets the gateway host itself race as a proxy node (direct, no upstream)
 - **Domain stats**: per-domain win counts tracked in SQLite, survive restarts
@@ -18,6 +19,7 @@ Lightweight forward proxy with parallel racing, domain-based caching, an HTTP re
 
 - HTTP and HTTPS (`CONNECT`) forwarding with parallel racing across upstream proxies
 - Domain-level caching (`cache_ttl`) of the winning proxy per domain
+- Session stickiness (per-client+domain, in-memory, sliding TTL) with redispatch on sticky-proxy failure
 - In-memory HTTP `GET` response cache with `Cache-Control` awareness
 - Optional local racing node (gateway races directly alongside upstreams)
 - Hop-by-hop header filtering in both directions: request headers (`proxy-authorization`, `connection`, etc.) are stripped before forwarding upstream so client-to-proxy credentials never leak to the next hop; response headers (`transfer-encoding`, `content-encoding`, `content-length`, etc.) are stripped and `Content-Length` is rewritten to the actual body length
@@ -51,6 +53,25 @@ curl -x http://admin:secret@127.0.0.1:10808 http://example.com
 ```
 
 > Auth gates the **proxy port only**. The management API on `:18080` stays open — protect it with a firewall as noted in Limitations.
+
+## Session stickiness
+
+**Disabled by default.** When enabled, requests from the same client IP to the same domain/target reuse the proxy that last won for that key (single-send, no racing), keeping the **egress IP stable** — origin sites often bind login state / bot-protection / CAPTCHA to the egress IP, so switching proxies mid-session can drop logins or trigger bot flags.
+
+```yaml
+router:
+  stickiness:
+    enabled: true
+    ttl: 1800          # stickiness TTL (s); refreshed on hit (sliding), active sessions never expire
+```
+
+Behavior notes:
+
+- Key is `client_ip|domain` (URL hostname for HTTP, `host:port` for CONNECT); **takes precedence over the domain cache**. Hit → single-send; miss → domain cache → racing.
+- **Redispatch**: a failing sticky proxy evicts its entry and falls back to the domain cache/racing; the racing winner repopulates the sticky table, so the next request automatically switches proxies.
+- In-memory only (HAProxy-style table), cleared on restart; a background sweep prunes expired entries so the client-IP set cannot grow unbounded.
+- Entries pointing at a deleted/disabled proxy are validated and evicted on use.
+- Inspect the current table: `curl http://127.0.0.1:18080/stickiness`.
 
 ## Quickstart
 
@@ -124,6 +145,7 @@ Client ──HTTP/S──> auto_squid (proxy :10808)
 - **CONNECT requests**: raced via raw `asyncio.open_connection` tunnels with connect/read timeouts
 - **Selection**: `ProxySelector.ordered_proxies()` returns a randomly shuffled list of enabled proxies; the first `max_retries` race, then any remaining proxies race as a fallback
 - **Domain cache**: after a win, the winning proxy is recorded in `domain_meta` and reused for the domain until `cache_ttl` expires
+- **Session stickiness**: same client IP + domain/target reuses the last winning proxy (single-send, beats the domain cache); a failing sticky proxy evicts its entry and falls back to racing, and the winner repopulates the table
 - **Stats**: `request_counts` (wins), `attempted_counts` (total attempts) per proxy; `domain_stats` (wins per domain per proxy) in SQLite
 
 ## API Endpoints
@@ -140,6 +162,7 @@ Client ──HTTP/S──> auto_squid (proxy :10808)
 | `GET /config` | Router config (`enable_local_racing`) |
 | `GET /domains` | Per-domain win stats from SQLite |
 | `GET /domains/meta` | Per-domain default proxy + last-updated time |
+| `GET /stickiness` | Session stickiness table (client_ip\|domain → sticky proxy + updated time) |
 
 ## Config
 
@@ -155,6 +178,9 @@ api:
 router:
   enable_local_racing: false   # let the gateway host race as a proxy node
   cache_ttl: 600               # domain cache TTL in seconds
+  stickiness:
+    enabled: false             # session stickiness (per-client+domain)
+    ttl: 1800                  # stickiness TTL in seconds, sliding
 logging:
   file: "auto_squid.log"
 ```

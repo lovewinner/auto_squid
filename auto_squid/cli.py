@@ -99,6 +99,8 @@ def start(config: str = "", proxies: str = "", db: str = "auto_squid.db"):
         auth_enabled=cfg.router.auth.enabled,
         auth_username=cfg.router.auth.username,
         auth_password=cfg.router.auth.password,
+        stickiness_enabled=cfg.router.stickiness.enabled,
+        stickiness_ttl=cfg.router.stickiness.ttl,
     )
     # 把 store/router 注入 FastAPI app 的模块级全局,供各端点使用。
     mount_api(proxy_store, router)

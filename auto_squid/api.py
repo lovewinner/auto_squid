@@ -98,6 +98,14 @@ async def domains_meta():
     return _router.get_domain_meta_from_db()
 
 
+@app.get("/stickiness")
+async def stickiness():
+    """返回会话粘性表（客户端IP|域名 → 粘性代理、更新时间）"""
+    if not _router:
+        return {}
+    return _router.get_sticky_cache()
+
+
 @app.get("/")
 async def domains_ui():
     return HTMLResponse("""<!DOCTYPE html>

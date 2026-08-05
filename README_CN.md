@@ -9,6 +9,7 @@
 - 在网关主机运行，接受 HTTP/HTTPS 代理流量，将每个请求转发到上游代理
 - **并行竞速**：每次请求同时发往多个上游代理，使用最先返回的成功响应，其余取消并释放连接
 - **域名缓存**：某个代理为某域名竞速胜出后，在 `cache_ttl` 有效期内复用该代理，避免每个请求都竞速
+- **会话粘性**：可选，同一客户端 IP + 域名/目标复用同一代理（保持 egress IP 稳定），粘性代理失败自动回落竞速（redispatch）
 - **HTTP 响应缓存**：幂等 `GET` 响应在内存中缓存（TTL 60s，遵循 `Cache-Control`）
 - **本机竞速**：可选，让网关主机自身作为代理节点直接参与竞速（不走上游）
 - **域名统计**：各域名胜出次数持久化到 SQLite，重启不丢失
@@ -18,6 +19,7 @@
 
 - HTTP 与 HTTPS（`CONNECT`）转发，**并行竞速多个上游代理**
 - 域名级缓存（`cache_ttl`），按域名复用胜出代理
+- 会话粘性（per-client+domain，内存-only，滑动 TTL），粘性代理失败自动回落竞速并回填
 - 内存级 HTTP `GET` 响应缓存，遵循 `Cache-Control`
 - 可选本机竞速节点（网关与上游一同竞速）
 - Hop-by-hop 头双向过滤：请求头（`proxy-authorization`、`connection` 等）在转发上游前剔除，避免客户端访问本代理的凭据泄漏到下一跳；响应头（`transfer-encoding`、`content-encoding`、`content-length` 等）剔除并按实际 body 长度重写 `Content-Length`
@@ -51,6 +53,25 @@ curl -x http://admin:secret@127.0.0.1:10808 http://example.com
 ```
 
 > 认证仅保护**代理端口**。管理 API（`:18080`）仍为开放状态，请按"限制"一节用防火墙保护。
+
+## 会话粘性
+
+**默认关闭**。开启后，同一客户端 IP 访问同一域名/目标时，复用该键上次胜出的代理单发（跳过竞速），保持 **egress IP 稳定**——目标站点常把登录态/风控/CAPTCHA 与出口 IP 绑定，竞速中途换代理会导致掉登录、触发风控。
+
+```yaml
+router:
+  stickiness:
+    enabled: true
+    ttl: 1800          # 粘性有效期（秒），粘性命中成功会滑动刷新，活跃会话不过期
+```
+
+行为要点：
+
+- 键为 `客户端IP|域名`（HTTP 用 URL 域名，CONNECT 用 `host:port`），**优先级高于域名缓存**；粘性命中即单发，未命中再查域名缓存，最后才竞速。
+- **redispatch**：粘性代理单发失败 → 驱逐该条目 → 回落域名缓存/竞速；竞速赢家回填粘性表，下一次请求自动切换到新代理。
+- 纯内存（HAProxy 式内存表），重启即清；后台周期清扫过期条目，防止客户端 IP 集合无界增长。
+- 粘性代理被删除/停用后，取用时会校验并自动驱逐。
+- 查看当前粘性表：`curl http://127.0.0.1:18080/stickiness`。
 
 ## 快速开始
 
@@ -124,6 +145,7 @@ curl -x http://admin:secret@127.0.0.1:10808 http://example.com
 - **CONNECT 请求**：通过 `asyncio.open_connection` 隧道并行竞速，带连接/读取超时
 - **选择**：`ProxySelector.ordered_proxies()` 返回随机打乱的已启用代理列表；前 `max_retries` 个先竞速，失败后再对剩余代理竞速兜底
 - **域名缓存**：胜出后把代理记入 `domain_meta`，在 `cache_ttl` 有效期内对该域名复用
+- **会话粘性**：同一客户端 IP + 域名/目标复用上次胜出的代理单发（跳过竞速），优先级高于域名缓存；粘性代理失败则驱逐该条目并回落竞速（redispatch），竞速赢家回填粘性表
 - **统计**：`request_counts` 各代理胜出次数，`attempted_counts` 各代理尝试次数；`domain_stats` 各域名下各代理胜出次数（SQLite 持久化）
 
 ## API 端点
@@ -140,6 +162,7 @@ curl -x http://admin:secret@127.0.0.1:10808 http://example.com
 | `GET /config` | 路由配置（`enable_local_racing`） |
 | `GET /domains` | 从 SQLite 读取的域名胜出统计 |
 | `GET /domains/meta` | 各域名默认代理 + 最近更新时间 |
+| `GET /stickiness` | 会话粘性表（客户端IP\|域名 → 粘性代理 + 更新时间） |
 
 ## 配置
 
@@ -155,6 +178,9 @@ api:
 router:
   enable_local_racing: false   # 让网关主机作为代理节点参与竞速
   cache_ttl: 600               # 域名缓存有效期（秒）
+  stickiness:
+    enabled: false             # 会话粘性（per-client+domain）
+    ttl: 1800                  # 粘性有效期（秒），滑动刷新
 logging:
   file: "auto_squid.log"
 ```

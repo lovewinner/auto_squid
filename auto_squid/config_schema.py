@@ -64,6 +64,19 @@ class AuthConfig(BaseModel):
     password: str = Field("")
 
 
+class StickinessConfig(BaseModel):
+    """会话粘性配置(per-client+domain 维度,内存-only)。
+
+    enabled: 是否启用会话粘性。启用后同一客户端 IP 访问同一域名/目标时,
+             复用该键上次胜出的代理单发(跳过竞速),保持 egress IP 稳定;
+             粘性代理失败时驱逐并回落竞速,赢家回填粘性表(redispatch)。
+    ttl:     粘性有效期(秒)。粘性命中成功会刷新 TTL(滑动),活跃会话不过期;
+             到期后重新走竞速。
+    """
+    enabled: bool = Field(False, description="启用会话粘性(同客户端+域名复用同一代理)")
+    ttl: int = Field(1800, description="会话粘性有效期(秒)，滑动刷新")
+
+
 class RouterConfig(BaseModel):
     """路由行为配置。
 
@@ -72,11 +85,13 @@ class RouterConfig(BaseModel):
     enable_local_racing: 让网关主机自身作为代理节点直接参与竞速(不走上游)。
     max_retries:         竞速首批并行的代理数量;全失败后对剩余代理再竞速兜底。
     auth:                客户端认证配置(AuthConfig)。
+    stickiness:          会话粘性配置(见 StickinessConfig)。
     """
     cache_ttl: int = Field(600, description="域名缓存有效期(秒)，过期后重新竞速")
     enable_local_racing: bool = Field(False, description="将本机作为代理节点参与竞速")
     max_retries: int = Field(3, description="竞速首批并行的代理数量")
     auth: AuthConfig = Field(default_factory=AuthConfig, description="客户端认证配置")
+    stickiness: StickinessConfig = Field(default_factory=StickinessConfig, description="会话粘性配置")
 
 
 class Config(BaseModel):

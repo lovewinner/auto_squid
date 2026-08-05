@@ -28,6 +28,13 @@ router:
     enabled: false
     username: "admin"
     password: "changeme"
+  # 会话粘性配置(per-client+domain 维度,内存-only,默认关闭)
+  stickiness:
+    enabled: false
+    # 粘性有效期(秒):同一客户端 IP 访问同一域名/目标时,复用该键上次胜出的
+    # 代理单发(跳过竞速),保持 egress IP 稳定;粘性代理失败自动回落竞速。
+    # 粘性命中成功会滑动刷新 TTL,活跃会话不过期。
+    ttl: 1800
 
 # 日志配置;file 为 null 时写默认文件 auto_squid.log
 logging:
