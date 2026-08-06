@@ -67,14 +67,21 @@ class AuthConfig(BaseModel):
 class StickinessConfig(BaseModel):
     """会话粘性配置(per-client+domain 维度,内存-only)。
 
-    enabled: 是否启用会话粘性。启用后同一客户端 IP 访问同一域名/目标时,
-             复用该键上次胜出的代理单发(跳过竞速),保持 egress IP 稳定;
-             粘性代理失败时驱逐并回落竞速,赢家回填粘性表(redispatch)。
-    ttl:     粘性有效期(秒)。粘性命中成功会刷新 TTL(滑动),活跃会话不过期;
-             到期后重新走竞速。
+    enabled:    是否启用会话粘性。启用后同一客户端 IP 访问同一域名/目标时,
+               复用该键上次胜出的代理单发(跳过竞速),保持 egress IP 稳定;
+               粘性代理失败时驱逐并回落竞速,赢家回填粘性表(redispatch)。
+    ttl:        粘性有效期(秒)。粘性命中成功会刷新 TTL(滑动),活跃会话不过期;
+               到期后重新走竞速。
+    recheck_hits: 粘性命中累计次数阈值。达到该次数后触发一次"探路重竞速",
+               用新赢家替换可能已变慢的粘性代理(默认开启 100 次;0 表示关闭
+               周期重评估)。驱逐后跳过域名缓存直接竞速,赢家 hits 归零。
+    max_entries: 粘性表容量硬上限。写前先清过期条目,仍超限则驱逐 updated_at
+               最旧的一条,防止客户端 IP 集合过大时内存无界增长(默认 100k)。
     """
     enabled: bool = Field(False, description="启用会话粘性(同客户端+域名复用同一代理)")
     ttl: int = Field(1800, description="会话粘性有效期(秒)，滑动刷新")
+    recheck_hits: int = Field(100, description="粘性命中 N 次后触发探路重竞速(0=关闭)")
+    max_entries: int = Field(100_000, description="粘性表最大条目数,超出驱逐最旧(内存保护)")
 
 
 class RouterConfig(BaseModel):

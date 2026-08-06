@@ -13,8 +13,10 @@
 - 域名缓存:某代理为某域名胜出后,在 cache_ttl 内复用该代理,避免每请求竞速
   (内存镜像 _meta_cache + _get_fresh_proxy)。
 - 会话粘性:同一客户端 IP + 域名/目标复用上次胜出的代理单发,保持 egress IP
-  稳定(纯内存 _sticky_cache,滑动 TTL);粘性代理失败则驱逐并回落竞速
-  (redispatch),赢家回填粘性表。优先级高于域名缓存。
+  稳定(纯内存 _sticky_cache,滑动 TTL);粘性代理失败或返回 5xx 则驱逐并回落
+  竞速(redispatch),赢家回填粘性表。优先级高于域名缓存。粘性命中 N 次
+  (recheck_hits)后触发探路重竞速,用新赢家替换可能已变慢的代理;粘性表有
+  容量硬上限(stickiness_max_entries),超限驱逐最旧条目。
 - HTTP 响应缓存:幂等 GET 的成功响应在内存缓存 60s(_http_cache_*),遵循
   Cache-Control;流式转发时边转边缓冲(带上限),缓冲满或响应过大则放弃缓存。
   写方法(POST/PUT/DELETE/PATCH)在转发前失效该域名的所有 GET 缓存
@@ -129,7 +131,7 @@ class Router:
     生命周期:start() 开始监听 → handle_client 处理每个连接 → stop() 优雅关闭。
     """
 
-    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, stickiness_enabled: bool = False, stickiness_ttl: int = 1800):
+    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000):
         """构造路由器。
 
         参数:
@@ -143,6 +145,8 @@ class Router:
             auth_username/password: 客户端认证的预期凭据。
             stickiness_enabled:  是否启用会话粘性(同客户端+域名复用同一代理)。
             stickiness_ttl:      会话粘性有效期(秒),粘性命中成功滑动刷新。
+            stickiness_recheck_hits: 粘性命中 N 次后触发探路重竞速(0=关闭)。
+            stickiness_max_entries: 粘性表最大条目数,超出驱逐最旧(内存保护)。
         """
         self.proxy_store = proxy_store
         self.selector = ProxySelector(proxy_store)
@@ -167,8 +171,11 @@ class Router:
         # 但不落盘(粘性是瞬态,重启即清)。
         self.stickiness_enabled = stickiness_enabled
         self.stickiness_ttl = stickiness_ttl
-        self._sticky_cache: dict[str, dict[str, str]] = {}
+        self.stickiness_recheck_hits = stickiness_recheck_hits
+        self.stickiness_max_entries = stickiness_max_entries
+        self._sticky_cache: dict[str, dict[str, object]] = {}
         self.sticky_cache_hits = 0
+        self.sticky_evictions = 0       # 粘性表驱逐次数(5xx/失败/超容量)
         # ── 服务端性能计数器 ────────────────────────────────────
         # 供压测经 /metrics 跨进程读取,在两种上游模式(mock/real)下统一计算
         # 缓存命中率与竞速放大率——不再依赖 mock 上游的 hit_count(那只对 mock
@@ -372,6 +379,7 @@ class Router:
             "http_cache_misses": self.http_cache_misses,
             "domain_cache_hits": self.domain_cache_hits,
             "sticky_cache_hits": self.sticky_cache_hits,
+            "sticky_evictions": self.sticky_evictions,
             "racing_invocations": self.racing_invocations,
             "upstream_attempts": self.upstream_attempts,
             "http_cache_entries": len(self._http_cache),
@@ -401,8 +409,8 @@ class Router:
 
     # ── 会话粘性 ────────────────────────────────────────────────
 
-    def get_sticky_cache(self) -> dict[str, dict[str, str]]:
-        """返回全量会话粘性表快照 {key: {proxy_id, updated_at}}。
+    def get_sticky_cache(self) -> dict[str, dict[str, object]]:
+        """返回全量会话粘性表快照 {key: {proxy_id, updated_at, hits}}。
 
         供管理 API / 仪表盘展示。读内存镜像,无锁无 I/O。
         """
@@ -413,13 +421,20 @@ class Router:
         """会话粘性键:"客户端IP|域名"。hostname/IP 均不含 '|',分隔安全。"""
         return f"{client_ip}|{domain}"
 
+    def _evict_sticky_key(self, key: str):
+        """按 key 驱逐粘性条目并计入驱逐统计(所有驱逐路径共用)。"""
+        if self._sticky_cache.pop(key, None) is not None:
+            self.sticky_evictions += 1
+
     def _get_sticky_proxy(self, client_ip: str, domain: str) -> Optional[str]:
         """返回客户端+域名在 stickiness_ttl 内的粘性代理 id;未启用/过期/代理
-        失效返回 None(并把失效条目驱逐)。
+        失效/重评估到期 返回 None(并把失效/过期条目就地驱逐)。
 
-        纯内存读取。TTL 为滑动制:命中后由 _record_sticky 刷新 updated_at,
-        活跃会话不过期;到期后重新走竞速。取回时校验代理仍在 ProxyStore 且
-        enabled——内存-only 的表可能在代理被删除/停用后残留,必须就地驱逐。
+        纯内存读取。TTL 为滑动制:命中后由 _bump_sticky 刷新 updated_at 并累加
+        hits,活跃会话不过期;到期后重新走竞速。取回时校验代理仍在 ProxyStore
+        且 enabled——内存-only 的表可能在代理被删除/停用后残留,必须就地驱逐。
+        本机竞速胜者('local')不经过 proxy_store(直连),仅当 enable_local_racing
+        时才视为有效,否则视作失效条目驱逐(A1)。
         """
         if not self.stickiness_enabled:
             return None
@@ -428,42 +443,104 @@ class Router:
         if not entry:
             return None
         pid = entry["proxy_id"]
-        proxy = self.proxy_store.get(pid)
-        if not proxy or not proxy.enabled:
-            self._sticky_cache.pop(key, None)
-            return None
-        updated_at_str = entry["updated_at"]
+        if pid == 'local':
+            if not self.enable_local_racing:
+                self._evict_sticky_key(key)
+                return None
+        else:
+            proxy = self.proxy_store.get(pid)
+            if not proxy or not proxy.enabled:
+                self._evict_sticky_key(key)
+                return None
         try:
-            dt = datetime.fromisoformat(updated_at_str)
-            if (datetime.now(timezone.utc) - dt).total_seconds() < self.stickiness_ttl:
-                return pid
+            dt = datetime.fromisoformat(entry["updated_at"])
+            if (datetime.now(timezone.utc) - dt).total_seconds() >= self.stickiness_ttl:
+                self._evict_sticky_key(key)
+                return None
         except Exception:
-            pass
-        self._sticky_cache.pop(key, None)
-        return None
+            self._evict_sticky_key(key)
+            return None
+        # B2:命中次数达到阈值 → 触发探路重竞速(不驱逐,由调用方依据
+        # _sticky_recheck_due 决定跳过域名缓存直接竞速)。
+        if self._sticky_recheck_due(client_ip, domain):
+            return None
+        return pid
+
+    def _sticky_recheck_due(self, client_ip: str, domain: str) -> bool:
+        """该客户端+域名是否到了"探路重竞速"时机(粘性命中 recheck_hits 次)。
+
+        仅当 sticky_recheck_hits > 0 且条目仍处于 TTL 内且 hits 达到阈值时为真。
+        调用方发现为真后应驱逐该条目并跳过域名缓存直接竞速,用新赢家替换可能
+        已变慢的粘性代理。
+        """
+        if not self.stickiness_enabled or self.stickiness_recheck_hits <= 0:
+            return False
+        entry = self._sticky_cache.get(self._sticky_key(client_ip, domain))
+        if not entry:
+            return False
+        try:
+            if int(entry.get("hits", 0)) < self.stickiness_recheck_hits:
+                return False
+            dt = datetime.fromisoformat(entry["updated_at"])
+            return (datetime.now(timezone.utc) - dt).total_seconds() < self.stickiness_ttl
+        except Exception:
+            return False
 
     def _record_sticky(self, client_ip: str, domain: str, pid: str):
-        """记录客户端+域名的粘性代理(刷新 updated_at,滑动 TTL)。
+        """记录客户端+域名的粘性代理(刷新 updated_at,hits 归零)。
 
-        仅由确认的赢家(粘性单发成功 / 竞速赢家)调用。未启用时为空操作。
+        仅由确认的赢家(粘性单发成功 / 竞速赢家 / 域名缓存单发成功)调用,新
+        赢家从 0 开始重新计数。未启用时为空操作。写前检查容量上限(B1):超限
+        先清过期条目,仍超则驱逐 updated_at 最旧的一条。
         """
         if not self.stickiness_enabled:
             return
-        self._sticky_cache[self._sticky_key(client_ip, domain)] = {
+        key = self._sticky_key(client_ip, domain)
+        if key not in self._sticky_cache and len(self._sticky_cache) >= self.stickiness_max_entries:
+            self._prune_sticky()
+            if len(self._sticky_cache) >= self.stickiness_max_entries:
+                self._evict_oldest_sticky()
+        self._sticky_cache[key] = {
             "proxy_id": pid,
             "updated_at": self._now_utc(),
+            "hits": 0,
         }
 
+    def _bump_sticky(self, client_ip: str, domain: str, pid: str):
+        """粘性命中成功:刷新 updated_at(滑动 TTL)并累加 hits(B2)。
+
+        区别于 _record_sticky:hits 只增不减(新赢家才归零),保证 recheck_hits
+        阈值可被持续命中累计触发。条目被并发驱逐时退化为重新记录。
+        """
+        key = self._sticky_key(client_ip, domain)
+        entry = self._sticky_cache.get(key)
+        if entry is None:
+            self._record_sticky(client_ip, domain, pid)
+            return
+        entry["proxy_id"] = pid
+        entry["updated_at"] = self._now_utc()
+        entry["hits"] = int(entry.get("hits", 0)) + 1
+
     def _evict_sticky(self, client_ip: str, domain: str):
-        """驱逐客户端+域名的粘性条目(粘性代理单发失败时调用)。"""
-        self._sticky_cache.pop(self._sticky_key(client_ip, domain), None)
+        """驱逐客户端+域名的粘性条目(粘性代理单发失败/5xx 时调用)。"""
+        self._evict_sticky_key(self._sticky_key(client_ip, domain))
+
+    def _evict_oldest_sticky(self):
+        """容量保护:驱逐 updated_at 最旧的一条粘性条目(计入驱逐统计)。
+
+        ISO-8601 UTC 时间戳同格式下按字典序比较即时间序,无需解析。
+        """
+        if not self._sticky_cache:
+            return
+        oldest_key = min(self._sticky_cache, key=lambda k: self._sticky_cache[k].get("updated_at", ""))
+        self._evict_sticky_key(oldest_key)
 
     def _prune_sticky(self):
         """清扫过期/指向失效代理的粘性条目,限制内存无界增长。
 
-        由后台 _flush_loop 周期调用。粘性键集合(客户端 IP)可能远大于域名
-        集合,若放任不管会缓慢累积;过期清扫把表规模收敛到"最近 TTL 内活跃
-        的客户端+域名"。
+        由后台 _flush_loop 周期调用,也由 _record_sticky 在超容量时先调用。
+        粘性键集合(客户端 IP)可能远大于域名集合,若放任不管会缓慢累积;
+        过期清扫把表规模收敛到"最近 TTL 内活跃的客户端+域名"。
         """
         if not self._sticky_cache:
             return
@@ -471,6 +548,10 @@ class Router:
         stale = []
         for key, entry in self._sticky_cache.items():
             pid = entry["proxy_id"]
+            if pid == 'local':
+                if not self.enable_local_racing:
+                    stale.append(key)
+                continue
             proxy = self.proxy_store.get(pid)
             if not proxy or not proxy.enabled:
                 stale.append(key)
@@ -482,7 +563,7 @@ class Router:
             except Exception:
                 stale.append(key)
         for key in stale:
-            self._sticky_cache.pop(key, None)
+            self._evict_sticky_key(key)
 
     # ── TCP 调优 ────────────────────────────────────────────────
 
@@ -549,7 +630,9 @@ class Router:
         # 共享缓存必须尊重源站的 Cache-Control 禁存指令(无论是否有
         # Content-Length)。no-cache 在此保守按"不存"处理:本代理不做再校验
         # (发条件请求),存了也只是徒增一次过期清除,不如直接不存。
-        cc = headers.get('cache-control', '')
+        # headers 为 list[(name, value)](保留重复头)或 dict,两种都按 (k, v) 迭代。
+        items = headers.items() if isinstance(headers, dict) else headers
+        cc = next((v for k, v in items if k.lower() == 'cache-control'), '')
         if 'no-store' in cc or 'no-cache' in cc or 'private' in cc:
             return
         key = self._http_cache_key(method, url)
@@ -766,9 +849,12 @@ class Router:
         与流式路径不同:缓存命中时 body 已完整在内存,直接整体写出即可。
         """
         hop_by_hop = _HOP_BY_HOP_RESPONSE_HEADERS
+        # 缓存命中路径传入的是 list[(name, value)](保留重复头如多个 Set-Cookie);
+        # 内部错误响应(407/502 等)传入 dict,两种都按 (k, v) 迭代即可。
+        items = headers.items() if isinstance(headers, dict) else headers
         try:
             writer.write(f"HTTP/1.1 {status_code} {reason_phrase}\r\n".encode('latin-1'))
-            for k, v in headers.items():
+            for k, v in items:
                 if k.lower() not in hop_by_hop:
                     writer.write(f"{k}: {v}\r\n".encode('latin-1'))
             writer.write(f"Content-Length: {len(body)}\r\n".encode('latin-1'))
@@ -1144,8 +1230,8 @@ class Router:
             pass
         if buffered is not None and resp.status_code in CACHEABLE_STATUS:
             self._http_cache_set(method, url, resp.status_code, resp.reason_phrase,
-                                 dict(resp.headers.items()), buffered)
-        return None
+                                 list(resp.headers.multi_items()), buffered)
+        return resp.status_code
 
     async def _forward_upstream(self, writer, method: str, url: str, hdrs: dict, body, domain: str, client_ip: str = ""):
         """把请求转发上游(会话粘性单发 → 域名缓存单发 → 竞速 → 兜底竞速 → 502)。
@@ -1156,24 +1242,34 @@ class Router:
         对剩余再竞速。赢家同时回填粘性表与域名缓存 meta。
         """
         # 1) 会话粘性:同一客户端+域名复用上次胜出的代理单发(滑动 TTL)。
-        #    失败则驱逐该条目,回落到域名缓存/竞速(redispatch)。
+        #    失败则驱逐该条目,回落到域名缓存/竞速(redispatch)。单发成功但
+        #    返回 5xx 同样驱逐(A2:响应已流式发出无法重试,下一请求竞速换新)。
+        #    非 5xx 成功则滑动 TTL 并累加命中次数(B2)。
+        skip_domain_cache = False
         if domain and self.stickiness_enabled:
             sticky_pid = self._get_sticky_proxy(client_ip, domain)
             if sticky_pid:
                 try:
-                    result = await self._forward_single(
+                    status = await self._forward_single(
                         writer, method, url, hdrs, body, domain, sticky_pid, sticky=True)
-                    self._record_sticky(client_ip, domain, sticky_pid)
-                    return result
+                    if status is not None and status >= 500:
+                        self._evict_sticky(client_ip, domain)
+                    else:
+                        self._bump_sticky(client_ip, domain, sticky_pid)
+                    return
                 except Exception:
                     logger.debug("sticky proxy %s failed for %s", sticky_pid, domain)
                     self._evict_sticky(client_ip, domain)
+            elif self._sticky_recheck_due(client_ip, domain):
+                # B2:探路重评估到期——驱逐并跳过域名缓存,直接竞速换新赢家。
+                self._evict_sticky(client_ip, domain)
+                skip_domain_cache = True
 
         # 2) 域名缓存:用上次胜出的代理单发请求(不重复更新 meta——_try_http
         #    内部只记尝试统计),失败则回退到竞速。单发路径同样流式转发。
         #    成功时也回填粘性表:粘性可能因上一轮 redispatch 被驱逐,而域名
         #    缓存仍有效;若不回填,该客户端+域名会一直丢粘性直到域名缓存过期。
-        if domain:
+        if domain and not skip_domain_cache:
             cached_pid = self._get_fresh_proxy(domain)
             if cached_pid:
                 try:
@@ -1237,8 +1333,11 @@ class Router:
         use_chunked = upstream_cl is None
         try:
             # 状态行 + 转发头(剔除 hop-by-hop,含 content-length)。
+            # 用 multi_items():httpx 的 items() 会把同名头(如多个 Set-Cookie)合并成
+            # 逗号拼接的单行值,浏览器据此只解析出第一个 cookie,其余(如 Django 的
+            # sessionid)被当未知属性丢弃,导致登录会话丢失。逐条写回保留重复头。
             client_writer.write(f"HTTP/1.1 {resp.status_code} {resp.reason_phrase}\r\n".encode('latin-1'))
-            for k, v in resp.headers.items():
+            for k, v in resp.headers.multi_items():
                 if k.lower() in _HOP_BY_HOP_RESPONSE_HEADERS:
                     continue
                 client_writer.write(f"{k}: {v}\r\n".encode('latin-1'))
@@ -1335,30 +1434,42 @@ class Router:
         已在 handle_client 完成,此处不再校验。
         """
         # 1) 会话粘性:同一客户端+target 复用上次胜出的代理单发隧道,失败则
-        #    驱逐该条目并回落到域名缓存/竞速(redispatch)。
+        #    驱逐该条目并回落到域名缓存/竞速(redispatch)。本机胜者('local')
+        #    走直连(None 代理),无需 proxy_store 校验(A1)。
+        skip_domain_cache = False
         if self.stickiness_enabled:
             sticky_pid = self._get_sticky_proxy(client_ip, target)
             if sticky_pid:
-                proxy = self.proxy_store.get(sticky_pid)
+                proxy = None if sticky_pid == 'local' else self.proxy_store.get(sticky_pid)
                 try:
-                    pid, up_reader, up_writer = await self._try_tunnel(sticky_pid, target, proxy.host, proxy.port, proxy.auth)
+                    if proxy is None:
+                        pid, up_reader, up_writer = await self._try_tunnel(sticky_pid, target, None, None, None)
+                    else:
+                        pid, up_reader, up_writer = await self._try_tunnel(sticky_pid, target, proxy.host, proxy.port, proxy.auth)
                     logger.debug("proxy %s sticky hit CONNECT %s", pid, target)
                     self.sticky_cache_hits += 1
-                    self._record_sticky(client_ip, target, sticky_pid)
+                    self._bump_sticky(client_ip, target, sticky_pid)
                     await self._connect_established(client_writer, up_writer)
                     await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer)
                     return
                 except Exception:
                     logger.debug("sticky proxy %s failed CONNECT %s", sticky_pid, target)
                     self._evict_sticky(client_ip, target)
+            elif self._sticky_recheck_due(client_ip, target):
+                # B2:探路重评估到期——驱逐并跳过域名缓存,直接竞速换新赢家。
+                self._evict_sticky(client_ip, target)
+                skip_domain_cache = True
 
         # 2) 域名缓存命中:用上次胜出的代理单发隧道(只记尝试统计),失败回退竞速。
         #    成功时也回填粘性表(见 _forward_upstream 同名说明)。
-        cached_pid = self._get_fresh_proxy(target)
+        cached_pid = None if skip_domain_cache else self._get_fresh_proxy(target)
         if cached_pid:
-            proxy = self.proxy_store.get(cached_pid)
+            proxy = None if cached_pid == 'local' else self.proxy_store.get(cached_pid)
             try:
-                pid, up_reader, up_writer = await self._try_tunnel(cached_pid, target, proxy.host, proxy.port, proxy.auth)
+                if proxy is None:
+                    pid, up_reader, up_writer = await self._try_tunnel(cached_pid, target, None, None, None)
+                else:
+                    pid, up_reader, up_writer = await self._try_tunnel(cached_pid, target, proxy.host, proxy.port, proxy.auth)
                 logger.debug("proxy %s cache hit CONNECT %s", pid, target)
                 self._record_sticky(client_ip, target, cached_pid)
                 await self._connect_established(client_writer, up_writer)

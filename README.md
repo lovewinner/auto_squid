@@ -9,7 +9,7 @@ Lightweight forward proxy with parallel racing, domain-based caching, an HTTP re
 - Runs on a gateway host, accepts HTTP/HTTPS proxy traffic, and forwards each request through upstream proxies
 - **Parallel racing**: sends each request to several upstream proxies simultaneously and uses the first successful response; the rest are cancelled and their connections released
 - **Domain cache**: once a proxy wins a race for a domain, it is reused for that domain until `cache_ttl` expires — avoids racing every request
-- **Session stickiness**: optional; the same client IP + domain/target reuses the same proxy (keeps the egress IP stable); a failing sticky proxy falls back to racing (redispatch)
+- **Session stickiness**: optional; the same client IP + domain/target reuses the same proxy (keeps the egress IP stable); a failing or 5xx-returning sticky proxy evicts its entry and falls back to racing (redispatch), and sticky entries are re-raced periodically (`recheck_hits`)
 - **HTTP response cache**: idempotent `GET` responses are cached in memory (TTL 60s, respects `Cache-Control`)
 - **Local racing**: optionally lets the gateway host itself race as a proxy node (direct, no upstream)
 - **Domain stats**: per-domain win counts tracked in SQLite, survive restarts
@@ -19,7 +19,7 @@ Lightweight forward proxy with parallel racing, domain-based caching, an HTTP re
 
 - HTTP and HTTPS (`CONNECT`) forwarding with parallel racing across upstream proxies
 - Domain-level caching (`cache_ttl`) of the winning proxy per domain
-- Session stickiness (per-client+domain, in-memory, sliding TTL) with redispatch on sticky-proxy failure
+- Session stickiness (per-client+domain, in-memory, sliding TTL) with redispatch on sticky-proxy failure, 5xx eviction, periodic re-race, and a capacity cap
 - In-memory HTTP `GET` response cache with `Cache-Control` awareness
 - Optional local racing node (gateway races directly alongside upstreams)
 - Hop-by-hop header filtering in both directions: request headers (`proxy-authorization`, `connection`, etc.) are stripped before forwarding upstream so client-to-proxy credentials never leak to the next hop; response headers (`transfer-encoding`, `content-encoding`, `content-length`, etc.) are stripped and `Content-Length` is rewritten to the actual body length
@@ -63,15 +63,21 @@ router:
   stickiness:
     enabled: true
     ttl: 1800          # stickiness TTL (s); refreshed on hit (sliding), active sessions never expire
+    recheck_hits: 100  # re-race after N sticky hits (0=off), default 100
+    max_entries: 100000 # hard capacity cap; evicts the oldest entry when exceeded
 ```
 
 Behavior notes:
 
 - Key is `client_ip|domain` (URL hostname for HTTP, `host:port` for CONNECT); **takes precedence over the domain cache**. Hit → single-send; miss → domain cache → racing.
 - **Redispatch**: a failing sticky proxy evicts its entry and falls back to the domain cache/racing; the racing winner repopulates the sticky table, so the next request automatically switches proxies.
+- **5xx eviction**: a sticky single-send that returns HTTP 5xx also evicts the entry (the response is already streamed, so the next request re-races) instead of letting a sick proxy hold the egress forever.
+- **Periodic recheck**: after `recheck_hits` sticky hits, the entry is evicted and, **skipping the domain cache**, re-raced so a newer winner replaces a sticky proxy that may have slowed down; the new winner restarts the hit counter.
+- **Local racing**: with `enable_local_racing` on, a local win is also pinned in the sticky table and stays sticky (direct connection) instead of being mistaken for a dead proxy.
+- **Capacity cap**: `max_entries` hard limit; before inserting, expired entries are pruned and, if still over, the entry with the oldest `updated_at` is evicted — bounding memory when the client-IP set grows large.
 - In-memory only (HAProxy-style table), cleared on restart; a background sweep prunes expired entries so the client-IP set cannot grow unbounded.
 - Entries pointing at a deleted/disabled proxy are validated and evicted on use.
-- Inspect the current table: `curl http://127.0.0.1:18080/stickiness`.
+- Inspect the current table: `curl http://127.0.0.1:18080/stickiness`; the management dashboard has a "Session stickiness" view showing the full table plus size / hits / evictions counters.
 
 ## Quickstart
 
@@ -181,6 +187,8 @@ router:
   stickiness:
     enabled: false             # session stickiness (per-client+domain)
     ttl: 1800                  # stickiness TTL in seconds, sliding
+    recheck_hits: 100          # re-race after N sticky hits (0=off)
+    max_entries: 100000        # hard capacity cap (evict oldest when exceeded)
 logging:
   file: "auto_squid.log"
 ```

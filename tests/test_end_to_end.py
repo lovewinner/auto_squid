@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -161,6 +162,42 @@ async def send_connect_status(host, port, target=b"example.com:443", userpass=No
     writer.close()
     await writer.wait_closed()
     return status
+
+
+async def run_mock_proxy_status(host, port, status=500, pre_header_delay=0.0):
+    """HTTP mock proxy returning a fixed status with an empty body.
+
+    Used to build an upstream that "works" (connects) but answers HTTP 5xx —
+    the target of the A2 eviction-on-5xx semantics. `pre_header_delay` lets the
+    caller make it lose races deterministically.
+    """
+    reason = {500: 'Internal Server Error', 502: 'Bad Gateway'}.get(status, 'Error')
+    async def handle(reader, writer):
+        try:
+            line = await reader.readline()
+            if not line:
+                writer.close()
+                return
+            while True:
+                h = await reader.readline()
+                if not h or h in (b"\r\n", b"\n"):
+                    break
+            if pre_header_delay:
+                await asyncio.sleep(pre_header_delay)
+            body = b""
+            writer.write(f"HTTP/1.1 {status} {reason}\r\n".encode())
+            writer.write(f"Content-Length: {len(body)}\r\n".encode())
+            writer.write(b"Content-Type: text/plain\r\n\r\n")
+            writer.write(body)
+            await writer.drain()
+            writer.close()
+        except Exception:
+            try:
+                writer.close()
+            except Exception:
+                pass
+    server = await asyncio.start_server(handle, host=host, port=port)
+    return server
 
 
 # ── tests ─────────────────────────────────────────────────────────
@@ -1445,3 +1482,274 @@ async def test_stickiness_repopulated_from_domain_cache():
         await fast_srv.wait_closed()
         slow_srv.close()
         await slow_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_stickiness_local_racing_stays_sticky():
+    """A1:本机竞速胜者('local')应能粘住,不被每次查询当失效代理驱逐。
+
+    空 ProxyStore + enable_local_racing:竞速只有 local 候选。首次请求 local
+    胜出并写入粘性表;第二次请求应粘性命中单发(直接连),'local' 条目不因
+    proxy_store.get('local') 返回 None 而被驱逐。修复前每次查询即驱逐,
+    sticky_cache_hits 恒为 0、每次请求都重新竞速。
+    """
+    local_srv = await run_local_http_server(HOST, LOCAL_HTTP_PORT)
+    ps = ProxyStore()
+    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                    enable_local_racing=True, enable_http_cache=False,
+                    stickiness_enabled=True, stickiness_ttl=1800,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        url = f"http://{HOST}:{LOCAL_HTTP_PORT}/".encode()
+        body = await send_http_get(HOST, ROUTER_PORT, url=url)
+        assert b'local-response' in body
+        # 首次竞速 local 胜出 → 粘性表写入 'local'(domain = urlparse 的 hostname)。
+        assert router._get_sticky_proxy('127.0.0.1', HOST) == 'local'
+        # 第二次请求:粘性命中 → 不再竞速,且 'local' 条目不因校验失败被驱逐。
+        body2 = await send_http_get(HOST, ROUTER_PORT, url=url)
+        assert b'local-response' in body2
+        assert router._get_sticky_proxy('127.0.0.1', HOST) == 'local', \
+            "local sticky entry must survive a sticky hit"
+        counters = router.snapshot_counters()
+        assert counters['sticky_cache_hits'] >= 1, "second request should be a sticky hit"
+        assert counters['sticky_cache_size'] == 1
+    finally:
+        await router.stop()
+        local_srv.close()
+        await local_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_stickiness_evicts_on_5xx():
+    """A2:粘性代理返回 HTTP 5xx → 驱逐该条目(不回填),下一请求竞速换新。
+
+    预置粘性指向返回 500 的坏代理:本请求把 500 原样转发给客户端(已流式发出
+    不可重试),同时驱逐该条目;下一请求无粘性 → 竞速 ok 胜出并回填。断言
+    sticky_evictions 计数、粘性表换新为 ok。
+    """
+    bad_port, ok_port = 31441, 31442
+    bad_srv = await run_mock_proxy_status(HOST, bad_port, status=500, pre_header_delay=0.05)
+    ok_srv = await run_mock_proxy_tagged(HOST, ok_port, 'OK', pre_header_delay=0.0)
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='bad', host=HOST, port=bad_port))
+    ps.add(ProxyInfo(id='ok', host=HOST, port=ok_port))
+    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                    max_retries=2, enable_http_cache=False,
+                    stickiness_enabled=True, stickiness_ttl=1800,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        domain = '5xx-sticky.example.com'
+        url = f"http://{domain}/p0".encode()
+        # 预置:该客户端+域名粘到返回 500 的坏代理。
+        router._record_sticky('127.0.0.1', domain, 'bad')
+        # 本请求:粘性单发拿到 500 → 原样回给客户端,同时驱逐粘性条目。
+        st1 = await send_http_get_status(HOST, ROUTER_PORT, url=url)
+        assert b'500' in st1, f"5xx from sticky proxy must pass through, got {st1}"
+        assert router._get_sticky_proxy('127.0.0.1', domain) is None, \
+            "5xx must evict the sticky entry"
+        assert router.snapshot_counters()['sticky_evictions'] >= 1
+        # 下一请求:无粘性 → 竞速 → ok(200)胜出并回填粘性表。
+        st2 = await send_http_get_status(HOST, ROUTER_PORT, url=url)
+        assert b'200' in st2, f"re-race should land on ok, got {st2}"
+        assert router._get_sticky_proxy('127.0.0.1', domain) == 'ok', \
+            "race winner must repopulate the sticky table"
+    finally:
+        await router.stop()
+        bad_srv.close()
+        await bad_srv.wait_closed()
+        ok_srv.close()
+        await ok_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_stickiness_capacity_limit_evicts_oldest():
+    """B1:粘性表容量硬上限——超限写前先清过期,仍超则驱逐 updated_at 最旧。
+
+    单元级直测 _record_sticky 的容量保护:stickiness_max_entries=3,连续写入
+    4 个键,第 4 个应驱逐时间戳最旧的 'c1|d0',其余 3 个保留。
+    """
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='p1', host=HOST, port=PROXY_PORT))
+    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                    stickiness_enabled=True, stickiness_ttl=1800,
+                    stickiness_max_entries=3,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    try:
+        base = datetime.now(timezone.utc)
+        router._record_sticky('c1', 'd0', 'p1')
+        router._sticky_cache['c1|d0']['updated_at'] = (base - timedelta(seconds=3)).isoformat()
+        router._record_sticky('c1', 'd1', 'p1')
+        router._sticky_cache['c1|d1']['updated_at'] = (base - timedelta(seconds=2)).isoformat()
+        router._record_sticky('c1', 'd2', 'p1')
+        router._sticky_cache['c1|d2']['updated_at'] = (base - timedelta(seconds=1)).isoformat()
+        assert len(router._sticky_cache) == 3
+        # 第 4 个键:超容量 → 驱逐最旧的 'c1|d0',新键写入。
+        router._record_sticky('c2', 'dX', 'p1')
+        assert len(router._sticky_cache) == 3, "capacity must be capped at max_entries"
+        assert 'c1|d0' not in router._sticky_cache, "oldest entry must be evicted"
+        assert 'c2|dX' in router._sticky_cache
+        assert router.snapshot_counters()['sticky_evictions'] >= 1
+    finally:
+        await router.stop()
+
+
+@pytest.mark.asyncio
+async def test_stickiness_recheck_reraces_after_hits():
+    """B2:粘性命中 recheck_hits 次后触发探路重竞速,且跳过域名缓存直接竞速。
+
+    recheck_hits=1:请求 1 竞速(fast 胜出,写粘性 hits=0);请求 2 粘性命中
+    (_bump_sticky → hits=1);请求 3 达到阈值 → 驱逐并跳过仍有效的域名缓存,
+    直接竞速换新。若未跳过域名缓存,请求 3 会走域名缓存单发(racing 不增);
+    断言 racing_invocations >= 2 即证明请求 3 确实重新竞速了。
+    """
+    fast_port, slow_port = 31451, 31452
+    fast_srv = await run_mock_proxy_tagged(HOST, fast_port, 'FAST', pre_header_delay=0.0)
+    slow_srv = await run_mock_proxy_tagged(HOST, slow_port, 'SLOW', pre_header_delay=0.05)
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='fast', host=HOST, port=fast_port))
+    ps.add(ProxyInfo(id='slow', host=HOST, port=slow_port))
+    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                    max_retries=2, enable_http_cache=False,
+                    stickiness_enabled=True, stickiness_ttl=1800,
+                    stickiness_recheck_hits=1,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        domain = 'sticky-recheck.example.com'
+        url = f"http://{domain}/p0".encode()
+        body1 = await send_http_get(HOST, ROUTER_PORT, url=url)
+        assert b'FAST' in body1
+        assert router._get_sticky_proxy('127.0.0.1', domain) == 'fast'
+        # 请求 2:粘性命中,累加 hits → 1。
+        body2 = await send_http_get(HOST, ROUTER_PORT, url=url)
+        assert b'FAST' in body2
+        entry = router._sticky_cache[router._sticky_key('127.0.0.1', domain)]
+        assert entry['hits'] == 1, f"sticky hit should accumulate hits, got {entry}"
+        # 请求 3:hits(1) >= recheck_hits(1) → 驱逐并重新竞速(跳过域名缓存)。
+        body3 = await send_http_get(HOST, ROUTER_PORT, url=url)
+        assert b'FAST' in body3
+        counters = router.snapshot_counters()
+        assert counters['sticky_evictions'] >= 1, "recheck must evict the old entry"
+        assert counters['racing_invocations'] >= 2, \
+            "recheck must re-race instead of relying on the (still valid) domain cache"
+        # 新赢家 hits 归零,开始下一轮计数。
+        entry = router._sticky_cache[router._sticky_key('127.0.0.1', domain)]
+        assert entry['hits'] == 0
+    finally:
+        await router.stop()
+        fast_srv.close()
+        await fast_srv.wait_closed()
+        slow_srv.close()
+        await slow_srv.wait_closed()
+
+
+# ── multiple Set-Cookie preservation tests ────────────────────────
+
+async def run_multi_setcookie_proxy(host, port):
+    """HTTP mock proxy returning 200 with TWO distinct Set-Cookie headers.
+
+    Mirrors Django/JumpServer setting several cookies in one response. httpx's
+    Headers.items() merges same-name headers into a comma-joined single value,
+    which browsers then parse as ONE cookie and drop the rest (e.g. the
+    sessionid). The router must forward them as separate header lines.
+    """
+    async def handle(reader, writer):
+        try:
+            await reader.readline()
+            while True:
+                h = await reader.readline()
+                if not h or h in (b"\r\n", b"\n"):
+                    break
+            body = b"ok"
+            writer.write(b"HTTP/1.1 200 OK\r\n")
+            writer.write(b"Set-Cookie: sid=abc123; Path=/\r\n")
+            writer.write(b"Set-Cookie: csrf=xyz789; Path=/; HttpOnly\r\n")
+            writer.write(f"Content-Length: {len(body)}\r\n".encode())
+            writer.write(b"Content-Type: text/plain\r\n\r\n")
+            writer.write(body)
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+    server = await asyncio.start_server(handle, host=host, port=port)
+    return server
+
+
+async def send_http_get_headers(host, port, url):
+    """GET through the router, returning (status_line, [header_lines], body)."""
+    reader, writer = await asyncio.open_connection(host, port)
+    writer.write(b"GET " + url + b" HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    await writer.drain()
+    status = await reader.readline()
+    headers = []
+    cl = 0
+    while True:
+        h = await reader.readline()
+        if not h or h in (b"\r\n", b"\n"):
+            break
+        headers.append(h)
+        if h.lower().startswith(b'content-length:'):
+            cl = int(h.split(b':', 1)[1].strip())
+    body = await reader.readexactly(cl) if cl > 0 else b''
+    writer.close()
+    await writer.wait_closed()
+    return status, headers, body
+
+
+def _setcookie_lines(headers):
+    """Return the value of each Set-Cookie header line (case-insensitive)."""
+    return [h.split(b':', 1)[1].strip().decode('latin-1')
+            for h in headers if h.lower().startswith(b'set-cookie:')]
+
+
+@pytest.mark.asyncio
+async def test_multiple_setcookie_headers_preserved():
+    """Regression: multiple Set-Cookie headers must reach the client as separate
+    lines, not merged into one comma-joined header.
+
+    httpx Headers.items() merges same-name headers (e.g. Django's multiple
+    Set-Cookie) into a single value; browsers then parse only the first cookie
+    and drop the rest — which broke the JumpServer login (sessionid cookie
+    lost → '登录超时，请重新登录'). Both the live streaming path AND the HTTP
+    response-cache path must preserve them separately.
+    """
+    proxy_srv = await run_multi_setcookie_proxy(HOST, PROXY_PORT)
+    proxy_store = ProxyStore()
+    proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        url = b"http://setcookie.example.com/login"
+        # 1) 流式转发路径(首次,未命中缓存)。
+        status, headers, body = await send_http_get_headers(HOST, ROUTER_PORT, url)
+        assert b'200' in status
+        assert body == b"ok"
+        cookies = _setcookie_lines(headers)
+        assert len(cookies) == 2, f"expected 2 separate Set-Cookie lines, got {cookies}"
+        assert cookies[0] == 'sid=abc123; Path=/'
+        assert cookies[1] == 'csrf=xyz789; Path=/; HttpOnly'
+        # 没有任何一行把两个 cookie 逗号拼接。
+        for line in cookies:
+            assert 'sid=abc123' not in line or 'csrf=xyz789' not in line, \
+                f"Set-Cookie headers must not be merged: {cookies}"
+        # 2) 缓存命中路径(第二次 GET 同 URL,200 + Content-Length 可缓存)。
+        status2, headers2, body2 = await send_http_get_headers(HOST, ROUTER_PORT, url)
+        assert b'200' in status2
+        assert body2 == b"ok"
+        cookies2 = _setcookie_lines(headers2)
+        assert len(cookies2) == 2, \
+            f"cached response must also keep separate Set-Cookie lines, got {cookies2}"
+        assert cookies2[0] == 'sid=abc123; Path=/'
+        assert cookies2[1] == 'csrf=xyz789; Path=/; HttpOnly'
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()

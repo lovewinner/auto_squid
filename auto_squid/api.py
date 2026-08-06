@@ -123,6 +123,9 @@ h1{font-size:22px;margin-bottom:16px;color:#e94560}
 .toolbar input:focus{border-color:#e94560}
 .toolbar button{padding:8px 20px;border:none;border-radius:6px;background:#e94560;color:#fff;font-size:14px;cursor:pointer}
 .toolbar button:hover{background:#d63850}
+.toolbar button.view-btn{background:#0f3460;color:#a8d8ea;border:1px solid #333;padding:8px 14px}
+.toolbar button.view-btn:hover{background:#1a5276;border-color:#e94560}
+.toolbar button.view-btn.active{border-color:#e94560;color:#fff;background:#1a5276}
 table{width:100%;border-collapse:collapse;font-size:13px}
 thead{position:sticky;top:0;z-index:1}
 th{background:#0f3460;padding:10px 12px;text-align:left;cursor:pointer;user-select:none;white-space:nowrap}
@@ -163,9 +166,11 @@ select:focus{border-color:#e94560}
 </style>
 </head>
 <body>
-<h1>Domain Stats</h1>
+<h1>auto_squid 管理面板</h1>
 <div class="toolbar">
-<input id="filter" placeholder="Filter domains..." oninput="onFilter()">
+<button id="view-domains" class="view-btn active" onclick="setView('domains')">域名统计</button>
+<button id="view-stickiness" class="view-btn" onclick="setView('stickiness')">会话粘性</button>
+<input id="filter" placeholder="Filter..." oninput="onFilter()">
 <select id="interval" onchange="onIntervalChange(this)">
 <option value="0">关闭</option>
 <option value="3">3s</option>
@@ -190,6 +195,8 @@ let page = 0, pageSize = 20;
 let refreshTimer = null;
 let refreshInterval = 30;
 let cfg = {};
+let view = 'domains';
+let sticky = [], stickyStats = {size: 0, hits: 0, evictions: 0};
 let activeProxy = new URLSearchParams(location.search).get('default_proxy') || null;
 
 function onIntervalChange(sel) {
@@ -199,10 +206,24 @@ function onIntervalChange(sel) {
   const label = document.getElementById('autorefresh-label');
   if (refreshInterval > 0) {
     label.textContent = '每 ' + sel.options[sel.selectedIndex].text + ' 自动刷新';
-    refreshTimer = setInterval(fetchData, refreshInterval * 1000);
+    refreshTimer = setInterval(() => { view === 'stickiness' ? renderStickiness() : fetchData(); }, refreshInterval * 1000);
   } else {
     label.textContent = '';
   }
+}
+
+function setView(v) {
+  view = v;
+  document.getElementById('view-domains').classList.toggle('active', v === 'domains');
+  document.getElementById('view-stickiness').classList.toggle('active', v === 'stickiness');
+  document.getElementById('filter').placeholder = v === 'stickiness' ? 'Filter client|domain / proxy...' : 'Filter domains...';
+  document.getElementById('stats').innerHTML = '';
+  document.getElementById('filter-banner').style.display = 'none';
+  if (v === 'stickiness') { renderStickiness(); return; }
+  page = 0;
+  render();
+  renderBanner();
+  renderStats();
 }
 
 async function fetchData() {
@@ -226,7 +247,7 @@ async function fetchData() {
   render();
   renderBanner();
   renderStats();
-  if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = setInterval(fetchData, refreshInterval * 1000); }
+  if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = setInterval(() => { view === 'stickiness' ? renderStickiness() : fetchData(); }, refreshInterval * 1000); }
 }
 
 function selectProxy(pid) {
@@ -284,7 +305,69 @@ function renderBanner() {
     '<button class="fb-close" onclick="clearFilter()" title="清除筛选">✕</button>';
 }
 
-function onFilter() { page = 0; render(); }
+function onFilter() { page = 0; if (view === 'stickiness') renderStickyTable(); else render(); }
+
+async function renderStickiness() {
+  const [r1, r2] = await Promise.all([fetch('/stickiness'), fetch('/metrics')]);
+  const raw = await r1.json();
+  const counters = (await r2.json()).counters || {};
+  stickyStats = {
+    size: counters.sticky_cache_size || 0,
+    hits: counters.sticky_cache_hits || 0,
+    evictions: counters.sticky_evictions || 0
+  };
+  const q = document.getElementById('filter').value.toLowerCase();
+  sticky = Object.entries(raw).map(([k, v]) => {
+    const i = k.indexOf('|');
+    return { client: k.slice(0, i), domain: k.slice(i + 1), pid: v.proxy_id || '-', hits: v.hits || 0, updatedAt: v.updated_at || '' };
+  });
+  if (q) sticky = sticky.filter(s => (s.client + '|' + s.domain).toLowerCase().includes(q) || s.pid.toLowerCase().includes(q));
+  sticky.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  document.getElementById('stats').innerHTML =
+    '<div class="stat-card" style="cursor:default"><div class="pid">条目</div><div class="count">' + stickyStats.size + '</div><div class="label">sticky cache</div></div>' +
+    '<div class="stat-card" style="cursor:default"><div class="pid">命中</div><div class="count">' + stickyStats.hits + '</div><div class="label">sticky hits</div></div>' +
+    '<div class="stat-card" style="cursor:default"><div class="pid">驱逐</div><div class="count">' + stickyStats.evictions + '</div><div class="label">sticky evictions</div></div>';
+  page = 0;
+  renderStickyTable();
+}
+
+function renderStickyTable() {
+  const wrap = document.getElementById('table-wrap');
+  if (!sticky.length) {
+    wrap.innerHTML = '<div class="no-data">No sticky entries</div>';
+    document.getElementById('pager').innerHTML = '';
+    document.getElementById('footer').textContent = '';
+    return;
+  }
+  const pageCount = Math.ceil(sticky.length / pageSize);
+  if (page >= pageCount) page = pageCount - 1;
+  const start = page * pageSize;
+  const pageEntries = sticky.slice(start, start + pageSize);
+  let html = '<table><thead><tr><th>Client</th><th>Domain / Target</th><th>Sticky Proxy</th><th>Hits</th><th>Updated At</th></tr></thead><tbody>';
+  for (const s of pageEntries) {
+    html += `<tr><td class="domain" title="${s.client}" style="max-width:280px;min-width:180px">${s.client}</td>`;
+    html += `<td class="domain" title="${s.domain}" style="max-width:280px;min-width:180px">${s.domain}</td>`;
+    html += `<td class="default-proxy">${s.pid}</td>`;
+    html += `<td class="num">${s.hits}</td>`;
+    html += `<td class="updated-at">${toBeijing(s.updatedAt)}</td></tr>`;
+  }
+  html += '</tbody></table>';
+  wrap.innerHTML = html;
+  let pagerHtml = '';
+  pagerHtml += `<button onclick="goPage(0)"${page===0?' disabled':''}>&laquo;</button>`;
+  pagerHtml += `<button onclick="goPage(${page-1})"${page===0?' disabled':''}>&lsaquo;</button>`;
+  const rangeStart = Math.max(0, page - 2);
+  const rangeEnd = Math.min(pageCount, page + 3);
+  if (rangeStart > 0) pagerHtml += '<button onclick="goPage(0)">1</button><span>...</span>';
+  for (let i = rangeStart; i < rangeEnd; i++) {
+    pagerHtml += `<button onclick="goPage(${i})"${i===page?' class="active"':''}>${i+1}</button>`;
+  }
+  if (rangeEnd < pageCount) pagerHtml += '<span>...</span>';
+  pagerHtml += `<button onclick="goPage(${page+1})"${page>=pageCount-1?' disabled':''}>&rsaquo;</button>`;
+  pagerHtml += `<button onclick="goPage(${pageCount-1})"${page>=pageCount-1?' disabled':''}>&raquo;</button>`;
+  document.getElementById('pager').innerHTML = pagerHtml;
+  document.getElementById('footer').textContent = sticky.length + ' sticky entries \u00b7 page ' + (page+1) + '/' + pageCount;
+}
 
 function render() {
   const entries = getFiltered();
@@ -339,7 +422,7 @@ function render() {
   document.getElementById('footer').textContent = entries.length + ' domains \u00b7 ' + proxyIds.length + ' proxies \u00b7 page ' + (page+1) + '/' + pageCount;
 }
 
-function goPage(n) { page = n; render(); }
+function goPage(n) { page = n; if (view === 'stickiness') renderStickyTable(); else render(); }
 
 function renderStats() {
   const cnt = {};
