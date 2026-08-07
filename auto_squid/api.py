@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from typing import List
+from typing import Dict, List
 
 from .config_schema import ProxyInfo
 from .proxy_store import ProxyStore
@@ -19,11 +19,22 @@ _server_stats: dict = {}
 
 
 class ProxyIn(BaseModel):
+    """POST /proxies 的入参模型:与 ProxyInfo 字段对齐。
+
+    历史上曾只含 id/name/host/port/protocol,导致通过管理 API 添加代理时
+    `enabled`(禁用状态)与 `auth`(上游认证)字段被 pydantic 静默丢弃——
+    ProxyInfo(**model_dump()) 拿到缺字段的 dict,添加出的代理总是 enabled=True、
+    无认证。这里显式列出全部可写字段(与 config_schema.ProxyInfo 对齐),
+    `auth` 复用 ProxyInfo 的 Dict[str,str] 结构(如 {"username": .., "password": ..})。
+    """
     id: str
     name: str | None = None
     host: str
     port: int = 3128
     protocol: str = "http"
+    auth: Dict[str, str] | None = None
+    enabled: bool = True
+    tags: Dict[str, str] | None = None
 
 
 @app.get("/health")

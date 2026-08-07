@@ -738,6 +738,39 @@ class TestAPI:
         assert "request_counts" in data
         assert "attempted_counts" in data
 
+    def test_add_proxy_preserves_enabled_and_auth(self):
+        """POST /proxies 的 enabled/auth 字段不得被丢弃(ProxyIn 与 ProxyInfo 对齐)。
+
+        曾回归:ProxyIn 只含 id/name/host/port/protocol,经 ProxyInfo(**model_dump())
+        添加时 enabled(禁用)与 auth(上游认证)被 pydantic 静默丢弃——无法通过
+        管理 API 添加禁用/带认证的代理。本测试锁定:POST 后 store 里的 ProxyInfo
+        保留这两个字段,GET 亦能回读。
+        """
+        proxy_store = ProxyStore()
+        mount(proxy_store, None)
+        client = TestClient(api_app)
+        payload = {
+            "id": "auth-proxy",
+            "host": "203.0.113.5",
+            "port": 6128,
+            "protocol": "http",
+            "enabled": False,
+            "auth": {"username": "up", "password": "secret123"},
+        }
+        r = client.post("/proxies", json=payload)
+        assert r.status_code == 200, r.text
+        stored = proxy_store.get("auth-proxy")
+        assert stored is not None
+        assert stored.enabled is False, f"enabled should persist, got {stored.enabled}"
+        assert stored.auth == {"username": "up", "password": "secret123"}, stored.auth
+        # GET /proxies 应能回读完整字段。
+        r2 = client.get("/proxies")
+        assert r2.status_code == 200
+        items = {p["id"]: p for p in r2.json()}
+        assert items["auth-proxy"]["enabled"] is False
+        assert items["auth-proxy"]["auth"] == {"username": "up", "password": "secret123"}
+        assert items["auth-proxy"]["port"] == 6128
+
 
 # ── streaming / pooling / DB-batching tests ───────────────────────
 
