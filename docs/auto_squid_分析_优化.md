@@ -207,9 +207,18 @@ auto_squid 是一个**正向 HTTP/HTTPS 代理**：监听一个端口，客户�
 - 配置 `域名规则 → 代理子集`，竞速只在该子集内进行。
 - 收益取决于代理地域分布；若代理全在国内/全在国外则意义有限。
 
-**6. 引入质量模型/权重到单发选择**
-- 域名缓存/粘性命中单发时，若该代理最近失败率上升或 EWMA 恶化，主动降级回竞速。
-- 结合 `recheck_hits`：把确定性探路升级为 EWMA 感知的"不稳定即重竞速"。
+**6. 引入质量模型/权重到单发选择** — ✅ **已落地（2026-08-08）**
+- **单发降级**：域名缓存/粘性命中单发时，若被钉住代理"最近失败率上升（连续失败）"或"EWMA 恶化（相对钉住时基线）"，主动降级回竞速——把确定性探路从 `recheck_hits` 的纯命中计数升级为 **EWMA 感知的"不稳定即重竞速"**（与 Envoy outlier 连续失败剔除 + 基线比对的思路同源）。
+- **两条独立信号**（`Router._single_send_degraded`，与熔断解耦——熔断是"连续失败达阈值直接剔除"，降级是"尚未熔断但已开始变差，别再确定性单发，交给竞速选路"）：
+  1. **连续失败**：`consec_fail ≥ single_send_degrade_fail`（默认 2，熔断阈值 3 的早告警）。被钉住代理最近在真实请求/探活中连续失败 → 单发命中它只会放大失败路径。
+  2. **EWMA 恶化**：当前 EWMA ≥ 钉住时基线 × `single_send_degrade_ratio`（默认 3.0，且绝对差 > `single_send_degrade_slack_ms` 默认 10ms 防极低延迟误判）。obs≥2 才触发（单次观测无趋势可言）。
+- **基线捕获**：`_record_win_meta` / `_record_sticky` 在钉住时刻捕获 `ref_ewma`；粘性命中（`_bump_sticky`）只滑动 TTL **不刷新基线**，保证"恶化"是相对钉住时的初始状态。
+- **降级集合（可观测）**：降级命中 → 代理记入 `_degraded_single_send`（供 `/metrics` `/circuit` 展示）；真正的门控是每次选择时**实时重估** `_single_send_degraded`（代理恢复后立即重新可单发，无冷却）。新赢家经 `_record_win_meta` 清除标记，`reset_proxy_quality` 一并清空。
+- **可观测**：`/metrics` counters 含 `single_send_degrades`；`/circuit` 含 `degraded_single_send` 集合；`/quality`、`/stickiness`、`/domain-meta` 均含 `ref_ewma`。
+- **配置贯通**：`config.yaml` `router.circuit.single_send_degrade_{fail,ratio,slack_ms}` + `config_schema` + `cli.py` + bench `--single-send-degrade-*`。DB `domain_meta` 加 `ref_ewma` 列（PRAGMA 迁移，老库自动补列）。
+- **验证**（单测 82 全绿，含 8 个单发降级定向测试；真实 socket 端到端）：
+  - 单元：连续失败达阈值 → 域名缓存/粘性都降级 None（未熔断时）；EWMA ratio 恶化 → 降级；slack 防误判；obs=1 不触发；粘性命中不刷新基线；reset 清空；降级标记清除/重钉；
+  - 端到端：fast 首次竞速胜出钉住 → 连续失败 2 次后单发降级、真实客户端请求由竞速换到 slow 应答（200）；fast 上游真实宕机后竞速也绕开（熔断器兜底）；恢复后重钉清除标记。
 
 ### P3 —— 视目标决定
 
@@ -267,6 +276,11 @@ _build_racing_tasks_* 改为:
   router.stagger_start: true        # 启用错峰启动
   router.stagger_initial: 1         # 首批并发数(冷启动自动翻倍到 2)
   router.stagger_interval_ms: 250   # 启动间隔(毫秒),钳制到 [100, 2000]
+
+  单发降级（已落地,见 P2-6）:
+  router.circuit.single_send_degrade_fail: 2     # 连续失败阈值(熔断早告警);0=关闭
+  router.circuit.single_send_degrade_ratio: 3.0  # EWMA 相对钉住基线恶化倍数;0=关闭
+  router.circuit.single_send_degrade_slack_ms: 10  # 降级绝对下限(ms),防极低延迟误判
 ```
 
 **边界与成本**：

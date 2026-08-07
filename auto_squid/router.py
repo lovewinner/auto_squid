@@ -161,8 +161,11 @@ class ProxySelector:
         # 加权 least-request 的在途惩罚指数(见 _LB_BIAS_DEFAULT)。
         # 排序权重 = ewma × (1 + active)^bias;bias=0 退化为纯 EWMA 排序。
         self.lb_bias = max(0.0, lb_bias)
-        # 每代理质量: {pid: {"ewma_ttfb": float(秒)}}。
-        # 仅存有观测的代理;无观测的代理在排序时视为"未知质量"(排在新手区)。
+        # 每代理质量: {pid: {"ewma_ttfb": float(秒), "obs": int}}。
+        #   obs = 成功观测计数(EWMA 样本数),供单发降级判定把"当前 EWMA"与该代理
+        #   被钉住时的基线 EWMA 对比(见 Router._single_send_degraded)。obs==1 时
+        #   EWMA 直接等于该次观测,可直接参与对比;仅存有观测的代理,无观测的代理
+        #   在排序时视为"未知质量"(排在新手区)。
         self._quality: dict[str, dict[str, float]] = {}
         # 每代理熔断/慢启动状态(与 _quality 分开维护,含未观测过的新代理):
         #   {pid: {"consec_fail": int, "open_until": float(monotonic 秒), "backoff": float}}
@@ -209,13 +212,15 @@ class ProxySelector:
         """记录一次成功请求的首字节耗时(秒),更新该代理的 EWMA。
 
         EWMA 公式:无历史时直接取当前值;有历史时 ewma = (1-alpha)*old + alpha*new。
+        obs 计数随每次观测 +1(EWMA 样本数),供单发降级判定读取。
         """
         q = self._quality.get(pid)
         if q is None:
-            self._quality[pid] = {"ewma_ttfb": ttfb}
+            self._quality[pid] = {"ewma_ttfb": ttfb, "obs": 1}
             return
         old = q["ewma_ttfb"]
         q["ewma_ttfb"] = (1.0 - self.EWMA_ALPHA) * old + self.EWMA_ALPHA * ttfb
+        q["obs"] = int(q.get("obs", 0)) + 1
 
     def reset_quality(self):
         """清空全部质量数据(RFC 8305 §4:历史 RTT 不可跨网络沿用)。
@@ -415,7 +420,7 @@ class Router:
     生命周期:start() 开始监听 → handle_client 处理每个连接 → stop() 优雅关闭。
     """
 
-    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT):
+    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0):
         """构造路由器。
 
         参数:
@@ -458,6 +463,16 @@ class Router:
                                 代理即使延迟历史最快也被压低排序,保护慢代理不被打爆
                                 (Envoy LeastRequest / Dubbo LeastActive)。bias=0
                                 退化为纯 EWMA 排序。
+            single_send_degrade_fail: 单发降级:连续失败阈值(默认 0=关闭)。域名缓存/
+                                粘性命中的代理连续失败达该值,即使未到熔断阈值也
+                                视作"不稳定",单发路径主动降级回竞速。
+            single_send_degrade_ratio: 单发降级:EWMA 恶化阈值(默认 0=关闭)。被钉住
+                                代理的当前 EWMA 相对钉住时基线的比值超过该值(如 3.0
+                                = 延迟恶化 3 倍)即降级回竞速。0=只按连续失败降级。
+            single_send_degrade_slack_ms: EWMA 降级的绝对下限(毫秒)。基线与当前值
+                                都极小时(如 0.2ms→0.9ms,比值 4.5 但绝对差距 <1ms)
+                                用纯比值会误判剧烈恶化——绝对差值低于该 slack 时
+                                即使比值超阈值也不降级(默认 10)。
         """
         self.proxy_store = proxy_store
         self.selector = ProxySelector(
@@ -515,6 +530,21 @@ class Router:
         self._sticky_cache: dict[str, dict[str, object]] = {}
         self.sticky_cache_hits = 0
         self.sticky_evictions = 0       # 粘性表驱逐次数(5xx/失败/超容量)
+        # 单发降级触发次数(Goal #6,供 /metrics / 仪表盘观察降级活动)。
+        self.single_send_degrades = 0
+        # ── 单发降级(质量感知的确定性探路,Goal #6)─────────────────
+        # 域名缓存/粘性命中单发时,若被钉住代理"最近失败率上升(连续失败)"
+        # 或"EWMA 恶化(相对钉住时基线)",主动降级回竞速——把确定性探路从
+        # recheck_hits 的纯命中计数升级为 EWMA 感知的"不稳定即重竞速"。
+        # 任一阈值为 0(默认)即关闭对应维度的降级。见 _single_send_degraded。
+        self.single_send_degrade_fail = max(0, int(single_send_degrade_fail))
+        self.single_send_degrade_ratio = max(0.0, float(single_send_degrade_ratio))
+        self.single_send_degrade_slack_ms = max(0.0, float(single_send_degrade_slack_ms))
+        # "降级中"代理集合(可观测,非门控):被单发降级判定命中的代理记录于此。
+        # 注意真正的门控是每次选择时实时重估 _single_send_degraded(代理恢复后立即
+        # 重新可单发,无需冷却),此集合只供 /metrics /circuit 展示"当前被判定降级的
+        # 代理";由 _record_win_meta(新赢家接管)或 reset_proxy_quality 清除。
+        self._degraded_single_send: set[str] = set()
         # ── 服务端性能计数器 ────────────────────────────────────
         # 供压测经 /metrics 跨进程读取,在两种上游模式(mock/real)下统一计算
         # 缓存命中率与竞速放大率——不再依赖 mock 上游的 hit_count(那只对 mock
@@ -563,9 +593,16 @@ class Router:
             CREATE TABLE IF NOT EXISTS domain_meta (
                 domain TEXT NOT NULL PRIMARY KEY,
                 default_proxy TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                ref_ewma REAL
             )
         """)
+        # 迁移:老库的 domain_meta 无 ref_ewma 列(GOAL #6 之前)。CREATE TABLE IF NOT
+        # EXISTS 不会给已存在的表补列,这里检查 PRAGMA 并 ALTER ADD COLUMN,保证
+        # 既有部署升级后启动不崩(老行 ref_ewma 为 NULL,降级判定按"无基线"处理)。
+        cols = {row[1] for row in self._db.execute("PRAGMA table_info(domain_meta)")}
+        if "ref_ewma" not in cols:
+            self._db.execute("ALTER TABLE domain_meta ADD COLUMN ref_ewma REAL")
         self._db.commit()
 
         # 内存镜像:热路径(每请求查域名缓存)只读这两份内存,不经 DB/锁。
@@ -612,13 +649,14 @@ class Router:
             stats_rows = self._db.execute(
                 "SELECT domain, proxy_id, wins FROM domain_stats").fetchall()
             meta_rows = self._db.execute(
-                "SELECT domain, default_proxy, updated_at FROM domain_meta").fetchall()
+                "SELECT domain, default_proxy, updated_at, ref_ewma FROM domain_meta").fetchall()
         self._stats_cache = {}
         for domain, pid, wins in stats_rows:
             self._stats_cache.setdefault(domain, {})[pid] = wins
         self._meta_cache = {
-            domain: {"default_proxy": dp, "updated_at": ua}
-            for domain, dp, ua in meta_rows
+            domain: {"default_proxy": dp, "updated_at": ua,
+                     "ref_ewma": (float(ewma) if ewma is not None else None)}
+            for domain, dp, ua, ewma in meta_rows
         }
 
     def _record_attempt(self, domain: str, pid: str):
@@ -640,11 +678,18 @@ class Router:
         仅在竞速判定赢家(或域名缓存命中复用)后调一次。这样 _meta_cache 反映
         真正被采用的上游,而非竞速中"最后收到响应头的候选"(可能被取消)。
         更新内存镜像并置脏,由后台 _flush_loop 落盘。
+
+        Goal #6:此处是域名缓存钉住时刻——捕获 pid 当前 EWMA 作为 ref_ewma 基线
+        (供 _get_fresh_proxy 判定"相对钉住时是否恶化");同时清除 _degraded_single_send
+        标记(新赢家已接管,该代理可再次被单发)。
         """
         self._meta_cache[domain] = {
             "default_proxy": pid,
             "updated_at": self._now_utc(),
+            "ref_ewma": self._proxy_quality_ewma(self.selector.get_quality().get(pid)),
         }
+        if pid in self._degraded_single_send:
+            self._degraded_single_send.remove(pid)
         self._meta_dirty = True
 
     def _flush_to_db(self):
@@ -669,8 +714,9 @@ class Router:
             if self._meta_dirty:
                 self._db.execute("DELETE FROM domain_meta")
                 self._db.executemany(
-                    "INSERT INTO domain_meta (domain, default_proxy, updated_at) VALUES (?, ?, ?)",
-                    [(d, m["default_proxy"], m["updated_at"])
+                    "INSERT INTO domain_meta (domain, default_proxy, updated_at, ref_ewma)"
+                    " VALUES (?, ?, ?, ?)",
+                    [(d, m["default_proxy"], m["updated_at"], m.get("ref_ewma"))
                      for d, m in self._meta_cache.items()],
                 )
                 self._meta_dirty = False
@@ -812,15 +858,26 @@ class Router:
             "probes_ok": self.probes_ok,
             "circuit_open_count": self.selector.circuit_open_count,
             "circuit_state": self.selector.get_circuit_state(),
+            "single_send_degrades": self.single_send_degrades,
         }
+
+    def get_degraded_single_send(self) -> list[str]:
+        """返回当前"被单发降级判定命中的代理"集合(供 /metrics / 仪表盘展示)。
+
+        仅用于可观测——真正的门控是每次选择的实时重估,此集合由新赢家接管
+        (_record_win_meta)或 reset_proxy_quality 清除。读内存无锁。
+        """
+        return sorted(self._degraded_single_send)
 
     def reset_proxy_quality(self):
         """清空全部代理 EWMA 质量数据(网络切换/代理分组变化时调用)。
 
         RFC 8305 §4:历史 RTT 数据不可跨网络接口使用,换网络后应清空重学。
-        熔断/慢启动状态一并清空(旧网络的连续失败对当前网络无意义)。
+        熔断/慢启动状态一并清空(旧网络的连续失败对当前网络无意义);
+        单发降级失效集合一并清空(旧网络的降级标记不可沿用)。
         """
         self.selector.reset_quality()
+        self._degraded_single_send.clear()
 
     def reset_proxy_circuits(self):
         """手动解除全部代理熔断并清空连续失败计数(运维介入后调用)。
@@ -830,17 +887,71 @@ class Router:
         """
         self.selector.reset_circuits()
 
+    @staticmethod
+    def _proxy_quality_ewma(q: Optional[dict]) -> Optional[float]:
+        """从质量表条目取出 EWMA(秒);无条目/缺字段返回 None。"""
+        if not q:
+            return None
+        ewma = q.get("ewma_ttfb")
+        return float(ewma) if isinstance(ewma, (int, float)) else None
+
+    def _single_send_degraded(self, pid: str, ref_ewma: Optional[float]) -> bool:
+        """被钉住代理在"单发选择"时是否已恶化,应降级回竞速(Goal #6)。
+
+        两条独立信号,任一命中即判定不稳定(与熔断解耦——熔断是"连续失败达阈值
+        直接剔除",这里是"尚未熔断但已开始变差,别再确定性单发,交给竞速选路"):
+          1) 连续失败:selector 的连续失败计数 ≥ single_send_degrade_fail
+             (熔断阈值 3 的早告警,默认 2)。被钉住代理最近在真实请求/探活中
+             连续失败,说明它在变差——单发命中它只会放大失败路径,降级回竞速
+             让有序候选/兜底批自动绕开它。
+          2) EWMA 恶化:当前 EWMA ≥ ref_ewma × single_send_degrade_ratio。
+             与熔断器解耦——该代理可能仍整体健康(EWMA 未到"差"的绝对档),但
+             相比被钉住时显著变慢,应重竞速换新赢家。EWMA 相对基线恶化
+             (envoy 风格连续失败剔除 + 基线比对,见分析 doc P2-6)。
+
+        防御:代理已熔断(open)→ 由调用方的 is_circuit_open 处理,此处不重复;
+        无 EWMA 观测/无基线 → 不触发 EWMA 信号(失败信号仍可独立触发)。
+        EWMA 信号要求观测数 obs>=2:obs==1 时当前 EWMA 即钉住时的单次观测,
+        尚无"趋势"可言,任何更新都会把它误判为恶化,故不触发。
+        'local'(本机直连)跳过本机直连路径的特殊处理由调用方负责。
+        """
+        if self.single_send_degrade_fail > 0:
+            st = self.selector.get_circuit_state().get(pid)
+            consec = int(st["consec_fail"]) if st else 0
+            if consec >= self.single_send_degrade_fail:
+                self.single_send_degrades += 1
+                return True
+        if self.single_send_degrade_ratio > 0 and ref_ewma is not None and ref_ewma > 0:
+            q = self.selector.get_quality().get(pid)
+            cur = self._proxy_quality_ewma(q)
+            if cur is not None and int(q.get("obs", 0)) >= 2 \
+                    and cur >= ref_ewma * self.single_send_degrade_ratio:
+                slack = self.single_send_degrade_slack_ms / 1000.0
+                if (cur - ref_ewma) > slack:
+                    self.single_send_degrades += 1
+                    return True
+        return False
+
     def _get_fresh_proxy(self, domain: str) -> Optional[str]:
         """返回某域名在 cache_ttl 内的缓存代理 id;过期或无记录返回 None。
 
         用于域名缓存:命中则直接复用该代理,跳过竞速。熔断中的代理视为未命中
-        (退回竞速找健康代理,竞速赢家会刷新 meta)。纯内存读取,无 DB/锁。
+        (退回竞速找健康代理,竞速赢家会刷新 meta)。单发降级判定(Goal #6)命中
+        的代理也视为未命中——被钉住代理最近失败率上升或 EWMA 恶化时,主动降级
+        回竞速,不再确定性单发。纯内存读取,无 DB/锁。
         """
         entry = self._meta_cache.get(domain)
         if not entry:
             return None
         pid = entry["default_proxy"]
         if self.selector.is_circuit_open(pid):
+            return None
+        # Goal #6:质量感知单发。基线 ref_ewma 在钉住时刻捕获(见 _record_win_meta),
+        # 已是浮点 EWMA 值(非质量 dict)。
+        # 命中降级 → 记入降级集合(可观测)并视为未命中退回竞速;竞速新赢家会经
+        # _record_win_meta 清除标记。
+        if self._single_send_degraded(pid, entry.get("ref_ewma")):
+            self._degraded_single_send.add(pid)
             return None
         updated_at_str = entry["updated_at"]
         try:
@@ -913,6 +1024,11 @@ class Router:
         # _sticky_recheck_due 决定跳过域名缓存直接竞速)。
         if self._sticky_recheck_due(client_ip, domain):
             return None
+        # Goal #6:质量感知粘性。被钉住代理最近失败率上升 / EWMA 恶化 → 驱逐
+        # 并回落竞速(调用方 _evict_sticky + 跳过域名缓存直接竞速)。local 直连
+        # 不经 selector,跳过降级判定(A1)。
+        if pid != 'local' and self._sticky_degrade_due(client_ip, domain):
+            return None
         return pid
 
     def _sticky_recheck_due(self, client_ip: str, domain: str) -> bool:
@@ -935,6 +1051,28 @@ class Router:
         except Exception:
             return False
 
+    def _sticky_degrade_due(self, client_ip: str, domain: str) -> bool:
+        """粘性单发是否该因"代理质量恶化"降级回竞速(Goal #6)。
+
+        与 _sticky_recheck_due(B2,命中计数触发)互补:B2 是"达到 N 次命中后周期
+        性重探路",这里是"被钉住代理已被质量模型判定不稳定"——两者任一命中都
+        应放弃粘性单发,驱逐条目并跳过域名缓存直接竞速,让竞速赢家重新钉住。
+        基线 ref_ewma 在钉住时刻捕获(见 _record_sticky),粘性命中仅滑动 TTL
+        不刷新基线,保证"恶化"是相对钉住时的初始状态,而非相对最近一次命中。
+        """
+        if not self.stickiness_enabled:
+            return False
+        entry = self._sticky_cache.get(self._sticky_key(client_ip, domain))
+        if not entry:
+            return False
+        pid = entry["proxy_id"]
+        if pid == 'local':
+            return False  # 本机直连不经 selector,跳过降级判定(A1)
+        if not self._single_send_degraded(pid, entry.get("ref_ewma")):
+            return False
+        self._degraded_single_send.add(pid)
+        return True
+
     def _record_sticky(self, client_ip: str, domain: str, pid: str):
         """记录客户端+域名的粘性代理(刷新 updated_at,hits 归零)。
 
@@ -953,6 +1091,9 @@ class Router:
             "proxy_id": pid,
             "updated_at": self._now_utc(),
             "hits": 0,
+            # Goal #6:钉住时刻的 EWMA 基线,供 _sticky_degrade_due 判定"相对钉住
+            # 时是否恶化"。粘性命中(_bump_sticky)只滑动 TTL,不刷新基线。
+            "ref_ewma": self._proxy_quality_ewma(self.selector.get_quality().get(pid)),
         }
 
     def _bump_sticky(self, client_ip: str, domain: str, pid: str):

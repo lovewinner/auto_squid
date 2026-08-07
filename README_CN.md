@@ -189,6 +189,10 @@ router:
     ttl: 1800                  # 粘性有效期（秒），滑动刷新
     recheck_hits: 100          # 粘性命中 N 次后触发探路重竞速（0=关闭）
     max_entries: 100000        # 粘性表容量硬上限
+  circuit:
+    single_send_degrade_fail: 2     # 单发降级:连续失败阈值(熔断早告警,0=关闭)
+    single_send_degrade_ratio: 3.0  # 单发降级:EWMA 相对钉住基线恶化倍数(0=关闭)
+    single_send_degrade_slack_ms: 10  # 降级绝对下限(ms),防极低延迟误判
 logging:
   file: "auto_squid.log"
 ```

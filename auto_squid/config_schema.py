@@ -103,6 +103,16 @@ class CircuitConfig(BaseModel):
                        权重 = ewma × (1 + active)^bias,在途积压多的代理被压低,
                        保护慢代理不被打爆(Envoy LeastRequest / Dubbo LeastActive)。
                        0 退化为纯 EWMA 排序。
+    single_send_degrade_fail: 单发降级:连续失败阈值(默认 0=关闭)。域名缓存/粘性
+                       命中的代理连续失败达该值,即使未到熔断阈值,单发路径也主动
+                       降级回竞速(质量感知的确定性探路,Goal #6)。建议设为
+                       circuit_threshold-1 作熔断早告警。
+    single_send_degrade_ratio: 单发降级:EWMA 恶化阈值(默认 0=关闭)。被钉住代理的
+                       当前 EWMA 相对钉住时基线的比值超过该值(如 3.0=延迟恶化
+                       3 倍)即降级回竞速。0=只按连续失败降级。
+    single_send_degrade_slack_ms: EWMA 降级的绝对下限(毫秒,默认 10)。基线与当前值
+                       都极小时(如 0.2ms→0.9ms,比值 4.5 但绝对差距 <1ms)用纯比值
+                       会误判剧烈恶化——绝对差值低于该 slack 时不降级。
     """
     probe_interval_sec: float = Field(30.0, description="后台探活周期(秒),0=关闭主动探活")
     probe_canary: str = Field("1.1.1.1:443", description="探活目标 host:port")
@@ -111,6 +121,9 @@ class CircuitConfig(BaseModel):
     slow_start_window: float = Field(60.0, description="slow-start 爬升窗口(秒)")
     slow_start_success: int = Field(3, description="slow-start 恢复期内成功多少次后恢复完整权重")
     lb_bias: float = Field(1.0, description="加权 least-request 在途惩罚指数,0=纯 EWMA 排序")
+    single_send_degrade_fail: int = Field(0, description="单发降级:连续失败阈值,0=关闭")
+    single_send_degrade_ratio: float = Field(0.0, description="单发降级:EWMA 恶化比值阈值,0=关闭")
+    single_send_degrade_slack_ms: float = Field(10.0, description="EWMA 降级绝对下限(毫秒)")
 
 
 class RouterConfig(BaseModel):

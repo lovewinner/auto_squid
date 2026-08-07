@@ -261,7 +261,8 @@ class ScenarioResult:
             racing_group = {"amplification": None, "upstream_attempts": None,
                             "invocations": None}
             circuit_group = {"circuit_open_count": None, "probes_sent": None,
-                             "probes_ok": None, "proxies_open_end": 0}
+                             "probes_ok": None, "proxies_open_end": 0,
+                             "single_send_degrades": None}
             inflight_group = {"max_in_flight": None, "in_flight_end": {}}
         else:
             cb, ca = self.counters_before, self.counters_after
@@ -288,6 +289,7 @@ class ScenarioResult:
                 "probes_sent": ca.get("probes_sent", 0) - cb.get("probes_sent", 0),
                 "probes_ok": ca.get("probes_ok", 0) - cb.get("probes_ok", 0),
                 "proxies_open_end": sum(1 for v in (ca.get("circuit_state") or {}).values() if v.get("open")),
+                "single_send_degrades": ca.get("single_send_degrades", 0) - cb.get("single_send_degrades", 0),
             }
             # 在途选批(in-flight)观测:场景内单代理在途数高水位(场景内峰值,而非
             # 累计,故取差值)与场景末各代理当前在途数(应回落为 0,证明计数无泄漏)。
@@ -1076,8 +1078,10 @@ def print_report(metrics_list: list, git_ver: str, upstream_mode: str,
             print(f"  竞速          : 放大率 {r['amplification']:.2f}x  上游尝试 {r['upstream_attempts']}  竞速触发 {r['invocations']}")
         circ = m.get('circuit') or {}
         if circ.get('circuit_open_count') is not None:
+            deg = circ.get('single_send_degrades')
+            deg_txt = f"  单发降级 {deg} 次" if deg else ""
             print(f"  熔断          : 开合 {circ['circuit_open_count']} 次  探活 {circ['probes_sent']}/{circ['probes_ok']} 成功  "
-                  f"末态熔断 {circ['proxies_open_end']} 个代理")
+                  f"末态熔断 {circ['proxies_open_end']} 个代理{deg_txt}")
         infl = m.get('in_flight') or {}
         if infl.get('max_in_flight') is not None:
             ends = infl.get('in_flight_end') or {}
@@ -1256,6 +1260,9 @@ async def amain(args):
             "slow_start_window": args.slow_start_window,
             "slow_start_success": args.slow_start_success,
             "lb_bias": args.lb_bias,
+            "single_send_degrade_fail": getattr(args, 'single_send_degrade_fail', 0),
+            "single_send_degrade_ratio": getattr(args, 'single_send_degrade_ratio', 0.0),
+            "single_send_degrade_slack_ms": getattr(args, 'single_send_degrade_slack_ms', 10.0),
             "dead_proxies": getattr(args, 'dead_proxies', []) or getattr(args, 'dead_proxy', []),
             "proxies_path": args.proxies,
             "mock_specs": mock_specs,
@@ -1350,6 +1357,12 @@ def main():
     p.add_argument("--lb-bias", type=float, default=1.0,
                    help="加权 least-request 在途惩罚指数(竞速排序权重 = ewma×(1+active)^bias;"
                         "0=纯 EWMA 排序,默认 1.0)")
+    p.add_argument("--single-send-degrade-fail", type=int, default=0,
+                   help="单发降级:连续失败阈值(默认 0=关闭;建议 circuit_threshold-1)")
+    p.add_argument("--single-send-degrade-ratio", type=float, default=0.0,
+                   help="单发降级:EWMA 恶化比值阈值(默认 0=关闭;如 3.0=延迟恶化3倍)")
+    p.add_argument("--single-send-degrade-slack-ms", type=float, default=10.0,
+                   help="EWMA 降级绝对下限毫秒(默认 10,防极低延迟误判)")
     p.add_argument("--dead-proxy", action="append", default=[],
                    metavar="ID:HOST:PORT",
                    help="注入指向死端口的代理(可重复),给熔断器制造连续失败负载;"

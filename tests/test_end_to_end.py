@@ -2298,3 +2298,130 @@ class TestInFlightSelection:
             await router.stop()
             proxy_srv.close()
             await proxy_srv.wait_closed()
+
+
+class TestSingleSendDegrade:
+    """质量感知的单发降级(Goal #6):域名缓存/粘性命中单发时,被钉住代理
+    连续失败上升或 EWMA 恶化 → 主动降级回竞速。
+
+    两条独立信号(见 Router._single_send_degraded):
+      1) 连续失败 ≥ single_send_degrade_fail(熔断阈值的早告警);
+      2) 当前 EWMA ≥ 钉住时基线 × single_send_degrade_ratio(且绝对差 > slack)。
+    """
+
+    def _router(self, **kw):
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host='h', port=3128))
+        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+                      db_path=tempfile.mktemp(suffix='.db'),
+                      stickiness_enabled=True, stickiness_ttl=1800, **kw)
+
+    def test_degrades_off_by_default(self):
+        """默认(阈值=0)不降级:连续失败/EWMA 恶化都不触发,行为与旧版一致。"""
+        r = self._router()
+        r.selector.record_ttfb('p', 0.01)
+        r._record_win_meta('example.com', 'p')
+        assert r._get_fresh_proxy('example.com') == 'p'
+        r._record_sticky('1.2.3.4', 'example.com', 'p')
+        assert r._get_sticky_proxy('1.2.3.4', 'example.com') == 'p'
+        r.selector.record_failure('p')
+        r.selector.record_failure('p')  # 连续失败 2 次也不降级(阈值 0=关闭)
+        assert r._get_fresh_proxy('example.com') == 'p'
+        assert r._get_sticky_proxy('1.2.3.4', 'example.com') == 'p'
+        assert r.single_send_degrades == 0
+
+    def test_consec_fail_degrades_domain_and_sticky(self):
+        """连续失败达阈值 → 域名缓存与粘性单发都降级回竞速(未熔断时)。"""
+        r = self._router(single_send_degrade_fail=2)
+        r.selector.record_ttfb('p', 0.01)
+        r._record_win_meta('example.com', 'p')
+        r._record_sticky('1.2.3.4', 'example.com', 'p')
+        # 连续失败 1 次:未达阈值 2,仍单发。
+        r.selector.record_failure('p')
+        assert r._get_fresh_proxy('example.com') == 'p'
+        assert r._get_sticky_proxy('1.2.3.4', 'example.com') == 'p'
+        # 连续失败 2 次:达阈值 → 均降级为 None(退回竞速)。
+        r.selector.record_failure('p')
+        assert r._get_fresh_proxy('example.com') is None
+        assert r._get_sticky_proxy('1.2.3.4', 'example.com') is None
+        assert r.single_send_degrades >= 2
+
+    def test_degraded_proxy_marked_for_repin(self):
+        """降级后代理进入 _degraded_single_send;新赢家(_record_win_meta)清除。"""
+        r = self._router(single_send_degrade_fail=2)
+        r.selector.record_ttfb('p', 0.01)
+        r._record_win_meta('example.com', 'p')
+        r._record_sticky('1.2.3.4', 'example.com', 'p')
+        r.selector.record_failure('p')
+        r.selector.record_failure('p')
+        # 降级命中 → 加入失效集合,且 meta 中的基线 ref_ewma 已捕获。
+        assert r._get_fresh_proxy('example.com') is None
+        assert 'p' in r.get_degraded_single_send()
+        # 竞速新赢家接管:该代理成功(清零连续失败)→ 清除失效标记,重新可单发,
+        # 且 ref_ewma 刷新为当前 EWMA。
+        r.selector.record_success('p')  # 竞速赢家会清零连续失败
+        r.selector.record_ttfb('p', 0.02)
+        r._record_win_meta('example.com', 'p')
+        assert 'p' not in r.get_degraded_single_send()
+        assert r._get_fresh_proxy('example.com') == 'p'
+
+    def test_ewma_ratio_degrades_single_send(self):
+        """EWMA 恶化 ratio 倍(绝对差超 slack)→ 单发降级回竞速。"""
+        r = self._router(single_send_degrade_ratio=3.0, single_send_degrade_slack_ms=5.0)
+        r.selector.record_ttfb('p', 0.01)  # obs=1,EWMA=0.01
+        r._record_win_meta('example.com', 'p')
+        r._record_sticky('1.2.3.4', 'example.com', 'p')
+        assert r._meta_cache['example.com']['ref_ewma'] == 0.01
+        # 恶化:连续观测 0.05 使 EWMA 上探到 ≥ 0.03。
+        #   第1次 obs=2:EWMA=0.7*0.01+0.3*0.05=0.022(比值2.2<3,未达)
+        #   第2次 obs=3:EWMA=0.7*0.022+0.3*0.05=0.0304(比值3.04≥3,
+        #     绝对差0.0204s=20.4ms>5ms slack)→ 降级。
+        r.selector.record_ttfb('p', 0.05)
+        r.selector.record_ttfb('p', 0.05)
+        assert r._get_fresh_proxy('example.com') is None
+        assert r._get_sticky_proxy('1.2.3.4', 'example.com') is None
+
+    def test_ewma_ratio_slack_prevents_false_positive(self):
+        """极低延迟下纯比值会误判:绝对差低于 slack 时不降级。"""
+        r = self._router(single_send_degrade_ratio=3.0, single_send_degrade_slack_ms=10.0)
+        r.selector.record_ttfb('p', 0.0002)  # 0.2ms
+        r._record_win_meta('example.com', 'p')
+        r.selector.record_ttfb('p', 0.0009)  # 0.9ms,比值 4.5 > 3 但绝对差 0.7ms < 10ms
+        assert r._get_fresh_proxy('example.com') == 'p', \
+            "absolute gap below slack must not trigger degrade"
+
+    def test_ewma_ratio_requires_observations(self):
+        """EWMA 降级只对有观测且 obs>=2 的代理生效:单观测 EWMA 不被视为恶化。"""
+        r = self._router(single_send_degrade_ratio=3.0, single_send_degrade_slack_ms=1.0)
+        r.selector.record_ttfb('p', 0.01)
+        r._record_win_meta('example.com', 'p')
+        # 直接手工抬高质量表(模拟并发异常写入),未增加 obs → 不降级。
+        r.selector._quality['p']['ewma_ttfb'] = 0.99
+        assert r._get_fresh_proxy('example.com') == 'p'
+
+    def test_ref_ewma_not_refreshed_by_sticky_bumps(self):
+        """粘性命中(_bump_sticky)只滑动 TTL,不刷新基线——恶化判定始终相对钉住时刻。"""
+        r = self._router(single_send_degrade_ratio=3.0, single_send_degrade_slack_ms=5.0)
+        r.selector.record_ttfb('p', 0.01)
+        r._record_sticky('1.2.3.4', 'example.com', 'p')
+        assert r._sticky_cache['1.2.3.4|example.com']['ref_ewma'] == 0.01
+        # 多次粘性命中(EWMA 已涨到 0.10),基线仍是钉住时的 0.01。
+        for _ in range(8):
+            r._bump_sticky('1.2.3.4', 'example.com', 'p')
+        assert r._sticky_cache['1.2.3.4|example.com']['ref_ewma'] == 0.01
+        assert r._get_sticky_proxy('1.2.3.4', 'example.com') == 'p'  # obs 未增,不降级
+
+    def test_reset_quality_clears_degraded_markers(self):
+        """reset_quality 清空全部质量与降级状态:降级集合与 ref_ewma 一并重置。"""
+        r = self._router(single_send_degrade_fail=2)
+        r.selector.record_ttfb('p', 0.01)
+        r._record_win_meta('example.com', 'p')
+        r.selector.record_failure('p')
+        r.selector.record_failure('p')
+        assert r._get_fresh_proxy('example.com') is None
+        assert 'p' in r.get_degraded_single_send()
+        r.reset_proxy_quality()
+        # reset 清空 _quality/熔断/降级集合 → 降级标记不再阻挡单发。
+        assert r.get_degraded_single_send() == []
+        # meta 仍指向 'p'(ref_ewma 基线保留但质量表已清,降级判定无据可依)。
+        assert r._get_fresh_proxy('example.com') == 'p'

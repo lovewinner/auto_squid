@@ -189,6 +189,10 @@ router:
     ttl: 1800                  # stickiness TTL in seconds, sliding
     recheck_hits: 100          # re-race after N sticky hits (0=off)
     max_entries: 100000        # hard capacity cap (evict oldest when exceeded)
+  circuit:
+    single_send_degrade_fail: 2     # single-send demote: consec-fail threshold (early warn, 0=off)
+    single_send_degrade_ratio: 3.0  # single-send demote: EWMA vs pin-time baseline ratio (0=off)
+    single_send_degrade_slack_ms: 10  # absolute floor (ms) against false positives at tiny latencies
 logging:
   file: "auto_squid.log"
 ```
