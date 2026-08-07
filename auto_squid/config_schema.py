@@ -84,6 +84,30 @@ class StickinessConfig(BaseModel):
     max_entries: int = Field(100_000, description="粘性表最大条目数,超出驱逐最旧(内存保护)")
 
 
+class CircuitConfig(BaseModel):
+    """熔断器 + 后台探活 + slow-start 配置(router.circuit)。
+
+    probe_interval_sec: 后台探活周期(秒)。每周期对 enabled 代理做轻量 CONNECT
+                       到 canary + 关闭,计延迟/成败 → 更新 EWMA 与熔断计数。
+                       0=关闭主动探活(仅真实请求驱动熔断)。默认 30。
+    probe_canary:       探活目标 "host:port"。轻量 CONNECT 只验证上游可达与
+                       建连延迟,域名级最终仍由竞速决定(默认 1.1.1.1:443)。
+    circuit_threshold:  连续失败多少次触发熔断(默认 3)。真实请求失败与探活
+                       失败共享计数。
+    circuit_max_backoff: 熔断退避上限(秒,默认 300)。退避指数增长:1s → 2s →
+                       4s → ... 直到此上限。
+    slow_start_window:  slow-start 爬升窗口(秒,默认 60)。熔断退避到期后该代理
+                       在此窗口内低权重垫底。
+    slow_start_success: slow-start 恢复期内累计成功多少次后恢复完整权重(默认 3)。
+    """
+    probe_interval_sec: float = Field(30.0, description="后台探活周期(秒),0=关闭主动探活")
+    probe_canary: str = Field("1.1.1.1:443", description="探活目标 host:port")
+    circuit_threshold: int = Field(3, description="连续失败熔断阈值")
+    circuit_max_backoff: float = Field(300.0, description="熔断退避上限(秒),指数增长到该值")
+    slow_start_window: float = Field(60.0, description="slow-start 爬升窗口(秒)")
+    slow_start_success: int = Field(3, description="slow-start 恢复期内成功多少次后恢复完整权重")
+
+
 class RouterConfig(BaseModel):
     """路由行为配置。
 
@@ -99,6 +123,7 @@ class RouterConfig(BaseModel):
                          EWMA 历史)时自动翻倍到 2,避免随机首抽丢快代理。
     stagger_interval_ms: 相邻候选的启动间隔(毫秒),钳制到 [100, 2000](RFC 8305
                          §5 下限 100ms/绝对值 10ms、上限 2s)。默认 250。
+    circuit:             熔断器 + 后台探活 + slow-start 配置(见 CircuitConfig)。
     auth:                客户端认证配置(AuthConfig)。
     stickiness:          会话粘性配置(见 StickinessConfig)。
     """
@@ -108,6 +133,7 @@ class RouterConfig(BaseModel):
     stagger_start: bool = Field(True, description="启用错峰启动(RFC 8305 §5)")
     stagger_initial: int = Field(1, description="错峰首批并发数(冷启动自动翻倍到2)")
     stagger_interval_ms: int = Field(250, description="错峰启动间隔(毫秒),钳制到[100,2000]")
+    circuit: CircuitConfig = Field(default_factory=CircuitConfig, description="熔断器/探活/slow-start 配置")
     auth: AuthConfig = Field(default_factory=AuthConfig, description="客户端认证配置")
     stickiness: StickinessConfig = Field(default_factory=StickinessConfig, description="会话粘性配置")
 

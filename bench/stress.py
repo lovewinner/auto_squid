@@ -1212,6 +1212,12 @@ async def amain(args):
             "stagger_start": not args.no_stagger,
             "stagger_initial": args.stagger_initial,
             "stagger_interval_ms": args.stagger_interval_ms,
+            "probe_interval_sec": args.probe_interval_sec,
+            "probe_canary": args.probe_canary,
+            "circuit_threshold": args.circuit_threshold,
+            "circuit_max_backoff": args.circuit_max_backoff,
+            "slow_start_window": args.slow_start_window,
+            "slow_start_success": args.slow_start_success,
             "proxies_path": args.proxies,
             "mock_specs": mock_specs,
             "db_path": db_path,
@@ -1295,6 +1301,13 @@ def main():
     p.add_argument("--no-http-cache", action="store_true", help="禁用 HTTP 响应缓存")
     p.add_argument("--no-stagger", action="store_true",
                    help="禁用错峰启动(同时全发;默认启用错峰,RFC 8305 §5)")
+    p.add_argument("--probe-interval-sec", type=float, default=0.0,
+                   help="后台探活周期(秒);默认 0=关闭(压测隔离探活层)")
+    p.add_argument("--probe-canary", default="1.1.1.1:443", help="探活目标 host:port")
+    p.add_argument("--circuit-threshold", type=int, default=3, help="连续失败熔断阈值")
+    p.add_argument("--circuit-max-backoff", type=float, default=300.0, help="熔断退避上限(秒)")
+    p.add_argument("--slow-start-window", type=float, default=60.0, help="slow-start 爬升窗口(秒)")
+    p.add_argument("--slow-start-success", type=int, default=3, help="slow-start 成功几次后恢复完整权重")
     p.add_argument("--duration", type=float, default=60.0, help="soak 模式时长(秒)")
     p.add_argument("--open-loop", action="store_true", help="soak 开环模式(不限速,测真实上限)")
     p.add_argument("--quick", action="store_true", help="快速冒烟(小规模,~10s)")

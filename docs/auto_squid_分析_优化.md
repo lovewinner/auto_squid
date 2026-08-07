@@ -177,10 +177,18 @@ auto_squid 是一个**正向 HTTP/HTTPS 代理**：监听一个端口，客户�
 
   结论：扇出减半、慢代理根本不发（CONNECT 败者隧道"建好再关"的成本归零）、TTFB 不劣化。冷启动（无 EWMA）自动翻倍到 2，等价旧 `_race` 兜底能力。
 
-**3. 全局熔断器 + 指数退避探活 + slow-start**
-- 连续失败 N 次 → `circuit_open_until` 指数退避，退避期内不参与竞速。
-- 后台探活任务（仿 `_flush_loop`）：每 `PROBE_INTERVAL` 对 enabled 代理做轻量 CONNECT 到 canary（如 1.1.1.1:443）+关闭，计延迟/成败 → 更新 quality；连续失败 → 熔断（指数退避）。
-- 恢复后 `started_at=now` → slow-start 低权重爬升，防冷启动被打懵。
+**3. 全局熔断器 + 指数退避探活 + slow-start** — ✅ **已落地（2026-08-07）**
+- **连续失败熔断**：`ProxySelector` 维护每代理 `consec_fail`。连续失败达 `circuit_threshold`(默认 3) → `circuit_open_until` 指数退避（1s→2s→4s，上限 `circuit_max_backoff` 300s），退避期内 `ordered_proxies()` **剔除**该代理、域名缓存/粘性单发路径也跳过（`_get_fresh_proxy`/`_get_sticky_proxy` 检查熔断），避免对已确认故障的代理持续单发。
+- **失败信号同源**：真实请求失败（`_try_http`/`_try_tunnel` 连接失败/超时/5xx）与后台探活失败**共享同一连续失败计数**——不再重复实现。关键：**被竞速取消（CancelledError）不算失败**，健康慢代理每次竞速都会被快代理抢先取消，若计入会误熔断。收到响应头（HTTP）/CONNECT 200（隧道）即记成功、归零计数。
+- **后台探活**（仿 `_flush_loop`）：每 `probe_interval_sec`（默认 30s，0=关闭）对 enabled 代理做轻量 CONNECT 到 canary（默认 `1.1.1.1:443`）+关闭，成功记 EWMA + 归零、失败累计连续失败（达阈值即熔断）。探活只在低流量期补全质量模型，域名级最终仍由竞速决定。
+- **slow-start**：退避到期 → `started_at=now` → slow-start 恢复期（默认 60s 窗口），排序**垫底**（`_slow_start_rank` 档位 1），累计 `slow_start_success`(默认 3) 次成功即恢复完整权重，防"熔断恢复的代理一上来就被单发/首批抢打"。
+- **可观测**：`/circuit` 返回每代理熔断状态（open/退避剩余/连续失败/slow-start 中）+ `probes_sent/ok` + `circuit_open_count`；`/metrics` counters 含 `circuit_state`；`POST /circuit/reset` 手动解熔断（不动 EWMA）。
+- **配置贯通**：`config.yaml` `router.circuit` 块 + `config_schema.CircuitConfig` + `cli.py` + bench（`--probe-interval-sec` 等，压测默认关探活隔离该层）。
+- **验证**（真实 socket 端到端 + 单测 68 全绿）：
+  - 坏代理 `down`(端口无人监听) + 好代理 `up`：请求 1-2 `down` 失败累计 → 第 3 次起 `down` 不再被尝试（`attempted_counts={'up': N, 'down': 2}` 恒定）、请求全部 200；
+  - 退避指数翻倍：首熔断 2s → 二次 4s → 三次 8s（`/circuit` 实读 `backoff` 字段）；
+  - slow-start：退避到期 `slow_start=true` 垫底，成功 2 次后恢复首位；
+  - 探活：`probe_interval_sec=3` 实跑，`up` 成功喂 EWMA（~0.96ms）、`down` 失败累计熔断（backoff 8s）。
 
 ### P2 —— 明显增益，值得纳入
 

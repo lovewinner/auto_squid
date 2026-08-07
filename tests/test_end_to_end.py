@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -1963,3 +1964,231 @@ class TestStagger:
             await fast_srv.wait_closed()
             slow_srv.close()
             await slow_srv.wait_closed()
+
+
+class TestCircuitBreaker:
+    """全局熔断器 + 指数退避探活 + slow-start。
+
+    覆盖:连续失败达阈值熔断、退避期内不参与竞速、熔断代理不作域名缓存/粘性
+    单发、成功归零计数、退避到期 slow-start 爬升、探活喂 EWMA/熔断、reset。
+    """
+
+    async def _circuit_router(self, **kw):
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='down', host=HOST, port=31990))   # 端口无人监听 → 连接失败
+        ps.add(ProxyInfo(id='up', host=HOST, port=31991))
+        r = Router(ps, listen_host=HOST, listen_port=10829,
+                   max_retries=2, enable_http_cache=False,
+                   probe_interval_sec=0.0,
+                   circuit_threshold=3, circuit_max_backoff=10.0,
+                   slow_start_window=60.0, slow_start_success=2,
+                   db_path=tempfile.mktemp(suffix='.db'), **kw)
+        return ps, r
+
+    @pytest.mark.asyncio
+    async def test_failure_threshold_trips_circuit(self):
+        """连续失败达阈值 → 熔断;退避期内 ordered_proxies 剔除该代理。"""
+        ps, r = await self._circuit_router()
+        try:
+            sel = r.selector
+            # 连续失败 2 次(低于阈值 3):未熔断。
+            sel.record_failure('down')
+            sel.record_failure('down')
+            assert sel.is_circuit_open('down') is False
+            assert 'down' in sel.ordered_proxies()
+            # 第 3 次失败:熔断开启。
+            sel.record_failure('down')
+            assert sel.is_circuit_open('down') is True
+            assert sel.circuit_open_count == 1
+            assert 'down' not in sel.ordered_proxies(), \
+                "open circuit must be excluded from racing order"
+            # 退避期内仍剔除。
+            assert 'down' not in sel.ordered_proxies()
+            state = sel.get_circuit_state()['down']
+            assert state['open'] is True
+            assert state['backoff'] > 0
+        finally:
+            await r.stop()
+
+    @pytest.mark.asyncio
+    async def test_success_clears_failure_count(self):
+        """一次成功清零连续失败计数(健康后不会熔断)。"""
+        _, r = await self._circuit_router()
+        try:
+            sel = r.selector
+            sel.record_failure('down')
+            sel.record_failure('down')
+            sel.record_success('down')
+            sel.record_failure('down')  # 第 3 次失败前已被成功清零 → 不熔断
+            assert sel.is_circuit_open('down') is False
+            assert sel.circuit_open_count == 0
+        finally:
+            await r.stop()
+
+    @pytest.mark.asyncio
+    async def test_backoff_expiry_triggers_slow_start(self):
+        """退避到期 → 解熔断并置 slow-start(垫底),成功 N 次后恢复完整权重。"""
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='p1', host='h1', port=1))
+        ps.add(ProxyInfo(id='p2', host='h2', port=2))
+        ps.add(ProxyInfo(id='p3', host='h3', port=3))
+        r = Router(ps, listen_host=HOST, listen_port=10829, max_retries=2,
+                   probe_interval_sec=0.0, circuit_threshold=1,
+                   circuit_max_backoff=100.0, slow_start_window=60.0,
+                   slow_start_success=2, db_path=tempfile.mktemp(suffix='.db'))
+        try:
+            sel = r.selector
+            # p1 熔断(阈值 1 → 一次失败即熔断),退避期 2s(circuit_max_backoff 未达)。
+            sel.record_failure('p1')
+            assert sel.is_circuit_open('p1') is True
+            assert 'p1' not in sel.ordered_proxies()
+            # 退避期未到,手工把 open_until 拨到过去 → 到期。
+            sel._circuit['p1']['open_until'] = time.monotonic() - 0.1
+            # 下次排序解熔断 → slow-start 垫底。
+            sel.record_ttfb('p1', 0.01)
+            sel.record_ttfb('p2', 0.02)
+            sel.record_ttfb('p3', 0.03)
+            lst = sel.ordered_proxies()
+            assert 'p1' in lst, "expired circuit must be back in order"
+            assert lst[-1] == 'p1', f"slow-start proxy should be last, got {lst}"
+            state = sel.get_circuit_state()['p1']
+            assert state['slow_start'] is True
+            # 累计 2 次成功 → 恢复完整权重(不再垫底)。
+            sel.record_success('p1')
+            assert sel.get_circuit_state()['p1']['slow_start'] is True
+            sel.record_success('p1')
+            assert sel.get_circuit_state()['p1']['slow_start'] is False
+            lst2 = sel.ordered_proxies()
+            assert lst2[0] == 'p1', f"p1 should be first after slow-start completes, got {lst2}"
+        finally:
+            await r.stop()
+
+    @pytest.mark.asyncio
+    async def test_circuit_open_proxy_excluded_from_caches(self):
+        """熔断代理不作域名缓存/粘性单发(退回竞速找健康代理)。
+
+        预置:up mock 返回 'OK' 单代理;域名缓存与粘性表都指向一个已熔断的
+        假代理 'down'(端口无人监听)。请求应因熔断跳过单发、直接竞速到 up。
+        """
+        up_srv = await run_mock_proxy_tagged(HOST, 31991, 'UP', pre_header_delay=0.0)
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='down', host=HOST, port=31990))
+        ps.add(ProxyInfo(id='up', host=HOST, port=31991))
+        r = Router(ps, listen_host=HOST, listen_port=10829,
+                   max_retries=2, enable_http_cache=False,
+                   probe_interval_sec=0.0, circuit_threshold=1,
+                   circuit_max_backoff=100.0,
+                   cache_ttl=300,
+                   db_path=tempfile.mktemp(suffix='.db'))
+        await r.start()
+        try:
+            domain = 'circuit-cache.example.com'
+            # 熔断 down。
+            r.selector.record_failure('down')
+            assert r.selector.is_circuit_open('down')
+            # 域名缓存与粘性表指向 down(但 down 已熔断)。
+            r._record_win_meta(domain, 'down')
+            r._record_sticky('127.0.0.1', domain, 'down')
+            # 请求:熔断代理被单发路径跳过 → 竞速 → up 胜出。
+            body = await send_http_get(HOST, 10829, url=f"http://{domain}/p0".encode())
+            assert b'UP' in body, f"should fall back to up, got {body!r}"
+            assert r.attempted_counts.get('down', 0) == 0, \
+                "circuit-open proxy must not be attempted"
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_probe_records_success_and_failure(self):
+        """后台探活:成功 → EWMA + probes_ok;失败 → 熔断计数(达阈值熔断)。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)  # CONNECT 200
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='up', host=HOST, port=31991))
+        ps.add(ProxyInfo(id='down', host=HOST, port=31990))  # 无人监听 → 失败
+        r = Router(ps, listen_host=HOST, listen_port=10829,
+                   max_retries=2, enable_http_cache=False,
+                   probe_interval_sec=0.0, probe_canary="1.1.1.1:443",
+                   circuit_threshold=2, circuit_max_backoff=100.0,
+                   db_path=tempfile.mktemp(suffix='.db'))
+        try:
+            # 探活成功:EWMA 写入 + 连续失败归零。
+            await r._probe_proxy('up')
+            assert r.probes_sent == 1 and r.probes_ok == 1
+            assert 'up' in r.selector.get_quality(), "probe success must feed EWMA"
+            # 探活失败:连续失败累计(达阈值 2 即熔断)。
+            await r._probe_proxy('down')   # fail 1
+            assert r.selector.is_circuit_open('down') is False
+            await r._probe_proxy('down')   # fail 2 → open
+            assert r.selector.is_circuit_open('down') is True
+            assert r.selector.circuit_open_count == 1
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_real_request_failures_drive_circuit(self):
+        """真实请求连续失败驱动熔断:坏代理被剔除,后续竞速不触发它。"""
+        ok_srv = await run_mock_proxy_tagged(HOST, 31991, 'OK', pre_header_delay=0.0)
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='down', host=HOST, port=31990))  # 无人监听
+        ps.add(ProxyInfo(id='ok', host=HOST, port=31991))
+        r = Router(ps, listen_host=HOST, listen_port=10829,
+                   max_retries=2, enable_http_cache=False,
+                   probe_interval_sec=0.0, circuit_threshold=2,
+                   circuit_max_backoff=100.0, stagger_start=False,
+                   db_path=tempfile.mktemp(suffix='.db'))
+        await r.start()
+        try:
+            url = b"http://real-fail.example.com/p0"
+            # 非错峰全发(禁用 stagger):每请求 down 与 ok 都参与竞速。
+            # 单请求:down 连接失败(计数 1)+ ok 胜出。
+            body = await send_http_get(HOST, 10829, url=url)
+            assert b'OK' in body
+            assert r.selector.is_circuit_open('down') is False, "1 fail < threshold 2"
+            # 第二个冷域名请求:down 再失败(计数 2 → 熔断)。
+            url2 = b"http://real-fail2.example.com/p0"
+            body2 = await send_http_get(HOST, 10829, url=url2)
+            assert b'OK' in body2
+            assert r.selector.is_circuit_open('down') is True, "2 fails should trip circuit"
+            # 熔断后:down 不再被尝试(attempted_counts 不再为 down 增加)。
+            before = r.attempted_counts.get('down', 0)
+            await send_http_get(HOST, 10829, url=b"http://real-fail3.example.com/p0")
+            assert r.attempted_counts.get('down', 0) == before, \
+                "open-circuit proxy must not be attempted"
+        finally:
+            await r.stop()
+            ok_srv.close()
+            await ok_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_reset_circuits(self):
+        """reset 清空熔断状态(不动 EWMA),代理立即重新参与。"""
+        _, r = await self._circuit_router()
+        try:
+            sel = r.selector
+            sel.record_ttfb('up', 0.05)
+            sel.record_failure('down')
+            sel.record_failure('down')
+            sel.record_failure('down')
+            assert sel.is_circuit_open('down')
+            assert sel.get_circuit_state()['down']['open'] is True
+            sel.reset_circuits()
+            assert sel.get_circuit_state() == {}
+            assert sel.is_circuit_open('down') is False
+            assert 'down' in sel.ordered_proxies()
+            # EWMA 不受 reset_circuits 影响。
+            assert sel.get_quality()['up']['ewma_ttfb'] == pytest.approx(0.05)
+        finally:
+            await r.stop()
+
+
+class TestCircuitAPI:
+    def test_circuit_endpoint_without_router(self):
+        """/circuit 在未挂载 router 时返回空 dict(不抛 500)。"""
+        mount(None, None)
+        client = TestClient(api_app)
+        r = client.get("/circuit")
+        assert r.status_code == 200
+        assert r.json() == {}

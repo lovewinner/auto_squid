@@ -78,6 +78,35 @@ async def quality_reset():
     return {"reset": True}
 
 
+@app.get("/circuit")
+async def circuit():
+    """返回每代理熔断器状态(是否熔断、退避剩余、连续失败、slow-start 中)。
+
+    供仪表盘/运维观察熔断活动。数据来自 selector.get_circuit_state()。
+    """
+    if not _router:
+        return {}
+    return {
+        "circuit_open_count": _router.selector.circuit_open_count,
+        "probes_sent": _router.probes_sent,
+        "probes_ok": _router.probes_ok,
+        "proxies": _router.selector.get_circuit_state(),
+    }
+
+
+@app.post("/circuit/reset")
+async def circuit_reset():
+    """手动解除全部代理熔断并清空连续失败计数(运维介入后调用)。
+
+    与 /quality/reset 的区别:不动 EWMA(延迟历史仍有效),只清熔断状态,
+    让代理立刻重新参与竞速。
+    """
+    if not _router:
+        raise HTTPException(status_code=500, detail="router not initialized")
+    _router.reset_proxy_circuits()
+    return {"reset": True}
+
+
 @app.get("/metrics")
 async def metrics():
     counts = _router.request_counts if _router else {}

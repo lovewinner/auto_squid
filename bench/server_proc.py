@@ -192,6 +192,12 @@ async def _serve(config: dict):
                         stagger_start=config.get("stagger_start", True),
                         stagger_initial=config.get("stagger_initial", 1),
                         stagger_interval_ms=config.get("stagger_interval_ms", 250),
+                        probe_interval_sec=config.get("probe_interval_sec", 0.0),
+                        probe_canary=config.get("probe_canary", "1.1.1.1:443"),
+                        circuit_threshold=config.get("circuit_threshold", 3),
+                        circuit_max_backoff=config.get("circuit_max_backoff", 300.0),
+                        slow_start_window=config.get("slow_start_window", 60.0),
+                        slow_start_success=config.get("slow_start_success", 3),
                         db_path=config["db_path"])
         await router.start()
         mount_api(ps, router)  # 注入 /metrics /server-stats 等端点

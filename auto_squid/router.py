@@ -92,6 +92,19 @@ _STAGGER_MIN_MS = 100
 _STAGGER_ABS_MIN_MS = 10
 _STAGGER_MAX_MS = 2000
 
+# 熔断器默认参数。连续失败 _CIRCUIT_THRESHOLD 次后熔断,退避期 circuit_until 按
+# 指数增长(初始 1s,每次翻倍,上限 _CIRCUIT_MAX_BACKOFF)。退避期内该代理不参与
+# 竞速/单发。退避到期后置 started_at=now 进入 slow-start:排序垫底、低权重,累计
+# _SLOW_START_SUCCESS 次成功(或窗口期满)才恢复完整权重,防冷启动被打懵。
+_CIRCUIT_THRESHOLD = 3
+_CIRCUIT_MAX_BACKOFF = 300.0
+_SLOW_START_WINDOW = 60.0
+_SLOW_START_SUCCESS = 3
+# 后台探活周期(秒)与 canary 目标。0=关闭主动探活(仅真实请求驱动熔断)。
+_PROBE_INTERVAL_DEFAULT = 30.0
+_PROBE_CANARY_DEFAULT = "1.1.1.1:443"
+_PROBE_TIMEOUT = 4.0
+
 # Hop-by-hop 请求头：只服务于"客户端→本代理"这一跳，绝不能转发给上游。
 # 特别是 Proxy-Authorization——若把客户端访问本代理的凭据透传到上游，
 # 上游 Squid 会用它校验缓存对象访问权限（ERR_CACHE_ACCESS_DENIED），
@@ -113,20 +126,37 @@ _HOP_BY_HOP_RESPONSE_HEADERS = frozenset({
 class ProxySelector:
     """从 ProxyStore 产出代理 id 的有序列表,供竞速使用。
 
-    策略:取所有 enabled 代理,按每代理的 EWMA 首字节延迟排序(快速者靠前),
-    同 EWMA 的代理间随机打乱以均衡负载。竞速顺序决定"谁先到/是否白占竞速槽"——
-    把扇出集中到优质代理,减少失败代理在竞速中的无谓参与。
+    策略:取所有 enabled 代理,剔除熔断中的代理,按每代理的 EWMA 首字节延迟排序
+    (快速者靠前),同 EWMA 的代理间随机打乱以均衡负载;slow-start 恢复期(熔断
+    退避刚结束)的代理垫底。竞速顺序决定"谁先到/是否白占竞速槽"——把扇出集中
+    到优质代理,减少失败代理在竞速中的无谓参与。
     """
 
     # EWMA 平滑系数:新观测占 0.3,历史占 0.7。取值参考 Finagle 峰值 EWMA 的
     # 常见做法,兼顾对新网络状况的响应速度与对抖动的抑制。
     EWMA_ALPHA = 0.3
 
-    def __init__(self, proxy_store: ProxyStore):
+    # 熔断退避指数:每次熔断退避期 * _CIRCUIT_BACKOFF_MULT,下一周期翻倍。
+    _CIRCUIT_BACKOFF_MULT = 2.0
+
+    def __init__(self, proxy_store: ProxyStore,
+                 circuit_threshold: int = _CIRCUIT_THRESHOLD,
+                 circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF,
+                 slow_start_window: float = _SLOW_START_WINDOW,
+                 slow_start_success: int = _SLOW_START_SUCCESS):
         self.proxy_store = proxy_store
+        self.circuit_threshold = max(1, circuit_threshold)
+        self.circuit_max_backoff = max(1.0, circuit_max_backoff)
+        self.slow_start_window = max(1.0, slow_start_window)
+        self.slow_start_success = max(1, slow_start_success)
         # 每代理质量: {pid: {"ewma_ttfb": float(秒)}}。
         # 仅存有观测的代理;无观测的代理在排序时视为"未知质量"(排在新手区)。
         self._quality: dict[str, dict[str, float]] = {}
+        # 每代理熔断/慢启动状态(与 _quality 分开维护,含未观测过的新代理):
+        #   {pid: {"consec_fail": int, "open_until": float(monotonic 秒), "backoff": float}}
+        self._circuit: dict[str, dict[str, float]] = {}
+        # 累计熔断开启次数(供 /metrics /circuit 观察熔断活动)。
+        self.circuit_open_count = 0
 
     def get_quality(self) -> dict[str, dict[str, float]]:
         """返回质量表快照(供 /metrics / 仪表盘展示,读内存无锁)。"""
@@ -147,9 +177,126 @@ class ProxySelector:
     def reset_quality(self):
         """清空全部质量数据(RFC 8305 §4:历史 RTT 不可跨网络沿用)。
 
-        网络切换/代理分组变化后调用,让排序回到无偏状态重新学习。
+        网络切换/代理分组变化后调用,让排序回到无偏状态重新学习。熔断/慢启动
+        状态一并清空(旧网络的连续失败计数对当前网络无意义)。
         """
         self._quality.clear()
+        self._circuit.clear()
+
+    def reset_circuits(self):
+        """手动解除全部代理的熔断并清空连续失败计数(运维介入后调用)。
+
+        与 reset_quality 的区别:不动 EWMA(延迟历史仍有效),只清熔断状态。
+        """
+        self._circuit.clear()
+
+    # ── 熔断器 / slow-start ────────────────────────────────────
+
+    def _circuit_state(self, pid: str) -> dict[str, float]:
+        """惰性取(或建)某代理的熔断状态 dict,避免在 __init__ 枚举代理。"""
+        s = self._circuit.get(pid)
+        if s is None:
+            s = {"consec_fail": 0, "open_until": 0.0, "backoff": 0.0}
+            self._circuit[pid] = s
+        return s
+
+    def record_failure(self, pid: str):
+        """记录一次上游失败(连接失败/超时/5xx)。连续失败达阈值即熔断。
+
+        退避期指数增长:首熔断 backoff=1s,此后每次新熔断翻倍(上限
+        circuit_max_backoff)。退避期内 open_until 未到,该代理不参与竞速/单发。
+        """
+        s = self._circuit_state(pid)
+        s["consec_fail"] = int(s.get("consec_fail", 0)) + 1
+        if s["consec_fail"] >= self.circuit_threshold:
+            backoff = (float(s.get("backoff", 0.0)) or 1.0) * self._CIRCUIT_BACKOFF_MULT
+            s["backoff"] = min(self.circuit_max_backoff, backoff)
+            s["open_until"] = time.monotonic() + s["backoff"]
+            s["consec_fail"] = 0  # 熔断后计数清零,恢复后的失败重新累计
+            self.circuit_open_count += 1
+            logger.warning("circuit opened for proxy %s, backoff=%.1fs", pid, s["backoff"])
+
+    def record_success(self, pid: str):
+        """记录一次上游成功,连续失败计数归零。
+
+        若正处于 slow-start 恢复期(backoff 期满但未完成爬升),累计成功次数,
+        达标即恢复完整权重。若此前无慢启动标记,本方法无副作用。
+        """
+        s = self._circuit.get(pid)
+        if s is None:
+            return
+        s["consec_fail"] = 0
+        if self._in_slow_start(pid, s):
+            s["slow_start_ok"] = int(s.get("slow_start_ok", 0)) + 1
+
+    def _in_slow_start(self, pid: str, s: Optional[dict] = None) -> bool:
+        """是否处于 slow-start 恢复期:退避刚结束(started_at 新鲜)且累计成功不足。
+
+        慢启动只在"熔断退避到期后的恢复阶段"触发,与冷启动(从未观测)无关。
+        判断依据:慢启动窗口(默认 60s)内且成功数未达阈值。窗口期内任一时刻
+        累计 slow_start_ok 达标即退出(由 record_success 判断)。
+        """
+        s = s or self._circuit.get(pid)
+        if not s:
+            return False
+        started_at = s.get("started_at")
+        if not started_at:
+            return False
+        if time.monotonic() - started_at >= self.slow_start_window:
+            return False
+        return int(s.get("slow_start_ok", 0)) < self.slow_start_success
+
+    def _rearm_slow_start(self, pid: str):
+        """熔断退避到期后,把代理置入 slow-start 恢复期(权重垫底,爬升中)。
+
+        重置 started_at=now、累计成功归零。在退避期满的下一次排序/取用路径上
+        触发一次,不单独起 task。
+        """
+        s = self._circuit_state(pid)
+        s["started_at"] = time.monotonic()
+        s["slow_start_ok"] = 0
+        s["consec_fail"] = 0
+
+    def is_circuit_open(self, pid: str) -> bool:
+        """该代理是否处于熔断退避期(open_until 未到)。已过期自动解除。
+
+        退避到期后清 open_until 并置入 slow-start 恢复期(started_at=now),此
+        后返回 False(可再次参与排序,但垫底)。整个过程在排序/取用路径上惰性
+        触发,不单独起 task。
+        """
+        s = self._circuit.get(pid)
+        if not s:
+            return False
+        open_until = s.get("open_until", 0.0)
+        if open_until and time.monotonic() < open_until:
+            return True
+        if open_until:  # 退避刚到期:进入 slow-start 恢复期(仅一次,清 open_until)。
+            s["open_until"] = 0.0
+            self._rearm_slow_start(pid)
+        return False
+
+    def get_circuit_state(self) -> dict[str, dict]:
+        """返回全部熔断状态快照(供 /circuit API / 仪表盘),含退避剩余时间。
+
+        返回结构:{pid: {"open": bool, "open_until": float 或 None, "backoff": float,
+                        "consec_fail": int, "slow_start": bool}}。
+        """
+        now = time.monotonic()
+        out = {}
+        for pid in self._circuit:
+            s = self._circuit[pid]
+            open_until = s.get("open_until", 0.0)
+            open_now = bool(open_until and now < open_until)
+            out[pid] = {
+                "open": open_now,
+                "open_until": open_until or None,
+                "backoff": s.get("backoff", 0.0),
+                "consec_fail": int(s.get("consec_fail", 0)),
+                "slow_start": self._in_slow_start(pid, s),
+            }
+        return out
+
+    # ── 排序 ───────────────────────────────────────────────────
 
     def _quality_rank(self, pid: str) -> tuple:
         """排序键:无观测(未知质量)的代理排最后,EWMA 小者靠前。
@@ -161,17 +308,30 @@ class ProxySelector:
             return (1, 0.0)
         return (0, q["ewma_ttfb"])
 
+    def _slow_start_rank(self, pid: str) -> int:
+        """slow-start 排序档位:恢复期代理垫底(档 1),正常代理靠前(档 0)。
+
+        slow-start 是恢复阶段的**临时低权重**——把恢复中的代理从"排第一被首批
+        竞速/被单发抢打"的位置挪开,先让一两个请求试水,成功若干次后再回到
+        正常排序。若此时恢复代理碰巧排在前 max_retries 内仍可能被竞速选中,但
+        竞速首字节判胜 + 扇出集中在健康代理,试水代价被天然稀释。
+        """
+        return 1 if self._in_slow_start(pid) else 0
+
     def ordered_proxies(self) -> List[str]:
         """返回按 EWMA 首字节延迟排序(快速者靠前)的已启用代理 id 列表。
 
-        同质量段的代理随机打乱,均衡负载的同时保持"快者先竞速"。
+        - 剔除熔断退避期内的代理(open_until 未到);
+        - 按 slow-start 档位分层(恢复期代理垫底),层内按 EWMA 排;
+        - 同质量段随机打乱,均衡负载的同时保持"快者先竞速"。
+        退避到期的代理在此被解熔断并置入 slow-start(is_circuit_open 副作用)。
         """
         proxies = self.proxy_store.list()
         enabled = [p for p in proxies if p.enabled]
-        # 先按 EWMA 排(快者靠前),再对同 EWMA 值分段打乱,避免极端场景下
-        # 永远重复同一排序(某代理总是第一个被竞速)。打乱粒度:按排序键分组。
+        # 过滤熔断中的代理(is_circuit_open 同时处理退避到期解熔断)。
+        enabled = [p for p in enabled if not self.is_circuit_open(p.id)]
         random.shuffle(enabled)
-        enabled.sort(key=lambda p: self._quality_rank(p.id))
+        enabled.sort(key=lambda p: (self._slow_start_rank(p.id), self._quality_rank(p.id)))
         return [p.id for p in enabled]
 
     def best_proxy(self) -> Optional[str]:
@@ -186,7 +346,7 @@ class Router:
     生命周期:start() 开始监听 → handle_client 处理每个连接 → stop() 优雅关闭。
     """
 
-    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS):
+    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS):
         """构造路由器。
 
         参数:
@@ -210,12 +370,43 @@ class Router:
                                  有历史 RTT 时可设 2 同时赌两个最优者(RFC 8305 §5 允许)。
             stagger_interval_ms: 相邻候选的启动间隔(毫秒),钳制到 [100, 2000]
                                  (RFC 8305 §5 下限 100ms/绝对值 10ms、上限 2s)。
+            probe_interval_sec: 后台探活周期(秒)。每周期对 enabled 代理做轻量
+                                CONNECT 到 probe_canary + 关闭,计延迟/成败 →
+                                更新 EWMA 与熔断计数。0=关闭主动探活(仅真实请求
+                                驱动熔断)。默认 30。
+            probe_canary:       探活目标 "host:port"。轻量 CONNECT 只验证上游可达
+                                与建连延迟,域名级最终仍由竞速决定。
+            circuit_threshold:  连续失败多少次触发熔断(默认 3)。真实请求失败与
+                                探活失败共享计数。
+            circuit_max_backoff: 熔断退避上限(秒,默认 300)。退避指数增长:1s → 2s
+                                → 4s → ... 直到此上限。
+            slow_start_window:  slow-start 爬升窗口(秒,默认 60)。熔断退避到期后
+                                该代理在此窗口内低权重垫底。
+            slow_start_success: slow-start 恢复期内累计成功多少次后恢复完整权重
+                                (默认 3)。
         """
         self.proxy_store = proxy_store
-        self.selector = ProxySelector(proxy_store)
+        self.selector = ProxySelector(
+            proxy_store,
+            circuit_threshold=circuit_threshold,
+            circuit_max_backoff=circuit_max_backoff,
+            slow_start_window=slow_start_window,
+            slow_start_success=slow_start_success)
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.max_retries = max_retries
+        # ── 熔断器 + 探活 + slow-start ────────────────────────────
+        # 连续失败达阈值 → 指数退避熔断;退避期内不参与竞速/单发。真实请求失败
+        # 与后台探活共享同一连续失败计数(见 selector.record_failure)。探活每
+        # probe_interval_sec 对 enabled 代理做轻量 CONNECT 到 canary + 关闭,
+        # 喂 EWMA 与熔断计数;0=关闭主动探活。退避到期 → slow-start 低权重爬升。
+        self.probe_interval_sec = probe_interval_sec
+        self.probe_canary = probe_canary
+        self._probe_task: Optional[asyncio.Task] = None
+        self.probes_sent = 0
+        self.probes_ok = 0
+        # 熔断开启计数归 ProxySelector 维护(开启时刻在 record_failure 内),经
+        # snapshot_counters 经 selector.circuit_open_count 读取。
         self.enable_local_racing = enable_local_racing
         self.enable_http_cache = enable_http_cache
         # ── 错峰启动(RFC 8305 §5)──
@@ -427,6 +618,85 @@ class Router:
         except asyncio.CancelledError:
             pass
 
+    # ── 后台探活(仿 _flush_loop)────────────────────────────────
+
+    async def _probe_loop(self):
+        """后台周期探活:每 probe_interval_sec 对 enabled 代理做轻量 CONNECT 探活。
+
+        探活只验证"上游代理本身可达"——建连 + CONNECT 握手,不拉取任何业务
+        数据;成功则更新 EWMA(粗延迟观测),失败则累计连续失败(与真实请求
+        共享,达阈值即熔断)。捕获异常不退出循环;被取消时静默退出(stop()
+        会做最终清理)。probe_interval_sec<=0 时 start() 不启动本循环。
+        """
+        try:
+            while True:
+                await asyncio.sleep(self.probe_interval_sec)
+                try:
+                    await self._probe_all()
+                except Exception:
+                    logger.exception("background probe failed")
+        except asyncio.CancelledError:
+            pass
+
+    async def _probe_all(self):
+        """对全部 enabled 代理各做一次轻量探活(并发,单个失败不影响其余)。
+
+        探活目标为 self.probe_canary(如 "1.1.1.1:443")。CONNECT 到 canary 只
+        验证上游代理存活与建连延迟,不做业务请求;成功/失败分别喂 EWMA 与
+        熔断计数,让质量模型在低流量期也能持续学习(而非只靠真实请求)。
+        """
+        proxies = [p for p in self.proxy_store.list() if p.enabled]
+        if not proxies:
+            return
+        tasks = [asyncio.create_task(self._probe_proxy(p.id)) for p in proxies]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _probe_proxy(self, pid: str):
+        """对单个代理发起一次 CONNECT 探活:经该上游 CONNECT 到 canary 后关闭。
+
+        用裸 socket 建连(CONNECT 不需要连接池;探活低频,无池化价值)。成功:
+        记录 EWMA + 成功观测(连续失败归零);失败/超时:记录失败(累计连续
+        失败,达阈值即熔断,与真实请求失败同源)。'local' 是本机直连,无上游
+        可探,跳过。超时 _PROBE_TIMEOUT 防半开上游长期占用。
+        """
+        if pid == 'local':
+            return
+        proxy = self.proxy_store.get(pid)
+        if proxy is None:
+            return
+        self.probes_sent += 1
+        t0 = time.perf_counter()
+        try:
+            up_reader, up_writer = await asyncio.wait_for(
+                asyncio.open_connection(proxy.host, proxy.port), timeout=_PROBE_TIMEOUT)
+        except (asyncio.TimeoutError, OSError, ConnectionError):
+            self.selector.record_failure(pid)
+            return
+        try:
+            auth_hdr = ""
+            if proxy.auth:
+                raw = f"{proxy.auth['username']}:{proxy.auth['password']}"
+                encoded = base64.b64encode(raw.encode()).decode()
+                auth_hdr = f"Proxy-Authorization: Basic {encoded}\r\n"
+            up_writer.write(
+                f"CONNECT {self.probe_canary} HTTP/1.1\r\nHost: {self.probe_canary}\r\n"
+                f"{auth_hdr}\r\n".encode('latin-1'))
+            await up_writer.drain()
+            status = await asyncio.wait_for(up_reader.readline(), timeout=_PROBE_TIMEOUT)
+            if not status or b'200' not in status:
+                raise RuntimeError('probe CONNECT failed')
+            self.selector.record_ttfb(pid, time.perf_counter() - t0)
+            self.selector.record_success(pid)
+            self.probes_ok += 1
+        except (asyncio.TimeoutError, OSError, ConnectionError, RuntimeError):
+            self.selector.record_failure(pid)
+        finally:
+            try:
+                up_writer.close()
+                await up_writer.wait_closed()
+            except Exception:
+                pass
+
     def get_domain_stats_from_db(self) -> dict[str, dict[str, int]]:
         """读取全量域名胜出统计,组织为 {domain: {proxy_id: wins}}。
 
@@ -461,24 +731,40 @@ class Router:
             "request_counts": dict(self.request_counts),
             "attempted_counts": dict(self.attempted_counts),
             "proxy_quality": self.selector.get_quality(),
+            "probes_sent": self.probes_sent,
+            "probes_ok": self.probes_ok,
+            "circuit_open_count": self.selector.circuit_open_count,
+            "circuit_state": self.selector.get_circuit_state(),
         }
 
     def reset_proxy_quality(self):
         """清空全部代理 EWMA 质量数据(网络切换/代理分组变化时调用)。
 
         RFC 8305 §4:历史 RTT 数据不可跨网络接口使用,换网络后应清空重学。
+        熔断/慢启动状态一并清空(旧网络的连续失败对当前网络无意义)。
         """
         self.selector.reset_quality()
+
+    def reset_proxy_circuits(self):
+        """手动解除全部代理熔断并清空连续失败计数(运维介入后调用)。
+
+        与 reset_proxy_quality 的区别:不动 EWMA(延迟历史仍有效),只清熔断
+        状态,让代理立刻重新参与竞速。
+        """
+        self.selector.reset_circuits()
 
     def _get_fresh_proxy(self, domain: str) -> Optional[str]:
         """返回某域名在 cache_ttl 内的缓存代理 id;过期或无记录返回 None。
 
-        用于域名缓存:命中则直接复用该代理,跳过竞速。纯内存读取,无 DB/锁。
+        用于域名缓存:命中则直接复用该代理,跳过竞速。熔断中的代理视为未命中
+        (退回竞速找健康代理,竞速赢家会刷新 meta)。纯内存读取,无 DB/锁。
         """
         entry = self._meta_cache.get(domain)
         if not entry:
             return None
         pid = entry["default_proxy"]
+        if self.selector.is_circuit_open(pid):
+            return None
         updated_at_str = entry["updated_at"]
         try:
             dt = datetime.fromisoformat(updated_at_str)
@@ -539,6 +825,11 @@ class Router:
                 self._evict_sticky_key(key)
                 return None
         except Exception:
+            self._evict_sticky_key(key)
+            return None
+        # 熔断中的代理不作粘性单发:直接驱逐(退回竞速找健康代理),避免对
+        # 已确认故障的代理持续单发。local 不经 selector,跳过该检查(A1)。
+        if pid != 'local' and self.selector.is_circuit_open(pid):
             self._evict_sticky_key(key)
             return None
         # B2:命中次数达到阈值 → 触发探路重竞速(不驱逐,由调用方依据
@@ -1131,8 +1422,10 @@ class Router:
             # 仅记尝试统计(竞速扇出);meta 由 _handle_http_request 在确认赢家后
             # 调 _record_win_meta 写一次,避免败者覆写域名缓存。
             self._record_attempt(domain, pid)
+            # 收到响应头即视为一次成功观测(EWMA + 连续失败归零)。
+            self.selector.record_success(pid)
             return pid, method, url, resp, client
-        except BaseException:
+        except BaseException as ex:
             # 仅在确实取得流式 resp 时才 aclose;client.build_request / client.send
             # 在赋值前抛错时 resp 仍为 None,无条件 aclose 会抛 UnboundLocalError
             # 被吞掉并掩盖根因。client 始终留在连接池,不在此关闭。
@@ -1141,6 +1434,11 @@ class Router:
                     await resp.aclose()
                 except Exception:
                     pass
+            # 竞速落败被取消(CancelledError)不算失败——健康慢代理每次竞速都会
+            # 被快代理抢先取消,若计入会误熔断。真失败(连接/超时/上游错误)
+            # 才累计连续失败并可能触发熔断。
+            if not isinstance(ex, asyncio.CancelledError) and pid != 'local':
+                self.selector.record_failure(pid)
             raise
 
     async def _try_tunnel(self, pid: str, target: str, proxy_host: Optional[str], proxy_port: Optional[int], proxy_auth: Optional[dict]):
@@ -1202,13 +1500,18 @@ class Router:
             self.selector.record_ttfb(pid, time.perf_counter() - t0)
             # 仅记尝试统计;meta 由 _handle_connect 在确认赢家后调 _record_win_meta。
             self._record_attempt(target, pid)
+            # CONNECT 拿到 200 即视为一次成功观测(EWMA + 连续失败归零)。
+            self.selector.record_success(pid)
             return pid, up_reader, up_writer
-        except BaseException:
+        except BaseException as ex:
             try:
                 up_writer.close()
                 await up_writer.wait_closed()
             except Exception:
                 pass
+            # 同 _try_http:被竞速取消(CancelledError)不算失败;真失败才累计熔断。
+            if not isinstance(ex, asyncio.CancelledError) and pid != 'local':
+                self.selector.record_failure(pid)
             raise
 
     # ── 客户端入口 ──────────────────────────────────────────────
@@ -1818,11 +2121,14 @@ class Router:
     async def start(self):
         """开始监听代理端口,接受客户端连接(非阻塞,返回后服务在后台运行)。
 
-        同时启动后台 flush task,周期把内存统计批量落盘。
+        同时启动后台 flush task(周期把内存统计批量落盘)与探活 task
+        (probe_interval_sec>0 时,周期对 enabled 代理做轻量 CONNECT 探活)。
         """
         self._server = await asyncio.start_server(self.handle_client, host=self.listen_host, port=self.listen_port)
         if self._flush_task is None or self._flush_task.done():
             self._flush_task = asyncio.create_task(self._flush_loop())
+        if self.probe_interval_sec > 0 and (self._probe_task is None or self._probe_task.done()):
+            self._probe_task = asyncio.create_task(self._probe_loop())
         logger.info("Router listening on %s:%s", self.listen_host, self.listen_port)
 
     async def stop(self):
@@ -1862,4 +2168,11 @@ class Router:
             except (asyncio.CancelledError, Exception):
                 pass
             self._flush_task = None
+        if self._probe_task and not self._probe_task.done():
+            self._probe_task.cancel()
+            try:
+                await self._probe_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._probe_task = None
         self._db.close()
