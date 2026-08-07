@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from auto_squid.proxy_store import ProxyStore
-from auto_squid.router import Router
+from auto_squid.router import Router, ProxySelector
 from auto_squid.config_schema import ProxyInfo
 from auto_squid.auth import check_auth
 from auto_squid.api import app as api_app, mount
@@ -1753,3 +1753,65 @@ async def test_multiple_setcookie_headers_preserved():
         await router.stop()
         proxy_srv.close()
         await proxy_srv.wait_closed()
+
+
+class TestProxySelectorEWMA:
+    """ProxySelector 的 EWMA 质量跟踪与竞速排序(纯内存,确定性)。"""
+
+    def test_unknown_quality_ranked_last(self):
+        """无观测的代理排在有观测的后面(未知质量放新手区)。"""
+        store = ProxyStore()
+        store.add(ProxyInfo(id='fast', host='h1', port=3128))
+        store.add(ProxyInfo(id='slow', host='h2', port=3128))
+        store.add(ProxyInfo(id='untested', host='h3', port=3128))
+        sel = ProxySelector(store)
+        sel.record_ttfb('fast', 0.05)
+        sel.record_ttfb('slow', 0.90)
+        lst = sel.ordered_proxies()
+        # 有观测的两个一定排在没有观测的前面(排序键 0 < 1)。
+        assert lst.index('fast') < lst.index('untested')
+        assert lst.index('slow') < lst.index('untested')
+
+    def test_ewma_formula(self):
+        """EWMA = 0.7*old + 0.3*new;首次观测直接取当前值。"""
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host='h', port=3128))
+        sel = ProxySelector(store)
+        sel.record_ttfb('p', 0.10)
+        assert sel._quality['p']['ewma_ttfb'] == 0.10
+        sel.record_ttfb('p', 0.50)
+        # 0.7*0.10 + 0.3*0.50 = 0.07 + 0.15 = 0.22
+        assert abs(sel._quality['p']['ewma_ttfb'] - 0.22) < 1e-9
+
+    def test_fast_proxy_first_in_race_order(self):
+        """快速代理在竞速顺序中靠前(决定谁先到/是否白占竞速槽)。"""
+        store = ProxyStore()
+        store.add(ProxyInfo(id='slow', host='h1', port=3128))
+        store.add(ProxyInfo(id='fast', host='h2', port=3128))
+        sel = ProxySelector(store)
+        sel.record_ttfb('slow', 0.80)
+        sel.record_ttfb('fast', 0.02)
+        # fast 稳定优于 slow,应始终排在前面(多次抽签也不逆转)。
+        for _ in range(50):
+            lst = sel.ordered_proxies()
+            assert lst[0] == 'fast'
+
+    def test_disabled_proxy_excluded(self):
+        """disabled 代理不参与排序。"""
+        store = ProxyStore()
+        store.add(ProxyInfo(id='on', host='h1', port=3128))
+        store.add(ProxyInfo(id='off', host='h2', port=3128, enabled=False))
+        sel = ProxySelector(store)
+        sel.record_ttfb('off', 0.001)
+        lst = sel.ordered_proxies()
+        assert lst == ['on']
+
+    def test_reset_quality_clears_all(self):
+        """reset_quality 清空全部观测(网络切换后重学,RFC 8305 §4)。"""
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host='h', port=3128))
+        sel = ProxySelector(store)
+        sel.record_ttfb('p', 0.10)
+        assert sel._quality
+        sel.reset_quality()
+        assert sel._quality == {}

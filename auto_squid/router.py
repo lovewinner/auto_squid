@@ -105,22 +105,69 @@ _HOP_BY_HOP_RESPONSE_HEADERS = frozenset({
 class ProxySelector:
     """从 ProxyStore 产出代理 id 的有序列表,供竞速使用。
 
-    当前策略:取所有 enabled 代理,随机打乱后返回 id 列表。竞速模式下
-    排序不影响结果(所有代理都会被尝试),随机化只为均衡负载。
+    策略:取所有 enabled 代理,按每代理的 EWMA 首字节延迟排序(快速者靠前),
+    同 EWMA 的代理间随机打乱以均衡负载。竞速顺序决定"谁先到/是否白占竞速槽"——
+    把扇出集中到优质代理,减少失败代理在竞速中的无谓参与。
     """
+
+    # EWMA 平滑系数:新观测占 0.3,历史占 0.7。取值参考 Finagle 峰值 EWMA 的
+    # 常见做法,兼顾对新网络状况的响应速度与对抖动的抑制。
+    EWMA_ALPHA = 0.3
 
     def __init__(self, proxy_store: ProxyStore):
         self.proxy_store = proxy_store
+        # 每代理质量: {pid: {"ewma_ttfb": float(秒)}}。
+        # 仅存有观测的代理;无观测的代理在排序时视为"未知质量"(排在新手区)。
+        self._quality: dict[str, dict[str, float]] = {}
+
+    def get_quality(self) -> dict[str, dict[str, float]]:
+        """返回质量表快照(供 /metrics / 仪表盘展示,读内存无锁)。"""
+        return {pid: dict(q) for pid, q in self._quality.items()}
+
+    def record_ttfb(self, pid: str, ttfb: float):
+        """记录一次成功请求的首字节耗时(秒),更新该代理的 EWMA。
+
+        EWMA 公式:无历史时直接取当前值;有历史时 ewma = (1-alpha)*old + alpha*new。
+        """
+        q = self._quality.get(pid)
+        if q is None:
+            self._quality[pid] = {"ewma_ttfb": ttfb}
+            return
+        old = q["ewma_ttfb"]
+        q["ewma_ttfb"] = (1.0 - self.EWMA_ALPHA) * old + self.EWMA_ALPHA * ttfb
+
+    def reset_quality(self):
+        """清空全部质量数据(RFC 8305 §4:历史 RTT 不可跨网络沿用)。
+
+        网络切换/代理分组变化后调用,让排序回到无偏状态重新学习。
+        """
+        self._quality.clear()
+
+    def _quality_rank(self, pid: str) -> tuple:
+        """排序键:无观测(未知质量)的代理排最后,EWMA 小者靠前。
+
+        返回 (未知标记, ewma) 二元组,让排序稳定:未知质量统一放尾部。
+        """
+        q = self._quality.get(pid)
+        if q is None:
+            return (1, 0.0)
+        return (0, q["ewma_ttfb"])
 
     def ordered_proxies(self) -> List[str]:
-        """返回随机打乱后的已启用代理 id 列表。"""
+        """返回按 EWMA 首字节延迟排序(快速者靠前)的已启用代理 id 列表。
+
+        同质量段的代理随机打乱,均衡负载的同时保持"快者先竞速"。
+        """
         proxies = self.proxy_store.list()
         enabled = [p for p in proxies if p.enabled]
+        # 先按 EWMA 排(快者靠前),再对同 EWMA 值分段打乱,避免极端场景下
+        # 永远重复同一排序(某代理总是第一个被竞速)。打乱粒度:按排序键分组。
         random.shuffle(enabled)
+        enabled.sort(key=lambda p: self._quality_rank(p.id))
         return [p.id for p in enabled]
 
     def best_proxy(self) -> Optional[str]:
-        """返回打乱后的首个代理 id(无代理时返回 None)。"""
+        """返回按 EWMA 排序后的首个代理 id(无代理时返回 None)。"""
         lst = self.ordered_proxies()
         return lst[0] if lst else None
 
@@ -387,7 +434,15 @@ class Router:
             "sticky_cache_size": len(self._sticky_cache),
             "request_counts": dict(self.request_counts),
             "attempted_counts": dict(self.attempted_counts),
+            "proxy_quality": self.selector.get_quality(),
         }
+
+    def reset_proxy_quality(self):
+        """清空全部代理 EWMA 质量数据(网络切换/代理分组变化时调用)。
+
+        RFC 8305 §4:历史 RTT 数据不可跨网络接口使用,换网络后应清空重学。
+        """
+        self.selector.reset_quality()
 
     def _get_fresh_proxy(self, domain: str) -> Optional[str]:
         """返回某域名在 cache_ttl 内的缓存代理 id;过期或无记录返回 None。
@@ -899,9 +954,12 @@ class Router:
         try:
             self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
             self.upstream_attempts += 1  # 聚合竞速扇出总数(供 /metrics 算放大率)
+            # 首字节计时:从发起到收到响应头。用于 EWMA 质量跟踪(竞速排序)。
+            t0 = time.perf_counter()
             resp = await client.send(
                 client.build_request(method, url, headers=headers, content=body),
                 stream=True)
+            self.selector.record_ttfb(pid, time.perf_counter() - t0)
             self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
             domain = urllib.parse.urlparse(url).hostname or url
             # 仅记尝试统计(竞速扇出);meta 由 _handle_http_request 在确认赢家后
@@ -948,6 +1006,8 @@ class Router:
                     asyncio.open_connection(host, port), timeout=connect_timeout)
         except (asyncio.TimeoutError, OSError, ConnectionError) as e:
             raise RuntimeError(f'connect to {proxy_host or target} timed out or failed: {e}') from e
+        # 首字节计时:从 CONNECT 发出到收到 200。用于 EWMA 质量跟踪(竞速排序)。
+        t0 = time.perf_counter()
         try:
             auth_hdr = ""
             if proxy_auth:
@@ -973,6 +1033,7 @@ class Router:
                 if not h or h in (b"\r\n", b"\n"):
                     break
             self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
+            self.selector.record_ttfb(pid, time.perf_counter() - t0)
             # 仅记尝试统计;meta 由 _handle_connect 在确认赢家后调 _record_win_meta。
             self._record_attempt(target, pid)
             return pid, up_reader, up_writer

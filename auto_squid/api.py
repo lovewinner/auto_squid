@@ -47,6 +47,26 @@ async def list_proxies():
     return [ProxyIn(**p.model_dump()) for p in _proxy_store.list()]
 
 
+@app.get("/quality")
+async def quality():
+    """返回每代理 EWMA 首字节延迟(秒),供仪表盘/运维观察竞速排序依据。"""
+    if not _router:
+        return {}
+    return _router.selector.get_quality()
+
+
+@app.post("/quality/reset")
+async def quality_reset():
+    """清空全部代理 EWMA 质量数据(网络切换/代理分组变化后调用)。
+
+    RFC 8305 §4:历史 RTT 不可跨网络沿用,换网络后应清空重学。
+    """
+    if not _router:
+        raise HTTPException(status_code=500, detail="router not initialized")
+    _router.reset_proxy_quality()
+    return {"reset": True}
+
+
 @app.get("/metrics")
 async def metrics():
     counts = _router.request_counts if _router else {}
