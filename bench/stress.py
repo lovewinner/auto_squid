@@ -144,6 +144,7 @@ class HostSet:
     real_hosts: list = field(default_factory=lambda: list(_DEFAULT_REAL_HOSTS))
     timeout: float = 15.0
     success_any_status: bool = False
+    has_dead: bool = False
 
     def __post_init__(self):
         if self.mode == "real":
@@ -174,6 +175,11 @@ class HostSet:
         if self.mode == "mock":
             return _MOCK_HOSTS["connect"]
         return f"{self.real_hosts[0]}:443"
+
+    def cold_or_hot(self, i: int) -> str:
+        """注入坏代理时用冷域名(强制竞速,让死代理被尝试);否则用热域名(缓存
+        命中率高,省上游流量)。由 run_scenarios 按 dead_proxies 是否注入切换。"""
+        return self.cold(i) if self.has_dead else self.hot(i)
 
 
 # ── mock 集群规格序列化(供子进程重建 + 客户端预期 body) ─────────
@@ -254,6 +260,8 @@ class ScenarioResult:
                            "http_cache_entries_end": None}
             racing_group = {"amplification": None, "upstream_attempts": None,
                             "invocations": None}
+            circuit_group = {"circuit_open_count": None, "probes_sent": None,
+                             "probes_ok": None, "proxies_open_end": 0}
         else:
             cb, ca = self.counters_before, self.counters_after
             hits = ca.get("http_cache_hits", 0) - cb.get("http_cache_hits", 0)
@@ -271,6 +279,14 @@ class ScenarioResult:
             racing_group = {
                 "amplification": (attempts / total_reqs) if total_reqs else 0.0,
                 "upstream_attempts": attempts, "invocations": invocs,
+            }
+            # 熔断/探活计数器差值(场景内熔断开合次数、探活次数) + 场景末仍处于
+            # 熔断的代理数。R18 曾因未持久化导致无法确认熔断器是否开合过,此处补齐。
+            circuit_group = {
+                "circuit_open_count": ca.get("circuit_open_count", 0) - cb.get("circuit_open_count", 0),
+                "probes_sent": ca.get("probes_sent", 0) - cb.get("probes_sent", 0),
+                "probes_ok": ca.get("probes_ok", 0) - cb.get("probes_ok", 0),
+                "proxies_open_end": sum(1 for v in (ca.get("circuit_state") or {}).values() if v.get("open")),
             }
 
         # 瓶颈归因:状态分布含 429/503 → 上游触顶;否则 proxy。
@@ -324,6 +340,7 @@ class ScenarioResult:
             "status_distribution": status_dist,
             "cache": cache_group,
             "racing": racing_group,
+            "circuit": circuit_group,
             "resources": {
                 "rss_peak_mb": self.rss_peak_mb,
                 "fd_peak": self.fd_peak,
@@ -748,7 +765,7 @@ async def scenario_staircase(router_host: str, router_port: int, host_set: HostS
 
     async def make(i):
         if i % 10 < 7:
-            url = f"http://{host_set.hot(i)}/p{i % 4}".encode()
+            url = f"http://{host_set.cold_or_hot(i)}/p{i % 4}".encode()
         else:
             url = f"http://{host_set.cold(i)}/p{i % 3}".encode()
         return await do_http_request(router_host, router_port, url,
@@ -788,7 +805,7 @@ async def scenario_rate(router_host: str, router_port: int, host_set: HostSet,
 
     async def make(i):
         if i % 10 < 7:
-            url = f"http://{host_set.hot(i)}/p{i % 4}".encode()
+            url = f"http://{host_set.cold_or_hot(i)}/p{i % 4}".encode()
         else:
             url = f"http://{host_set.cold(i)}/p{i % 3}".encode()
         return await do_http_request(router_host, router_port, url,
@@ -886,7 +903,7 @@ async def scenario_soak(router_host: str, router_port: int, host_set: HostSet,
 
     async def make(i):
         if i % 10 < 7:
-            url = f"http://{host_set.hot(i)}/p{i % 4}".encode()
+            url = f"http://{host_set.cold_or_hot(i)}/p{i % 4}".encode()
         else:
             url = f"http://{host_set.cold(i)}/p{i % 5}".encode()
         return await do_http_request(router_host, router_port, url,
@@ -934,7 +951,8 @@ async def scenario_conn_reuse(router_host: str, router_port: int, host_set: Host
 
     async def make(i):
         # 同一热域名反复请求 → 域名缓存命中 → 单发同一上游 → 复用 keepalive 连接。
-        url = f"http://{host_set.hot(0)}/p{i % 4}".encode()
+        # 注入坏代理时(has_dead)改用冷域名强制竞速,让死代理被尝试以喂熔断计数。
+        url = f"http://{host_set.cold_or_hot(0)}/p{i % 4}".encode()
         return await do_http_request(router_host, router_port, url,
                                      timeout=host_set.timeout,
                                      success_any_status=host_set.success_any_status)
@@ -1048,6 +1066,10 @@ def print_report(metrics_list: list, git_ver: str, upstream_mode: str,
         r = m['racing']
         if r['amplification'] is not None:
             print(f"  竞速          : 放大率 {r['amplification']:.2f}x  上游尝试 {r['upstream_attempts']}  竞速触发 {r['invocations']}")
+        circ = m.get('circuit') or {}
+        if circ.get('circuit_open_count') is not None:
+            print(f"  熔断          : 开合 {circ['circuit_open_count']} 次  探活 {circ['probes_sent']}/{circ['probes_ok']} 成功  "
+                  f"末态熔断 {circ['proxies_open_end']} 个代理")
         res = m['resources']
         lag = res['server_loop_lag_ms']
         print(f"  资源          : RSS={res['rss_peak_mb']:.0f}MB  fd={res['fd_peak']}  池末值={res['pool_size_end']}  "
@@ -1190,7 +1212,8 @@ async def amain(args):
     print(f"auto_squid 压测  git={git_ver}  mode={args.mode}  upstream={args.upstream}  "
           f"quick={args.quick}  open_loop={args.open_loop}  rounds={args.rounds}  [进程隔离]")
     real_hosts = args.real_hosts.split(",") if args.real_hosts else list(_DEFAULT_REAL_HOSTS)
-    host_set = HostSet(mode=args.upstream, real_hosts=[h.strip() for h in real_hosts if h.strip()])
+    host_set = HostSet(mode=args.upstream, real_hosts=[h.strip() for h in real_hosts if h.strip()],
+                       has_dead=bool(getattr(args, 'dead_proxies', []) or getattr(args, 'dead_proxy', [])))
     # mock 规格每轮一致 → 相同条件;提升到循环外只算一次。
     mock_specs = default_mock_specs(args.quick) if args.upstream == "mock" else []
     run_start = time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -1218,6 +1241,7 @@ async def amain(args):
             "circuit_max_backoff": args.circuit_max_backoff,
             "slow_start_window": args.slow_start_window,
             "slow_start_success": args.slow_start_success,
+            "dead_proxies": getattr(args, 'dead_proxies', []) or getattr(args, 'dead_proxy', []),
             "proxies_path": args.proxies,
             "mock_specs": mock_specs,
             "db_path": db_path,
@@ -1308,6 +1332,10 @@ def main():
     p.add_argument("--circuit-max-backoff", type=float, default=300.0, help="熔断退避上限(秒)")
     p.add_argument("--slow-start-window", type=float, default=60.0, help="slow-start 爬升窗口(秒)")
     p.add_argument("--slow-start-success", type=int, default=3, help="slow-start 成功几次后恢复完整权重")
+    p.add_argument("--dead-proxy", action="append", default=[],
+                   metavar="ID:HOST:PORT",
+                   help="注入指向死端口的代理(可重复),给熔断器制造连续失败负载;"
+                        "如 --dead-proxy dead:127.0.0.1:31990")
     p.add_argument("--duration", type=float, default=60.0, help="soak 模式时长(秒)")
     p.add_argument("--open-loop", action="store_true", help="soak 开环模式(不限速,测真实上限)")
     p.add_argument("--quick", action="store_true", help="快速冒烟(小规模,~10s)")

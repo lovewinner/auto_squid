@@ -184,6 +184,18 @@ async def _serve(config: dict):
         else:
             ps = ProxyStore(config["proxies_path"])
 
+        # 1.5) 坏代理注入:经 config["dead_proxies"] 向注册表注入指向死端口的代理,
+        #     给熔断器制造"连续失败"的真实负载(真实请求/竞速尝试该代理即失败)。
+        #     两种上游模式均适用。格式:["id:host:port", ...](空列表=不注入)。
+        for spec in config.get("dead_proxies", []):
+            parts = spec.split(":")
+            if len(parts) != 3:
+                print(f"ERROR bad dead_proxy spec: {spec!r}", file=sys.stderr, flush=True)
+                continue
+            dead_id, dead_host, dead_port = parts[0], parts[1], int(parts[2])
+            ps.add(ProxyInfo(id=dead_id, host=dead_host, port=dead_port,
+                             protocol="http", enabled=True))
+
         # 2) Router(被测方)。错峰参数可经 config 注入(默认启用;压测对比错峰
         #    on/off 时传 stagger_start=False)。
         router = Router(ps, listen_host="127.0.0.1", listen_port=config["router_port"],
