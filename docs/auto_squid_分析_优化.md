@@ -192,9 +192,16 @@ auto_squid 是一个**正向 HTTP/HTTPS 代理**：监听一个端口，客户�
 
 ### P2 —— 明显增益，值得纳入
 
-**4. in-flight 计数 + P2C/least-active 选批**
-- 竞速选批时避开在途积压多的代理（Envoy P2C / Dubbo LeastActive）。
-- 保护慢代理不被打爆；加权 least-request 公式 `weight/(active+1)^bias` 可作选批权重。
+**4. in-flight 计数 + P2C/least-active 选批** — ✅ **已落地（2026-08-07）**
+- **在途计数**：`ProxySelector` 维护每代理 `_in_flight`。`_try_http`/`_try_tunnel` 在"发起→收到响应头/CONNECT 200/失败/被取消"的整个尝试生命周期 `_inflight_start`/`_inflight_finish`（finally 保证取消也释放，防计数泄漏）；`max_in_flight` 记录单代理在途高水位。
+- **加权 least-request 选批**：`ordered_proxies()` 排序权重 = `ewma × (1 + active)^lb_bias`（默认 bias=1.0）——快而空闲的代理靠前，背上在途积压的代理即使延迟历史最快也被压低排序，竞速首批/补发天然避开积压代理，保护慢代理不被打爆（Envoy LeastRequest `weight/(active+1)^bias` 的对偶，即分析 2.2 的 peak-EWMA）。slow-start 垫底档不变；未知质量代理仍靠未知标记垫底；`bias=0` 退化为纯 EWMA 排序。
+- **P2C 已在既有排序层覆盖**：分批候选来自 EWMA+least-active 排序后的有序列表，首批取最优、补发按序——比随机抽 2 的 P2C 更确定，同权重段随机打乱保留抗羊群。
+- **可观测**：`/metrics` counters 含 `proxy_in_flight`（当前在途快照）+ `max_in_flight`（高水位）；bench 报告 `in_flight` 组（单代理在途峰值 + 末态在途，验证计数归零无泄漏）。
+- **配置贯通**：`config.yaml` `router.circuit.lb_bias` + `config_schema` + `cli.py` + bench `--lb-bias`。
+- **验证**（mock 2 台：快 0ms / 慢 200ms，100 并发全竞速端到端）：
+  - 单测 74 全绿（含 6 个 in-flight 定向测试：积压挤位、释放恢复、bias=0 纯 EWMA、未知垫底、reset 清空、真实请求生命周期）；
+  - 100/100 请求成功，`max_in_flight=100`（真实竞速双代理同时积压），请求结束后 `in_flight` 归零（**无泄漏**）；
+  - 排序单元验证：fast 背 5 个在途时权重 0.02×6=0.12 > slow 0.05 → slow 排前；释放后 fast 回首位。
 
 **5. 域名 → 代理子集策略路由（地域感知）**
 - 配置 `域名规则 → 代理子集`，竞速只在该子集内进行。

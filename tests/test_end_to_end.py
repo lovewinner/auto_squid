@@ -2192,3 +2192,109 @@ class TestCircuitAPI:
         r = client.get("/circuit")
         assert r.status_code == 200
         assert r.json() == {}
+
+
+class TestInFlightSelection:
+    """in-flight 计数 + 加权 least-request 选批(P2/Envoy LeastRequest)。
+
+    竞速排序权重 = ewma × (1 + active)^lb_bias:快而空闲的代理靠前,背上在途
+    积压的代理即使延迟历史最快也被压低排序——保护慢代理不被打爆。
+    """
+
+    def test_backlog_deprioritizes_fast_proxy(self):
+        """fast 代理背上大量在途请求后,从首位被挤到 slow(轻载)之后。"""
+        store = ProxyStore()
+        store.add(ProxyInfo(id='fast', host='h1', port=3128))
+        store.add(ProxyInfo(id='slow', host='h2', port=3128))
+        sel = ProxySelector(store, lb_bias=1.0)
+        # fast 延迟历史远优于 slow:默认排序 fast 在前。
+        sel.record_ttfb('fast', 0.02)
+        sel.record_ttfb('slow', 0.05)
+        assert sel.ordered_proxies()[0] == 'fast'
+        # fast 背上 5 个在途请求(在途计数模拟并发打满)。
+        for _ in range(5):
+            sel._inflight_start('fast')
+        # 权重:fast = 0.02 × (1+5)^1 = 0.12 > slow = 0.05 → slow 靠前。
+        # 多次排序(含 shuffle)都不应逆转:fast 被挤出首位。
+        for _ in range(50):
+            assert sel.ordered_proxies()[0] == 'slow', \
+                "backlogged fast proxy must not stay first"
+
+    def test_finish_releases_backlog(self):
+        """在途请求结束后排序恢复:积压释放后 fast 重新回到首位。"""
+        store = ProxyStore()
+        store.add(ProxyInfo(id='fast', host='h1', port=3128))
+        store.add(ProxyInfo(id='slow', host='h2', port=3128))
+        sel = ProxySelector(store, lb_bias=1.0)
+        sel.record_ttfb('fast', 0.02)
+        sel.record_ttfb('slow', 0.05)
+        for _ in range(5):
+            sel._inflight_start('fast')
+        for _ in range(5):
+            sel._inflight_finish('fast')
+        # 积压清零 → 退化为纯 EWMA 排序,fast 回到首位。
+        assert sel.get_in_flight() == {}
+        for _ in range(50):
+            assert sel.ordered_proxies()[0] == 'fast'
+
+    def test_lb_bias_zero_is_pure_ewma(self):
+        """bias=0 时在途积压不影响排序(纯 EWMA 排序)。"""
+        store = ProxyStore()
+        store.add(ProxyInfo(id='fast', host='h1', port=3128))
+        store.add(ProxyInfo(id='slow', host='h2', port=3128))
+        sel = ProxySelector(store, lb_bias=0.0)
+        sel.record_ttfb('fast', 0.02)
+        sel.record_ttfb('slow', 0.05)
+        for _ in range(50):
+            sel._inflight_start('fast')
+        for _ in range(50):
+            assert sel.ordered_proxies()[0] == 'fast', \
+                "bias=0 must ignore in-flight backlog"
+
+    def test_unknown_quality_still_last_with_backlog(self):
+        """未知质量代理即使无在途也排在末尾(新手区兜底仍在)。"""
+        store = ProxyStore()
+        store.add(ProxyInfo(id='fast', host='h1', port=3128))
+        store.add(ProxyInfo(id='slow', host='h2', port=3128))
+        store.add(ProxyInfo(id='untested', host='h3', port=3128))
+        sel = ProxySelector(store, lb_bias=1.0)
+        sel.record_ttfb('fast', 0.02)
+        sel.record_ttfb('slow', 0.05)
+        # fast 背上 5 个在途(slow 无在途):权重 fast = 0.02×6 = 0.12 > slow = 0.05
+        # → slow 排 fast 前,但未知质量仍垫底。
+        for _ in range(5):
+            sel._inflight_start('fast')
+        for _ in range(50):
+            lst = sel.ordered_proxies()
+            assert lst[-1] == 'untested'
+            assert lst.index('slow') < lst.index('fast')
+
+    def test_reset_quality_clears_in_flight(self):
+        """reset_quality 一并清空在途计数(RFC 8305 §4:旧数据不跨网络沿用)。"""
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host='h', port=3128))
+        sel = ProxySelector(store, lb_bias=1.0)
+        sel._inflight_start('p')
+        assert sel.get_in_flight() == {'p': 1}
+        sel.reset_quality()
+        assert sel.get_in_flight() == {}
+        assert sel.max_in_flight == 1  # 高水位是历史峰值,不随 reset 清零
+
+    async def test_real_http_attempt_updates_in_flight(self):
+        """真实 HTTP 请求在途计数生命周期:发起 +1、结束(成功)归零。"""
+        proxy_srv = await run_mock_proxy(HOST, PROXY_PORT)
+        proxy_store = ProxyStore()
+        proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+        router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+                        db_path=tempfile.mktemp(suffix='.db'))
+        await router.start()
+        try:
+            await send_http_get(HOST, ROUTER_PORT,
+                                url=b"http://inflight.example.com/one")
+            # 请求完成后在途计数应归零(无泄漏)。
+            assert router.selector.get_in_flight() == {}
+            assert router.selector.max_in_flight >= 1
+        finally:
+            await router.stop()
+            proxy_srv.close()
+            await proxy_srv.wait_closed()

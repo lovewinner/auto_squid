@@ -85,7 +85,7 @@ class StickinessConfig(BaseModel):
 
 
 class CircuitConfig(BaseModel):
-    """熔断器 + 后台探活 + slow-start 配置(router.circuit)。
+    """熔断器 + 后台探活 + slow-start + in-flight 选批配置(router.circuit)。
 
     probe_interval_sec: 后台探活周期(秒)。每周期对 enabled 代理做轻量 CONNECT
                        到 canary + 关闭,计延迟/成败 → 更新 EWMA 与熔断计数。
@@ -99,6 +99,10 @@ class CircuitConfig(BaseModel):
     slow_start_window:  slow-start 爬升窗口(秒,默认 60)。熔断退避到期后该代理
                        在此窗口内低权重垫底。
     slow_start_success: slow-start 恢复期内累计成功多少次后恢复完整权重(默认 3)。
+    lb_bias:            加权 least-request 的在途惩罚指数(默认 1.0)。竞速排序
+                       权重 = ewma × (1 + active)^bias,在途积压多的代理被压低,
+                       保护慢代理不被打爆(Envoy LeastRequest / Dubbo LeastActive)。
+                       0 退化为纯 EWMA 排序。
     """
     probe_interval_sec: float = Field(30.0, description="后台探活周期(秒),0=关闭主动探活")
     probe_canary: str = Field("1.1.1.1:443", description="探活目标 host:port")
@@ -106,6 +110,7 @@ class CircuitConfig(BaseModel):
     circuit_max_backoff: float = Field(300.0, description="熔断退避上限(秒),指数增长到该值")
     slow_start_window: float = Field(60.0, description="slow-start 爬升窗口(秒)")
     slow_start_success: int = Field(3, description="slow-start 恢复期内成功多少次后恢复完整权重")
+    lb_bias: float = Field(1.0, description="加权 least-request 在途惩罚指数,0=纯 EWMA 排序")
 
 
 class RouterConfig(BaseModel):
@@ -123,7 +128,8 @@ class RouterConfig(BaseModel):
                          EWMA 历史)时自动翻倍到 2,避免随机首抽丢快代理。
     stagger_interval_ms: 相邻候选的启动间隔(毫秒),钳制到 [100, 2000](RFC 8305
                          §5 下限 100ms/绝对值 10ms、上限 2s)。默认 250。
-    circuit:             熔断器 + 后台探活 + slow-start 配置(见 CircuitConfig)。
+    circuit:             熔断器 + 后台探活 + slow-start + in-flight 选批配置
+                         (见 CircuitConfig)。
     auth:                客户端认证配置(AuthConfig)。
     stickiness:          会话粘性配置(见 StickinessConfig)。
     """

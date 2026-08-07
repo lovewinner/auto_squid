@@ -105,6 +105,13 @@ _PROBE_INTERVAL_DEFAULT = 30.0
 _PROBE_CANARY_DEFAULT = "1.1.1.1:443"
 _PROBE_TIMEOUT = 4.0
 
+# 加权 least-request 的在途积压惩罚指数(bias,默认 1.0)。
+# 排序权重 = ewma × (1 + active)^bias,即分析 doc 2.2 的 "peak EWMA"(最近 RTT ×
+# 在途数):在途积压多的代理即使延迟历史最快,有效权重也被抬高、排序靠后,竞速选批
+# 天然避开——保护慢代理不被打爆(Envoy LeastRequest 的 weight/(active+1)^bias
+# 公式的对偶,此处以乘法形式作用于延迟权重)。bias=0 时退化为纯 EWMA 排序。
+_LB_BIAS_DEFAULT = 1.0
+
 # Hop-by-hop 请求头：只服务于"客户端→本代理"这一跳，绝不能转发给上游。
 # 特别是 Proxy-Authorization——若把客户端访问本代理的凭据透传到上游，
 # 上游 Squid 会用它校验缓存对象访问权限（ERR_CACHE_ACCESS_DENIED），
@@ -126,10 +133,11 @@ _HOP_BY_HOP_RESPONSE_HEADERS = frozenset({
 class ProxySelector:
     """从 ProxyStore 产出代理 id 的有序列表,供竞速使用。
 
-    策略:取所有 enabled 代理,剔除熔断中的代理,按每代理的 EWMA 首字节延迟排序
-    (快速者靠前),同 EWMA 的代理间随机打乱以均衡负载;slow-start 恢复期(熔断
-    退避刚结束)的代理垫底。竞速顺序决定"谁先到/是否白占竞速槽"——把扇出集中
-    到优质代理,减少失败代理在竞速中的无谓参与。
+    策略:取所有 enabled 代理,剔除熔断中的代理,按加权 least-request 权重排序
+    ——权重 = ewma × (1 + active)^lb_bias,快速者靠前、在途积压多者被压低
+    (least-active 语义),同权重代理间随机打乱以均衡负载;slow-start 恢复期
+    (熔断退避刚结束)的代理垫底。竞速顺序决定"谁先到/是否白占竞速槽"——把扇出
+    集中到快且空闲的优质代理,减少失败/积压代理在竞速中的无谓参与。
     """
 
     # EWMA 平滑系数:新观测占 0.3,历史占 0.7。取值参考 Finagle 峰值 EWMA 的
@@ -143,24 +151,59 @@ class ProxySelector:
                  circuit_threshold: int = _CIRCUIT_THRESHOLD,
                  circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF,
                  slow_start_window: float = _SLOW_START_WINDOW,
-                 slow_start_success: int = _SLOW_START_SUCCESS):
+                 slow_start_success: int = _SLOW_START_SUCCESS,
+                 lb_bias: float = _LB_BIAS_DEFAULT):
         self.proxy_store = proxy_store
         self.circuit_threshold = max(1, circuit_threshold)
         self.circuit_max_backoff = max(1.0, circuit_max_backoff)
         self.slow_start_window = max(1.0, slow_start_window)
         self.slow_start_success = max(1, slow_start_success)
+        # 加权 least-request 的在途惩罚指数(见 _LB_BIAS_DEFAULT)。
+        # 排序权重 = ewma × (1 + active)^bias;bias=0 退化为纯 EWMA 排序。
+        self.lb_bias = max(0.0, lb_bias)
         # 每代理质量: {pid: {"ewma_ttfb": float(秒)}}。
         # 仅存有观测的代理;无观测的代理在排序时视为"未知质量"(排在新手区)。
         self._quality: dict[str, dict[str, float]] = {}
         # 每代理熔断/慢启动状态(与 _quality 分开维护,含未观测过的新代理):
         #   {pid: {"consec_fail": int, "open_until": float(monotonic 秒), "backoff": float}}
         self._circuit: dict[str, dict[str, float]] = {}
+        # 每代理当前在途请求数(P2C/least-active 选批依据)。
+        # 由 Router._try_http/_try_tunnel 在候选"发起→结束(成功/失败/取消)"的生命
+        # 周期内 self._inflight_start/_inflight_finish 增减,含竞速与单发两条路径。
+        self._in_flight: dict[str, int] = {}
+        # 在途数高水位(历史峰值,供 /metrics 观察选批负载压力)。
+        self.max_in_flight = 0
         # 累计熔断开启次数(供 /metrics /circuit 观察熔断活动)。
         self.circuit_open_count = 0
 
     def get_quality(self) -> dict[str, dict[str, float]]:
         """返回质量表快照(供 /metrics / 仪表盘展示,读内存无锁)。"""
         return {pid: dict(q) for pid, q in self._quality.items()}
+
+    # ── in-flight 计数(P2C / least-active 选批依据)──────────────
+
+    def _inflight_start(self, pid: str):
+        """发起一次上游尝试:在途数 +1,并推进高水位。热路径,O(1),无锁。"""
+        n = self._in_flight.get(pid, 0) + 1
+        self._in_flight[pid] = n
+        if n > self.max_in_flight:
+            self.max_in_flight = n
+
+    def _inflight_finish(self, pid: str):
+        """结束一次上游尝试(成功/失败/被取消):在途数 -1。
+
+        由 _try_http/_try_tunnel 的 finally 调用,保证竞速取消也释放计数。
+        只在确有发起(started)时递减;防御性下限 0,防止并发异常路径下计数漂移。
+        """
+        n = max(0, self._in_flight.get(pid, 0) - 1)
+        if n == 0:
+            self._in_flight.pop(pid, None)
+        else:
+            self._in_flight[pid] = n
+
+    def get_in_flight(self) -> dict[str, int]:
+        """返回当前在途数快照 {pid: n}(供 /metrics / 仪表盘,读内存无锁)。"""
+        return dict(self._in_flight)
 
     def record_ttfb(self, pid: str, ttfb: float):
         """记录一次成功请求的首字节耗时(秒),更新该代理的 EWMA。
@@ -182,6 +225,7 @@ class ProxySelector:
         """
         self._quality.clear()
         self._circuit.clear()
+        self._in_flight.clear()
 
     def reset_circuits(self):
         """手动解除全部代理的熔断并清空连续失败计数(运维介入后调用)。
@@ -308,6 +352,27 @@ class ProxySelector:
             return (1, 0.0)
         return (0, q["ewma_ttfb"])
 
+    def _weighted_rank(self, pid: str) -> float:
+        """加权 least-request 排序权重:ewma × (1 + active)^lb_bias。
+
+        无观测(未知质量)的代理排新手区、由 _quality_rank 的未知标记兜底,
+        此处不参与加权(不曾在途/无 EWMA 的新代理直接给 0 权重,靠前尝试)。
+        在途积压惩罚随 active 指数放大:fast 代理同时背上大量在途请求时,
+        (1+active)^bias 的权重把它从"首批竞速"的位置挤下去,让轻载代理顶上
+        ——正是"保护慢代理不被打爆"的 least-active 语义(Envoy LeastRequest
+        的 weight/(active+1)^bias 对偶,见 _LB_BIAS_DEFAULT)。bias=0 时恒为
+        ewma,退化为纯 EWMA 排序(RFC 8305 §4 RTT 排序)。
+        """
+        q = self._quality.get(pid)
+        if q is None:
+            return 0.0
+        w = q["ewma_ttfb"]
+        if self.lb_bias > 0:
+            active = self._in_flight.get(pid, 0)
+            if active:
+                w *= (1.0 + active) ** self.lb_bias
+        return w
+
     def _slow_start_rank(self, pid: str) -> int:
         """slow-start 排序档位:恢复期代理垫底(档 1),正常代理靠前(档 0)。
 
@@ -319,11 +384,13 @@ class ProxySelector:
         return 1 if self._in_slow_start(pid) else 0
 
     def ordered_proxies(self) -> List[str]:
-        """返回按 EWMA 首字节延迟排序(快速者靠前)的已启用代理 id 列表。
+        """返回按加权 least-request 权重(快且不忙者靠前)排序的已启用代理列表。
 
         - 剔除熔断退避期内的代理(open_until 未到);
-        - 按 slow-start 档位分层(恢复期代理垫底),层内按 EWMA 排;
-        - 同质量段随机打乱,均衡负载的同时保持"快者先竞速"。
+        - 按 slow-start 档位分层(恢复期代理垫底),层内按加权权重排:
+          权重 = ewma × (1 + active)^lb_bias——快而空闲的代理靠前,背上大量
+          在途积压的代理被压低(least-active 语义,保护慢代理不被打爆);
+        - 同权重段随机打乱,均衡负载的同时保持"快且不忙者先竞速"。
         退避到期的代理在此被解熔断并置入 slow-start(is_circuit_open 副作用)。
         """
         proxies = self.proxy_store.list()
@@ -331,7 +398,9 @@ class ProxySelector:
         # 过滤熔断中的代理(is_circuit_open 同时处理退避到期解熔断)。
         enabled = [p for p in enabled if not self.is_circuit_open(p.id)]
         random.shuffle(enabled)
-        enabled.sort(key=lambda p: (self._slow_start_rank(p.id), self._quality_rank(p.id)))
+        enabled.sort(key=lambda p: (self._slow_start_rank(p.id),
+                                    self._quality_rank(p.id)[0],  # 未知质量垫底
+                                    self._weighted_rank(p.id)))
         return [p.id for p in enabled]
 
     def best_proxy(self) -> Optional[str]:
@@ -346,7 +415,7 @@ class Router:
     生命周期:start() 开始监听 → handle_client 处理每个连接 → stop() 优雅关闭。
     """
 
-    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS):
+    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT):
         """构造路由器。
 
         参数:
@@ -384,6 +453,11 @@ class Router:
                                 该代理在此窗口内低权重垫底。
             slow_start_success: slow-start 恢复期内累计成功多少次后恢复完整权重
                                 (默认 3)。
+            lb_bias:            加权 least-request 的在途惩罚指数(默认 1.0)。竞速
+                                排序权重 = ewma × (1 + active)^bias,在途积压多的
+                                代理即使延迟历史最快也被压低排序,保护慢代理不被打爆
+                                (Envoy LeastRequest / Dubbo LeastActive)。bias=0
+                                退化为纯 EWMA 排序。
         """
         self.proxy_store = proxy_store
         self.selector = ProxySelector(
@@ -391,7 +465,8 @@ class Router:
             circuit_threshold=circuit_threshold,
             circuit_max_backoff=circuit_max_backoff,
             slow_start_window=slow_start_window,
-            slow_start_success=slow_start_success)
+            slow_start_success=slow_start_success,
+            lb_bias=lb_bias)
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.max_retries = max_retries
@@ -731,6 +806,8 @@ class Router:
             "request_counts": dict(self.request_counts),
             "attempted_counts": dict(self.attempted_counts),
             "proxy_quality": self.selector.get_quality(),
+            "proxy_in_flight": self.selector.get_in_flight(),
+            "max_in_flight": self.selector.max_in_flight,
             "probes_sent": self.probes_sent,
             "probes_ok": self.probes_ok,
             "circuit_open_count": self.selector.circuit_open_count,
@@ -1408,6 +1485,9 @@ class Router:
         key = self._client_key(pid, proxy_url)
         client = await self._get_client(key, proxy_url)
         resp = None
+        # 计入该代理在途数:从"发起尝试"到"收到响应头/失败/被取消"的整个窗口,
+        # 供加权 least-request 选批避开积压代理。finally 中无论何种出口都释放。
+        self.selector._inflight_start(pid)
         try:
             self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
             self.upstream_attempts += 1  # 聚合竞速扇出总数(供 /metrics 算放大率)
@@ -1440,6 +1520,8 @@ class Router:
             if not isinstance(ex, asyncio.CancelledError) and pid != 'local':
                 self.selector.record_failure(pid)
             raise
+        finally:
+            self.selector._inflight_finish(pid)
 
     async def _try_tunnel(self, pid: str, target: str, proxy_host: Optional[str], proxy_port: Optional[int], proxy_auth: Optional[dict]):
         """尝试建立一条 CONNECT 隧道,作为竞速的一个候选。
@@ -1472,6 +1554,8 @@ class Router:
             raise RuntimeError(f'connect to {proxy_host or target} timed out or failed: {e}') from e
         # 首字节计时:从 CONNECT 发出到收到 200。用于 EWMA 质量跟踪(竞速排序)。
         t0 = time.perf_counter()
+        # 计入该代理在途数(从 CONNECT 发起到拿到 200/失败/被取消),finally 释放。
+        self.selector._inflight_start(pid)
         try:
             auth_hdr = ""
             if proxy_auth:
@@ -1513,6 +1597,8 @@ class Router:
             if not isinstance(ex, asyncio.CancelledError) and pid != 'local':
                 self.selector.record_failure(pid)
             raise
+        finally:
+            self.selector._inflight_finish(pid)
 
     # ── 客户端入口 ──────────────────────────────────────────────
 

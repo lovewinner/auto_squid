@@ -105,6 +105,7 @@ def start(config: str = "", proxies: str = "", db: str = "auto_squid.db"):
         circuit_max_backoff=cfg.router.circuit.circuit_max_backoff,
         slow_start_window=cfg.router.circuit.slow_start_window,
         slow_start_success=cfg.router.circuit.slow_start_success,
+        lb_bias=cfg.router.circuit.lb_bias,
         auth_enabled=cfg.router.auth.enabled,
         auth_username=cfg.router.auth.username,
         auth_password=cfg.router.auth.password,

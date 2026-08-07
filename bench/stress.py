@@ -262,6 +262,7 @@ class ScenarioResult:
                             "invocations": None}
             circuit_group = {"circuit_open_count": None, "probes_sent": None,
                              "probes_ok": None, "proxies_open_end": 0}
+            inflight_group = {"max_in_flight": None, "in_flight_end": {}}
         else:
             cb, ca = self.counters_before, self.counters_after
             hits = ca.get("http_cache_hits", 0) - cb.get("http_cache_hits", 0)
@@ -287,6 +288,12 @@ class ScenarioResult:
                 "probes_sent": ca.get("probes_sent", 0) - cb.get("probes_sent", 0),
                 "probes_ok": ca.get("probes_ok", 0) - cb.get("probes_ok", 0),
                 "proxies_open_end": sum(1 for v in (ca.get("circuit_state") or {}).values() if v.get("open")),
+            }
+            # 在途选批(in-flight)观测:场景内单代理在途数高水位(场景内峰值,而非
+            # 累计,故取差值)与场景末各代理当前在途数(应回落为 0,证明计数无泄漏)。
+            inflight_group = {
+                "max_in_flight": ca.get("max_in_flight", 0) - cb.get("max_in_flight", 0),
+                "in_flight_end": ca.get("proxy_in_flight", {}) or {},
             }
 
         # 瓶颈归因:状态分布含 429/503 → 上游触顶;否则 proxy。
@@ -341,6 +348,7 @@ class ScenarioResult:
             "cache": cache_group,
             "racing": racing_group,
             "circuit": circuit_group,
+            "in_flight": inflight_group,
             "resources": {
                 "rss_peak_mb": self.rss_peak_mb,
                 "fd_peak": self.fd_peak,
@@ -1070,6 +1078,12 @@ def print_report(metrics_list: list, git_ver: str, upstream_mode: str,
         if circ.get('circuit_open_count') is not None:
             print(f"  熔断          : 开合 {circ['circuit_open_count']} 次  探活 {circ['probes_sent']}/{circ['probes_ok']} 成功  "
                   f"末态熔断 {circ['proxies_open_end']} 个代理")
+        infl = m.get('in_flight') or {}
+        if infl.get('max_in_flight') is not None:
+            ends = infl.get('in_flight_end') or {}
+            leaked = {k: v for k, v in ends.items() if v}
+            print(f"  在途选批      : 单代理在途峰值 {infl['max_in_flight']}  "
+                  f"末态在途 {ends} {'⚠️ 计数未归零!' if leaked else '(归零,无泄漏)'}")
         res = m['resources']
         lag = res['server_loop_lag_ms']
         print(f"  资源          : RSS={res['rss_peak_mb']:.0f}MB  fd={res['fd_peak']}  池末值={res['pool_size_end']}  "
@@ -1241,6 +1255,7 @@ async def amain(args):
             "circuit_max_backoff": args.circuit_max_backoff,
             "slow_start_window": args.slow_start_window,
             "slow_start_success": args.slow_start_success,
+            "lb_bias": args.lb_bias,
             "dead_proxies": getattr(args, 'dead_proxies', []) or getattr(args, 'dead_proxy', []),
             "proxies_path": args.proxies,
             "mock_specs": mock_specs,
@@ -1332,6 +1347,9 @@ def main():
     p.add_argument("--circuit-max-backoff", type=float, default=300.0, help="熔断退避上限(秒)")
     p.add_argument("--slow-start-window", type=float, default=60.0, help="slow-start 爬升窗口(秒)")
     p.add_argument("--slow-start-success", type=int, default=3, help="slow-start 成功几次后恢复完整权重")
+    p.add_argument("--lb-bias", type=float, default=1.0,
+                   help="加权 least-request 在途惩罚指数(竞速排序权重 = ewma×(1+active)^bias;"
+                        "0=纯 EWMA 排序,默认 1.0)")
     p.add_argument("--dead-proxy", action="append", default=[],
                    metavar="ID:HOST:PORT",
                    help="注入指向死端口的代理(可重复),给熔断器制造连续失败负载;"

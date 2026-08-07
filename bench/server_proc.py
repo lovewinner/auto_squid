@@ -210,6 +210,7 @@ async def _serve(config: dict):
                         circuit_max_backoff=config.get("circuit_max_backoff", 300.0),
                         slow_start_window=config.get("slow_start_window", 60.0),
                         slow_start_success=config.get("slow_start_success", 3),
+                        lb_bias=config.get("lb_bias", 1.0),
                         db_path=config["db_path"])
         await router.start()
         mount_api(ps, router)  # 注入 /metrics /server-stats 等端点
