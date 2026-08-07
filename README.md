@@ -7,7 +7,7 @@ Lightweight forward proxy with parallel racing, domain-based caching, an HTTP re
 ## Overview
 
 - Runs on a gateway host, accepts HTTP/HTTPS proxy traffic, and forwards each request through upstream proxies
-- **Parallel racing**: sends each request to several upstream proxies simultaneously and uses the first successful response; the rest are cancelled and their connections released
+- **Parallel racing + staggered start**: races upstreams sorted by per-proxy EWMA latency, launching the best 1–2 first (RFC 8305 §5) and refilling at ~250ms intervals; the first first-byte response wins and the rest are cancelled. Staggering cuts CONNECT tunnel fan-out and HTTP double-write traffic dramatically
 - **Domain cache**: once a proxy wins a race for a domain, it is reused for that domain until `cache_ttl` expires — avoids racing every request
 - **Session stickiness**: optional; the same client IP + domain/target reuses the same proxy (keeps the egress IP stable); a failing or 5xx-returning sticky proxy evicts its entry and falls back to racing (redispatch), and sticky entries are re-raced periodically (`recheck_hits`)
 - **HTTP response cache**: idempotent `GET` responses are cached in memory (TTL 60s, respects `Cache-Control`)
@@ -17,7 +17,7 @@ Lightweight forward proxy with parallel racing, domain-based caching, an HTTP re
 
 ## Features
 
-- HTTP and HTTPS (`CONNECT`) forwarding with parallel racing across upstream proxies
+- HTTP and HTTPS (`CONNECT`) forwarding with parallel racing across upstream proxies (EWMA-sorted + staggered start)
 - Domain-level caching (`cache_ttl`) of the winning proxy per domain
 - Session stickiness (per-client+domain, in-memory, sliding TTL) with redispatch on sticky-proxy failure, 5xx eviction, periodic re-race, and a capacity cap
 - In-memory HTTP `GET` response cache with `Cache-Control` awareness

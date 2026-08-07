@@ -159,9 +159,23 @@ auto_squid 是一个**正向 HTTP/HTTPS 代理**：监听一个端口，客户�
 - **清空**：`reset_quality()`（网络切换/代理分组变化时调用，RFC 8305 §4）；经管理 API `POST /quality/reset` 暴露，`GET /quality` 可查看。
 - 运行时验证：快代理（0.01s）EWMA≈0.057s，慢代理（0.30s 单独时）EWMA≈0.329s，reset 清空生效（bench mock 集群端到端）。
 
-**2. 错峰启动（staggered start）**
-- 竞速首批改为：先发最优 1~2 个，间隔 ~50-250ms 补发下一个，首字节成功即取消其余。
-- 极大减少 CONNECT 隧道扇出（CONNECT 败者隧道要建好再关，最浪费）与 HTTP 双写流量。
+**2. 错峰启动（staggered start）** — ✅ **已落地（2026-08-07）**
+- 竞速首批改为：先发最优 `stagger_initial` 个（默认 1，冷启动自动翻倍到 2），间隔 `stagger_interval_ms`（默认 250ms，钳制到 RFC 8305 [100, 2000]）补发下一个，首字节成功即取消其余。
+- **实现**：`_race_staggered` 按 interval **定时补发**（RFC 8305 §5 关键——补发不等待上一候选失败，慢代理挂起时后发者仍能顶上）；候选**惰性创建**（真 task 只在补发时经 `_make_race_task` 创建，未发候选不启动）；败者清理复用 `_spawn_cleanup`/`_drain_losers`（软上限 + 后台排空）。非错峰路径 `_race` 保留作对比。
+- **HTTP 5xx 不算胜出**：`_is_acceptable_win` 过滤——上游 5xx 不作竞速赢家（否则错峰首批单发时，坏的先应答即胜，吞掉好代理），继续补发/兜底找 200；单发路径（粘性/域名缓存）仍原样透传 5xx 由调用方驱逐。
+- **配置贯通**：`config.yaml` + `config_schema`（`stagger_start/stagger_initial/stagger_interval_ms`）+ `cli.py` + `bench`（`--no-stagger` 对比开关）。
+- **验证**（mock 2 台：快 10ms / 慢 300ms，每请求冷域名强制竞速，EWMA 已学习）：
+
+  | 指标 | OFF 全发 | ON 错峰 |
+  |---|---|---|
+  | 每请求扇出 amplification | 2.0 | **1.0** |
+  | upstream_attempts（40 req） | 80 | **40** |
+  | 慢代理被打中次数 | 40 | **0** |
+  | TTFB p50（HTTP） | 14.4ms | **13.7ms** |
+  | CONNECT 慢隧道被打中 | 40 | **0** |
+  | 正确性 | 40/40 FAST | 40/40 FAST |
+
+  结论：扇出减半、慢代理根本不发（CONNECT 败者隧道"建好再关"的成本归零）、TTFB 不劣化。冷启动（无 EWMA）自动翻倍到 2，等价旧 `_race` 兜底能力。
 
 **3. 全局熔断器 + 指数退避探活 + slow-start**
 - 连续失败 N 次 → `circuit_open_until` 指数退避，退避期内不参与竞速。
@@ -233,7 +247,11 @@ _build_racing_tasks_* 改为:
     circuit_threshold: 3      # 连续失败熔断阈值
     circuit_max_backoff: 300  # 指数退避上限（秒）
     slow_start_window: 60     # slow-start 爬升窗口（秒）
-    stagger_ms: 250           # 错峰启动间隔（毫秒）
+
+  错峰（已落地,见 P1-2）:
+  router.stagger_start: true        # 启用错峰启动
+  router.stagger_initial: 1         # 首批并发数(冷启动自动翻倍到 2)
+  router.stagger_interval_ms: 250   # 启动间隔(毫秒),钳制到 [100, 2000]
 ```
 
 **边界与成本**：

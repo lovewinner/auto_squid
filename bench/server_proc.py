@@ -184,10 +184,14 @@ async def _serve(config: dict):
         else:
             ps = ProxyStore(config["proxies_path"])
 
-        # 2) Router(被测方)。
+        # 2) Router(被测方)。错峰参数可经 config 注入(默认启用;压测对比错峰
+        #    on/off 时传 stagger_start=False)。
         router = Router(ps, listen_host="127.0.0.1", listen_port=config["router_port"],
                         max_retries=config["max_retries"], cache_ttl=config["cache_ttl"],
                         enable_http_cache=config["enable_http_cache"],
+                        stagger_start=config.get("stagger_start", True),
+                        stagger_initial=config.get("stagger_initial", 1),
+                        stagger_interval_ms=config.get("stagger_interval_ms", 250),
                         db_path=config["db_path"])
         await router.start()
         mount_api(ps, router)  # 注入 /metrics /server-stats 等端点

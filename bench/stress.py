@@ -1209,6 +1209,9 @@ async def amain(args):
             "max_retries": args.max_retries,
             "cache_ttl": args.cache_ttl,
             "enable_http_cache": not args.no_http_cache,
+            "stagger_start": not args.no_stagger,
+            "stagger_initial": args.stagger_initial,
+            "stagger_interval_ms": args.stagger_interval_ms,
             "proxies_path": args.proxies,
             "mock_specs": mock_specs,
             "db_path": db_path,
@@ -1286,8 +1289,12 @@ def main():
                    help="真实模式下压测的主机名(逗号分隔);默认内置大站池")
     p.add_argument("--router-port", type=int, default=10820, help="被测 Router 监听端口")
     p.add_argument("--max-retries", type=int, default=3, help="竞速首批并行数")
+    p.add_argument("--stagger-initial", type=int, default=1, help="错峰首批并发数(默认1,冷启动自动翻倍)")
+    p.add_argument("--stagger-interval-ms", type=int, default=250, help="错峰启动间隔(毫秒,默认250)")
     p.add_argument("--cache-ttl", type=int, default=300, help="域名缓存 TTL(秒)")
     p.add_argument("--no-http-cache", action="store_true", help="禁用 HTTP 响应缓存")
+    p.add_argument("--no-stagger", action="store_true",
+                   help="禁用错峰启动(同时全发;默认启用错峰,RFC 8305 §5)")
     p.add_argument("--duration", type=float, default=60.0, help="soak 模式时长(秒)")
     p.add_argument("--open-loop", action="store_true", help="soak 开环模式(不限速,测真实上限)")
     p.add_argument("--quick", action="store_true", help="快速冒烟(小规模,~10s)")

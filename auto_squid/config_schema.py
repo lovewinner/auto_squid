@@ -91,12 +91,23 @@ class RouterConfig(BaseModel):
                          在该有效期内复用同一代理,避免每请求都竞速。
     enable_local_racing: 让网关主机自身作为代理节点直接参与竞速(不走上游)。
     max_retries:         竞速首批并行的代理数量;全失败后对剩余代理再竞速兜底。
+    stagger_start:       是否启用错峰启动(RFC 8305 §5)。竞速首批不再同时全发:
+                         先发最优 stagger_initial 个,间隔 stagger_interval_ms 补发
+                         下一个,首个首字节成功即取消其余。显著减少 CONNECT 隧道
+                         扇出与 HTTP 双写流量。默认 True。
+    stagger_initial:     错峰首批并发数(>=1,经 max_retries 钳制)。冷启动(无任何
+                         EWMA 历史)时自动翻倍到 2,避免随机首抽丢快代理。
+    stagger_interval_ms: 相邻候选的启动间隔(毫秒),钳制到 [100, 2000](RFC 8305
+                         §5 下限 100ms/绝对值 10ms、上限 2s)。默认 250。
     auth:                客户端认证配置(AuthConfig)。
     stickiness:          会话粘性配置(见 StickinessConfig)。
     """
     cache_ttl: int = Field(600, description="域名缓存有效期(秒)，过期后重新竞速")
     enable_local_racing: bool = Field(False, description="将本机作为代理节点参与竞速")
     max_retries: int = Field(3, description="竞速首批并行的代理数量")
+    stagger_start: bool = Field(True, description="启用错峰启动(RFC 8305 §5)")
+    stagger_initial: int = Field(1, description="错峰首批并发数(冷启动自动翻倍到2)")
+    stagger_interval_ms: int = Field(250, description="错峰启动间隔(毫秒),钳制到[100,2000]")
     auth: AuthConfig = Field(default_factory=AuthConfig, description="客户端认证配置")
     stickiness: StickinessConfig = Field(default_factory=StickinessConfig, description="会话粘性配置")
 

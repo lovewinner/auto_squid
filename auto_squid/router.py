@@ -84,6 +84,14 @@ _AGG_WAIT_TIMEOUT = 0.1
 # 下 _pending_cleanups 无界堆积(soak 模式曾观测 fd_peak 冲到 569)。
 _MAX_PENDING_CLEANUPS = 64
 
+# 错峰启动(staggered start,RFC 8305 §5)的配置下限。
+# 默认间隔 250ms,下限 100ms(绝对值下限 10ms,防止丢包率高时拥塞崩溃),上限 2s。
+# stagger_interval 由 __init__ 钳制到此区间,配置传 0/负值时落到默认。
+_STAGGER_DEFAULT_MS = 250
+_STAGGER_MIN_MS = 100
+_STAGGER_ABS_MIN_MS = 10
+_STAGGER_MAX_MS = 2000
+
 # Hop-by-hop 请求头：只服务于"客户端→本代理"这一跳，绝不能转发给上游。
 # 特别是 Proxy-Authorization——若把客户端访问本代理的凭据透传到上游，
 # 上游 Squid 会用它校验缓存对象访问权限（ERR_CACHE_ACCESS_DENIED），
@@ -178,7 +186,7 @@ class Router:
     生命周期:start() 开始监听 → handle_client 处理每个连接 → stop() 优雅关闭。
     """
 
-    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000):
+    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS):
         """构造路由器。
 
         参数:
@@ -194,6 +202,14 @@ class Router:
             stickiness_ttl:      会话粘性有效期(秒),粘性命中成功滑动刷新。
             stickiness_recheck_hits: 粘性命中 N 次后触发探路重竞速(0=关闭)。
             stickiness_max_entries: 粘性表最大条目数,超出驱逐最旧(内存保护)。
+            stagger_start:       是否启用错峰启动(RFC 8305 §5)。竞速首批不再同时全发,
+                                 先发最优 stagger_initial 个,间隔 stagger_interval_ms
+                                 补发下一个;首个首字节成功即取消其余。显著减少 CONNECT
+                                 隧道扇出与 HTTP 双写流量。默认 True(启用错峰)。
+            stagger_initial:     错峰首批并发数(必须 >= 1;经 max_retries 钳制)。
+                                 有历史 RTT 时可设 2 同时赌两个最优者(RFC 8305 §5 允许)。
+            stagger_interval_ms: 相邻候选的启动间隔(毫秒),钳制到 [100, 2000]
+                                 (RFC 8305 §5 下限 100ms/绝对值 10ms、上限 2s)。
         """
         self.proxy_store = proxy_store
         self.selector = ProxySelector(proxy_store)
@@ -202,6 +218,16 @@ class Router:
         self.max_retries = max_retries
         self.enable_local_racing = enable_local_racing
         self.enable_http_cache = enable_http_cache
+        # ── 错峰启动(RFC 8305 §5)──
+        # 竞速首批不再同时全发:先发最优 stagger_initial 个,间隔 stagger_interval_ms
+        # 补发下一个,首个首字节成功即取消其余。interval 钳制到 RFC 8305 参数区间
+        # (默认 250ms、下限 100ms、绝对值下限 10ms、上限 2s),防配置越界破坏竞速。
+        self.stagger_start = stagger_start
+        self.stagger_initial = max(1, min(max_retries, stagger_initial))
+        if stagger_interval_ms <= 0:
+            stagger_interval_ms = _STAGGER_DEFAULT_MS
+        self.stagger_interval = max(_STAGGER_MIN_MS,
+                                    min(_STAGGER_MAX_MS, stagger_interval_ms)) / 1000.0
         self.auth_enabled = auth_enabled
         self.auth_username = auth_username
         self.auth_password = auth_password
@@ -770,6 +796,22 @@ class Router:
 
     # ── 通用竞速 / pipe / 响应写入 ──────────────────────────────
 
+    @staticmethod
+    def _is_acceptable_win(result) -> bool:
+        """竞速赢家过滤:HTTP 5xx 不算胜出,CONNECT 一律算。
+
+        HTTP 候选返回 5xx(500 内部错误/503 过载)说明上游已应答但业务失败,
+        不该作为竞速赢家——否则错峰首批单发时,坏的先应答即胜,吞掉好代理,
+        还会污染域名缓存与粘性表。CONNECT 候选拿到 200 才返回(见 _try_tunnel),
+        故无需在此检查。
+        """
+        if not result:
+            return False
+        if len(result) >= 5:
+            # HTTP 结果元组 (pid, method, url, resp, client);CONNECT 为 (pid, r, w)。
+            return result[3].status_code < 500
+        return True
+
     async def _race(self, tasks: set, cleanup=None) -> Optional[Any]:
         """取最先成功完成的 task 的结果;败者清理下放后台,立即返回赢家。
 
@@ -795,6 +837,12 @@ class Router:
             for t in done:
                 try:
                     winner = t.result()
+                    # HTTP 5xx 不算胜出(见 _is_acceptable_win):跳过,保持 winner
+                    # 为 None,让本批继续等待其他候选/兜底;该 t 仍是败者(由下方
+                    # losers 收集并经 cleanup 释放 resp)。
+                    if not self._is_acceptable_win(winner):
+                        winner = None
+                        continue
                     winner_task = t
                     break
                 except Exception:
@@ -827,6 +875,100 @@ class Router:
                 break
         return winner
 
+    async def _race_staggered(self, places, cleanup=None,
+                              initial: int = 1, interval: float = 0.25,
+                              method: str = "", url: str = "",
+                              headers: Optional[dict] = None, body: Optional[bytes] = None) -> Optional[Any]:
+        """错峰启动竞速(RFC 8305 §5):先发最优 initial 个,间隔 interval 补发,首字节成功即取消其余。
+
+        与 _race 的差异只在**候选的启动时机**:
+        - _race 首批同时全发,赢家由首字节最快者决定;
+        - 本方法首批只发 initial 个(默认 1 个),此后**按 interval 定时补发**下一个,
+          首个候选拿到响应头/CONNECT 200 即判胜,取消其余未完成/未开始的候选,
+          败者清理下放 _drain_losers(同 _race)。
+
+        定时补发是 RFC 8305 §5 的关键:补发**不等待**上一候选失败——若最优者恰好
+        半开挂起,后发者仍能按 interval 及时顶上,竞速的"慢时兜底"能力得以保留。
+        相比 _race 同时全发,错峰让先发的优质代理先到,劣质代理大概率根本不发;
+        HTTP 候选不发就不双写上游流量,CONNECT 候选不发就不必建好隧道再关(最浪费),
+        扇出与败者清理成本随未发候选数线性下降。代价:若先发者慢,TTFB 最坏多等
+        一个 interval(默认 250ms,RFC 8305 容限内);EWMA 排序保证先发的几乎总是
+        历史最快者,此代价只在网络突变时出现。
+
+        places 是**有序候选占位**(pid 或 (pid, target)),按"最优在前"排列;真 task
+        只在补发时经 _make_race_task 惰性创建。若急切 create_task,事件循环立刻
+        调度,错峰退化为同时全发。前 initial 个占位首批同时发出,其后每个 interval
+        从前方 pop 一个补发(保证"下一个最优者"先补)。
+
+        `winner` 为 None 只表示"已发候选全部失败",不表示"未胜出就中止"——循环会
+        把未发候选按 interval 逐一补发完才结束,让调用方据此走兜底批。
+        """
+        headers = headers or {}
+        places = list(places)
+        initial = max(1, min(initial, len(places)))
+        running: set = set()
+        for p in places[:initial]:
+            running.add(self._make_race_task(p, method, url, headers, body))
+        # 未发候选:后补发的先 pop 先发,故反转成"从最优端 pop"。
+        unlaunched = places[initial:]
+        unlaunched.reverse()
+        # 已完成的候选累积:失败候选的异常需在收尾时 retrieval(_drain_losers 的
+        # gather + result),否则 asyncio 报 "Task exception was never retrieved"。
+        completed: set = set()
+        winner = None
+        while running or unlaunched:
+            # 等待首字节;interval 超时无候选完成则返回(未完成者仍在 running 里),
+            # 用于定时补发下一个。有候选完成则 done 含该候选。
+            done, running = await asyncio.wait(
+                running, return_when=asyncio.FIRST_COMPLETED, timeout=interval)
+            # 判胜:任一候选拿到结果(响应头/CONNECT 200)即获胜;HTTP 5xx 不算胜出
+            # (见 _is_acceptable_win),跳过并继续补发/等待其他候选。
+            winner_task = None
+            for t in done:
+                completed.add(t)
+                try:
+                    winner = t.result()
+                    if not self._is_acceptable_win(winner):
+                        winner = None
+                        continue
+                    winner_task = t
+                    break
+                except Exception:
+                    pass
+            if winner is not None:
+                losers = set(running)
+                for t in completed:
+                    if t is not winner_task:
+                        losers.add(t)
+                for t in running:
+                    t.cancel()
+                if losers:
+                    self._spawn_cleanup(losers, cleanup)
+                return winner
+            # 无胜者(完成候选均失败/被取消):定时补发下一个候选(若有)。
+            if unlaunched:
+                running.add(self._make_race_task(unlaunched.pop(), method, url, headers, body))
+        return winner
+
+    def _spawn_cleanup(self, losers: set, cleanup):
+        """把竞速败者清理下放后台 task(_drain_losers),带软上限就地排空。
+
+        _race / _race_staggered 共用:败者清理不阻塞赢家首字节。软上限阈值
+        _MAX_PENDING_CLEANUPS 下,持续高吞吐时先就地 gather 已完成的清理 task,
+        释放其持有的流式 resp / 上游连接,避免 _pending_cleanups 无界堆积。
+        """
+        if not losers:
+            return
+        if cleanup is not None:
+            if len(self._pending_cleanups) >= _MAX_PENDING_CLEANUPS:
+                stale = self._pending_cleanups
+                self._pending_cleanups = set()
+                asyncio.get_running_loop().create_task(
+                    asyncio.gather(*stale, return_exceptions=True))
+            cleanup_task = asyncio.create_task(self._drain_losers(losers, cleanup))
+            self._pending_cleanups.add(cleanup_task)
+            cleanup_task.add_done_callback(self._pending_cleanups.discard)
+
     async def _drain_losers(self, losers: set, cleanup):
         """后台清理竞速败者:等未完成者取消结束,对已完成者调 cleanup。
 
@@ -843,6 +985,30 @@ class Router:
                         pass
         except Exception:
             pass
+
+    def _make_race_task(self, place, method: str, url: str, headers: dict,
+                        body: Optional[bytes]) -> asyncio.Task:
+        """把一个候选占位(pid 或 (pid, target))惰性创建为竞速 task。
+
+        统一工厂供 _race_staggered 补发候选:place 为字符串 pid 时建 HTTP task
+        (_try_http,经上游代理转发;pid='local' 直连);place 为 (pid, target) 时建
+        CONNECT 隧道 task(_try_tunnel,经上游 CONNECT)。延迟到调用时才 create_task,
+        保证"未发候选不启动"——这是错峰与 _race 同时全发的本质区别。
+        """
+        if isinstance(place, tuple):
+            pid, target = place
+            proxy = self.proxy_store.get(pid)
+            if proxy is None:
+                # 本机直连路径:pid 为 'local' 时 proxy 不存在,proxy_host 置 None。
+                return asyncio.create_task(self._try_tunnel(pid, target, None, None, None))
+            return asyncio.create_task(
+                self._try_tunnel(pid, target, proxy.host, proxy.port, proxy.auth))
+        pid = place
+        proxy = self.proxy_store.get(pid)
+        if proxy is None:
+            return asyncio.create_task(self._try_http('local', None, method, url, headers, body))
+        return asyncio.create_task(
+            self._try_http(pid, self._build_proxy_url(proxy), method, url, headers, body))
 
     @staticmethod
     async def _cleanup_http_result(result):
@@ -1146,21 +1312,48 @@ class Router:
 
     # ── HTTP 请求处理 ──────────────────────────────────────────
 
-    async def _build_racing_tasks_http(self, proxies: List[str], method: str, url: str, headers: dict, body: Optional[bytes]) -> set:
-        """为一组代理创建竞速 task 集合:前 N 个上游各一个 _try_http task。
+    def _build_racing_tasks_http(self, proxies: List[str]) -> set:
+        """为 HTTP 竞速产出候选占位集合(前 max_retries 个 pid + 本机 local)。
 
-        N 由 max_retries 限制(本批只竞速前 N 个)。开启本机竞速时追加一个
-        不走上游的 local task。返回的 set 交给 _race 执行。
+        N 由 max_retries 限制(本批只竞速前 N 个)。返回的 set 交给 _race(真 task)
+        或 _race_staggered(惰性占位,补发时才创建)。占位为 pid 字符串,
+        _make_race_task 据此建 _try_http task。
         """
-        tasks = set()
-        for pid in proxies[:self.max_retries]:
-            proxy = self.proxy_store.get(pid)
-            if not proxy:
-                continue
-            tasks.add(asyncio.create_task(self._try_http(pid, self._build_proxy_url(proxy), method, url, headers, body)))
+        places = {pid for pid in proxies[:self.max_retries] if self.proxy_store.get(pid)}
         if self.enable_local_racing:
-            tasks.add(asyncio.create_task(self._try_http('local', None, method, url, headers, body)))
-        return tasks
+            places.add('local')
+        return places
+
+    def _stagger_initial(self) -> int:
+        """首批并发数:冷启动(无任何 EWMA 历史)时翻倍,其余用配置值。
+
+        RFC 8305 §5 允许有历史 RTT 时首批发多个。冷启动时排序等于均匀随机,
+        只发 1 个会概率性丢掉快代理(随机首抽到慢者即败)——翻倍到 2 个同时赌两个
+        最优者,等价于旧 _race 的兜底能力;一旦学得任一 EWMA 即回落到 stagger_initial
+        (历史排序可信,首批单发即可)。与 _race 的差异只在候选启动时机,不影响
+        max_retries 的候选总数上限。
+        """
+        if not self.selector.get_quality():
+            return min(self.max_retries, max(2, self.stagger_initial))
+        return self.stagger_initial
+
+    def _prep_http(self, proxies: List[str]) -> tuple:
+        """HTTP 竞速的启动参数:首批/补发按 stagger 配置取占位,返回 (initial_places, remaining)。
+
+        供 _forward_upstream 统一拼接 _race_staggered 的调用。`initial_places` 是
+        首批要同时发出的**有序**占位列表(最优先发出,保持 proxies 的 EWMA 排序);
+        `remaining` 是待定时补发的**有序**占位列表。本机竞速开启时 local 优先
+        (直连,常最快)。占位为 pid 字符串,_make_race_task 据此建 _try_http task。
+        """
+        n_initial = self._stagger_initial()
+        initial_pids = proxies[:n_initial]
+        if self.enable_local_racing and 'local' not in initial_pids:
+            initial_pids = ['local'] + initial_pids
+        initial_places = [pid for pid in initial_pids
+                          if pid == 'local' or self.proxy_store.get(pid)]
+        remaining = [pid for pid in proxies
+                     if pid not in initial_places and (pid == 'local' or self.proxy_store.get(pid))]
+        return initial_places, remaining
 
     async def _handle_http_request(self, method: str, url: str, headers: dict, body: bytes, writer: asyncio.StreamWriter, client_ip: str = ""):
         """处理一个完整 HTTP 请求(已解析好的 method/url/headers/body),按优先级回写响应。
@@ -1342,6 +1535,8 @@ class Router:
                     logger.debug("cached proxy %s failed for %s", cached_pid, domain)
 
         # 3) 竞速:首批并行 max_retries 个代理,全失败且还有剩余则对剩余再竞速。
+        #    错峰启动(stagger_start)时首批只发 stagger_initial 个(默认 1 个),
+        #    补发剩余占位交 _race_staggered 按 interval 定时补发;否则同时全发。
         proxies = self.selector.ordered_proxies()
         if not proxies and not self.enable_local_racing:
             await self._write_cached_response(writer, 502, 'Bad Gateway', {'Content-Type': 'text/plain'}, b'Bad Gateway')
@@ -1349,15 +1544,25 @@ class Router:
 
         # 计数:进入竞速(首批)。兜底批单独再 +1,故 invocations 可能 > 请求数。
         self.racing_invocations += 1
-        tasks = await self._build_racing_tasks_http(proxies, method, url, hdrs, body)
-        winner_resp = await self._race(tasks, cleanup=self._cleanup_http_result)
-
-        # 首批全失败且代理数超过 max_retries:对剩余代理再竞速兜底。
-        if not winner_resp and len(proxies) > self.max_retries:
-            self.racing_invocations += 1
-            remaining = proxies[self.max_retries:]
-            tasks = await self._build_racing_tasks_http(remaining, method, url, hdrs, body)
+        if self.stagger_start:
+            initial_places, remaining = self._prep_http(proxies)
+            winner_resp = await self._race_staggered(
+                initial_places + remaining, cleanup=self._cleanup_http_result,
+                initial=len(initial_places), interval=self.stagger_interval,
+                method=method, url=url, headers=hdrs, body=body)
+        else:
+            # 非错峰(_race):需真 task,占位经 _make_race_task 急切创建。
+            places = self._build_racing_tasks_http(proxies)
+            tasks = {self._make_race_task(p, method, url, hdrs, body) for p in places}
             winner_resp = await self._race(tasks, cleanup=self._cleanup_http_result)
+
+            # 首批全失败且代理数超过 max_retries:对剩余代理再竞速兜底。
+            if not winner_resp and len(proxies) > self.max_retries:
+                self.racing_invocations += 1
+                remaining = proxies[self.max_retries:]
+                places = self._build_racing_tasks_http(remaining)
+                tasks = {self._make_race_task(p, method, url, hdrs, body) for p in places}
+                winner_resp = await self._race(tasks, cleanup=self._cleanup_http_result)
 
         if winner_resp:
             pid, method, url, resp, client = winner_resp
@@ -1450,20 +1655,36 @@ class Router:
 
     # ── CONNECT 处理 ──────────────────────────────────────────
 
-    async def _build_racing_tasks_connect(self, proxies: List[str], target: str) -> set:
-        """为一组代理创建 CONNECT 竞速 task 集合(前 N 个上游各一个 _try_tunnel)。
+    def _build_racing_tasks_connect(self, proxies: List[str], target: str) -> set:
+        """为 CONNECT 竞速产出候选占位集合(前 max_retries 个上游 + 本机 local)。
 
-        本机竞速时追加一个直连 target 的 local task(proxy_host=None)。
+        占位为 (pid, target) 元组,交由 _race(真 task)/ _race_staggered(惰性占位,
+        补发时才创建)执行;本机竞速时追加 (local, target) 直连占位。
         """
-        tasks = set()
+        places = set()
         for pid in proxies[:self.max_retries]:
-            proxy = self.proxy_store.get(pid)
-            if not proxy:
-                continue
-            tasks.add(asyncio.create_task(self._try_tunnel(pid, target, proxy.host, proxy.port, proxy.auth)))
+            if self.proxy_store.get(pid):
+                places.add((pid, target))
         if self.enable_local_racing:
-            tasks.add(asyncio.create_task(self._try_tunnel('local', target, None, None, None)))
-        return tasks
+            places.add(('local', target))
+        return places
+
+    def _prep_connect(self, proxies: List[str], target: str) -> tuple:
+        """CONNECT 竞速的启动参数:首批/补发按 stagger 配置取占位,返回 (initial_places, remaining)。
+
+        与 _prep_http 同构:首批取前 stagger_initial 个最优代理,本机竞速时 local
+        优先(直连,常最快)。占位为 (pid, target) 元组,_make_race_task 据此建
+        _try_tunnel task。返回的两个列表均保持 proxies 的 EWMA 排序(最优在前)。
+        """
+        n_initial = self._stagger_initial()
+        initial_pids = proxies[:n_initial]
+        if self.enable_local_racing and 'local' not in initial_pids:
+            initial_pids = ['local'] + initial_pids
+        initial_places = [(pid, target) for pid in initial_pids
+                          if pid == 'local' or self.proxy_store.get(pid)]
+        remaining = [(pid, target) for pid in proxies
+                     if (pid, target) not in initial_places and (pid == 'local' or self.proxy_store.get(pid))]
+        return initial_places, remaining
 
     async def _connect_established(self, client_writer, up_writer):
         """回写 CONNECT 200 并对客户端与上游连接设 TCP_NODELAY。"""
@@ -1549,14 +1770,25 @@ class Router:
                 pass
             return
 
-        tasks = await self._build_racing_tasks_connect(proxies, target)
-        winner = await self._race(tasks, cleanup=self._cleanup_tunnel_result)
-
-        # 首批全失败且代理数超过 max_retries:对剩余代理再竞速兜底。
-        if not winner and len(proxies) > self.max_retries:
-            remaining = proxies[self.max_retries:]
-            tasks = await self._build_racing_tasks_connect(remaining, target)
+        # 错峰启动(stagger_start)时首批只发 stagger_initial 个,补发占位交
+        # _race_staggered 按 interval 定时补发;否则同时全发(全失败再兜底批)。
+        if self.stagger_start:
+            initial_places, remaining = self._prep_connect(proxies, target)
+            winner = await self._race_staggered(
+                initial_places + remaining, cleanup=self._cleanup_tunnel_result,
+                initial=len(initial_places), interval=self.stagger_interval)
+        else:
+            # 非错峰(_race):需真 task,占位经 _make_race_task 急切创建。
+            places = self._build_racing_tasks_connect(proxies, target)
+            tasks = {self._make_race_task(p, '', '', None, None) for p in places}
             winner = await self._race(tasks, cleanup=self._cleanup_tunnel_result)
+
+            # 首批全失败且代理数超过 max_retries:对剩余代理再竞速兜底。
+            if not winner and len(proxies) > self.max_retries:
+                remaining = proxies[self.max_retries:]
+                places = self._build_racing_tasks_connect(remaining, target)
+                tasks = {self._make_race_task(p, '', '', None, None) for p in places}
+                winner = await self._race(tasks, cleanup=self._cleanup_tunnel_result)
 
         if winner:
             pid, up_reader, up_writer = winner

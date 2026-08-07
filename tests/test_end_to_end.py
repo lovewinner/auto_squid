@@ -1815,3 +1815,118 @@ class TestProxySelectorEWMA:
         assert sel._quality
         sel.reset_quality()
         assert sel._quality == {}
+
+
+class TestStagger:
+    """错峰启动(staggered start,RFC 8305 §5)行为。
+
+    竞速首批只发最优 stagger_initial 个,间隔 interval 补发;首字节成功即取消其余。
+    覆盖:冷启动加倍、5xx 不算胜出、配置钳制、错峰 vs 全发扇出对比。
+    """
+
+    @pytest.mark.asyncio
+    async def test_race_staggered_lazy_launch_respects_initial(self):
+        """首批只发 initial 个;赢家出现后未发候选不再创建(扇出下降)。"""
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='p1', host='127.0.0.1', port=31301))
+        ps.add(ProxyInfo(id='p2', host='127.0.0.1', port=31302))
+        ps.add(ProxyInfo(id='p3', host='127.0.0.1', port=31303))
+        r = Router(ps, listen_host='127.0.0.1', listen_port=10819,
+                   max_retries=3, enable_http_cache=False, stagger_start=True,
+                   db_path=tempfile.mktemp(suffix='.db'))
+        # 直接驱动:initial=1 + 一个立即成功的占位 → 只发 1 个,赢家即返回。
+        launched = []
+        async def fast(pid, proxy_url, method, url, headers, body):
+            launched.append(pid)
+            return pid, method, url, object(), object()
+        r._make_race_task = lambda place, method, url, headers, body: \
+            asyncio.create_task(fast(place, None, method, url, headers, body))
+        win = await r._race_staggered(['p1', 'p2', 'p3'], initial=1, interval=0.01)
+        assert win[0] == 'p1'
+        # 首字节判胜 → 未发候选(p2/p3)不创建。
+        assert launched == ['p1'], f"stagger should launch only initial, got {launched}"
+
+    @pytest.mark.asyncio
+    async def test_stagger_5xx_not_a_win(self):
+        """HTTP 5xx 不算竞速胜出:即使 5xx 先应答,仍继续补发找到 200。"""
+        bad_port, ok_port = 31311, 31312
+        bad_srv = await run_mock_proxy_status(HOST, bad_port, status=500, pre_header_delay=0.0)
+        ok_srv = await run_mock_proxy_tagged(HOST, ok_port, 'OK', pre_header_delay=0.0)
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='bad', host=HOST, port=bad_port))
+        ps.add(ProxyInfo(id='ok', host=HOST, port=ok_port))
+        r = Router(ps, listen_host=HOST, listen_port=10819,
+                   max_retries=2, enable_http_cache=False, stagger_start=True,
+                   db_path=tempfile.mktemp(suffix='.db'))
+        await r.start()
+        try:
+            # 冷启动加倍:首批 2 个(no quality)同时发,两者都答 500/200;
+            # 5xx 不算赢家,最终落在 200 的 ok。
+            status = await send_http_get_status(HOST, 10819, url=b"http://stg5xx.example.com/p0")
+            assert b'200' in status, f"expected 200, got {status!r}"
+        finally:
+            await r.stop()
+            bad_srv.close()
+            await bad_srv.wait_closed()
+            ok_srv.close()
+            await ok_srv.wait_closed()
+
+    def test_stagger_interval_clamped(self):
+        """interval 钳制到 RFC 8305 区间 [100ms, 2000ms];0/负值回默认 250ms。"""
+        ps = ProxyStore()
+        r = Router(ps, listen_host='127.0.0.1', listen_port=10819,
+                   max_retries=2, stagger_interval_ms=0)
+        assert r.stagger_interval == 0.25
+        r2 = Router(ps, listen_host='127.0.0.1', listen_port=10819,
+                    max_retries=2, stagger_interval_ms=5000)
+        assert r2.stagger_interval == 2.0
+        r3 = Router(ps, listen_host='127.0.0.1', listen_port=10819,
+                    max_retries=2, stagger_interval_ms=20)
+        assert r3.stagger_interval == 0.1
+
+    def test_stagger_initial_clamped_to_max_retries(self):
+        """stagger_initial 钳制到 max_retries;冷启动(无 EWMA)时翻倍到 2。"""
+        ps = ProxyStore()
+        r = Router(ps, listen_host='127.0.0.1', listen_port=10819,
+                   max_retries=1, stagger_initial=5, stagger_start=True)
+        assert r.stagger_initial == 1
+        # 冷启动:无质量观测 → 首批翻倍(最多 max_retries)。
+        assert r._stagger_initial() == 1  # min(max_retries=1, max(2,1))=1
+        r2 = Router(ps, listen_host='127.0.0.1', listen_port=10819,
+                    max_retries=3, stagger_initial=1, stagger_start=True)
+        assert r2._stagger_initial() == 2  # 冷启动翻倍到 2(<=3)
+        # 学到质量后回落 stagger_initial=1。
+        r2.selector.record_ttfb('x', 0.01)
+        assert r2._stagger_initial() == 1
+
+    @pytest.mark.asyncio
+    async def test_stagger_reduces_fanout_on_learned_quality(self):
+        """学得 EWMA 后错峰:快代理先发即胜,慢代理不参与(扇出下降)。"""
+        fast_port, slow_port = 31321, 31322
+        fast_srv = await run_mock_proxy_tagged(HOST, fast_port, 'FAST', pre_header_delay=0.0)
+        slow_srv = await run_mock_proxy_tagged(HOST, slow_port, 'SLOW', pre_header_delay=0.3)
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='fast', host=HOST, port=fast_port))
+        ps.add(ProxyInfo(id='slow', host=HOST, port=slow_port))
+        r = Router(ps, listen_host=HOST, listen_port=10819,
+                   max_retries=2, enable_http_cache=False, stagger_start=True,
+                   db_path=tempfile.mktemp(suffix='.db'))
+        # 预置质量:fast 远快于 slow → 排序 fast 在前。
+        r.selector.record_ttfb('fast', 0.01)
+        r.selector.record_ttfb('slow', 0.30)
+        await r.start()
+        try:
+            url = b"http://stg-fanout.example.com/p0"
+            # 首次竞速:首批只发 fast(有质量→stagger_initial=1),fast 立即胜,
+            # slow 不参与 → upstream_attempts 只 +1(fast)。
+            status = await send_http_get(HOST, 10819, url=url)
+            assert b'FAST' in status
+            c = r.snapshot_counters()
+            assert c['upstream_attempts'] == 1, \
+                f"stagger should not launch slow, upstream_attempts={c['upstream_attempts']}"
+        finally:
+            await r.stop()
+            fast_srv.close()
+            await fast_srv.wait_closed()
+            slow_srv.close()
+            await slow_srv.wait_closed()
