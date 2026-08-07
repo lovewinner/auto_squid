@@ -2113,15 +2113,52 @@ class TestCircuitBreaker:
                    db_path=tempfile.mktemp(suffix='.db'))
         try:
             # 探活成功:EWMA 写入 + 连续失败归零。
-            await r._probe_proxy('up')
+            await r._probe_proxy('up', canary_reachable=True)
             assert r.probes_sent == 1 and r.probes_ok == 1
             assert 'up' in r.selector.get_quality(), "probe success must feed EWMA"
             # 探活失败:连续失败累计(达阈值 2 即熔断)。
-            await r._probe_proxy('down')   # fail 1
+            await r._probe_proxy('down', canary_reachable=True)   # fail 1
             assert r.selector.is_circuit_open('down') is False
-            await r._probe_proxy('down')   # fail 2 → open
+            await r._probe_proxy('down', canary_reachable=True)   # fail 2 → open
             assert r.selector.is_circuit_open('down') is True
             assert r.selector.circuit_open_count == 1
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_probe_skips_when_canary_unreachable(self):
+        """本机→canary 不可达时,探活整轮跳过(probes_skipped),不累计上游失败。
+
+        这是修复"canary 选错导致健康代理被误熔断"的守卫:直连 canary 失败只
+        说明本机路由/防火墙挡了 canary,不代表上游代理挂了,故不得 record_failure。
+        """
+        # 两个代理:up(可达 mock)+ down(无人监听)。若守卫失效,down 会累计失败。
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)  # CONNECT 200
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='up', host=HOST, port=31991))
+        ps.add(ProxyInfo(id='down', host=HOST, port=31990))  # 无人监听 → 失败
+        r = Router(ps, listen_host=HOST, listen_port=10829,
+                   max_retries=2, enable_http_cache=False,
+                   probe_interval_sec=0.0, probe_canary="1.1.1.1:443",
+                   circuit_threshold=2, circuit_max_backoff=100.0,
+                   db_path=tempfile.mktemp(suffix='.db'))
+        try:
+            # 单代理探活:守卫按 canary_reachable 短路,不计入 sent/ok/失败。
+            await r._probe_proxy('up', canary_reachable=False)
+            await r._probe_proxy('down', canary_reachable=False)
+            assert r.probes_sent == 0 and r.probes_ok == 0
+            assert r.probes_skipped == 2
+            # down 未累计失败(consec_fail 应仍为 0)→ 未触发熔断。
+            st = r.selector.get_circuit_state().get('down')
+            assert st is None or st.get('consec_fail') == 0, \
+                "unreachable canary must not count as proxy failure"
+            assert r.selector.circuit_open_count == 0
+            # 对照:canary 可达时 down 照常累计失败并熔断。
+            await r._probe_proxy('down', canary_reachable=True)   # fail 1
+            await r._probe_proxy('down', canary_reachable=True)   # fail 2 → open
+            assert r.selector.is_circuit_open('down') is True
         finally:
             await r.stop()
             up_srv.close()

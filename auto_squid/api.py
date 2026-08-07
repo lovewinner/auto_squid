@@ -90,6 +90,7 @@ async def circuit():
         "circuit_open_count": _router.selector.circuit_open_count,
         "probes_sent": _router.probes_sent,
         "probes_ok": _router.probes_ok,
+        "probes_skipped": _router.probes_skipped,
         "single_send_degrades": _router.single_send_degrades,
         "degraded_single_send": _router.get_degraded_single_send(),
         "proxies": _router.selector.get_circuit_state(),

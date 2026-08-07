@@ -495,6 +495,7 @@ class Router:
         self._probe_task: Optional[asyncio.Task] = None
         self.probes_sent = 0
         self.probes_ok = 0
+        self.probes_skipped = 0  # 因本机→canary 不可达(环境原因)而跳过的探活次数
         # 熔断开启计数归 ProxySelector 维护(开启时刻在 record_failure 内),经
         # snapshot_counters 经 selector.circuit_open_count 读取。
         self.enable_local_racing = enable_local_racing
@@ -765,25 +766,58 @@ class Router:
         探活目标为 self.probe_canary(如 "1.1.1.1:443")。CONNECT 到 canary 只
         验证上游代理存活与建连延迟,不做业务请求;成功/失败分别喂 EWMA 与
         熔断计数,让质量模型在低流量期也能持续学习(而非只靠真实请求)。
+
+        关键预检:先直连一次 canary,确认"本机→canary"这条路径可达。若不可达
+        (选错 canary / 校网防火墙 DROP 出口,如 1.1.1.1),则经上游 CONNECT 到
+        canary 的应答永远收不到——探活结果反映的是本机路由而非上游健康,会把
+        健康上游误判为故障并误熔断。此时整轮探活跳过(计 probes_skipped),
+        避免污染熔断计数。直连超时 _PROBE_TIMEOUT;即便直连可达,经上游的
+        CONNECT 仍可能因上游侧不通而失败(该情况照常累计 record_failure)。
         """
         proxies = [p for p in self.proxy_store.list() if p.enabled]
         if not proxies:
             return
-        tasks = [asyncio.create_task(self._probe_proxy(p.id)) for p in proxies]
+        # 解析 canary "host:port" / "[ipv6]:port"。
+        if self.probe_canary.startswith('['):
+            c_host_end = self.probe_canary.find(']')
+            c_host = self.probe_canary[1:c_host_end]
+            c_port = int(self.probe_canary[c_host_end + 2:])
+        else:
+            c_host, c_port_str = self.probe_canary.rsplit(':', 1)
+            c_port = int(c_port_str)
+        # 本机直连 canary 探可达性(短超时;失败仅跳过本轮,不算任何上游失败)。
+        canary_reachable = True
+        try:
+            c_reader, c_writer = await asyncio.wait_for(
+                asyncio.open_connection(c_host, c_port), timeout=_PROBE_TIMEOUT)
+            c_writer.close()
+            await c_writer.wait_closed()
+        except (asyncio.TimeoutError, OSError, ConnectionError):
+            canary_reachable = False
+        tasks = [asyncio.create_task(self._probe_proxy(p.id, canary_reachable))
+                 for p in proxies]
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _probe_proxy(self, pid: str):
+    async def _probe_proxy(self, pid: str, canary_reachable: bool):
         """对单个代理发起一次 CONNECT 探活:经该上游 CONNECT 到 canary 后关闭。
 
         用裸 socket 建连(CONNECT 不需要连接池;探活低频,无池化价值)。成功:
         记录 EWMA + 成功观测(连续失败归零);失败/超时:记录失败(累计连续
         失败,达阈值即熔断,与真实请求失败同源)。'local' 是本机直连,无上游
         可探,跳过。超时 _PROBE_TIMEOUT 防半开上游长期占用。
+
+        canary_reachable:本机直连 canary 是否可达。False 表示"探活目标在本机
+        网络里不可达"——此时探活结果无法反映上游代理的真实健康状况(上游可能
+        很好,只是本机到 canary 的路由/防火墙挡了)。为避免把健康上游误熔断,
+        跳过本轮探活,计入 probes_skipped,而不是累计 record_failure。
         """
         if pid == 'local':
             return
         proxy = self.proxy_store.get(pid)
         if proxy is None:
+            return
+        if not canary_reachable:
+            self.probes_skipped += 1
             return
         self.probes_sent += 1
         t0 = time.perf_counter()
@@ -856,6 +890,7 @@ class Router:
             "max_in_flight": self.selector.max_in_flight,
             "probes_sent": self.probes_sent,
             "probes_ok": self.probes_ok,
+            "probes_skipped": self.probes_skipped,
             "circuit_open_count": self.selector.circuit_open_count,
             "circuit_state": self.selector.get_circuit_state(),
             "single_send_degrades": self.single_send_degrades,
