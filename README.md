@@ -167,8 +167,14 @@ Client ──HTTP/S──> auto_squid (proxy :10808)
 | `GET /server-stats` | server resource sampling (CPU %, event-loop lag) filled by the bench subprocess; empty in normal runs |
 | `GET /config` | Router config (`enable_local_racing`) |
 | `GET /domains` | Per-domain win stats from SQLite |
-| `GET /domains/meta` | Per-domain default proxy + last-updated time |
+| `GET /domains/meta` | Per-domain default proxy + last-updated time (+ `ttl`/`expires_at`/`switch_count` when adaptive TTL is enabled) |
 | `GET /stickiness` | Session stickiness table (client_ip\|domain → sticky proxy + updated time) |
+| `GET /quality` | Per-proxy EWMA first-byte latency (s), the racing-order basis |
+| `POST /quality/reset` | Clear all proxy EWMA quality (call after network changes) |
+| `GET /circuit` | Circuit-breaker + probe state per proxy (`open`, backoff, `probes_sent/ok/skipped`, `single_send_degrades`) |
+| `GET /policies` | Policy-routing config snapshot (match + allowed proxy subset) |
+| `POST /circuit/reset` | Un-break all circuits, keep EWMA quality |
+| `GET /server-stats` | server resource sampling (CPU %, event-loop lag) filled by the bench subprocess; empty in normal runs |
 
 ## Config
 
@@ -193,9 +199,75 @@ router:
     single_send_degrade_fail: 2     # single-send demote: consec-fail threshold (early warn, 0=off)
     single_send_degrade_ratio: 3.0  # single-send demote: EWMA vs pin-time baseline ratio (0=off)
     single_send_degrade_slack_ms: 10  # absolute floor (ms) against false positives at tiny latencies
+  # optional speed features (all off by default):
+  # policies:                        # narrow the racing candidate set per domain/tag
+  #   - match: {domain_suffix: [".cn", "baidu.com"]}
+  #     proxies: {tags: {region: "cn"}}
+  # adaptive_ttl: {enabled: true, min_sec: 60, max_sec: 1800}   # per-domain TTL by stability
+  # switch_damping: {enabled: true, min_wins: 2, ratio: 0.8, abs_ms: 30}  # stable egress
+  # concurrency_limit: {enabled: true, initial: 16, min: 2, max: 128, add_on_success: 4, mult_on_failure: 0.5, failure_window: 20}
+  # conn_pool: {enabled: true, per_proxy: 4, total: 64, idle_timeout: 30.0, refill_interval: 5.0, refill_target: 2, connect_timeout: 10.0}
 logging:
   file: "auto_squid.log"
 ```
+
+## Speed tuning
+
+The proxy already ships with most latency levers wired in (`examples/config.yaml` shows every field). Which settings to pick depends on your traffic. Three recommended profiles:
+
+**Stability-first** (egress-IP stability, login/bot-protection-sensitive sites):
+
+```yaml
+router:
+  stickiness:
+    enabled: true
+    ttl: 1800
+    recheck_hits: 100
+  circuit:
+    probe_interval_sec: 30
+    probe_canary: "www.baidu.com:443"
+    single_send_degrade_fail: 2
+    single_send_degrade_ratio: 3.0
+    single_send_degrade_slack_ms: 10
+```
+
+**Speed-first** (low TTFB, tolerant of egress switching):
+
+```yaml
+router:
+  cache_ttl: 900
+  stagger_start: true
+  stagger_initial: 1        # race the best proxy first, refill at interval
+  stagger_interval_ms: 100  # shortest legal refill interval (RFC 8305 floor)
+  circuit:
+    probe_interval_sec: 20
+    lb_bias: 0.5            # stop de-prioritizing the fast proxy too eagerly
+    single_send_degrade_fail: 2
+    single_send_degrade_ratio: 3.0
+    single_send_degrade_slack_ms: 10
+```
+
+**Low-fan-out first** (CONNECT-heavy, want minimal racing amplification):
+
+```yaml
+router:
+  stagger_start: true
+  stagger_initial: 1
+  stagger_interval_ms: 200
+  circuit:
+    probe_interval_sec: 30
+    lb_bias: 1.0
+    single_send_degrade_fail: 1   # pin faster than the circuit breaker
+    single_send_degrade_ratio: 2.0
+    single_send_degrade_slack_ms: 10
+```
+
+Tuning notes:
+
+- **`probe_canary` must be reachable both locally and through every upstream.** After deploying, watch `GET /circuit` — if `probes_skipped` keeps growing, the canary is wrong for your network and probes are silently being skipped (no mis-trips, but no quality signal either).
+- **`single_send_degrade_fail` is an early warning for the circuit breaker**: set it to `circuit_threshold - 1` (2 with the default 3) so a pinned proxy that starts failing demotes to racing *before* it breaks the circuit.
+- **`lb_bias`** controls how much in-flight backlog penalizes a proxy's race order (`ewma × (1 + active)^bias`). Raise it if slow proxies get hammered; lower it if the fastest proxy is being deprioritized.
+- **Policy routing** (`router.policies`) narrows the racing candidate set per domain/tag, cutting TTFB and `racing.amplification` — see `examples/config.yaml` for the shape.
 
 ## Container deployment (Docker / docker compose)
 

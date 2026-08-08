@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from auto_squid.proxy_store import ProxyStore
 from auto_squid.router import Router, ProxySelector
-from auto_squid.config_schema import ProxyInfo
+from auto_squid.config_schema import ProxyInfo, PolicyConfig
 from auto_squid.auth import check_auth
 from auto_squid.api import app as api_app, mount
 
@@ -2108,18 +2108,18 @@ class TestCircuitBreaker:
         ps.add(ProxyInfo(id='down', host=HOST, port=31990))  # 无人监听 → 失败
         r = Router(ps, listen_host=HOST, listen_port=10829,
                    max_retries=2, enable_http_cache=False,
-                   probe_interval_sec=0.0, probe_canary="1.1.1.1:443",
+                   probe_interval_sec=0.0, probe_canary=f"{HOST}:31991",  # 本机可达
                    circuit_threshold=2, circuit_max_backoff=100.0,
                    db_path=tempfile.mktemp(suffix='.db'))
         try:
             # 探活成功:EWMA 写入 + 连续失败归零。
-            await r._probe_proxy('up', canary_reachable=True)
+            await r._probe_proxy(ps.get('up'))
             assert r.probes_sent == 1 and r.probes_ok == 1
             assert 'up' in r.selector.get_quality(), "probe success must feed EWMA"
             # 探活失败:连续失败累计(达阈值 2 即熔断)。
-            await r._probe_proxy('down', canary_reachable=True)   # fail 1
+            await r._probe_proxy(ps.get('down'))   # fail 1
             assert r.selector.is_circuit_open('down') is False
-            await r._probe_proxy('down', canary_reachable=True)   # fail 2 → open
+            await r._probe_proxy(ps.get('down'))   # fail 2 → open
             assert r.selector.is_circuit_open('down') is True
             assert r.selector.circuit_open_count == 1
         finally:
@@ -2135,19 +2135,23 @@ class TestCircuitBreaker:
         说明本机路由/防火墙挡了 canary,不代表上游代理挂了,故不得 record_failure。
         """
         # 两个代理:up(可达 mock)+ down(无人监听)。若守卫失效,down 会累计失败。
+        # canary 用 1.1.1.1:443(校网对 1.1.1.1 直连超时;若本机恰好可达则该
+        # 测试改用 127.0.0.1:1 这类必达不通的目标,见下方对照)。为确定性,这里
+        # 直接对可达 mock 作"本机不可达"模拟:把 canary 设成 127.0.0.1:1
+        # (本机无人监听,直连必然失败),验证守卫把它当"环境不可达"处理。
         up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)  # CONNECT 200
         ps = ProxyStore()
         ps.add(ProxyInfo(id='up', host=HOST, port=31991))
         ps.add(ProxyInfo(id='down', host=HOST, port=31990))  # 无人监听 → 失败
         r = Router(ps, listen_host=HOST, listen_port=10829,
                    max_retries=2, enable_http_cache=False,
-                   probe_interval_sec=0.0, probe_canary="1.1.1.1:443",
+                   probe_interval_sec=0.0, probe_canary=f"127.0.0.1:1",
                    circuit_threshold=2, circuit_max_backoff=100.0,
                    db_path=tempfile.mktemp(suffix='.db'))
         try:
-            # 单代理探活:守卫按 canary_reachable 短路,不计入 sent/ok/失败。
-            await r._probe_proxy('up', canary_reachable=False)
-            await r._probe_proxy('down', canary_reachable=False)
+            # 单代理探活:本机直连 canary 失败 → 整轮跳过,不计入 sent/ok/失败。
+            await r._probe_proxy(ps.get('up'))
+            await r._probe_proxy(ps.get('down'))
             assert r.probes_sent == 0 and r.probes_ok == 0
             assert r.probes_skipped == 2
             # down 未累计失败(consec_fail 应仍为 0)→ 未触发熔断。
@@ -2156,13 +2160,46 @@ class TestCircuitBreaker:
                 "unreachable canary must not count as proxy failure"
             assert r.selector.circuit_open_count == 0
             # 对照:canary 可达时 down 照常累计失败并熔断。
-            await r._probe_proxy('down', canary_reachable=True)   # fail 1
-            await r._probe_proxy('down', canary_reachable=True)   # fail 2 → open
+            r.probe_canary = f"{HOST}:31991"  # 换成本机可达的 canary
+            await r._probe_proxy(ps.get('down'))   # fail 1
+            await r._probe_proxy(ps.get('down'))   # fail 2 → open
             assert r.selector.is_circuit_open('down') is True
         finally:
             await r.stop()
             up_srv.close()
-            await up_srv.wait_closed()
+
+    def test_canary_for_proxy_tag_matching(self):
+        """多 canary:按代理 tags 命中第一条匹配的 canary;无匹配用兜底/全局。"""
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='cn', host='h', port=3128, tags={'region': 'cn'}))
+        ps.add(ProxyInfo(id='hk', host='h', port=3128, tags={'region': 'hk'}))
+        ps.add(ProxyInfo(id='plain', host='h', port=3128))
+        r = Router(ps, listen_host='127.0.0.1', listen_port=10809,
+                   db_path=tempfile.mktemp(suffix='.db'),
+                   probe_canary="fallback:443",
+                   probe_canaries=[
+                       {"name": "cn", "target": "baidu.com:443", "tags": {"region": "cn"}},
+                       {"name": "global", "target": "1.1.1.1:443"},
+                   ])
+        assert r._canary_for_proxy(ps.get('cn')) == "baidu.com:443"
+        # hk 不匹配 cn canary → 命中无 tags 的兜底 canary。
+        assert r._canary_for_proxy(ps.get('hk')) == "1.1.1.1:443"
+        assert r._canary_for_proxy(ps.get('plain')) == "1.1.1.1:443"
+
+    def test_canary_for_proxy_falls_back_to_global(self):
+        """未配置多 canary 或全未命中 → 回退单 canary(probe_canary)。"""
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='p', host='h', port=3128, tags={'region': 'cn'}))
+        r = Router(ps, listen_host='127.0.0.1', listen_port=10809,
+                   db_path=tempfile.mktemp(suffix='.db'), probe_canary="1.1.1.1:443")
+        assert r._canary_for_proxy(ps.get('p')) == "1.1.1.1:443"
+        # 多 canary 全带 tags 且全不匹配 → 回退全局。
+        r2 = Router(ps, listen_host='127.0.0.1', listen_port=10809,
+                    db_path=tempfile.mktemp(suffix='.db'),
+                    probe_canary="fallback:443",
+                    probe_canaries=[{"name": "hk", "target": "hk.com:443",
+                                     "tags": {"region": "hk"}}])
+        assert r2._canary_for_proxy(ps.get('p')) == "fallback:443"
 
     @pytest.mark.asyncio
     async def test_real_request_failures_drive_circuit(self):
@@ -2462,3 +2499,558 @@ class TestSingleSendDegrade:
         assert r.get_degraded_single_send() == []
         # meta 仍指向 'p'(ref_ewma 基线保留但质量表已清,降级判定无据可依)。
         assert r._get_fresh_proxy('example.com') == 'p'
+
+
+class TestPolicyRouting:
+    """策略路由(P1):按目标域名(后缀/精确/正则)命中第一条策略,把候选代理集
+    收窄到策略允许的 tags/ids 子集。作用于竞速候选、域名缓存、粘性取用三方
+    (三者一致,防旧缓存绕过新策略)。"""
+
+    @staticmethod
+    def _proxy(pid, **kw):
+        return ProxyInfo(id=pid, host='h', port=3128, **kw)
+
+    def _router(self, policies=None, **kw):
+        store = ProxyStore()
+        store.add(self._proxy('cn-1', tags={'region': 'cn'}))
+        store.add(self._proxy('hk-1', tags={'region': 'hk'}))
+        store.add(self._proxy('plain'))
+        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+                      db_path=tempfile.mktemp(suffix='.db'),
+                      policies=policies, **kw)
+
+    def test_no_policies_candidates_unchanged(self):
+        """无策略时:候选即全部 enabled 代理(等价旧行为)。"""
+        r = self._router()
+        assert sorted(r._policy_candidate_pids('any.example.com', ['cn-1', 'hk-1', 'plain'])) \
+            == ['cn-1', 'hk-1', 'plain']
+        assert r._policy_matches('any.example.com') is None
+        assert r._policy_allows_sticky('any.example.com', 'cn-1')
+
+    def test_suffix_policy_filters_candidates(self):
+        """后缀命中 → 只保留允许子集;未命中的域名不过滤。"""
+        pol = PolicyConfig(match={'domain_suffix': ['.cn', 'baidu.com']},
+                           proxies={'tags': {'region': 'cn'}})
+        r = self._router(policies=[pol])
+        assert sorted(r._policy_candidate_pids('www.baidu.com', ['cn-1', 'hk-1', 'plain'])) == ['cn-1']
+        assert sorted(r._policy_candidate_pids('a.cn', ['cn-1', 'hk-1', 'plain'])) == ['cn-1']
+        # 未命中:全量保留。
+        assert sorted(r._policy_candidate_pids('youtube.com', ['cn-1', 'hk-1', 'plain'])) \
+            == ['cn-1', 'hk-1', 'plain']
+
+    def test_ids_policy(self):
+        """按 ids 收窄:直接列代理 id,与 tags 并集。"""
+        pol = PolicyConfig(match={'domain_exact': ['api.example.com']},
+                           proxies={'ids': ['cn-1', 'plain']})
+        r = self._router(policies=[pol])
+        assert sorted(r._policy_candidate_pids('api.example.com', ['cn-1', 'hk-1', 'plain'])) \
+            == ['cn-1', 'plain']
+
+    def test_regex_policy(self):
+        """正则命中 → 收窄到允许子集。"""
+        pol = PolicyConfig(match={'domain_regex': [r'.*\.api\.example\.com$']},
+                           proxies={'tags': {'region': 'hk'}})
+        r = self._router(policies=[pol])
+        assert sorted(r._policy_candidate_pids('x.api.example.com', ['cn-1', 'hk-1', 'plain'])) == ['hk-1']
+        assert r._policy_matches('y.api.example.com') is pol
+        assert r._policy_matches('www.example.com') is None
+
+    def test_connect_target_host_extraction(self):
+        """CONNECT target 'host:port' 剥端口后匹配;IPv6 括号剥除。"""
+        pol = PolicyConfig(match={'domain_suffix': ['example.com']},
+                           proxies={'tags': {'region': 'cn'}})
+        r = self._router(policies=[pol])
+        assert r._normalize_host('www.example.com:443') == 'www.example.com'
+        assert r._normalize_host('www.example.com.') == 'www.example.com'
+        assert r._normalize_host('[2001:db8::1]:443') == '2001:db8::1'
+        # target 带端口 → 命中。
+        assert sorted(r._policy_candidate_pids('www.example.com:443', ['cn-1', 'hk-1', 'plain'])) == ['cn-1']
+
+    def test_domain_cache_respects_policy(self):
+        """策略命中但缓存代理不在子集 → 视为 miss(旧缓存不能绕过新策略)。"""
+        pol = PolicyConfig(match={'domain_suffix': ['cn']},
+                           proxies={'tags': {'region': 'cn'}})
+        r = self._router(policies=[pol], stickiness_enabled=True)
+        r.selector.record_ttfb('hk-1', 0.01)
+        r._record_win_meta('a.cn', 'hk-1')  # 旧缓存钉在 hk-1
+        assert r._get_fresh_proxy('a.cn') is None  # hk-1 不在 cn 子集 → miss
+        # 符合策略的缓存代理正常命中。
+        r.selector.record_ttfb('cn-1', 0.01)
+        r._record_win_meta('b.cn', 'cn-1')
+        assert r._get_fresh_proxy('b.cn') == 'cn-1'
+
+    def test_sticky_respects_policy(self):
+        """策略命中但粘性代理不在子集 → 视为 miss(旧粘性不能绕过新策略)。"""
+        pol = PolicyConfig(match={'domain_suffix': ['cn']},
+                           proxies={'tags': {'region': 'cn'}})
+        r = self._router(policies=[pol], stickiness_enabled=True, stickiness_ttl=1800)
+        r.selector.record_ttfb('hk-1', 0.01)
+        r._record_sticky('1.2.3.4', 'a.cn', 'hk-1')
+        assert r._get_sticky_proxy('1.2.3.4', 'a.cn') is None  # hk-1 不在子集 → miss
+
+    def test_local_blocked_by_restrictive_policy(self):
+        """策略限制 tags/ids 时本机直连(local)被排除;未限制策略放行。"""
+        pol = PolicyConfig(match={'domain_suffix': ['cn']},
+                           proxies={'tags': {'region': 'cn'}})
+        r = self._router(policies=[pol], enable_local_racing=True)
+        assert not r._policy_allows_sticky('a.cn', 'local')
+        # 未限制策略(无 tags/ids)→ local 放行。
+        pol2 = PolicyConfig(match={'domain_suffix': ['cn']}, proxies={})
+        r2 = self._router(policies=[pol2], enable_local_racing=True)
+        assert r2._policy_allows_sticky('a.cn', 'local')
+
+    def test_policy_order_first_match_wins(self):
+        """多策略按配置顺序,第一条命中即用(可配置优先级/覆盖)。"""
+        p1 = PolicyConfig(match={'domain_suffix': ['example.com']},
+                          proxies={'ids': ['cn-1']})
+        p2 = PolicyConfig(match={'domain_suffix': ['sub.example.com']},
+                          proxies={'ids': ['hk-1']})
+        r = self._router(policies=[p1, p2])
+        # 同时命中 p1(example.com 后缀)与 p2(sub 更具体),但顺序 p1 在前 → 取 p1。
+        assert r._policy_matches('sub.example.com') is p1
+        assert sorted(r._policy_candidate_pids('sub.example.com', ['cn-1', 'hk-1'])) == ['cn-1']
+
+    def test_http_race_uses_policy_candidates(self):
+        """端到端:命中策略的域名只在该子集内竞速(_policy_candidate_pids 收窄)。"""
+        pol = PolicyConfig(match={'domain_suffix': ['cn']},
+                           proxies={'tags': {'region': 'cn'}})
+        r = self._router(policies=[pol])
+        got = r._policy_candidate_pids('a.cn', ['cn-1', 'hk-1', 'plain'])
+        assert got == ['cn-1']
+
+
+class TestHttpCacheLRU:
+    """HTTP 响应缓存 LRU + 容量上限(P2):_http_cache_set 写前按 max_entries /
+    max_bytes 淘汰最久未访问条目,_get 命中刷新访问序,_bytes 计数与二级索引
+    在所有删除路径(过期/LRU/按域名失效)保持一致。"""
+
+    def _router(self, **kw):
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host='h', port=3128))
+        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+                      db_path=tempfile.mktemp(suffix='.db'), **kw)
+
+    def test_lru_evicts_least_recently_used_by_entries(self):
+        """max_entries 超限 → 淘汰 last_access 最旧的条目(即使刚写入)。"""
+        r = self._router(http_cache_max_entries=3)
+        r._http_cache_set('GET', 'http://a.example.com/', 200, 'OK', {}, b'aaa')
+        r._http_cache_set('GET', 'http://b.example.com/', 200, 'OK', {}, b'bbb')
+        r._http_cache_set('GET', 'http://c.example.com/', 200, 'OK', {}, b'ccc')
+        assert len(r._http_cache) == 3
+        assert r._http_cache_get('GET', 'http://a.example.com/') is not None
+        # 第 4 条:淘汰最久未访问——b(未被访问)在 a 之前淘汰。
+        r._http_cache_set('GET', 'http://d.example.com/', 200, 'OK', {}, b'ddd')
+        assert r._http_cache_get('GET', 'http://a.example.com/') is not None
+        assert r._http_cache_get('GET', 'http://b.example.com/') is None
+        assert r._http_cache_get('GET', 'http://c.example.com/') is not None
+        assert r._http_cache_get('GET', 'http://d.example.com/') is not None
+        assert r.http_cache_evictions == 1
+        assert len(r._http_cache) == 3
+
+    def test_lru_evicts_by_bytes(self):
+        """max_bytes 超限 → 按字节淘汰,直到回到上限以内。"""
+        r = self._router(http_cache_max_bytes=50, http_cache_max_entries=1000)
+        r._http_cache_set('GET', 'http://a.example.com/', 200, 'OK', {}, b'x' * 20)
+        r._http_cache_set('GET', 'http://b.example.com/', 200, 'OK', {}, b'y' * 20)
+        # 两条共 40 字节 ≤ 50:都保留。
+        assert len(r._http_cache) == 2
+        assert r._http_cache_bytes == 40
+        r._http_cache_set('GET', 'http://c.example.com/', 200, 'OK', {}, b'z' * 20)
+        # 三条共 60 > 50:淘汰最旧 a,留下 b/c。
+        assert len(r._http_cache) == 2
+        assert r._http_cache_get('GET', 'http://a.example.com/') is None
+        assert r._http_cache_get('GET', 'http://b.example.com/') is not None
+        assert r._http_cache_get('GET', 'http://c.example.com/') is not None
+        assert r._http_cache_bytes == 40
+        assert r.http_cache_evictions == 1
+
+    def test_single_large_response_not_cached(self):
+        """单一响应超过 max_bytes 一半 → 不缓存(防单条打满预算)。"""
+        r = self._router(http_cache_max_bytes=100, http_cache_max_entries=1000)
+        r._http_cache_set('GET', 'http://a.example.com/', 200, 'OK', {}, b'x' * 60)
+        assert r._http_cache_get('GET', 'http://a.example.com/') is None
+        assert r._http_cache_bytes == 0
+
+    def test_update_existing_key_byte_accounting(self):
+        """覆盖已有 key 时字节计数不重复(先归还旧字节再计入新字节)。"""
+        r = self._router(http_cache_max_entries=1000, http_cache_max_bytes=100_000)
+        r._http_cache_set('GET', 'http://a.example.com/', 200, 'OK', {}, b'aaa')
+        assert r._http_cache_bytes == 3
+        r._http_cache_set('GET', 'http://a.example.com/', 200, 'OK', {}, b'bbbbbb')
+        assert r._http_cache_bytes == 6
+        assert len(r._http_cache) == 1
+
+    def test_invalidate_updates_bytes_and_index(self):
+        """写方法按域名失效:字节计数与二级索引同步,不残留。"""
+        r = self._router(http_cache_max_entries=1000, http_cache_max_bytes=100_000)
+        r._http_cache_set('GET', 'http://a.example.com/x', 200, 'OK', {}, b'aaa')
+        r._http_cache_set('GET', 'http://a.example.com/y', 200, 'OK', {}, b'bbb')
+        r._http_cache_set('GET', 'http://b.example.com/', 200, 'OK', {}, b'ccc')
+        assert r._http_cache_bytes == 9
+        r._http_cache_invalidate('a.example.com')
+        assert r._http_cache_get('GET', 'http://a.example.com/x') is None
+        assert r._http_cache_get('GET', 'http://a.example.com/y') is None
+        assert r._http_cache_get('GET', 'http://b.example.com/') is not None
+        assert r._http_cache_bytes == 3
+        assert 'a.example.com' not in r._http_cache_domain_index
+
+    def test_get_refreshes_lru_order(self):
+        """_get 命中刷新 last_access:访问过的条目不被误淘汰。"""
+        r = self._router(http_cache_max_entries=3)
+        for i in range(3):
+            r._http_cache_set('GET', f'http://{i}.example.com/', 200, 'OK', {}, b'x')
+        # 访问 0 与 1 → 2 成为最久未访问。
+        r._http_cache_get('GET', 'http://0.example.com/')
+        r._http_cache_get('GET', 'http://1.example.com/')
+        r._http_cache_set('GET', 'http://3.example.com/', 200, 'OK', {}, b'x')
+        assert r._http_cache_get('GET', 'http://2.example.com/') is None
+        assert r._http_cache_get('GET', 'http://0.example.com/') is not None
+        assert r._http_cache_get('GET', 'http://1.example.com/') is not None
+
+    def test_snapshot_exposes_cache_metrics(self):
+        """snapshot_counters 暴露 http_cache_bytes / http_cache_evictions。"""
+        r = self._router(http_cache_max_entries=2)
+        r._http_cache_set('GET', 'http://a.example.com/', 200, 'OK', {}, b'aaa')
+        r._http_cache_set('GET', 'http://b.example.com/', 200, 'OK', {}, b'bbb')
+        r._http_cache_set('GET', 'http://c.example.com/', 200, 'OK', {}, b'ccc')
+        s = r.snapshot_counters()
+        assert s['http_cache_bytes'] == 6  # 两条(淘汰后)
+        assert s['http_cache_evictions'] == 1
+        assert s['http_cache_entries'] == 2
+
+
+class TestAdaptiveTTL:
+    """自适应域名缓存 TTL(P2):稳定域名 TTL 上浮,抖动/恶化域名 TTL 回落。"""
+
+    def _router(self, **kw):
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host='h', port=3128))
+        store.add(ProxyInfo(id='q', host='h', port=3129))
+        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+                      db_path=tempfile.mktemp(suffix='.db'),
+                      adaptive_ttl=True, adaptive_ttl_min=60.0,
+                      adaptive_ttl_max=1800.0, **kw)
+
+    def test_off_by_default_uses_global_ttl(self):
+        """未开启时 _domain_ttl 返回全局 cache_ttl,且不记录 per-domain 状态。"""
+        r = Router(ProxyStore(), listen_host='127.0.0.1', listen_port=10809,
+                   db_path=tempfile.mktemp(suffix='.db'), cache_ttl=600)
+        assert r._domain_ttl('example.com') == 600
+
+    def test_stable_domain_ttl_grows(self):
+        """同代理连续胜出 → TTL 上浮(1.5× 步进,封顶)。"""
+        r = self._router()
+        r.selector.record_ttfb('p', 0.01)
+        r._record_win_meta('d0.example.com', 'p')  # 首次钉住 → 基础 TTL(cache_ttl)
+        base = r._domain_ttl_cache['d0.example.com']
+        # 同域连续胜出 → TTL 逐步上浮。
+        for _ in range(4):
+            r._record_win_meta('d0.example.com', 'p')
+        ttl = r._domain_ttl_cache['d0.example.com']
+        assert ttl > base, f"stable domain TTL should grow, got {ttl} (base {base})"
+        assert ttl <= r.adaptive_ttl_max
+        assert r.domain_ttl_grows > 0
+        assert r._get_fresh_proxy('d0.example.com') == 'p'
+
+    def test_switch_resets_ttl_to_min(self):
+        """赢家切换 → switch_count+1,TTL 回落下限。"""
+        r = self._router()
+        r.selector.record_ttfb('p', 0.01)
+        r.selector.record_ttfb('q', 0.02)
+        r._record_win_meta('d.example.com', 'p')
+        r._record_win_meta('d.example.com', 'p')
+        r._record_win_meta('d.example.com', 'p')  # TTL 已上浮
+        base = r._domain_ttl_cache['d.example.com']
+        assert base > r.adaptive_ttl_min
+        r._record_win_meta('d.example.com', 'q')  # 切换
+        assert r._domain_ttl_cache['d.example.com'] == r.adaptive_ttl_min
+        assert r._domain_switch_count['d.example.com'] == 1
+        assert r.domain_ttl_resets >= 1
+
+    def test_degrade_resets_ttl(self):
+        """单发降级(代理开始恶化)→ TTL 打回下限。"""
+        r = self._router(single_send_degrade_fail=2)
+        r.selector.record_ttfb('p', 0.01)
+        r._record_win_meta('d.example.com', 'p')
+        r._record_win_meta('d.example.com', 'p')
+        assert r._domain_ttl_cache['d.example.com'] > r.adaptive_ttl_min
+        r.selector.record_failure('p')
+        r.selector.record_failure('p')  # 达降级阈值
+        assert r._get_fresh_proxy('d.example.com') is None
+        assert r._domain_ttl_cache['d.example.com'] == r.adaptive_ttl_min
+
+    def test_enriched_meta_includes_ttl_fields(self):
+        """/domains/meta 展示 ttl/expires_at/switch_count(自适应开启时)。"""
+        r = self._router()
+        r.selector.record_ttfb('p', 0.01)
+        r._record_win_meta('d.example.com', 'p')
+        meta = r.get_domain_meta_enriched()
+        assert 'ttl' in meta['d.example.com']
+        assert 'expires_at' in meta['d.example.com']
+        assert meta['d.example.com']['switch_count'] == 0
+        # 关闭时与旧结构一致(无附加字段)。
+        r2 = Router(ProxyStore(), listen_host='127.0.0.1', listen_port=10809,
+                    db_path=tempfile.mktemp(suffix='.db'))
+        r2.selector.record_ttfb('p', 0.01)
+        r2._record_win_meta('d.example.com', 'p')
+        m2 = r2.get_domain_meta_enriched()
+        assert set(m2['d.example.com'].keys()) == {'default_proxy', 'updated_at', 'ref_ewma'}
+
+
+class TestSwitchDamping:
+    """域名赢家切换阻尼(P3):新赢家不能因单次竞速抖动就替换稳定域名赢家。"""
+
+    def _router(self, **kw):
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host='h', port=3128))
+        store.add(ProxyInfo(id='q', host='h', port=3129))
+        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+                      db_path=tempfile.mktemp(suffix='.db'),
+                      switch_damping=True, switch_damping_min_wins=2, **kw)
+
+    def test_off_by_default_allows_immediate_switch(self):
+        """默认关闭:新赢家立即替换旧赢家(旧行为)。"""
+        r = Router(ProxyStore(), listen_host='127.0.0.1', listen_port=10809,
+                   db_path=tempfile.mktemp(suffix='.db'))
+        r._record_win_meta('d.example.com', 'p')
+        r._record_win_meta('d.example.com', 'q')
+        assert r._meta_cache['d.example.com']['default_proxy'] == 'q'
+
+    def test_requires_consecutive_wins_to_switch(self):
+        """新赢家单次胜出不能替换旧赢家;连续胜出达阈值才替换。"""
+        r = self._router()
+        r.selector.record_ttfb('p', 0.01)
+        r.selector.record_ttfb('q', 0.01)
+        r._record_win_meta('d.example.com', 'p')  # 首次钉住 p
+        # q 单次胜出 → 被阻尼挡下,仍保持 p。
+        r._record_win_meta('d.example.com', 'q')
+        assert r._meta_cache['d.example.com']['default_proxy'] == 'p'
+        assert r.switch_damping_blocks == 1
+        # q 连续第 2 次胜出 → 通过,替换为 q。
+        r._record_win_meta('d.example.com', 'q')
+        assert r._meta_cache['d.example.com']['default_proxy'] == 'q'
+
+    def test_ewma_significant_advantage_switches_immediately(self):
+        """新赢家 EWMA 显著优于旧赢家 → 跳过阻尼立即切换。"""
+        r = self._router(switch_damping_ratio=0.8, switch_damping_abs_ms=0.0)
+        r.selector.record_ttfb('p', 0.10)  # 旧赢家 EWMA 100ms
+        r.selector.record_ttfb('q', 0.01)  # 新赢家 EWMA 10ms(快 90%)
+        r._record_win_meta('d.example.com', 'p')
+        r._record_win_meta('d.example.com', 'q')
+        assert r._meta_cache['d.example.com']['default_proxy'] == 'q'
+        assert r.switch_damping_fast_swaps == 1
+
+    def test_circuit_open_old_winner_switches_immediately(self):
+        """旧赢家熔断 → 跳过阻尼立即切换(对故障类不延迟换路)。"""
+        r = self._router()
+        r.selector.record_ttfb('p', 0.01)
+        r.selector.record_ttfb('q', 0.01)
+        r._record_win_meta('d.example.com', 'p')
+        for _ in range(3):
+            r.selector.record_failure('p')  # 熔断 p
+        assert r.selector.is_circuit_open('p')
+        r._record_win_meta('d.example.com', 'q')
+        assert r._meta_cache['d.example.com']['default_proxy'] == 'q'
+        assert r.switch_damping_blocks == 0
+
+    def test_abs_ms_advantage_switches_immediately(self):
+        """新赢家快 ≥ abs_ms 毫秒 → 立即切换。"""
+        r = self._router(switch_damping_ratio=0.0, switch_damping_abs_ms=30.0)
+        r.selector.record_ttfb('p', 0.050)  # 50ms
+        r.selector.record_ttfb('q', 0.010)  # 10ms(快 40ms ≥ 30ms)
+        r._record_win_meta('d.example.com', 'p')
+        r._record_win_meta('d.example.com', 'q')
+        assert r._meta_cache['d.example.com']['default_proxy'] == 'q'
+        # 小优势(快 < 30ms)→ 不立即切换,走连续胜出。
+        r2 = self._router(switch_damping_ratio=0.0, switch_damping_abs_ms=30.0)
+        r2.selector.record_ttfb('p', 0.050)
+        r2.selector.record_ttfb('q', 0.040)  # 快 10ms < 30ms
+        r2._record_win_meta('d.example.com', 'p')
+        r2._record_win_meta('d.example.com', 'q')
+        assert r2._meta_cache['d.example.com']['default_proxy'] == 'p'
+
+    def test_snapshot_exposes_damping_counters(self):
+        """snapshot_counters 暴露 switch_damping 计数。"""
+        r = self._router()
+        r.selector.record_ttfb('p', 0.01)
+        r.selector.record_ttfb('q', 0.01)
+        r._record_win_meta('d.example.com', 'p')
+        r._record_win_meta('d.example.com', 'q')
+        s = r.snapshot_counters()
+        assert s['switch_damping_enabled'] is True
+        assert s['switch_damping_blocks'] == 1
+
+
+class TestAdaptiveConcurrencyLimit:
+    """自适应并发限制(P3):每代理并发上限成功加性增/失败乘性降,在途达上限
+    的代理被过滤出竞速候选。"""
+
+    def _router(self, **kw):
+        store = ProxyStore()
+        store.add(ProxyInfo(id='slow', host='h', port=3128))
+        store.add(ProxyInfo(id='fast', host='h', port=3129))
+        kw.setdefault('concurrency_limit_enabled', True)
+        kw.setdefault('concurrency_limit_initial', 4)
+        kw.setdefault('concurrency_limit_min', 2)
+        kw.setdefault('concurrency_limit_max', 32)
+        kw.setdefault('concurrency_add_on_success', 2)
+        kw.setdefault('concurrency_mult_on_failure', 0.5)
+        kw.setdefault('concurrency_failure_window', 3)
+        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+                      db_path=tempfile.mktemp(suffix='.db'), **kw)
+
+    def test_off_by_default_no_filter(self):
+        """默认关闭:达上限的代理仍参与候选(旧行为)。"""
+        r = Router(ProxyStore(), listen_host='127.0.0.1', listen_port=10809,
+                   db_path=tempfile.mktemp(suffix='.db'))
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='p', host='h', port=3128))
+        sel = r.selector
+        sel._inflight_start('p')
+        sel._in_flight['p'] = 1000  # 手工超限
+        assert sel._at_concurrency_limit('p') is False
+
+    def test_at_limit_filtered_from_candidates(self):
+        """在途达上限 → 该代理从 ordered_proxies 过滤。"""
+        r = self._router()
+        sel = r.selector
+        for _ in range(4):  # 填满 initial=4
+            sel._inflight_start('slow')
+        assert sel._at_concurrency_limit('slow') is True
+        assert 'slow' not in sel.ordered_proxies()
+        assert 'fast' in sel.ordered_proxies()
+
+    def test_success_raises_limit_after_window(self):
+        """成功 ≥ 窗口 → 加性提升上限。"""
+        r = self._router()
+        sel = r.selector
+        assert sel._conc_state('slow')['limit'] == 4
+        for _ in range(3):  # 窗口=3
+            sel.record_ttfb('slow', 0.01)
+        assert sel._conc_state('slow')['limit'] == 6  # 4 + add(2)
+
+    def test_failure_lowers_limit(self):
+        """失败 → 乘性降低上限(触底 min)。"""
+        r = self._router()
+        sel = r.selector
+        sel.record_failure('slow')
+        assert sel._conc_state('slow')['limit'] == 2  # 4 × 0.5
+        # 触底:再失败不再降。
+        sel.record_failure('slow')
+        assert sel._conc_state('slow')['limit'] == 2
+
+    def test_reset_quality_clears_limits(self):
+        """reset_quality 清空并发限制状态(重新学)。"""
+        r = self._router()
+        sel = r.selector
+        sel.record_failure('slow')
+        assert sel._conc_state('slow')['limit'] == 2
+        sel.reset_quality()
+        assert sel._conc == {}
+
+    def test_snapshot_exposes_limits(self):
+        """snapshot_counters 暴露 proxy_concurrency_limits / enabled。"""
+        r = self._router()
+        s = r.snapshot_counters()
+        assert s['concurrency_limit_enabled'] is True
+        assert s['proxy_concurrency_limits'] == {}
+
+
+class TestConnPool:
+    """CONNECT 上游 TCP 预热池(P1):CONNECT 优先取池中已连接 socket,省建连;
+    带 per-proxy/全局 fd 预算与空闲超时,防泄漏。"""
+
+    def _router(self, **kw):
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host=HOST, port=31991))
+        kw.setdefault('conn_pool_enabled', True)
+        kw.setdefault('conn_pool_per_proxy', 2)
+        kw.setdefault('conn_pool_total', 8)
+        kw.setdefault('conn_pool_refill_interval', 0.0)  # 只取不补(测试手动补)
+        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+                      db_path=tempfile.mktemp(suffix='.db'), **kw)
+
+    @pytest.mark.asyncio
+    async def test_refill_then_peek_reuses_connection(self):
+        """预热补满后,peek 取到池中连接(hits),不再 miss。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router()
+        try:
+            await r._conn_pool_refill()
+            # refill_target 默认 2,per_proxy=2 → 预热 2 条。
+            assert r.conn_pool_creates == 2
+            key = f"{HOST}:31991"
+            assert len(r._conn_pool.get(key, [])) == 2
+            got = r._conn_pool_peek(HOST, 31991)
+            assert got is not None
+            assert r.conn_pool_hits == 1
+            assert r.conn_pool_misses == 0
+        finally:
+            await r._conn_pool_close_all()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_peek_empty_misses(self):
+        """池空 → peek 返回 None 并计 misses。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router()
+        try:
+            assert r._conn_pool_peek(HOST, 31991) is None
+            assert r.conn_pool_misses == 1
+        finally:
+            await r._conn_pool_close_all()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_prune_closes_idle(self):
+        """空闲超时 → prune 关闭并计 expired。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router(conn_pool_idle_timeout=1.0)
+        try:
+            await r._conn_pool_refill()
+            assert r.conn_pool_creates >= 1
+            # 伪造创建时间在很久以前,触发空闲超时。
+            for stack in r._conn_pool.values():
+                for _, w in stack:
+                    w._conn_pool_created = time.monotonic() - 100
+            await r._conn_pool_prune()
+            assert r.conn_pool_expired >= 1
+            assert sum(len(v) for v in r._conn_pool.values()) == 0
+        finally:
+            await r._conn_pool_close_all()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_global_budget_respected(self):
+        """refill 受全局 conn_pool_total 钳制。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='p1', host=HOST, port=31991))
+        ps.add(ProxyInfo(id='p2', host=HOST, port=31992))
+        up_srv2 = await run_mock_proxy(HOST, 31992, hit_counter=None)
+        r = Router(ps, listen_host='127.0.0.1', listen_port=10809,
+                   db_path=tempfile.mktemp(suffix='.db'),
+                   conn_pool_enabled=True, conn_pool_per_proxy=5,
+                   conn_pool_total=2, conn_pool_refill_target=5,
+                   conn_pool_refill_interval=0.0)
+        try:
+            await r._conn_pool_refill()
+            total = sum(len(v) for v in r._conn_pool.values())
+            assert total <= 2, f"global budget exceeded: {total}"
+        finally:
+            await r._conn_pool_close_all()
+            up_srv.close()
+            await up_srv.wait_closed()
+            up_srv2.close()
+            await up_srv2.wait_closed()
+
+    def test_snapshot_exposes_conn_pool(self):
+        """snapshot_counters 暴露 conn_pool 计数。"""
+        r = self._router()
+        s = r.snapshot_counters()
+        assert s['conn_pool_enabled'] is True
+        assert s['conn_pool_hits'] == 0
+        assert s['conn_pool_size'] == 0

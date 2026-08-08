@@ -11,7 +11,7 @@
 `ProxyInfo` 是上游代理节点定义,由 `proxies.yaml` 加载(见 ProxyStore)。
 """
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
@@ -64,6 +64,37 @@ class AuthConfig(BaseModel):
     password: str = Field("")
 
 
+class PolicyProxiesConfig(BaseModel):
+    """策略命中后允许使用的代理集合:按 tags 或按 ids 收窄(两者都给则取并集)。
+
+    tags 匹配 ProxyInfo.tags(如 region=cn);ids 直接列出代理 id。两者都缺省
+    (空集合)时该策略只匹配不限制(防御:不阻断流量,等同全量候选)。
+    """
+    tags: Optional[Dict[str, str]] = Field(None, description="代理标签匹配,如 region=cn")
+    ids: Optional[List[str]] = Field(None, description="允许的代理 id 列表")
+
+
+class PolicyMatchConfig(BaseModel):
+    """策略匹配条件(目标域名维度)。任一子条件命中即匹配(OR)。
+
+    host 提取规则:HTTP 用 URL hostname,CONNECT 用 target 去端口后的 host,
+    均不含端口、小写化、去尾部点。
+    """
+    domain_suffix: List[str] = Field(default_factory=list, description="域名后缀,如 '.cn' / 'baidu.com'")
+    domain_exact: List[str] = Field(default_factory=list, description="域名精确匹配")
+    domain_regex: List[str] = Field(default_factory=list, description="域名正则(re.search)")
+
+
+class PolicyConfig(BaseModel):
+    """一条策略路由:目标域名命中 match → 只在该子集代理中竞速/单发。
+
+    作用于竞速候选收窄、域名缓存与粘性的取用校验(三者一致,防旧缓存绕过新
+    策略)。match 命中按 policies 列表顺序取第一条。
+    """
+    match: PolicyMatchConfig = Field(default_factory=PolicyMatchConfig)
+    proxies: PolicyProxiesConfig = Field(default_factory=PolicyProxiesConfig)
+
+
 class StickinessConfig(BaseModel):
     """会话粘性配置(per-client+domain 维度,内存-only)。
 
@@ -82,6 +113,110 @@ class StickinessConfig(BaseModel):
     ttl: int = Field(1800, description="会话粘性有效期(秒)，滑动刷新")
     recheck_hits: int = Field(100, description="粘性命中 N 次后触发探路重竞速(0=关闭)")
     max_entries: int = Field(100_000, description="粘性表最大条目数,超出驱逐最旧(内存保护)")
+
+
+class HttpCacheConfig(BaseModel):
+    """HTTP 响应缓存配置(P2:LRU + 容量上限)。
+
+    enabled:            总开关。False 时 _http_cache_get 一律未命中(压测隔离
+                       缓存层测纯路由性能)。默认 True。
+    ttl:                条目有效期(秒),命中后滑动刷新。默认 60。
+    max_entries:        条目数硬上限。写入前若超限,按 LRU 淘汰最久未访问条目。
+                       默认 10000。
+    max_bytes:          缓存总字节上限(body 内容之和)。超限按 LRU 淘汰直到
+                       低于上限。默认 256 MiB。
+    stream_cache_limit: 单条响应 body 缓冲上限(字节)。流式转发时超过该大小即
+                       放弃缓存该响应(大文件不缓存)。默认 1 MiB。
+    """
+    enabled: bool = Field(True, description="HTTP 响应缓存总开关")
+    ttl: int = Field(60, description="缓存条目有效期(秒),命中滑动刷新")
+    max_entries: int = Field(10_000, description="缓存条目数硬上限,超限 LRU 淘汰")
+    max_bytes: int = Field(256 * 1024 * 1024, description="缓存总字节上限,超限 LRU 淘汰")
+    stream_cache_limit: int = Field(1 * 1024 * 1024, description="单条响应 body 缓冲上限(字节),超过放弃缓存")
+
+
+class ProbeCanaryConfig(BaseModel):
+    """一个探活 canary 目标(P2:多 canary/按标签探活)。
+
+    name:    canary 名称(可观测/日志)。
+    target:  "host:port"(或 "[ipv6]:port")。必须"本机直连可达 + 经目标标签
+             代理也可达"。
+    tags:    该 canary 适用哪些代理标签(如 region=cn)。代理 tags 全命中即选
+             该 canary;未配置 tags 的 canary 作为兜底(默认第一条)。
+    """
+    name: str = Field("global", description="canary 名称")
+    target: str = Field(..., description="探活目标 host:port")
+    tags: Optional[Dict[str, str]] = Field(None, description="适用代理标签,全命中即选")
+
+
+class ConnPoolConfig(BaseModel):
+    """CONNECT 上游 TCP 预热池(P1)。
+
+    enabled:      总开关(默认关闭)。开启后为每个上游代理维护少量空闲 TCP
+                 连接,CONNECT 请求到来时优先取已连接到代理的 socket 再发
+                 CONNECT target,省掉"本机→上游代理"的建连 TTFB。
+    per_proxy:    每个上游最多预热连接数(默认 4)。
+    total:        全局预热连接数上限(fd 预算,默认 64)。
+    idle_timeout: 空闲连接超时(秒,默认 30)。超时未取用则关闭,防泄漏。
+    refill_interval: 后台补充预热连接的周期(秒,默认 5)。0=只取不补。
+    refill_target: 每代理保持的空闲连接数目标(默认 2,受 per_proxy/total 钳制)。
+    connect_timeout: 预热/取用建连超时(秒,默认 10)。
+    """
+    enabled: bool = Field(False, description="启用 CONNECT 上游 TCP 预热池")
+    per_proxy: int = Field(4, description="每代理预热连接数上限")
+    total: int = Field(64, description="全局预热连接数上限(fd 预算)")
+    idle_timeout: float = Field(30.0, description="空闲连接超时(秒)")
+    refill_interval: float = Field(5.0, description="后台补充预热连接的周期(秒),0=只取不补")
+    refill_target: int = Field(2, description="每代理保持的空闲连接数目标")
+    connect_timeout: float = Field(10.0, description="预热/取用建连超时(秒)")
+
+
+class ConcurrencyLimitConfig(BaseModel):
+    """自适应并发限制(P3):每代理并发上限随稳定性加减。
+
+    enabled:  总开关(默认关闭)。
+    initial:  每代理初始并发上限(默认 16)。
+    min:      上限下限(默认 2)。
+    max:      上限上限(默认 128)。
+    add_on_success: 成功且稳定 → 加性增加上限(默认 +4,封顶 max)。
+    mult_on_failure: 超时/5xx/EWMA 快速恶化 → 乘性降低上限(默认 0.5,触底 min)。
+    failure_window:  用于 EWMA 恶化判定的成功观测窗口(默认 20 次观测内比较)。
+    """
+    enabled: bool = Field(False, description="启用自适应并发限制")
+    initial: int = Field(16, description="每代理初始并发上限")
+    min: int = Field(2, description="并发上限下限")
+    max: int = Field(128, description="并发上限上限")
+    add_on_success: int = Field(4, description="成功加性增加上限")
+    mult_on_failure: float = Field(0.5, description="失败乘性降低上限")
+    failure_window: int = Field(20, description="EWMA 恶化比较的观测窗口")
+
+
+class SwitchDampingConfig(BaseModel):
+    """域名赢家切换阻尼(P3)。
+
+    enabled:  总开关(默认关闭)。开启后新赢家不能因单次竞速抖动就替换稳定
+              域名赢家,降低出口 IP 抖动(适合 egress 稳定要求高的部署)。
+    min_wins: 新赢家需连续胜出多少次才替换旧赢家(默认 2)。
+    ratio:    新赢家 EWMA ≤ 旧赢家 × ratio 即立即切换(如 0.8 = 快 20%)。
+              0=关闭该维度。
+    abs_ms:   新赢家 EWMA 比旧赢家快 ≥ abs_ms 毫秒即立即切换。0=关闭。
+    """
+    enabled: bool = Field(False, description="启用域名赢家切换阻尼")
+    min_wins: int = Field(2, description="新赢家需连续胜出次数才替换")
+    ratio: float = Field(0.8, description="新赢家 EWMA ≤ 旧×ratio 立即切换(0=关闭)")
+    abs_ms: float = Field(30.0, description="新赢家快 ≥ 该毫秒立即切换(0=关闭)")
+
+
+class AdaptiveTTLConfig(BaseModel):
+    """自适应域名缓存 TTL(P2)。
+
+    enabled:  总开关(默认关闭,保持全局固定 cache_ttl 的旧行为)。
+    min_sec:  每域名 TTL 下限(秒)。抖动域名/代理恶化 → TTL 回落到该值。
+    max_sec:  每域名 TTL 上限(秒)。稳定域名连续同代理胜出 → TTL 上浮到该值封顶。
+    """
+    enabled: bool = Field(False, description="启用自适应域名缓存 TTL")
+    min_sec: float = Field(60.0, description="每域名 TTL 下限(秒)")
+    max_sec: float = Field(1800.0, description="每域名 TTL 上限(秒)")
 
 
 class CircuitConfig(BaseModel):
@@ -115,7 +250,8 @@ class CircuitConfig(BaseModel):
                        会误判剧烈恶化——绝对差值低于该 slack 时不降级。
     """
     probe_interval_sec: float = Field(30.0, description="后台探活周期(秒),0=关闭主动探活")
-    probe_canary: str = Field("1.1.1.1:443", description="探活目标 host:port")
+    probe_canary: str = Field("1.1.1.1:443", description="探活目标 host:port(单 canary;被 probe_canaries 覆盖)")
+    probe_canaries: List[ProbeCanaryConfig] = Field(default_factory=list, description="多 canary(按代理标签选),配置后替代 probe_canary")
     circuit_threshold: int = Field(3, description="连续失败熔断阈值")
     circuit_max_backoff: float = Field(300.0, description="熔断退避上限(秒),指数增长到该值")
     slow_start_window: float = Field(60.0, description="slow-start 爬升窗口(秒)")
@@ -155,6 +291,12 @@ class RouterConfig(BaseModel):
     circuit: CircuitConfig = Field(default_factory=CircuitConfig, description="熔断器/探活/slow-start 配置")
     auth: AuthConfig = Field(default_factory=AuthConfig, description="客户端认证配置")
     stickiness: StickinessConfig = Field(default_factory=StickinessConfig, description="会话粘性配置")
+    policies: List[PolicyConfig] = Field(default_factory=list, description="策略路由:按目标域名收窄候选代理集(见 PolicyConfig)")
+    http_cache: HttpCacheConfig = Field(default_factory=HttpCacheConfig, description="HTTP 响应缓存 LRU + 容量上限配置(见 HttpCacheConfig)")
+    adaptive_ttl: AdaptiveTTLConfig = Field(default_factory=AdaptiveTTLConfig, description="自适应域名缓存 TTL(见 AdaptiveTTLConfig)")
+    switch_damping: SwitchDampingConfig = Field(default_factory=SwitchDampingConfig, description="域名赢家切换阻尼(见 SwitchDampingConfig)")
+    concurrency_limit: ConcurrencyLimitConfig = Field(default_factory=ConcurrencyLimitConfig, description="自适应并发限制(见 ConcurrencyLimitConfig)")
+    conn_pool: ConnPoolConfig = Field(default_factory=ConnPoolConfig, description="CONNECT 上游 TCP 预热池(见 ConnPoolConfig)")
 
 
 class Config(BaseModel):

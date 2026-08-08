@@ -2,6 +2,10 @@
 # auto_squid 配置示例 —— 结构与 config_schema.py 中的 Config 模型一一对应。
 # 通过 `python -m auto_squid.cli --config examples/config.yaml` 加载。
 # 所有字段均有默认值,缺少的配置块按默认行为启动。
+#
+# 本示例展示"速度相关"的完整字段(circuit / stagger / stickiness / policies /
+# http_cache),作为生产部署的起点。README 的"Speed tuning"一节给出三套
+# 推荐参数(稳定优先 / 速度优先 / 低扇出优先)。
 
 # 代理端口监听配置(面向客户端的 HTTP/CONNECT 代理端口)
 listen:
@@ -23,11 +27,23 @@ router:
   enable_local_racing: false
   # 竞速首批并行的代理数量;全失败后对剩余代理再竞速兜底
   max_retries: 3
+
+  # 错峰启动(RFC 8305 §5):竞速首批不再同时全发,先发最优 stagger_initial 个,
+  # 间隔 stagger_interval_ms 补发下一个;首个首字节成功即取消其余。
+  # 显著减少 CONNECT 隧道扇出与 HTTP 双写流量。默认开启。
+  stagger_start: true
+  # 错峰首批并发数(>=1,经 max_retries 钳制)。冷启动(无任何 EWMA 历史)时
+  # 自动翻倍到 2,避免随机首抽丢快代理。
+  stagger_initial: 1
+  # 相邻候选的启动间隔(毫秒),钳制到 [100, 2000]。默认 250。
+  stagger_interval_ms: 250
+
   # 客户端访问代理端口所需的 HTTP Basic 认证,默认关闭(开放代理)
   auth:
     enabled: false
     username: "admin"
     password: "changeme"
+
   # 会话粘性配置(per-client+domain 维度,内存-only,默认关闭)
   stickiness:
     enabled: false
@@ -42,10 +58,118 @@ router:
     # 防止客户端 IP 集合过大时内存无界增长。
     max_entries: 100000
 
+  # 熔断器 + 后台探活 + slow-start + in-flight 选批 + 单发降级
+  circuit:
+    # 后台探活周期(秒):每周期对 enabled 代理做轻量 CONNECT 到 canary + 关闭,
+    # 更新 EWMA 与熔断计数。0=关闭主动探活(仅真实请求驱动熔断)。
+    probe_interval_sec: 30
+    # 探活目标 "host:port"。必须选"本机直连可达、上游代理也可达"的目标——
+    # 本机不可达时探活整轮跳过(计 probes_skipped),不误熔断健康代理。
+    # 域名会走 DNS,用可达域名比 IP 更稳。部署后看 /circuit 的 probes_skipped
+    # 持续增长说明 canary 不适合当前网络,应更换。
+    probe_canary: "www.baidu.com:443"
+    # 多 canary(P2):按代理标签选 canary,让探活更贴近真实目标网络。
+    # probe_canaries 配置后替代 probe_canary;代理 tags 全命中第一条匹配的
+    # canary,无 tags 的 canary 作为兜底,全未命中回退 probe_canary。
+    # probe_canaries:
+    #   - name: "global"
+    #     target: "1.1.1.1:443"
+    #   - name: "cn"
+    #     target: "www.baidu.com:443"
+    #     tags:
+    #       region: "cn"
+    # 连续失败多少次触发熔断(真实请求失败与探活失败共享计数)。默认 3。
+    circuit_threshold: 3
+    # 熔断退避上限(秒):退避指数增长 1s→2s→4s→… 直到此上限。默认 300。
+    circuit_max_backoff: 300
+    # slow-start 爬升窗口(秒):熔断退避到期后,该代理在此窗口内低权重垫底。
+    slow_start_window: 60
+    # slow-start 恢复期内累计成功多少次后恢复完整权重。默认 3。
+    slow_start_success: 3
+    # 加权 least-request 在途惩罚指数:排序权重 = ewma × (1 + active)^bias。
+    # 在途积压多的代理被压低,保护慢代理不被打爆。1.0 默认;最快代理被过度
+    # 避让可降到 0.5;慢代理易积压可升到 1.5。0=退化为纯 EWMA 排序。
+    lb_bias: 1.0
+    # 单发降级(质量感知的确定性探路):域名缓存/粘性命中单发时,被钉住代理
+    # 连续失败 ≥ 阈值 或 EWMA 相对钉住时恶化 ratio 倍,主动降级回竞速。
+    # 0=关闭对应维度。fail 建议 = circuit_threshold-1(熔断早告警)。
+    single_send_degrade_fail: 2
+    single_send_degrade_ratio: 3.0
+    single_send_degrade_slack_ms: 10
+
+  # 策略路由(P1):按目标域名/标签收窄竞速候选集。不配置则对所有 enabled
+  # 代理统一竞速。match 命中按列表顺序取第一条,proxies 可按 tags 或 ids 收窄。
+  # policies:
+  #   - match:
+  #       domain_suffix: [".cn", "baidu.com", "qq.com"]
+  #     proxies:
+  #       tags:
+  #         region: "cn"
+  #   - match:
+  #       domain_suffix: ["youtube.com", "google.com"]
+  #     proxies:
+  #       tags:
+  #         region: "hk"
+  #   - match:
+  #       domain_regex: ".*\\.api\\.example\\.com$"
+  #     proxies:
+  #       ids: ["proxy-a", "proxy-b"]
+
+  # HTTP 响应缓存容量(P2):LRU 淘汰,防止高基数 URL 下内存无界增长。
+  # http_cache:
+  #   enabled: true
+  #   ttl: 60
+  #   max_entries: 10000
+  #   max_bytes: 268435456
+  #   stream_cache_limit: 1048576
+
+  # 自适应域名缓存 TTL(P2):稳定域名 TTL 上浮(减少竞速),抖动域名/代理恶化
+  # TTL 回落(更快换路)。默认关闭(保持全局固定 cache_ttl 的旧行为)。
+  # adaptive_ttl:
+  #   enabled: true
+  #   min_sec: 60
+  #   max_sec: 1800
+
+  # 域名赢家切换阻尼(P3):新赢家不能因单次竞速抖动就替换稳定域名赢家,
+  # 需连续胜出 min_wins 次,或 EWMA 显著优于旧赢家(ratio 比例/abs_ms 绝对
+  # 毫秒)才立即替换。对 5xx/熔断类故障跳过阻尼立即切换。适合 egress 稳定
+  # 要求高于极致低延迟的部署。默认关闭。
+  # switch_damping:
+  #   enabled: true
+  #   min_wins: 2
+  #   ratio: 0.8
+  #   abs_ms: 30.0
+
+  # 自适应并发限制(P3):每代理并发上限成功加性增/失败乘性降,在途达上限的
+  # 代理不参与竞速候选,防慢代理被请求堆死。默认关闭(需压测/生产观测调参,
+  # 与策略路由/多 canary 配合避免把源站慢误判为代理慢)。
+  # concurrency_limit:
+  #   enabled: true
+  #   initial: 16
+  #   min: 2
+  #   max: 128
+  #   add_on_success: 4
+  #   mult_on_failure: 0.5
+  #   failure_window: 20
+
+  # CONNECT 上游 TCP 预热池(P1):为每上游维护少量空闲 TCP,CONNECT 请求优先取
+  # 池中连接再发 CONNECT target,省掉"本机→上游代理"的建连 TTFB(HTTPS 短连接
+  # 场景收益最大)。带 per-proxy 上限 + 全局 fd 预算 + 空闲超时,防泄漏。
+  # 默认关闭。开启后看 /metrics 的 conn_pool_hits/misses 评估收益。
+  # conn_pool:
+  #   enabled: true
+  #   per_proxy: 4
+  #   total: 64
+  #   idle_timeout: 30.0
+  #   refill_interval: 5.0
+  #   refill_target: 2
+  #   connect_timeout: 10.0
+
 # 日志配置;file 为 null 时写默认文件 auto_squid.log
 logging:
   level: "INFO"
   file: "auto_squid.log"
 
 # 上游代理列表请放独立文件,通过 --proxies examples/proxies.yaml 加载
-# (见 examples/proxies.yaml,结构与 ProxyInfo 模型一致)
+# (见 examples/proxies.yaml,结构与 ProxyInfo 模型一致;ProxyInfo.tags 可给代理
+#  打 region/line/cost/bandwidth 等标签,供策略路由的 proxies.tags 匹配)

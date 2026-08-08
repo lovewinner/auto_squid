@@ -35,17 +35,19 @@ import asyncio
 import base64
 import logging
 import random
+import re
 import socket
 import sqlite3
 import threading
 import time
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Any, Dict, Tuple
 import httpx
 
 from .proxy_store import ProxyStore
 from .auth import check_auth
+from .config_schema import PolicyConfig
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +154,14 @@ class ProxySelector:
                  circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF,
                  slow_start_window: float = _SLOW_START_WINDOW,
                  slow_start_success: int = _SLOW_START_SUCCESS,
-                 lb_bias: float = _LB_BIAS_DEFAULT):
+                 lb_bias: float = _LB_BIAS_DEFAULT,
+                 concurrency_limit_enabled: bool = False,
+                 concurrency_limit_initial: int = 16,
+                 concurrency_limit_min: int = 2,
+                 concurrency_limit_max: int = 128,
+                 concurrency_add_on_success: int = 4,
+                 concurrency_mult_on_failure: float = 0.5,
+                 concurrency_failure_window: int = 20):
         self.proxy_store = proxy_store
         self.circuit_threshold = max(1, circuit_threshold)
         self.circuit_max_backoff = max(1.0, circuit_max_backoff)
@@ -161,6 +170,17 @@ class ProxySelector:
         # 加权 least-request 的在途惩罚指数(见 _LB_BIAS_DEFAULT)。
         # 排序权重 = ewma × (1 + active)^bias;bias=0 退化为纯 EWMA 排序。
         self.lb_bias = max(0.0, lb_bias)
+        # ── 自适应并发限制(P3)────────────────────────────────
+        # 每代理并发上限,成功加性增/失败乘性降,防慢代理被请求堆死。
+        self.concurrency_enabled = concurrency_limit_enabled
+        self._conc_initial = max(1, concurrency_limit_initial)
+        self._conc_min = max(1, min(concurrency_limit_min, self._conc_initial))
+        self._conc_max = max(self._conc_initial, concurrency_limit_max)
+        self._conc_add = max(1, concurrency_add_on_success)
+        self._conc_mult = max(0.0, min(1.0, concurrency_mult_on_failure))
+        self._conc_win = max(1, concurrency_failure_window)
+        # {pid: {"limit": int, "ok": int, "fail": int}} —— ok/fail 为最近窗口计数。
+        self._conc: dict[str, dict[str, float]] = {}
         # 每代理质量: {pid: {"ewma_ttfb": float(秒), "obs": int}}。
         #   obs = 成功观测计数(EWMA 样本数),供单发降级判定把"当前 EWMA"与该代理
         #   被钉住时的基线 EWMA 对比(见 Router._single_send_degraded)。obs==1 时
@@ -208,6 +228,54 @@ class ProxySelector:
         """返回当前在途数快照 {pid: n}(供 /metrics / 仪表盘,读内存无锁)。"""
         return dict(self._in_flight)
 
+    # ── 自适应并发限制(P3)────────────────────────────────────
+
+    def _conc_state(self, pid: str) -> dict[str, float]:
+        """惰性取(或建)某代理的并发限制状态。"""
+        s = self._conc.get(pid)
+        if s is None:
+            s = {"limit": float(self._conc_initial), "ok": 0.0, "fail": 0.0}
+            self._conc[pid] = s
+        return s
+
+    def _at_concurrency_limit(self, pid: str) -> bool:
+        """该代理当前在途数是否达到并发上限。"""
+        if not self.concurrency_enabled:
+            return False
+        s = self._conc_state(pid)
+        return self._in_flight.get(pid, 0) >= int(s["limit"])
+
+    def _conc_observe_success(self, pid: str):
+        """成功观测:窗口内累计成功;达标(成功 ≥ 窗口)且稳定 → 加性提升上限。
+
+        只增不降,上限封顶 _conc_max。用 EWMA 作为稳定度参考:仅当当前观测数
+        >= 窗口时才提升,避免冷启动即打满。
+        """
+        if not self.concurrency_enabled:
+            return
+        s = self._conc_state(pid)
+        s["ok"] = int(s.get("ok", 0)) + 1
+        s["fail"] = 0  # 成功清零失败窗口
+        if s["ok"] >= self._conc_win and int(s["limit"]) < self._conc_max:
+            s["limit"] = min(float(self._conc_max), int(s["limit"]) + self._conc_add)
+            s["ok"] = 0
+
+    def _conc_observe_failure(self, pid: str):
+        """失败观测:乘性降低上限(触底 _conc_min),并清成功窗口。"""
+        if not self.concurrency_enabled:
+            return
+        s = self._conc_state(pid)
+        s["fail"] = int(s.get("fail", 0)) + 1
+        if s["fail"] >= 1:
+            new_limit = max(float(self._conc_min), int(s["limit"]) * self._conc_mult)
+            s["limit"] = new_limit
+            s["fail"] = 0
+            s["ok"] = 0
+
+    def get_concurrency_limits(self) -> dict[str, int]:
+        """返回当前每代理并发上限快照 {pid: limit}(供 /metrics / 仪表盘)。"""
+        return {pid: int(s["limit"]) for pid, s in self._conc.items()}
+
     def record_ttfb(self, pid: str, ttfb: float):
         """记录一次成功请求的首字节耗时(秒),更新该代理的 EWMA。
 
@@ -217,10 +285,12 @@ class ProxySelector:
         q = self._quality.get(pid)
         if q is None:
             self._quality[pid] = {"ewma_ttfb": ttfb, "obs": 1}
+            self._conc_observe_success(pid)
             return
         old = q["ewma_ttfb"]
         q["ewma_ttfb"] = (1.0 - self.EWMA_ALPHA) * old + self.EWMA_ALPHA * ttfb
         q["obs"] = int(q.get("obs", 0)) + 1
+        self._conc_observe_success(pid)
 
     def reset_quality(self):
         """清空全部质量数据(RFC 8305 §4:历史 RTT 不可跨网络沿用)。
@@ -231,6 +301,7 @@ class ProxySelector:
         self._quality.clear()
         self._circuit.clear()
         self._in_flight.clear()
+        self._conc.clear()  # 并发上限随质量重学(P3)
 
     def reset_circuits(self):
         """手动解除全部代理的熔断并清空连续失败计数(运维介入后调用)。
@@ -255,6 +326,7 @@ class ProxySelector:
         退避期指数增长:首熔断 backoff=1s,此后每次新熔断翻倍(上限
         circuit_max_backoff)。退避期内 open_until 未到,该代理不参与竞速/单发。
         """
+        self._conc_observe_failure(pid)  # 自适应并发:失败 → 乘性降低上限(P3)
         s = self._circuit_state(pid)
         s["consec_fail"] = int(s.get("consec_fail", 0)) + 1
         if s["consec_fail"] >= self.circuit_threshold:
@@ -402,6 +474,9 @@ class ProxySelector:
         enabled = [p for p in proxies if p.enabled]
         # 过滤熔断中的代理(is_circuit_open 同时处理退避到期解熔断)。
         enabled = [p for p in enabled if not self.is_circuit_open(p.id)]
+        # 自适应并发限制(P3):在途已达上限的代理不参与候选(防慢代理被堆死)。
+        if self.concurrency_enabled:
+            enabled = [p for p in enabled if not self._at_concurrency_limit(p.id)]
         random.shuffle(enabled)
         enabled.sort(key=lambda p: (self._slow_start_rank(p.id),
                                     self._quality_rank(p.id)[0],  # 未知质量垫底
@@ -420,7 +495,7 @@ class Router:
     生命周期:start() 开始监听 → handle_client 处理每个连接 → stop() 优雅关闭。
     """
 
-    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0):
+    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0):
         """构造路由器。
 
         参数:
@@ -473,6 +548,43 @@ class Router:
                                 都极小时(如 0.2ms→0.9ms,比值 4.5 但绝对差距 <1ms)
                                 用纯比值会误判剧烈恶化——绝对差值低于该 slack 时
                                 即使比值超阈值也不降级(默认 10)。
+            policies:           策略路由:按目标域名(后缀/精确/正则)命中第一条
+                                策略,把候选代理集收窄到该策略允许的 tags/ids 子集
+                                (作用于竞速、域名缓存、粘性,三者一致)。
+            http_cache_ttl:     HTTP 响应缓存条目有效期(秒),命中滑动刷新。
+            http_cache_max_entries: 缓存条目数硬上限,超限按 LRU 淘汰最久未访问。
+            http_cache_max_bytes:   缓存总字节(body)上限,超限按 LRU 淘汰。
+            http_cache_stream_limit: 单条响应 body 缓冲上限(字节),超过放弃缓存。
+            adaptive_ttl:       启用自适应域名缓存 TTL(默认关闭)。开启后每域名
+                                TTL 按稳定度升降:连续同代理胜出 → TTL 上浮
+                                (上限 adaptive_ttl_max);单发降级/换赢家/熔断类
+                                故障 → TTL 回落(下限 adaptive_ttl_min)。
+            adaptive_ttl_min:   自适应 TTL 下限(秒,默认 60)。
+            adaptive_ttl_max:   自适应 TTL 上限(秒,默认 1800)。
+            switch_damping:     启用域名赢家切换阻尼(默认关闭)。新赢家不能因单次
+                                竞速抖动就替换稳定域名赢家,需连续胜出
+                                switch_damping_min_wins 次,或 EWMA 显著优于旧赢家
+                                (switch_damping_ratio 比例 / switch_damping_abs_ms
+                                绝对毫秒)才立即替换。降低出口 IP 抖动。
+            switch_damping_min_wins: 新赢家需连续胜出次数(默认 2)。
+            switch_damping_ratio: 新赢家 EWMA ≤ 旧×该比例即立即切换(默认 0.8)。
+            switch_damping_abs_ms: 新赢家快 ≥ 该毫秒即立即切换(默认 30)。
+            concurrency_limit_enabled: 启用自适应并发限制(默认关闭)。每代理
+                                并发上限成功加性增/失败乘性降,在途达上限的代理
+                                不参与竞速候选,防慢代理被请求堆死。
+            concurrency_limit_initial/min/max: 每代理并发上限的初始/下限/上限。
+            concurrency_add_on_success: 成功且稳定时加性提升上限(默认 +4)。
+            concurrency_mult_on_failure: 失败时乘性降低上限(默认 0.5)。
+            concurrency_failure_window: 成功观测窗口(达标才提升上限)。
+            conn_pool_enabled:   启用 CONNECT 上游 TCP 预热池(默认关闭)。为每
+                                上游维护少量空闲 TCP,CONNECT 到来优先取池中
+                                socket 再发 CONNECT target,省"本机→上游"建连。
+            conn_pool_per_proxy: 每代理预热连接数上限。
+            conn_pool_total:     全局预热连接数上限(fd 预算)。
+            conn_pool_idle_timeout: 空闲连接超时(秒),超时未取用则关闭。
+            conn_pool_refill_interval: 后台补充周期(秒),0=只取不补。
+            conn_pool_refill_target: 每代理保持的空闲连接数目标。
+            conn_pool_connect_timeout: 预热/取用建连超时(秒)。
         """
         self.proxy_store = proxy_store
         self.selector = ProxySelector(
@@ -481,7 +593,14 @@ class Router:
             circuit_max_backoff=circuit_max_backoff,
             slow_start_window=slow_start_window,
             slow_start_success=slow_start_success,
-            lb_bias=lb_bias)
+            lb_bias=lb_bias,
+            concurrency_limit_enabled=concurrency_limit_enabled,
+            concurrency_limit_initial=concurrency_limit_initial,
+            concurrency_limit_min=concurrency_limit_min,
+            concurrency_limit_max=concurrency_limit_max,
+            concurrency_add_on_success=concurrency_add_on_success,
+            concurrency_mult_on_failure=concurrency_mult_on_failure,
+            concurrency_failure_window=concurrency_failure_window)
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.max_retries = max_retries
@@ -492,10 +611,18 @@ class Router:
         # 喂 EWMA 与熔断计数;0=关闭主动探活。退避到期 → slow-start 低权重爬升。
         self.probe_interval_sec = probe_interval_sec
         self.probe_canary = probe_canary
+        # ── 多 canary / 按标签探活(P2)─────────────────────────
+        # probe_canaries 配置后替代单 canary:每个代理按 tags 命中第一条匹配的
+        # canary(无 tags 的 canary 为兜底),未命中任何 → 用全局 probe_canary。
+        # 结构:[{"name": str, "target": "host:port", "tags": {k:v}},...]
+        self.probe_canaries: List[Dict[str, Any]] = [
+            dict(c) for c in (probe_canaries or []) if c.get("target")
+        ]
         self._probe_task: Optional[asyncio.Task] = None
         self.probes_sent = 0
         self.probes_ok = 0
         self.probes_skipped = 0  # 因本机→canary 不可达(环境原因)而跳过的探活次数
+        self.probes_failed = 0   # 经上游 CONNECT 失败的探活次数(上游侧真故障)
         # 熔断开启计数归 ProxySelector 维护(开启时刻在 record_failure 内),经
         # snapshot_counters 经 selector.circuit_open_count 读取。
         self.enable_local_racing = enable_local_racing
@@ -519,6 +646,22 @@ class Router:
         self.request_counts: dict[str, int] = {}
         self.attempted_counts: dict[str, int] = {}
         self.cache_ttl = cache_ttl
+        # 自适应域名缓存 TTL(P2):开启后每域名 TTL 按稳定度升降。
+        self.adaptive_ttl_enabled = adaptive_ttl
+        self.adaptive_ttl_min = max(1.0, adaptive_ttl_min)
+        self.adaptive_ttl_max = max(self.adaptive_ttl_min, adaptive_ttl_max)
+        # ── 域名赢家切换阻尼(P3)──────────────────────────────
+        # 开启后新赢家不能因单次竞速抖动就替换稳定域名赢家:需连续胜出
+        # switch_damping_min_wins 次,或 EWMA 显著优于旧赢家(比例/绝对毫秒)
+        # 才立即替换。对 5xx/熔断类故障跳过阻尼立即切换。降低出口 IP 抖动。
+        self.switch_damping_enabled = switch_damping
+        self.switch_damping_min_wins = max(1, int(switch_damping_min_wins))
+        self.switch_damping_ratio = max(0.0, float(switch_damping_ratio))
+        self.switch_damping_abs_ms = max(0.0, float(switch_damping_abs_ms))
+        # 每域名"新赢家候选连续胜出计数"与"被阻尼的替换次数(可观测)"。
+        self._damping_wins: dict[str, dict[str, int]] = {}   # domain -> {pid: consecutive}
+        self.switch_damping_blocks = 0   # 被阻尼挡下的替换次数
+        self.switch_damping_fast_swaps = 0  # 因 EWMA 显著优势直接切换的次数
         # ── 会话粘性 ────────────────────────────────────────────
         # 键 = "{client_ip}|{domain}",值 = {"proxy_id": pid, "updated_at": ts}。
         # 纯内存、滑动 TTL:同一客户端+域名复用上次胜出的代理,保持 egress IP
@@ -546,6 +689,18 @@ class Router:
         # 重新可单发,无需冷却),此集合只供 /metrics /circuit 展示"当前被判定降级的
         # 代理";由 _record_win_meta(新赢家接管)或 reset_proxy_quality 清除。
         self._degraded_single_send: set[str] = set()
+        # ── 策略路由(P1)───────────────────────────────────────
+        # 按目标域名收窄候选代理集。不配置(policies 为空)→ 对所有 enabled
+        # 代理统一竞速,等价旧行为。预编译正则避免每请求重编译;条目为
+        # (policy_index, compiled_regex),匹配时按该索引取对应策略。
+        self._policies = [p for p in (policies or []) if p.match is not None]
+        self._policy_regexes: List[Tuple[int, re.Pattern]] = []
+        for idx, pol in enumerate(self._policies):
+            for pat in pol.match.domain_regex or []:
+                try:
+                    self._policy_regexes.append((idx, re.compile(pat)))
+                except re.error:
+                    logger.warning("ignoring invalid domain_regex %r in policy %d", pat, idx)
         # ── 服务端性能计数器 ────────────────────────────────────
         # 供压测经 /metrics 跨进程读取,在两种上游模式(mock/real)下统一计算
         # 缓存命中率与竞速放大率——不再依赖 mock 上游的 hit_count(那只对 mock
@@ -568,6 +723,30 @@ class Router:
         # 权衡而非净赢(且有坏点:5s 配置引爆 soak p99 + fd 堆积),故回退,保留
         # 原超时。尾延迟治理改由 Phase 2a(败者清理下放后台)承担,不带超时权衡。
         self._upstream_timeout = httpx.Timeout(10.0, connect=5.0, pool=5.0, read=10.0, write=10.0)
+
+        # ── CONNECT 上游 TCP 预热池(P1)────────────────────────
+        # 每个上游维护少量空闲 TCP 连接,CONNECT 请求到来时优先取池中 socket
+        # 再发 CONNECT target,省掉"本机→上游代理"的建连 TTFB。隧道结束后该
+        # 连接不可复用到新 target(CONNECT 后 socket 已被隧道占用),但池可提前
+        # 补充下一条空闲连接。资源约束:per-proxy 上限 + 全局 fd 预算(total)+
+        # 空闲超时,防泄漏。后台 refill task 周期性补充到目标水位。
+        self.conn_pool_enabled = conn_pool_enabled
+        self.conn_pool_per_proxy = max(1, conn_pool_per_proxy)
+        self.conn_pool_total = max(1, conn_pool_total)
+        self.conn_pool_idle_timeout = max(1.0, conn_pool_idle_timeout)
+        self.conn_pool_refill_interval = max(0.0, conn_pool_refill_interval)
+        self.conn_pool_refill_target = max(0, min(self.conn_pool_per_proxy, conn_pool_refill_target))
+        self.conn_pool_connect_timeout = max(1.0, conn_pool_connect_timeout)
+        # {proxy_url: [StreamWriter,...]} —— 空闲预热连接。只由事件循环线程读写。
+        self._conn_pool: dict[str, list] = {}
+        self.conn_pool_creates = 0      # 累计预热建连次数
+        self.conn_pool_hits = 0         # 池中取用成功次数
+        self.conn_pool_misses = 0       # 取池未中需新建的次数
+        self.conn_pool_expired = 0      # 空闲超时关闭次数
+        self._conn_pool_task: Optional[asyncio.Task] = None
+        # 观测(P1 先观测后实现):CONNECT 到上游的新建 TCP 连接计数(不含预热池
+        # 命中)。供压测算 HTTPS 建链成本、验证预热池收益。
+        self.connect_new_conns = 0
 
         # ── 数据持久化 ──────────────────────────────────────────
         self._db_path = db_path
@@ -611,6 +790,15 @@ class Router:
         # _stats_cache: {domain: {pid: wins}}(内存累加,后台 flush 落盘)
         self._meta_cache: dict[str, dict[str, str]] = {}
         self._stats_cache: dict[str, dict[str, int]] = {}
+        # ── 自适应域名缓存 TTL(P2)──────────────────────────────
+        # 每域名独立 TTL,按稳定度升降(见 _domain_ttl)。状态与 _meta_cache
+        # 并列维护:meta 负责"当前赢家/时间",这里负责"该域名缓存多久过期"。
+        # 稳定域名 TTL 上浮(减少竞速),抖动域名 TTL 下调(更快换路)。
+        self._domain_ttl_cache: dict[str, float] = {}      # domain -> 当前 TTL(秒)
+        self._domain_switch_count: dict[str, int] = {}     # domain -> 切换赢家次数
+        self._domain_last_pid: dict[str, str] = {}         # domain -> 上次赢家 pid
+        self.domain_ttl_grows = 0       # TTL 上调次数(可观测)
+        self.domain_ttl_resets = 0      # TTL 下调/重置次数(可观测)
         self._load_caches_from_db()
         # _stats_dirty / _meta_dirty 标记自上次 flush 后是否有变更。
         self._stats_dirty = False
@@ -621,8 +809,20 @@ class Router:
         self._pending_cleanups: set = set()
 
         # ── HTTP 响应缓存 ───────────────────────────────────────
+        # P2:LRU + 容量上限。普通 dict 升级为 OrderedDict + 访问时间戳:
+        #   - _http_cache_get 命中时刷新 last_access(滑动 TTL + LRU 顺序);
+        #   - _http_cache_set 写入前检查 max_entries / max_bytes,超限淘汰
+        #     last_access 最旧的条目(避免高基数 URL 下内存无界增长)。
+        # 二级索引 _http_cache_domain_index 与淘汰同步维护,防漏删。
         self._http_cache: dict[str, dict] = {}
-        self._http_cache_ttl = 60
+        self._http_cache_ttl = max(1, http_cache_ttl)
+        self._http_cache_max_entries = max(1, http_cache_max_entries)
+        self._http_cache_max_bytes = max(1, http_cache_max_bytes)
+        # 流式转发时响应 body 的缓冲上限(超过放弃缓存该响应)。原为模块常量
+        # STREAM_CACHE_LIMIT,现由配置 http_cache.stream_cache_limit 控制。
+        self._stream_cache_limit = max(1024, http_cache_stream_limit)
+        self._http_cache_bytes = 0           # 当前缓存 body 总字节数
+        self.http_cache_evictions = 0        # 累计淘汰次数(LRU 或 TTL)
         # 二级索引: domain → set[缓存键]。使 _http_cache_invalidate 从 O(N) 降为
         # O(K)(K=该域名条目数)。_http_cache_set 写入时同步更新,_http_cache_get
         # 过期清除时同步删除。索引与主 dict 无锁(均在同一个 asyncio 线程)。
@@ -673,6 +873,53 @@ class Router:
         per_domain[pid] = per_domain.get(pid, 0) + 1
         self._stats_dirty = True
 
+    def _damping_allows_switch(self, domain: str, new_pid: str) -> bool:
+        """切换阻尼判定(P3):新赢家 new_pid 能否替换该域名当前赢家。
+
+        关闭(默认)→ 恒 True(旧行为)。开启时:
+          - 无当前赢家 / 同代理 / 旧赢家熔断或已删除 → 立即允许(首次钉住不算
+            切换;对故障类跳过阻尼立即换路)。
+          - EWMA 显著优势 → 立即允许:新 EWMA ≤ 旧 × ratio,或新 EWMA 快 ≥
+            abs_ms 毫秒(fast_swap 计数)。
+          - 否则需连续胜出 switch_damping_min_wins 次才允许(计数经 _damping_wins
+            维护,换候选清零);未达阈值 → 阻止(switch_damping_blocks 计数)。
+        """
+        if not self.switch_damping_enabled:
+            return True
+        old_entry = self._meta_cache.get(domain)
+        if not old_entry:
+            return True
+        old_pid = old_entry["default_proxy"]
+        if old_pid == new_pid:
+            return True
+        # 旧赢家故障(熔断)/已删除 → 跳过阻尼立即切换。
+        if old_pid != 'local':
+            old_proxy = self.proxy_store.get(old_pid)
+            if not old_proxy or self.selector.is_circuit_open(old_pid):
+                return True
+        # EWMA 显著优势 → 立即切换。
+        if self.switch_damping_ratio > 0 or self.switch_damping_abs_ms > 0:
+            q = self.selector.get_quality()
+            new_ewma = self._proxy_quality_ewma(q.get(new_pid))
+            old_ewma = self._proxy_quality_ewma(q.get(old_pid))
+            if new_ewma is not None and old_ewma is not None and old_ewma > 0:
+                if self.switch_damping_ratio > 0 and new_ewma <= old_ewma * self.switch_damping_ratio:
+                    self.switch_damping_fast_swaps += 1
+                    return True
+                if self.switch_damping_abs_ms > 0 \
+                        and new_ewma + self.switch_damping_abs_ms / 1000.0 <= old_ewma:
+                    self.switch_damping_fast_swaps += 1
+                    return True
+        # 需连续胜出:维护每域名的候选胜出计数。
+        per = self._damping_wins.setdefault(domain, {})
+        if per.get(new_pid, 0) + 1 >= self.switch_damping_min_wins:
+            self._damping_wins[domain] = {new_pid: 0}  # 已通过,清计数
+            return True
+        per.clear()
+        per[new_pid] = 1
+        self.switch_damping_blocks += 1
+        return False
+
     def _record_win_meta(self, domain: str, pid: str):
         """记录某域名确认的"赢家代理",更新 _meta_cache(域名→首选代理)。
 
@@ -683,12 +930,40 @@ class Router:
         Goal #6:此处是域名缓存钉住时刻——捕获 pid 当前 EWMA 作为 ref_ewma 基线
         (供 _get_fresh_proxy 判定"相对钉住时是否恶化");同时清除 _degraded_single_send
         标记(新赢家已接管,该代理可再次被单发)。
+
+        P2 自适应 TTL:每次确认赢家时按稳定度演化该域名 TTL——
+          - 同代理连续胜出(稳定)→ TTL 上浮,步进 1.5×,封顶 adaptive_ttl_max;
+          - 赢家切换(抖动)→ switch_count+1,TTL 下调至 adaptive_ttl_min。
+        _get_fresh_proxy 在命中时若检测到代理开始恶化(降级/熔断)也会把 TTL
+        打回下限(见 _domain_ttl)。
+
+        P3 切换阻尼:开启时若 _damping_allows_switch 判定新赢家不可替换旧赢家,
+        则**不更新** _meta_cache(保持旧赢家钉住,降低出口 IP 抖动),仅记录尝试。
         """
+        if not self._damping_allows_switch(domain, pid):
+            return  # 阻尼拦截:保持旧赢家,不替换
         self._meta_cache[domain] = {
             "default_proxy": pid,
             "updated_at": self._now_utc(),
             "ref_ewma": self._proxy_quality_ewma(self.selector.get_quality().get(pid)),
         }
+        if self.adaptive_ttl_enabled:
+            prev = self._domain_last_pid.get(domain)
+            if prev == pid:
+                # 同代理连续胜出 → TTL 上浮(步进 1.5×,封顶)。
+                new_ttl = min(self.adaptive_ttl_max,
+                              self._domain_ttl_cache.get(domain, self.cache_ttl) * 1.5)
+                if new_ttl > self._domain_ttl_cache.get(domain, self.cache_ttl):
+                    self.domain_ttl_grows += 1
+                self._domain_ttl_cache[domain] = new_ttl
+            else:
+                # 赢家切换(抖动)→ 计数 +1,TTL 回落下限。首次钉住(prev 为空)
+                # 不算切换,只有"从某代理换成另一代理"才算。
+                if prev is not None:
+                    self._domain_switch_count[domain] = self._domain_switch_count.get(domain, 0) + 1
+                    self.domain_ttl_resets += 1
+                self._domain_ttl_cache[domain] = self.adaptive_ttl_min
+            self._domain_last_pid[domain] = pid
         if pid in self._degraded_single_send:
             self._degraded_single_send.remove(pid)
         self._meta_dirty = True
@@ -760,63 +1035,90 @@ class Router:
         except asyncio.CancelledError:
             pass
 
-    async def _probe_all(self):
-        """对全部 enabled 代理各做一次轻量探活(并发,单个失败不影响其余)。
-
-        探活目标为 self.probe_canary(如 "1.1.1.1:443")。CONNECT 到 canary 只
-        验证上游代理存活与建连延迟,不做业务请求;成功/失败分别喂 EWMA 与
-        熔断计数,让质量模型在低流量期也能持续学习(而非只靠真实请求)。
-
-        关键预检:先直连一次 canary,确认"本机→canary"这条路径可达。若不可达
-        (选错 canary / 校网防火墙 DROP 出口,如 1.1.1.1),则经上游 CONNECT 到
-        canary 的应答永远收不到——探活结果反映的是本机路由而非上游健康,会把
-        健康上游误判为故障并误熔断。此时整轮探活跳过(计 probes_skipped),
-        避免污染熔断计数。直连超时 _PROBE_TIMEOUT;即便直连可达,经上游的
-        CONNECT 仍可能因上游侧不通而失败(该情况照常累计 record_failure)。
-        """
-        proxies = [p for p in self.proxy_store.list() if p.enabled]
-        if not proxies:
-            return
-        # 解析 canary "host:port" / "[ipv6]:port"。
-        if self.probe_canary.startswith('['):
-            c_host_end = self.probe_canary.find(']')
-            c_host = self.probe_canary[1:c_host_end]
-            c_port = int(self.probe_canary[c_host_end + 2:])
+    @staticmethod
+    def _parse_target(target: str) -> Tuple[str, int]:
+        """解析 "host:port" / "[ipv6]:port" 为目标 (host, port)。"""
+        if target.startswith('['):
+            host_end = target.find(']')
+            host = target[1:host_end]
+            port = int(target[host_end + 2:])
         else:
-            c_host, c_port_str = self.probe_canary.rsplit(':', 1)
-            c_port = int(c_port_str)
-        # 本机直连 canary 探可达性(短超时;失败仅跳过本轮,不算任何上游失败)。
-        canary_reachable = True
+            host, port_str = target.rsplit(':', 1)
+            port = int(port_str)
+        return host, port
+
+    def _canary_for_proxy(self, proxy) -> str:
+        """返回该代理应探活的 canary 目标:按 tags 命中第一条,无匹配用全局。
+
+        多 canary 配置(probe_canaries)下:遍历 canary,若 canary 有 tags 且
+        代理 tags 全命中 → 选它;若无 tags 的 canary(兜底)遇到即选。未配置
+        多 canary 或全未命中 → 回退 self.probe_canary(单 canary)。
+        """
+        if self.probe_canaries:
+            ptags = proxy.tags or {}
+            for c in self.probe_canaries:
+                ctags = c.get("tags") or {}
+                if not ctags:
+                    return c["target"]  # 兜底 canary
+                if all(ptags.get(k) == v for k, v in ctags.items()):
+                    return c["target"]
+        return self.probe_canary
+
+    async def _canary_reachable(self, target: str) -> bool:
+        """本机直连 canary 探可达性(短超时;失败仅跳过本轮,不算任何上游失败)。
+
+        探活结果只有在"本机→canary"路径可达时才有意义:不可达(选错 canary /
+        校网防火墙 DROP 出口)时经上游 CONNECT 的应答永远收不到,会把健康上游
+        误判为故障。返回 False 表示该 canary 不适合本机网络,本轮跳过。
+        """
+        try:
+            c_host, c_port = self._parse_target(target)
+        except (ValueError, IndexError):
+            logger.warning("invalid probe canary target %r", target)
+            return False
         try:
             c_reader, c_writer = await asyncio.wait_for(
                 asyncio.open_connection(c_host, c_port), timeout=_PROBE_TIMEOUT)
             c_writer.close()
             await c_writer.wait_closed()
+            return True
         except (asyncio.TimeoutError, OSError, ConnectionError):
-            canary_reachable = False
-        tasks = [asyncio.create_task(self._probe_proxy(p.id, canary_reachable))
-                 for p in proxies]
+            return False
+
+    async def _probe_all(self):
+        """对全部 enabled 代理各做一次轻量探活(并发,单个失败不影响其余)。
+
+        探活目标:单 canary(probe_canary)或按代理标签选的多 canary
+        (probe_canaries,见 _canary_for_proxy)。CONNECT 到 canary 只验证上游
+        存活与建连延迟;成功/失败分别喂 EWMA 与熔断计数。
+
+        关键预检:每代理按其 canary 先直连一次,确认"本机→canary"可达。不可达
+        时该代理探活跳过(计 probes_skipped),避免把健康上游误判为故障并误熔断。
+        直连超时 _PROBE_TIMEOUT;即便直连可达,经上游的 CONNECT 仍可能因上游侧
+        不通而失败(该情况照常累计 record_failure)。
+        """
+        proxies = [p for p in self.proxy_store.list() if p.enabled]
+        if not proxies:
+            return
+        tasks = [asyncio.create_task(self._probe_proxy(p)) for p in proxies]
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _probe_proxy(self, pid: str, canary_reachable: bool):
-        """对单个代理发起一次 CONNECT 探活:经该上游 CONNECT 到 canary 后关闭。
+    async def _probe_proxy(self, proxy):
+        """对单个代理发起一次 CONNECT 探活:经该上游 CONNECT 到其 canary 后关闭。
 
-        用裸 socket 建连(CONNECT 不需要连接池;探活低频,无池化价值)。成功:
-        记录 EWMA + 成功观测(连续失败归零);失败/超时:记录失败(累计连续
-        失败,达阈值即熔断,与真实请求失败同源)。'local' 是本机直连,无上游
-        可探,跳过。超时 _PROBE_TIMEOUT 防半开上游长期占用。
+        成功:记录 EWMA + 成功观测(连续失败归零);失败/超时:记录失败(累计连续
+        失败,达阈值即熔断,与真实请求失败同源)。'local' 是本机直连,无上游可
+        探,跳过。超时 _PROBE_TIMEOUT 防半开上游长期占用。
 
-        canary_reachable:本机直连 canary 是否可达。False 表示"探活目标在本机
-        网络里不可达"——此时探活结果无法反映上游代理的真实健康状况(上游可能
-        很好,只是本机到 canary 的路由/防火墙挡了)。为避免把健康上游误熔断,
-        跳过本轮探活,计入 probes_skipped,而不是累计 record_failure。
+        探活前先本机直连 canary(该代理选的 canary):不可达表示"探活目标在本机
+        网络里不可达"——探活结果无法反映上游真实健康(上游可能很好,只是本机到
+        canary 的路由/防火墙挡了)。跳过本轮,计入 probes_skipped,而不是累计
+        record_failure。
         """
-        if pid == 'local':
+        if proxy.id == 'local':
             return
-        proxy = self.proxy_store.get(pid)
-        if proxy is None:
-            return
-        if not canary_reachable:
+        canary = self._canary_for_proxy(proxy)
+        if not await self._canary_reachable(canary):
             self.probes_skipped += 1
             return
         self.probes_sent += 1
@@ -825,7 +1127,8 @@ class Router:
             up_reader, up_writer = await asyncio.wait_for(
                 asyncio.open_connection(proxy.host, proxy.port), timeout=_PROBE_TIMEOUT)
         except (asyncio.TimeoutError, OSError, ConnectionError):
-            self.selector.record_failure(pid)
+            self.selector.record_failure(proxy.id)
+            self.probes_failed += 1
             return
         try:
             auth_hdr = ""
@@ -834,17 +1137,18 @@ class Router:
                 encoded = base64.b64encode(raw.encode()).decode()
                 auth_hdr = f"Proxy-Authorization: Basic {encoded}\r\n"
             up_writer.write(
-                f"CONNECT {self.probe_canary} HTTP/1.1\r\nHost: {self.probe_canary}\r\n"
+                f"CONNECT {canary} HTTP/1.1\r\nHost: {canary}\r\n"
                 f"{auth_hdr}\r\n".encode('latin-1'))
             await up_writer.drain()
             status = await asyncio.wait_for(up_reader.readline(), timeout=_PROBE_TIMEOUT)
             if not status or b'200' not in status:
                 raise RuntimeError('probe CONNECT failed')
-            self.selector.record_ttfb(pid, time.perf_counter() - t0)
-            self.selector.record_success(pid)
+            self.selector.record_ttfb(proxy.id, time.perf_counter() - t0)
+            self.selector.record_success(proxy.id)
             self.probes_ok += 1
         except (asyncio.TimeoutError, OSError, ConnectionError, RuntimeError):
-            self.selector.record_failure(pid)
+            self.selector.record_failure(proxy.id)
+            self.probes_failed += 1
         finally:
             try:
                 up_writer.close()
@@ -866,6 +1170,27 @@ class Router:
         """
         return {d: dict(m) for d, m in self._meta_cache.items()}
 
+    def get_domain_meta_enriched(self) -> dict[str, dict]:
+        """读取域名元数据 + 自适应 TTL 状态(P2 验收:/domains/meta 展示
+        ttl/expires_at/switch_count)。仅自适应 TTL 开启时附加字段,否则与
+        get_domain_meta_from_db 同构(兼容旧消费方)。
+        """
+        out = {d: dict(m) for d, m in self._meta_cache.items()}
+        if self.adaptive_ttl_enabled:
+            now = datetime.now(timezone.utc)
+            for d, m in out.items():
+                ttl = self._domain_ttl(d)
+                m["ttl"] = ttl
+                try:
+                    dt = datetime.fromisoformat(m["updated_at"])
+                    m["expires_at"] = (dt + timedelta(seconds=ttl)).isoformat()
+                    m["ttl_remaining"] = max(0.0, (dt + timedelta(seconds=ttl) - now).total_seconds())
+                except Exception:
+                    m["expires_at"] = None
+                    m["ttl_remaining"] = None
+                m["switch_count"] = self._domain_switch_count.get(d, 0)
+        return out
+
     def snapshot_counters(self) -> dict:
         """快照服务端性能计数器 + 池/缓存规模,供 /metrics 跨进程读取。
 
@@ -881,6 +1206,8 @@ class Router:
             "racing_invocations": self.racing_invocations,
             "upstream_attempts": self.upstream_attempts,
             "http_cache_entries": len(self._http_cache),
+            "http_cache_bytes": self._http_cache_bytes,
+            "http_cache_evictions": self.http_cache_evictions,
             "client_pool_size": len(self._client_pool),
             "sticky_cache_size": len(self._sticky_cache),
             "request_counts": dict(self.request_counts),
@@ -888,12 +1215,28 @@ class Router:
             "proxy_quality": self.selector.get_quality(),
             "proxy_in_flight": self.selector.get_in_flight(),
             "max_in_flight": self.selector.max_in_flight,
+            "proxy_concurrency_limits": self.selector.get_concurrency_limits(),
+            "concurrency_limit_enabled": self.selector.concurrency_enabled,
+            "conn_pool_enabled": self.conn_pool_enabled,
+            "conn_pool_creates": self.conn_pool_creates,
+            "conn_pool_hits": self.conn_pool_hits,
+            "conn_pool_misses": self.conn_pool_misses,
+            "conn_pool_expired": self.conn_pool_expired,
+            "conn_pool_size": sum(len(v) for v in self._conn_pool.values()),
+            "connect_new_conns": self.connect_new_conns,
             "probes_sent": self.probes_sent,
             "probes_ok": self.probes_ok,
             "probes_skipped": self.probes_skipped,
+            "probes_failed": self.probes_failed,
             "circuit_open_count": self.selector.circuit_open_count,
             "circuit_state": self.selector.get_circuit_state(),
             "single_send_degrades": self.single_send_degrades,
+            "domain_ttl_grows": self.domain_ttl_grows,
+            "domain_ttl_resets": self.domain_ttl_resets,
+            "adaptive_ttl_enabled": self.adaptive_ttl_enabled,
+            "switch_damping_blocks": self.switch_damping_blocks,
+            "switch_damping_fast_swaps": self.switch_damping_fast_swaps,
+            "switch_damping_enabled": self.switch_damping_enabled,
         }
 
     def get_degraded_single_send(self) -> list[str]:
@@ -921,6 +1264,85 @@ class Router:
         状态,让代理立刻重新参与竞速。
         """
         self.selector.reset_circuits()
+
+    @staticmethod
+    def _normalize_host(host: str) -> str:
+        """规范化目标 host 用于策略匹配:小写、去尾部点、去 IPv6 括号、剥端口。
+
+        输入可能是纯域名、域名:port(CONNECT target)、[ipv6]:port 或 [ipv6]。
+        仅当末尾段为纯数字才剥端口,避免误伤裸 IPv6(裸 IPv6 不以 '[' 开头时
+        rpartition 后末段恰是十六进制,isdigit 为 False,不剥)。
+        """
+        h = host.strip().lower()
+        if h.startswith('[') and ']' in h:
+            h = h[1:h.find(']')]
+        elif ':' in h:
+            head, _, tail = h.rpartition(':')
+            if tail.isdigit():
+                h = head
+        return h.rstrip('.')
+
+    def _policy_matches(self, host: str) -> Optional[PolicyConfig]:
+        """返回命中的第一条策略(匹配条件 OR);无命中返回 None。
+
+        顺序语义:按配置的 policies 列表顺序,第一条命中即返回(可配置
+        覆盖/优先级)。命中后调用方用 _policy_allows_proxy 校验单个代理。
+        """
+        if not self._policies:
+            return None
+        h = self._normalize_host(host)
+        # 精确匹配与后缀匹配(直接比较,无正则开销;host 已小写化)。
+        for pol in self._policies:
+            m = pol.match
+            if h in (m.domain_exact or []):
+                return pol
+            if any(h.endswith(suf.lower()) for suf in (m.domain_suffix or [])):
+                return pol
+        # 正则匹配(数量少,预编译后逐条 re.search)。
+        for idx, rx in self._policy_regexes:
+            if rx.search(h):
+                return self._policies[idx]
+        return None
+
+    def _policy_allows_proxy(self, pol: PolicyConfig, proxy: Optional[Any]) -> bool:
+        """策略是否允许该代理参与候选:tags 或 ids 任一命中即允许(并集)。
+
+        代理不存在(如 'local' 直连)→ 仅当策略无 tags 且无 ids(未限制)才允许;
+        有 tags/ids 限制时 local 不属于任何显式子集,排除(防御:不直连绕过
+        策略)。防御性:策略限制为空(异常配置)视为不限制,不阻断流量。
+        """
+        if pol is None:
+            return True
+        tags = pol.proxies.tags or {}
+        ids = set(pol.proxies.ids or [])
+        if not tags and not ids:
+            return True  # 未限制:全量候选(防御,不阻断流量)
+        if proxy is None:
+            return False  # local 直连不在任何显式子集内
+        if proxy.id in ids:
+            return True
+        ptags = proxy.tags or {}
+        return any(ptags.get(k) == v for k, v in tags.items())
+
+    def _policy_candidate_pids(self, host: str, proxies: List[str]) -> List[str]:
+        """按 host 命中的策略过滤有序候选 pid 列表(保持顺序)。"""
+        pol = self._policy_matches(host)
+        if pol is None:
+            return proxies
+        return [pid for pid in proxies
+                if self._policy_allows_proxy(pol, self.proxy_store.get(pid))]
+
+    def _policy_allows_sticky(self, host: str, pid: str) -> bool:
+        """粘性/域名缓存取用时的策略校验:命中策略但 pid 不在子集 → 视为 miss。
+
+        与竞速候选收窄保持同一套策略,防止旧缓存/粘性条目绕过新策略
+        (文档 §8:策略路由必须同时作用于粘性、域名缓存与竞速)。
+        'local' 直连由 _policy_allows_proxy 处理(受限时排除)。
+        """
+        pol = self._policy_matches(host)
+        if pol is None:
+            return True
+        return self._policy_allows_proxy(pol, self.proxy_store.get(pid))
 
     @staticmethod
     def _proxy_quality_ewma(q: Optional[dict]) -> Optional[float]:
@@ -979,6 +1401,10 @@ class Router:
         if not entry:
             return None
         pid = entry["default_proxy"]
+        # 策略路由(P1):命中策略但缓存代理不在允许子集内 → 视为 miss 退回竞速
+        # (防旧缓存绕过新策略;竞速赢家会经 _record_win_meta 重新钉住)。
+        if self._policies and not self._policy_allows_sticky(domain, pid):
+            return None
         if self.selector.is_circuit_open(pid):
             return None
         # Goal #6:质量感知单发。基线 ref_ewma 在钉住时刻捕获(见 _record_win_meta),
@@ -987,15 +1413,26 @@ class Router:
         # _record_win_meta 清除标记。
         if self._single_send_degraded(pid, entry.get("ref_ewma")):
             self._degraded_single_send.add(pid)
+            # 自适应 TTL:被钉住代理开始恶化 → TTL 打回下限,让竞速新赢家接管。
+            if self.adaptive_ttl_enabled:
+                self._domain_ttl_cache[domain] = self.adaptive_ttl_min
+                self.domain_ttl_resets += 1
             return None
         updated_at_str = entry["updated_at"]
+        ttl = self._domain_ttl(domain)
         try:
             dt = datetime.fromisoformat(updated_at_str)
-            if (datetime.now(timezone.utc) - dt).total_seconds() < self.cache_ttl:
+            if (datetime.now(timezone.utc) - dt).total_seconds() < ttl:
                 return pid
         except Exception:
             pass
         return None
+
+    def _domain_ttl(self, domain: str) -> float:
+        """该域名缓存当前有效期:自适应 TTL 开启时取 per-domain 值,否则全局值。"""
+        if not self.adaptive_ttl_enabled:
+            return self.cache_ttl
+        return self._domain_ttl_cache.get(domain, self.cache_ttl)
 
     # ── 会话粘性 ────────────────────────────────────────────────
 
@@ -1053,6 +1490,11 @@ class Router:
         # 熔断中的代理不作粘性单发:直接驱逐(退回竞速找健康代理),避免对
         # 已确认故障的代理持续单发。local 不经 selector,跳过该检查(A1)。
         if pid != 'local' and self.selector.is_circuit_open(pid):
+            self._evict_sticky_key(key)
+            return None
+        # 策略路由(P1):命中策略但粘性代理不在允许子集内 → 视为 miss 驱逐并
+        # 回落竞速(防旧粘性绕过新策略;与域名缓存同一套策略校验)。
+        if self._policies and not self._policy_allows_sticky(domain, pid):
             self._evict_sticky_key(key)
             return None
         # B2:命中次数达到阈值 → 触发探路重竞速(不驱逐,由调用方依据
@@ -1217,6 +1659,8 @@ class Router:
         """取 GET 的缓存响应;非 GET 或未命中或已过期返回 None。过期项顺便清除。
 
         enable_http_cache=False 时一律未命中(用于压测隔离缓存层,测纯路由性能)。
+        P2:命中刷新 last_access(滑动 TTL 兼作 LRU 顺序);过期项按 LRU 淘汰
+        路径清除(同步维护 _http_cache_bytes 与二级索引)。
         """
         if not self.enable_http_cache or method != 'GET':
             return None
@@ -1224,22 +1668,31 @@ class Router:
         entry = self._http_cache.get(key)
         if not entry:
             return None
-        if time.time() - entry['cached_at'] > self._http_cache_ttl:
-            self._http_cache_del_with_index(key)
+        now = time.time()
+        if now - entry['cached_at'] > self._http_cache_ttl:
+            self._http_cache_remove(key)
             return None
+        entry['last_access'] = now  # 滑动 TTL + LRU 顺序
         return entry
 
-    def _http_cache_del_with_index(self, key: str) -> None:
-        """从 _http_cache 删除 key,并同步清除 _http_cache_domain_index 中的引用。"""
+    def _http_cache_remove(self, key: str) -> None:
+        """从 _http_cache 删除 key,同步维护字节计数与 _http_cache_domain_index。
+
+        所有删除路径统一走这里(过期清除、LRU 淘汰、写方法按域名失效),确保
+        _http_cache_bytes 与二级索引不漏不重。返回是否删除了条目。
+        """
         entry = self._http_cache.pop(key, None)
-        if entry is not None:
-            cached_url = key[len('GET:'):] if key.startswith('GET:') else key
-            cached_host = urllib.parse.urlparse(cached_url).hostname or cached_url
-            idx = self._http_cache_domain_index.get(cached_host)
-            if idx:
-                idx.discard(key)
-                if not idx:
-                    del self._http_cache_domain_index[cached_host]
+        if entry is None:
+            return False
+        self._http_cache_bytes -= len(entry.get('content', b'') or b'')
+        cached_url = key[len('GET:'):] if key.startswith('GET:') else key
+        cached_host = urllib.parse.urlparse(cached_url).hostname or cached_url
+        idx = self._http_cache_domain_index.get(cached_host)
+        if idx:
+            idx.discard(key)
+            if not idx:
+                del self._http_cache_domain_index[cached_host]
+        return True
 
     def _http_cache_set(self, method: str, url: str, status_code, reason_phrase, headers, content) -> None:
         """缓存一个 GET 可缓存响应(状态码、原因、头、body、时间戳)。
@@ -1249,6 +1702,10 @@ class Router:
         本代理是共享缓存(为多客户端服务),private 明确禁止共享缓存存储,
         no-store/no-cache 同理。原实现仅在缺 Content-Length 时查 Cache-Control,
         扩展到 3xx/404 后必须无条件查,否则会把源站标 private 的 302 也缓存。
+
+        P2:写入前按 max_entries / max_bytes 做 LRU 淘汰(淘汰 last_access 最旧
+        的条目),并维护 _http_cache_bytes。单一超大响应(>max_bytes 的一半)不缓存,
+        避免单条即打满总预算。更新已有 key 时先归还旧字节再计入新字节。
         """
         if method != 'GET':
             return
@@ -1260,14 +1717,31 @@ class Router:
         cc = next((v for k, v in items if k.lower() == 'cache-control'), '')
         if 'no-store' in cc or 'no-cache' in cc or 'private' in cc:
             return
+        size = len(content or b'')
+        if size > self._http_cache_max_bytes // 2:
+            return  # 单一超大响应不缓存
+        now = time.time()
         key = self._http_cache_key(method, url)
+        # 更新已有 key:先归还旧字节,避免重复计数。
+        old = self._http_cache.get(key)
+        if old is not None:
+            self._http_cache_bytes -= len(old.get('content', b'') or b'')
         self._http_cache[key] = {
             'status_code': status_code,
             'reason_phrase': reason_phrase,
             'headers': headers,
             'content': content,
-            'cached_at': time.time(),
+            'cached_at': now,
+            'last_access': now,
         }
+        self._http_cache_bytes += size
+        # 容量保护(LRU):条目数或字节数超限 → 淘汰 last_access 最旧的条目,
+        # 直至回到上限以内。单次 O(N),写入远低于读取频率,可接受。
+        while len(self._http_cache) > self._http_cache_max_entries \
+                or self._http_cache_bytes > self._http_cache_max_bytes:
+            oldest = min(self._http_cache, key=lambda k: self._http_cache[k].get('last_access', 0.0))
+            self._http_cache_remove(oldest)
+            self.http_cache_evictions += 1
         # 同步更新二级索引:缓存键 -> 域名,供 O(1) 域名级批量失效。
         cached_host = urllib.parse.urlparse(url).hostname or url
         self._http_cache_domain_index.setdefault(cached_host, set()).add(key)
@@ -1285,7 +1759,7 @@ class Router:
         """
         stale = self._http_cache_domain_index.pop(domain, set())
         for key in stale:
-            self._http_cache.pop(key, None)
+            self._http_cache_remove(key)
 
     # ── 上游连接池 ──────────────────────────────────────────────
 
@@ -1337,6 +1811,123 @@ class Router:
                 await c.aclose()
             except Exception:
                 pass
+
+    # ── CONNECT 上游 TCP 预热池(P1)─────────────────────────────
+
+    def _conn_pool_peek(self, proxy_host: str, proxy_port: int) -> Optional[Tuple[asyncio.StreamReader, asyncio.StreamWriter]]:
+        """从预热池取一条到该上游的空闲连接 (reader, writer);无则返回 None。
+
+        取用成功计 hits,需新建计 misses。连接在取用后由调用方发 CONNECT,
+        隧道结束即关闭(不归还——CONNECT 后 socket 已被隧道占用)。池中存
+        (reader, writer) 对:asyncio 的 get_extra_info('reader') 不可靠,必须
+        由建连处成对保存。
+        """
+        key = f"{proxy_host}:{proxy_port}"
+        stack = self._conn_pool.get(key)
+        while stack:
+            reader, writer = stack.pop()
+            if writer.is_closing():
+                continue  # 已关闭的废弃连接直接丢弃
+            self.conn_pool_hits += 1
+            return reader, writer
+        if stack is not None and not stack:
+            self._conn_pool.pop(key, None)
+        self.conn_pool_misses += 1
+        return None
+
+    async def _conn_pool_refill(self):
+        """补充预热连接到目标水位(后台 refill task 周期调用)。
+
+        每代理目标 conn_pool_refill_target 条;全局受 conn_pool_total 钳制。
+        建连失败静默(上游临时不可达时下次再补)。空代理/未启用跳过。
+        """
+        if not self.conn_pool_enabled:
+            return
+        # 快照当前空闲总数,防止并发补充超过全局预算。
+        total_idle = sum(len(v) for v in self._conn_pool.values())
+        for proxy in self.proxy_store.list():
+            if not proxy.enabled:
+                continue
+            key = f"{proxy.host}:{proxy.port}"
+            have = len(self._conn_pool.get(key, []))
+            need = self.conn_pool_refill_target - have
+            if need <= 0 or total_idle >= self.conn_pool_total:
+                continue
+            need = min(need, self.conn_pool_total - total_idle,
+                       self.conn_pool_per_proxy - have)
+            for _ in range(max(0, need)):
+                try:
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(proxy.host, proxy.port),
+                        timeout=self.conn_pool_connect_timeout)
+                except (asyncio.TimeoutError, OSError, ConnectionError):
+                    break
+                writer._conn_pool_created = time.monotonic()
+                self._conn_pool.setdefault(key, []).append((reader, writer))
+                self.conn_pool_creates += 1
+                total_idle += 1
+                if total_idle >= self.conn_pool_total:
+                    break
+
+    async def _conn_pool_prune(self):
+        """关闭空闲超时的预热连接(每 refill 周期顺带清理,防 fd 泄漏)。"""
+        now = time.monotonic()
+        stale = []
+        # 先收集待关连接,再统一重建 dict —— 迭代中 pop 会触发
+        # "dictionary changed size during iteration"。
+        for key in list(self._conn_pool.keys()):
+            stack = self._conn_pool[key]
+            alive = []
+            for item in stack:
+                reader, writer = item
+                if writer.is_closing():
+                    continue
+                last = getattr(writer, '_conn_pool_created', 0)
+                if now - last > self.conn_pool_idle_timeout:
+                    stale.append(writer)
+                    self.conn_pool_expired += 1
+                    continue
+                alive.append(item)
+            if alive:
+                self._conn_pool[key] = alive
+            else:
+                self._conn_pool.pop(key, None)
+        for w in stale:
+            try:
+                w.close()
+                await w.wait_closed()
+            except Exception:
+                pass
+
+    async def _conn_pool_loop(self):
+        """后台预热循环:周期补充到目标水位并清理过期连接。
+
+        捕获异常不退出;被取消静默退出(stop() 会收尾)。refill_interval<=0
+        时 start() 不启动本循环(只取不补)。
+        """
+        try:
+            while True:
+                await asyncio.sleep(self.conn_pool_refill_interval)
+                try:
+                    await self._conn_pool_refill()
+                    await self._conn_pool_prune()
+                except Exception:
+                    logger.exception("conn pool refill failed")
+        except asyncio.CancelledError:
+            pass
+
+    async def _conn_pool_close_all(self):
+        """关闭全部预热连接(stop 时调用)。"""
+        stacks = list(self._conn_pool.values())
+        self._conn_pool.clear()
+        for stack in stacks:
+            for item in stack:
+                reader, writer = item
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
 
     # ── 通用竞速 / pipe / 响应写入 ──────────────────────────────
 
@@ -1712,8 +2303,20 @@ class Router:
         connect_timeout = 15
         try:
             if proxy_host is not None:
-                up_reader, up_writer = await asyncio.wait_for(
-                    asyncio.open_connection(proxy_host, proxy_port), timeout=connect_timeout)
+                # CONNECT 预热池(P1):优先取已连接到上游代理的空闲连接,省
+                # "本机→上游"建连 TTFB;池无可用时新建(计数 misses)。
+                if self.conn_pool_enabled:
+                    pooled = self._conn_pool_peek(proxy_host, proxy_port)
+                    if pooled is not None:
+                        up_reader, up_writer = pooled
+                    else:
+                        self.connect_new_conns += 1  # 观测:池未中需新建
+                        up_reader, up_writer = await asyncio.wait_for(
+                            asyncio.open_connection(proxy_host, proxy_port), timeout=connect_timeout)
+                else:
+                    self.connect_new_conns += 1  # 观测:无池路径每次新建
+                    up_reader, up_writer = await asyncio.wait_for(
+                        asyncio.open_connection(proxy_host, proxy_port), timeout=connect_timeout)
             else:
                 if ':' not in target:
                     raise ValueError(f'Invalid CONNECT target: {target}')
@@ -1877,15 +2480,16 @@ class Router:
 
     # ── HTTP 请求处理 ──────────────────────────────────────────
 
-    def _build_racing_tasks_http(self, proxies: List[str]) -> set:
+    def _build_racing_tasks_http(self, proxies: List[str], host: str = "") -> set:
         """为 HTTP 竞速产出候选占位集合(前 max_retries 个 pid + 本机 local)。
 
         N 由 max_retries 限制(本批只竞速前 N 个)。返回的 set 交给 _race(真 task)
         或 _race_staggered(惰性占位,补发时才创建)。占位为 pid 字符串,
-        _make_race_task 据此建 _try_http task。
+        _make_race_task 据此建 _try_http task。host 给策略路由:命中策略时
+        proxies 已由调用方按策略收窄;local 仅当策略放行时加入。
         """
         places = {pid for pid in proxies[:self.max_retries] if self.proxy_store.get(pid)}
-        if self.enable_local_racing:
+        if self.enable_local_racing and self._policy_allows_sticky(host, 'local'):
             places.add('local')
         return places
 
@@ -1902,17 +2506,19 @@ class Router:
             return min(self.max_retries, max(2, self.stagger_initial))
         return self.stagger_initial
 
-    def _prep_http(self, proxies: List[str]) -> tuple:
+    def _prep_http(self, proxies: List[str], host: str = "") -> tuple:
         """HTTP 竞速的启动参数:首批/补发按 stagger 配置取占位,返回 (initial_places, remaining)。
 
         供 _forward_upstream 统一拼接 _race_staggered 的调用。`initial_places` 是
         首批要同时发出的**有序**占位列表(最优先发出,保持 proxies 的 EWMA 排序);
         `remaining` 是待定时补发的**有序**占位列表。本机竞速开启时 local 优先
         (直连,常最快)。占位为 pid 字符串,_make_race_task 据此建 _try_http task。
+        host 给策略路由:local 仅当策略放行时参与。
         """
         n_initial = self._stagger_initial()
         initial_pids = proxies[:n_initial]
-        if self.enable_local_racing and 'local' not in initial_pids:
+        if self.enable_local_racing and 'local' not in initial_pids \
+                and self._policy_allows_sticky(host, 'local'):
             initial_pids = ['local'] + initial_pids
         initial_places = [pid for pid in initial_pids
                           if pid == 'local' or self.proxy_store.get(pid)]
@@ -2102,7 +2708,10 @@ class Router:
         # 3) 竞速:首批并行 max_retries 个代理,全失败且还有剩余则对剩余再竞速。
         #    错峰启动(stagger_start)时首批只发 stagger_initial 个(默认 1 个),
         #    补发剩余占位交 _race_staggered 按 interval 定时补发;否则同时全发。
+        #    策略路由(P1):按目标域名收窄候选集,命中策略的域只在该子集内竞速。
         proxies = self.selector.ordered_proxies()
+        if self._policies:
+            proxies = self._policy_candidate_pids(domain, proxies)
         if not proxies and not self.enable_local_racing:
             await self._write_cached_response(writer, 502, 'Bad Gateway', {'Content-Type': 'text/plain'}, b'Bad Gateway')
             return
@@ -2110,14 +2719,14 @@ class Router:
         # 计数:进入竞速(首批)。兜底批单独再 +1,故 invocations 可能 > 请求数。
         self.racing_invocations += 1
         if self.stagger_start:
-            initial_places, remaining = self._prep_http(proxies)
+            initial_places, remaining = self._prep_http(proxies, domain)
             winner_resp = await self._race_staggered(
                 initial_places + remaining, cleanup=self._cleanup_http_result,
                 initial=len(initial_places), interval=self.stagger_interval,
                 method=method, url=url, headers=hdrs, body=body)
         else:
             # 非错峰(_race):需真 task,占位经 _make_race_task 急切创建。
-            places = self._build_racing_tasks_http(proxies)
+            places = self._build_racing_tasks_http(proxies, domain)
             tasks = {self._make_race_task(p, method, url, hdrs, body) for p in places}
             winner_resp = await self._race(tasks, cleanup=self._cleanup_http_result)
 
@@ -2147,7 +2756,7 @@ class Router:
 
         关键:首字节判胜后,获胜者的 body 在这里逐块转发,客户端无需等待
         整包到达代理即可拿到首字节(TTFB 下降)。同时把已转发的字节缓冲到
-        内存(上限 STREAM_CACHE_LIMIT),收齐且为 2xx 时写入响应缓存——这样
+        内存(上限 self._stream_cache_limit),收齐且为 2xx 时写入响应缓存——这样
         流式路径仍能命中缓存,无需把整包读进内存才缓存。
 
         长度策略:若上游提供 content-length,转发头时剔除它(避免与 chunked
@@ -2187,7 +2796,7 @@ class Router:
         try:
             async for chunk in resp.aiter_raw():
                 if buffering:
-                    if len(buffered) + len(chunk) <= STREAM_CACHE_LIMIT:
+                    if len(buffered) + len(chunk) <= self._stream_cache_limit:
                         buffered.extend(chunk)
                     else:
                         # 超过缓存上限:放弃缓存,丢弃已缓冲的部分省内存。
@@ -2224,13 +2833,14 @@ class Router:
         """为 CONNECT 竞速产出候选占位集合(前 max_retries 个上游 + 本机 local)。
 
         占位为 (pid, target) 元组,交由 _race(真 task)/ _race_staggered(惰性占位,
-        补发时才创建)执行;本机竞速时追加 (local, target) 直连占位。
+        补发时才创建)执行;本机竞速时追加 (local, target) 直连占位。target 给
+        策略路由:proxies 已由调用方收窄,local 仅当策略放行时参与。
         """
         places = set()
         for pid in proxies[:self.max_retries]:
             if self.proxy_store.get(pid):
                 places.add((pid, target))
-        if self.enable_local_racing:
+        if self.enable_local_racing and self._policy_allows_sticky(target, 'local'):
             places.add(('local', target))
         return places
 
@@ -2240,10 +2850,12 @@ class Router:
         与 _prep_http 同构:首批取前 stagger_initial 个最优代理,本机竞速时 local
         优先(直连,常最快)。占位为 (pid, target) 元组,_make_race_task 据此建
         _try_tunnel task。返回的两个列表均保持 proxies 的 EWMA 排序(最优在前)。
+        target 给策略路由:local 仅当策略放行时参与。
         """
         n_initial = self._stagger_initial()
         initial_pids = proxies[:n_initial]
-        if self.enable_local_racing and 'local' not in initial_pids:
+        if self.enable_local_racing and 'local' not in initial_pids \
+                and self._policy_allows_sticky(target, 'local'):
             initial_pids = ['local'] + initial_pids
         initial_places = [(pid, target) for pid in initial_pids
                           if pid == 'local' or self.proxy_store.get(pid)]
@@ -2282,7 +2894,9 @@ class Router:
         """
         # 1) 会话粘性:同一客户端+target 复用上次胜出的代理单发隧道,失败则
         #    驱逐该条目并回落到域名缓存/竞速(redispatch)。本机胜者('local')
-        #    走直连(None 代理),无需 proxy_store 校验(A1)。
+        #    走直连(None 代理),无需 proxy_store 校验(A1)。策略路由(P1):
+        #    粘性取用也须满足策略——命中策略但 pid 不在子集内 → 视为 miss
+        #    驱逐并回落(防旧粘性绕过新策略)。
         skip_domain_cache = False
         if self.stickiness_enabled:
             sticky_pid = self._get_sticky_proxy(client_ip, target)
@@ -2326,7 +2940,10 @@ class Router:
                 logger.debug("cached proxy %s failed CONNECT %s", cached_pid, target)
 
         # 3) 竞速:首批并行 max_retries 个,全失败且还有剩余则对剩余再竞速。
+        #    策略路由(P1):按 target 收窄候选集,命中策略的 target 只在该子集内竞速。
         proxies = self.selector.ordered_proxies()
+        if self._policies:
+            proxies = self._policy_candidate_pids(target, proxies)
         if not proxies and not self.enable_local_racing:
             try:
                 client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n\r\nBad Gateway")
@@ -2391,6 +3008,10 @@ class Router:
             self._flush_task = asyncio.create_task(self._flush_loop())
         if self.probe_interval_sec > 0 and (self._probe_task is None or self._probe_task.done()):
             self._probe_task = asyncio.create_task(self._probe_loop())
+        # CONNECT 预热池(P1):refill_interval>0 时启动后台补充循环。
+        if self.conn_pool_enabled and self.conn_pool_refill_interval > 0 \
+                and (self._conn_pool_task is None or self._conn_pool_task.done()):
+            self._conn_pool_task = asyncio.create_task(self._conn_pool_loop())
         logger.info("Router listening on %s:%s", self.listen_host, self.listen_port)
 
     async def stop(self):
@@ -2411,6 +3032,15 @@ class Router:
             logger.exception("final flush failed")
         # 关闭上游连接池(归还所有 keep-alive 连接)。
         await self._aclose_all_clients()
+        # 关闭 CONNECT 预热池(P1):停补充循环,关闭全部预热连接。
+        if self._conn_pool_task and not self._conn_pool_task.done():
+            self._conn_pool_task.cancel()
+            try:
+                await self._conn_pool_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._conn_pool_task = None
+        await self._conn_pool_close_all()
         # 排空竞速败者的后台清理 task:它们正在 aclose 流式 resp / 关上游裸连接,
         # 必须在 _db.close() 前完成,否则连接泄漏(ResourceWarning)。
         if self._pending_cleanups:

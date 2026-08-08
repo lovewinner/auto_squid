@@ -167,8 +167,12 @@ router:
 | `GET /server-stats` | 服务端资源采样（CPU 占用、事件循环延迟），由压测子进程填充；正常运行返回空快照 |
 | `GET /config` | 路由配置（`enable_local_racing`） |
 | `GET /domains` | 从 SQLite 读取的域名胜出统计 |
-| `GET /domains/meta` | 各域名默认代理 + 最近更新时间 |
+| `GET /domains/meta` | 各域名默认代理 + 最近更新时间（自适应 TTL 开启时含 `ttl`/`expires_at`/`switch_count`） |
 | `GET /stickiness` | 会话粘性表（客户端IP\|域名 → 粘性代理 + 更新时间） |
+| `GET /quality` | 各代理 EWMA 首字节延迟（秒），竞速排序依据 |
+| `POST /quality/reset` | 清空全部代理 EWMA 质量（网络切换后调用） |
+| `GET /circuit` | 各代理熔断 + 探活状态（`open`、退避、`probes_sent/ok/skipped`、`single_send_degrades`） |
+| `POST /circuit/reset` | 手动解除全部熔断（保留 EWMA 质量） |
 
 ## 配置
 
@@ -196,6 +200,64 @@ router:
 logging:
   file: "auto_squid.log"
 ```
+
+## 速度调优
+
+代理的大部分延迟优化杠杆已内置(`examples/config.yaml` 展示了全部字段)。按流量特征选参数。三套推荐配置:
+
+**稳定优先**(egress IP 稳定,登录态/风控敏感站点):
+
+```yaml
+router:
+  stickiness:
+    enabled: true
+    ttl: 1800
+    recheck_hits: 100
+  circuit:
+    probe_interval_sec: 30
+    probe_canary: "www.baidu.com:443"
+    single_send_degrade_fail: 2
+    single_send_degrade_ratio: 3.0
+    single_send_degrade_slack_ms: 10
+```
+
+**速度优先**(低 TTFB,容忍出口切换):
+
+```yaml
+router:
+  cache_ttl: 900
+  stagger_start: true
+  stagger_initial: 1        # 先发最优代理,按 interval 补发
+  stagger_interval_ms: 100  # RFC 8305 允许的最短补发间隔
+  circuit:
+    probe_interval_sec: 20
+    lb_bias: 0.5            # 不要过度避让最快代理
+    single_send_degrade_fail: 2
+    single_send_degrade_ratio: 3.0
+    single_send_degrade_slack_ms: 10
+```
+
+**低扇出优先**(CONNECT 占比高,希望最小化竞速放大):
+
+```yaml
+router:
+  stagger_start: true
+  stagger_initial: 1
+  stagger_interval_ms: 200
+  circuit:
+    probe_interval_sec: 30
+    lb_bias: 1.0
+    single_send_degrade_fail: 1   # 比熔断更早脱离钉住
+    single_send_degrade_ratio: 2.0
+    single_send_degrade_slack_ms: 10
+```
+
+调参说明:
+
+- **`probe_canary` 必须"本机直连可达 + 经所有上游都可达"。** 部署后看 `GET /circuit`——若 `probes_skipped` 持续增长,说明 canary 不适合当前网络,探活被静默跳过(不会误熔断,但也失去了质量信号)。
+- **`single_send_degrade_fail` 是熔断的早告警**:建议设为 `circuit_threshold - 1`(默认 3 时取 2),让被钉住代理开始失败时**先**降级回竞速,而不是等熔断。
+- **`lb_bias`** 控制在途积压对竞速排序的惩罚(`ewma × (1 + active)^bias`)。慢代理易被打爆就调高;最快代理被过度避让就调低。
+- **策略路由**(`router.policies`)按域名/标签收窄竞速候选集,直接降低 TTFB 与 `racing.amplification`——形状见 `examples/config.yaml`。
 
 ## 容器化部署（Docker / docker compose）
 

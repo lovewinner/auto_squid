@@ -78,6 +78,23 @@ async def quality_reset():
     return {"reset": True}
 
 
+@app.get("/policies")
+async def policies():
+    """返回策略路由配置快照(匹配条件 + 允许的代理子集)。
+
+    供运维确认策略路由已生效、校验命中顺序。读 _router._policies,无锁。
+    """
+    if not _router:
+        return []
+    return [
+        {
+            "match": p.match.model_dump(exclude_none=True),
+            "proxies": p.proxies.model_dump(exclude_none=True),
+        }
+        for p in _router._policies
+    ]
+
+
 @app.get("/circuit")
 async def circuit():
     """返回每代理熔断器状态(是否熔断、退避剩余、连续失败、slow-start 中)。
@@ -91,6 +108,7 @@ async def circuit():
         "probes_sent": _router.probes_sent,
         "probes_ok": _router.probes_ok,
         "probes_skipped": _router.probes_skipped,
+        "probes_failed": _router.probes_failed,
         "single_send_degrades": _router.single_send_degrades,
         "degraded_single_send": _router.get_degraded_single_send(),
         "proxies": _router.selector.get_circuit_state(),
@@ -155,10 +173,11 @@ async def domains():
 
 @app.get("/domains/meta")
 async def domains_meta():
-    """返回域名缓存元数据（当前默认代理、更新时间）"""
+    """返回域名缓存元数据（当前默认代理、更新时间；自适应 TTL 开启时含
+    ttl/expires_at/switch_count）"""
     if not _router:
         return {}
-    return _router.get_domain_meta_from_db()
+    return _router.get_domain_meta_enriched()
 
 
 @app.get("/stickiness")
