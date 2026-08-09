@@ -70,6 +70,26 @@ def git_version() -> str:
 
 # ── 通用小工具 ─────────────────────────────────────────────────
 
+def _parse_policies(raw: str) -> list:
+    """解析 --policies 的 JSON 串为策略路由配置列表;空串/解析失败 → 不启用。
+
+    每项形如 {"match": {"domain_suffix": [".cn", "baidu.com"]},
+               "proxies": {"tags": {"region": "cn"}}} 或
+               {"match": {"domain_regex": "...", "domain_exact": [...]},
+                "proxies": {"ids": ["proxy-a"]}}。
+    非法 JSON 直接告警并视为未配置,不中断压测。
+    """
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list):
+            raise ValueError("--policies 需为 JSON 数组")
+        return parsed
+    except (ValueError, json.JSONDecodeError) as e:
+        print(f"[warn] --policies 解析失败,忽略: {e}")
+        return []
+
 def _percentile(vals: list[float], p: float) -> float:
     """计算有序百分位。空列表返回 0.0;索引越界钳制到两端。"""
     if not vals:
@@ -264,6 +284,8 @@ class ScenarioResult:
                              "probes_ok": None, "proxies_open_end": 0,
                              "single_send_degrades": None}
             inflight_group = {"max_in_flight": None, "in_flight_end": {}}
+            conn_pool_group = {"hits": None, "misses": None, "new_conns": None,
+                               "pool_size_end": None, "creates": None}
         else:
             cb, ca = self.counters_before, self.counters_after
             hits = ca.get("http_cache_hits", 0) - cb.get("http_cache_hits", 0)
@@ -296,6 +318,15 @@ class ScenarioResult:
             inflight_group = {
                 "max_in_flight": ca.get("max_in_flight", 0) - cb.get("max_in_flight", 0),
                 "in_flight_end": ca.get("proxy_in_flight", {}) or {},
+            }
+            # CONNECT 预热池(P1):场景内 hits/misses/new_conns 差值 + 场景末池规模。
+            # hits 高 = 预热生效省建连;misses+new_conns 高 = 池未命中需新建。
+            conn_pool_group = {
+                "hits": ca.get("conn_pool_hits", 0) - cb.get("conn_pool_hits", 0),
+                "misses": ca.get("conn_pool_misses", 0) - cb.get("conn_pool_misses", 0),
+                "new_conns": ca.get("connect_new_conns", 0) - cb.get("connect_new_conns", 0),
+                "pool_size_end": ca.get("conn_pool_size", 0),
+                "creates": ca.get("conn_pool_creates", 0) - cb.get("conn_pool_creates", 0),
             }
 
         # 瓶颈归因:状态分布含 429/503 → 上游触顶;否则 proxy。
@@ -351,6 +382,7 @@ class ScenarioResult:
             "racing": racing_group,
             "circuit": circuit_group,
             "in_flight": inflight_group,
+            "conn_pool": conn_pool_group,
             "resources": {
                 "rss_peak_mb": self.rss_peak_mb,
                 "fd_peak": self.fd_peak,
@@ -1267,6 +1299,32 @@ async def amain(args):
             "proxies_path": args.proxies,
             "mock_specs": mock_specs,
             "db_path": db_path,
+            # 代理访问速度提升方案(P1-P3)透传:默认关闭,传参即开启。
+            "policies": _parse_policies(getattr(args, 'policies', "")),
+            "adaptive_ttl": args.adaptive_ttl,
+            "adaptive_ttl_min": 60.0,
+            "adaptive_ttl_max": 1800.0,
+            "switch_damping": args.switch_damping,
+            "switch_damping_min_wins": 2,
+            "switch_damping_ratio": 0.8,
+            "switch_damping_abs_ms": 30.0,
+            "concurrency_limit_enabled": args.concurrency_limit,
+            "concurrency_limit_initial": 16,
+            "concurrency_limit_min": 2,
+            "concurrency_limit_max": 128,
+            "concurrency_add_on_success": 4,
+            "concurrency_mult_on_failure": 0.5,
+            "concurrency_failure_window": 20,
+            "conn_pool_enabled": args.conn_pool,
+            "conn_pool_per_proxy": args.conn_pool_per_proxy,
+            "conn_pool_total": args.conn_pool_total,
+            "conn_pool_idle_timeout": args.conn_pool_idle_timeout,
+            "conn_pool_refill_interval": args.conn_pool_refill_interval,
+            "conn_pool_refill_target": args.conn_pool_refill_target,
+            "conn_pool_connect_timeout": 10.0,
+            "http_cache_max_entries": args.http_cache_max_entries,
+            "http_cache_max_bytes": args.http_cache_max_bytes,
+            "http_cache_stream_limit": args.http_cache_stream_limit,
         }
         # metrics_port=0 时 uvicorn 绑定随机端口;但子进程需先知道端口才能 print READY。
         # 主进程预选一个空闲端口,避免子进程内探测端口的复杂度。
@@ -1277,7 +1335,12 @@ async def amain(args):
             await server.start()
             print(f"[round {rnd}] 子进程就绪: Router 127.0.0.1:{server.router_port}  "
                   f"管理API {server.metrics_base}  max_retries={args.max_retries}  "
-                  f"cache_ttl={args.cache_ttl}  http_cache={'on' if not args.no_http_cache else 'off'}")
+                  f"cache_ttl={args.cache_ttl}  http_cache={'on' if not args.no_http_cache else 'off'}"
+                  f"  conn_pool={'on(refill=%.1fs,target=%d)' % (args.conn_pool_refill_interval, args.conn_pool_refill_target) if args.conn_pool else 'off'}"
+                  f"  adaptive_ttl={'on' if args.adaptive_ttl else 'off'}"
+                  f"  switch_damping={'on' if args.switch_damping else 'off'}"
+                  f"  concurrency_limit={'on' if args.concurrency_limit else 'off'}"
+                  f"  policies={'on' if (getattr(args, 'policies', '') or '') else 'off'}")
 
             rh, rp, mb = "127.0.0.1", server.router_port, server.metrics_base
             pr = None
@@ -1367,6 +1430,32 @@ def main():
                    metavar="ID:HOST:PORT",
                    help="注入指向死端口的代理(可重复),给熔断器制造连续失败负载;"
                         "如 --dead-proxy dead:127.0.0.1:31990")
+    # ── 代理访问速度提升方案(P1-P3)开关:默认关闭,传开启后在真实上游上对比收益 ──
+    p.add_argument("--conn-pool", action="store_true",
+                   help="开启 CONNECT 上游 TCP 预热池(P1);看 /metrics conn_pool_hits/misses")
+    p.add_argument("--conn-pool-per-proxy", type=int, default=4, help="预热池每代理连接数")
+    p.add_argument("--conn-pool-total", type=int, default=64, help="预热池全局 fd 预算")
+    p.add_argument("--conn-pool-refill-target", type=int, default=2,
+                   help="预热池 refill 目标水位(每代理)")
+    p.add_argument("--conn-pool-refill-interval", type=float, default=5.0,
+                   help="预热池 refill 周期(秒);短场景压测可调小以尽快见到 hits")
+    p.add_argument("--conn-pool-idle-timeout", type=float, default=30.0,
+                   help="预热池空闲连接超时(秒)")
+    p.add_argument("--adaptive-ttl", action="store_true",
+                   help="开启自适应域名缓存 TTL(P2);稳定域名 TTL 上浮,抖动回落")
+    p.add_argument("--switch-damping", action="store_true",
+                   help="开启域名赢家切换阻尼(P3);稳定域名不被单次竞速抖动替换")
+    p.add_argument("--concurrency-limit", action="store_true",
+                   help="开启自适应并发限制(P3);在途达上限的代理不参与竞速候选")
+    p.add_argument("--policies", default="",
+                   help="策略路由(P1)配置 JSON:列表,每项 {match:{domain_suffix:[...]}, "
+                        "proxies:{tags:{...}|ids:[...]}};空=不启用")
+    p.add_argument("--http-cache-max-entries", type=int, default=10_000,
+                   help="HTTP 缓存条目数上限(P2 LRU)")
+    p.add_argument("--http-cache-max-bytes", type=int, default=256 * 1024 * 1024,
+                   help="HTTP 缓存总字节上限(P2 LRU)")
+    p.add_argument("--http-cache-stream-limit", type=int, default=1024 * 1024,
+                   help="HTTP 缓存单条响应缓冲上限(超过不缓存)")
     p.add_argument("--duration", type=float, default=60.0, help="soak 模式时长(秒)")
     p.add_argument("--open-loop", action="store_true", help="soak 开环模式(不限速,测真实上限)")
     p.add_argument("--quick", action="store_true", help="快速冒烟(小规模,~10s)")

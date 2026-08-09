@@ -52,7 +52,29 @@ curl -x http://127.0.0.1:10808 http://example.com        # → 407
 curl -x http://admin:secret@127.0.0.1:10808 http://example.com
 ```
 
-> 认证仅保护**代理端口**。管理 API（`:18080`）仍为开放状态，请按"限制"一节用防火墙保护。
+> 认证默认仅保护**代理端口**。管理 API（`:18080`）自带可选 HTTP Basic 认证（`api.auth`，默认关闭）：开启后除 `/health` 外全部管理端点均需凭据。
+
+### 管理 API 认证
+
+管理 API（`:18080`）**默认开放**。如需保护，在 `config.yaml` 中开启：
+
+```yaml
+api:
+  auth:
+    enabled: true
+    username: "admin"
+    password: "secret"
+```
+
+开启后，除 `/health` 外的全部端点无凭据访问返回 `401`：
+
+```bash
+curl http://127.0.0.1:18080/proxies        # → 401
+curl -u admin:secret http://127.0.0.1:18080/proxies   # → 200
+curl http://127.0.0.1:18080/health          # 始终开放
+```
+
+内置仪表盘（`/`）使用同一套认证：浏览器打开后输入凭据，自动刷新请求会复用（浏览器按 origin 缓存 Basic 凭据）。`/health` 保持开放，供负载均衡与监控探活。
 
 ## 会话粘性
 
@@ -332,7 +354,7 @@ python -m bench.stress --rounds 5
 ## 限制
 
 - HTTP 解析为 MVP 级别，大流量流式响应可能有边界情况
-- 管理 API 无鉴权，生产环境请用防火墙保护端口 18080
+- 管理 API 默认开放——将端口 18080 暴露到非可信网络前,请开启 `api.auth`(HTTP Basic)并用防火墙限制访问
 - CONNECT 隧道使用原始管道（无 TLS 拦截）
 
 ## 许可证

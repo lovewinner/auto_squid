@@ -52,7 +52,29 @@ curl -x http://127.0.0.1:10808 http://example.com        # → 407
 curl -x http://admin:secret@127.0.0.1:10808 http://example.com
 ```
 
-> Auth gates the **proxy port only**. The management API on `:18080` stays open — protect it with a firewall as noted in Limitations.
+> Auth gates the **proxy port only** by default. The management API on `:18080` has its own optional HTTP Basic auth (`api.auth`, off by default) — when enabled, every management endpoint except `/health` requires credentials.
+
+### Management API authentication
+
+The management API on `:18080` is **open by default**. To protect it, enable Basic auth in `config.yaml`:
+
+```yaml
+api:
+  auth:
+    enabled: true
+    username: "admin"
+    password: "secret"
+```
+
+When enabled, every endpoint except `/health` returns `401` without credentials:
+
+```bash
+curl http://127.0.0.1:18080/proxies        # → 401
+curl -u admin:secret http://127.0.0.1:18080/proxies   # → 200
+curl http://127.0.0.1:18080/health          # always open
+```
+
+The built-in dashboard at `/` uses the same protection: open it in a browser, enter the credentials in the prompt, and the auto-refresh fetches reuse them (browsers cache Basic credentials per origin). `/health` stays open for load balancers and monitoring.
 
 ## Session stickiness
 
@@ -342,7 +364,7 @@ Key metrics: throughput (req/s), TTFB & total at P50/P95/P99, error rate by cate
 ## Limitations
 
 - HTTP parsing is MVP-level; large streaming responses may have edge cases
-- Management API has no auth — protect port 18080 with a firewall before production
+- Management API is open by default — enable `api.auth` (HTTP Basic) before exposing port 18080 beyond a trusted network
 - CONNECT tunnel uses raw pipes (no TLS interception)
 
 ## License

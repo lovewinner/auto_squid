@@ -1,9 +1,10 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Dict, List
 
-from .config_schema import ProxyInfo
+from .auth import check_auth
+from .config_schema import AuthConfig, ProxyInfo
 from .proxy_store import ProxyStore
 from .router import Router
 
@@ -12,10 +13,41 @@ app = FastAPI(title="auto_squid API")
 # 由 CLI 在启动时注入
 _proxy_store: ProxyStore | None = None
 _router: Router | None = None
+# 管理 API 的 HTTP Basic 认证配置(默认 None = 关闭)。由 mount() 注入。
+_api_auth: AuthConfig | None = None
 
 # 由 bench 压测子进程(server_proc)周期填充:服务端 CPU 与事件循环延迟采样。
 # 非压测启动(CLI 正常运行)时为空 dict,/server-stats 返回空快照。
 _server_stats: dict = {}
+
+
+@app.middleware("http")
+async def api_auth_middleware(request: Request, call_next):
+    """管理 API 的 HTTP Basic 认证(经 config api.auth 开启,默认关闭)。
+
+    开启后除 /health(健康检查/负载均衡探活)外,全部端点(含内嵌仪表盘 /
+    以及 FastAPI 自动生成的 /docs、/openapi.json)均需凭据。凭据经标准
+    Authorization 头传入,复用 auth.check_auth(常量时间比较)。认证失败回
+    401 + WWW-Authenticate,浏览器据此弹出原生凭据框;成功后浏览器按 origin
+    缓存 Basic 凭据,页面内同源 fetch 自动附带 Authorization,仪表盘无需改动。
+    """
+    if not _api_auth or not _api_auth.enabled:
+        return await call_next(request)
+    if request.url.path == "/health":
+        return await call_next(request)
+    # Starlette 的 Headers 会把键小写化(dict(request.headers) 的键为
+    # "authorization"),而 check_auth 读取字面量 "Authorization"/"Proxy-Authorization",
+    # 这里补回标准大小写,否则认证永不通过。
+    hdrs = dict(request.headers)
+    if "authorization" in hdrs and "Authorization" not in hdrs:
+        hdrs["Authorization"] = hdrs["authorization"]
+    if "proxy-authorization" in hdrs and "Proxy-Authorization" not in hdrs:
+        hdrs["Proxy-Authorization"] = hdrs["proxy-authorization"]
+    ok, _ = check_auth(hdrs, True, _api_auth.username, _api_auth.password)
+    if not ok:
+        return JSONResponse(status_code=401, content={"detail": "Authentication required"},
+                            headers={"WWW-Authenticate": 'Basic realm="auto_squid"'})
+    return await call_next(request)
 
 
 class ProxyIn(BaseModel):
@@ -552,7 +584,10 @@ onIntervalChange(document.getElementById('interval'));
 </body>
 </html>""")
 
-def mount(proxy_store: ProxyStore, router: Router | None = None):
-    global _proxy_store, _router
+def mount(proxy_store: ProxyStore, router: Router | None = None,
+          api_auth: AuthConfig | None = None):
+    global _proxy_store, _router, _api_auth
     _proxy_store = proxy_store
     _router = router
+    # api_auth 为 None 或 AuthConfig(enabled 默认 False)→ 认证关闭。
+    _api_auth = api_auth

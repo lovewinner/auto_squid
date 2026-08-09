@@ -16,3 +16,4 @@ bench_report.json
 *.db-wal
 bench_report_*.json
 bench_profile.txt
+.playwright-mcp/

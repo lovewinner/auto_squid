@@ -773,6 +773,105 @@ class TestAPI:
         assert items["auth-proxy"]["port"] == 6128
 
 
+class TestApiAuth:
+    """管理 API 的 HTTP Basic 认证(api.auth,默认关闭)。
+
+    mount() 不传 api_auth → 认证关闭(现有行为);传入启用状态 → 除 /health
+    外全部端点需凭据,失败回 401 + WWW-Authenticate(浏览器据此弹出凭据框)。
+    每个测试用 finally: mount(None, None) 复位模块级全局,防状态泄漏到其他用例。
+    """
+
+    USER, PASSWORD = "api_user", "api_pass"
+
+    @staticmethod
+    def _mount(enabled: bool = True):
+        from auto_squid.config_schema import AuthConfig
+        mount(None, None, api_auth=AuthConfig(enabled=enabled,
+                                              username=TestApiAuth.USER,
+                                              password=TestApiAuth.PASSWORD))
+
+    @staticmethod
+    def _auth(user: str = None, pw: str = None) -> dict:
+        user = TestApiAuth.USER if user is None else user
+        pw = TestApiAuth.PASSWORD if pw is None else pw
+        import base64
+        return {"Authorization": "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode()}
+
+    def test_off_by_default(self):
+        """未传 api_auth → 全部端点开放(回归保护)。"""
+        mount(None, None)
+        client = TestClient(api_app)
+        try:
+            assert client.get("/health").status_code == 200
+            assert client.get("/stats").status_code == 200
+            assert client.get("/proxies").status_code == 200
+        finally:
+            mount(None, None)
+
+    def test_health_open_with_auth_on(self):
+        """认证开启时 /health 仍无需凭据(健康检查/负载均衡探活)。"""
+        self._mount()
+        client = TestClient(api_app)
+        try:
+            assert client.get("/health").status_code == 200
+        finally:
+            mount(None, None)
+
+    def test_requires_auth(self):
+        """认证开启时无凭据 → 401 + WWW-Authenticate 头。"""
+        self._mount()
+        client = TestClient(api_app)
+        try:
+            r = client.get("/stats")
+            assert r.status_code == 401
+            assert "Basic realm" in r.headers.get("WWW-Authenticate", "")
+        finally:
+            mount(None, None)
+
+    def test_accepts_valid_basic(self):
+        """正确 Basic 凭据 → 200。"""
+        self._mount()
+        client = TestClient(api_app)
+        try:
+            assert client.get("/stats", headers=self._auth()).status_code == 200
+        finally:
+            mount(None, None)
+
+    def test_rejects_wrong_creds(self):
+        """错误凭据 / 非 Basic 方案 → 401。"""
+        self._mount()
+        client = TestClient(api_app)
+        try:
+            assert client.get("/stats", headers=self._auth("api_user", "wrong")).status_code == 401
+            assert client.get("/stats", headers={"Authorization": "Bearer xyz"}).status_code == 401
+        finally:
+            mount(None, None)
+
+    def test_all_routes_protected_except_health(self):
+        """认证开启时全部数据端点需凭据,`/health` 与仪表盘页面本身开放。"""
+        self._mount()
+        client = TestClient(api_app)
+        try:
+            for path in ["/proxies", "/quality", "/policies", "/circuit", "/metrics",
+                         "/server-stats", "/config", "/domains", "/domains/meta", "/stickiness"]:
+                r = client.get(path)
+                assert r.status_code == 401, f"{path} 应要求认证"
+            assert client.get("/").status_code == 401  # 无凭据访问仪表盘页面
+            assert client.get("/", headers=self._auth()).status_code == 200
+        finally:
+            mount(None, None)
+
+    def test_mount_resets_auth_state(self):
+        """mount(None, None) 清空认证状态 → API 恢复开放(防全局状态泄漏)。"""
+        self._mount()
+        client = TestClient(api_app)
+        try:
+            assert client.get("/stats").status_code == 401
+        finally:
+            mount(None, None)
+        assert TestClient(api_app).get("/stats").status_code == 200
+
+
 # ── streaming / pooling / DB-batching tests ───────────────────────
 
 

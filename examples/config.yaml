@@ -13,10 +13,15 @@ listen:
   port: 10808
 
 # 管理 API 监听配置(独立于代理端口)
-# 注意:管理 API 不受客户端认证保护,生产环境请用防火墙限制访问
+# 默认开放;生产环境请开启 api.auth(HTTP Basic,默认关闭)并用防火墙限制访问。
+# 开启后除 /health 外全部管理端点需 Authorization: Basic 凭据。
 api:
   host: "0.0.0.0"
   port: 18080
+  # auth:
+  #   enabled: true
+  #   username: "admin"
+  #   password: "changeme"
 
 # 路由行为配置
 router:

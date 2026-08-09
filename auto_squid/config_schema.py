@@ -24,10 +24,14 @@ class ListenConfig(BaseModel):
 class APIConfig(BaseModel):
     """管理 API 的监听配置(独立于代理端口,默认 18080)。
 
-    注意:管理 API 不受客户端认证保护,生产环境需用防火墙限制访问。
+    `auth` 复用 AuthConfig(默认关闭):开启后除 /health 外全部端点需 HTTP
+    Basic 认证(经 api.py 的中间件统一校验)。注意 APIConfig 定义在 AuthConfig
+    之后,故用字符串前向引用 + 模块末尾 model_rebuild() 解析。
     """
     host: str = Field("0.0.0.0")
     port: int = Field(18080)
+    auth: "AuthConfig" = Field(default_factory=lambda: AuthConfig(),
+                               description="管理 API 的 HTTP Basic 认证配置(默认关闭)")
 
 
 class LoggingConfig(BaseModel):
@@ -54,12 +58,14 @@ class ProxyInfo(BaseModel):
 
 
 class AuthConfig(BaseModel):
-    """客户端访问代理端口所需的 HTTP Basic 认证配置。
+    """HTTP Basic 认证配置,同时用于:
+    - 客户端访问**代理端口**的认证(开启后客户端每个请求都需带
+      `Proxy-Authorization` 头,见 auth.check_auth);
+    - 管理 API 的认证(api.auth,开启后除 /health 外全部端点需凭据)。
 
-    默认 `enabled=False`(开放代理),开启后客户端每个请求都需带
-    `Proxy-Authorization` 头(见 auth.check_auth)。
+    默认 `enabled=False`(开放)。
     """
-    enabled: bool = Field(False, description="要求客户端通过 HTTP Basic 认证")
+    enabled: bool = Field(False, description="要求 HTTP Basic 认证")
     username: str = Field("")
     password: str = Field("")
 
@@ -305,3 +311,8 @@ class Config(BaseModel):
     api: APIConfig = Field(default_factory=APIConfig)
     router: RouterConfig = Field(default_factory=RouterConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+
+
+# APIConfig.auth 是字符串前向引用("AuthConfig"),在模块底部解析一次,
+# 使 pydantic 能构建正确类型。AuthConfig 定义于本文件下方。
+APIConfig.model_rebuild()

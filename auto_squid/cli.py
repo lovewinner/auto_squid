@@ -146,7 +146,8 @@ def start(config: str = "", proxies: str = "", db: str = "auto_squid.db"):
         policies=list(cfg.router.policies),
     )
     # 把 store/router 注入 FastAPI app 的模块级全局,供各端点使用。
-    mount_api(proxy_store, router)
+    # api.auth 控制管理 API 的 HTTP Basic 认证(默认关闭)。
+    mount_api(proxy_store, router, api_auth=cfg.api.auth)
 
     async def _main():
         # 先启动代理端口(接受客户端 HTTP/CONNECT),再后台跑管理 API。
