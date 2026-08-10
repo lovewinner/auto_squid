@@ -21,6 +21,8 @@ Lightweight forward proxy with parallel racing, domain-based caching, an HTTP re
 - Domain-level caching (`cache_ttl`) of the winning proxy per domain
 - Session stickiness (per-client+domain, in-memory, sliding TTL) with redispatch on sticky-proxy failure, 5xx eviction, periodic re-race, and a capacity cap
 - In-memory HTTP `GET` response cache with `Cache-Control` awareness
+- In-flight GET coalescing: concurrent requests to the same URL await the in-flight upstream request instead of racing a duplicate (bounded wait, falls back to racing on timeout)
+- Write-method cache invalidation: `POST`/`PUT`/`DELETE`/`PATCH` evict all cached `GET` responses for that domain before forwarding, so subsequent `GET`s don't serve stale content
 - Optional local racing node (gateway races directly alongside upstreams)
 - Hop-by-hop header filtering in both directions: request headers (`proxy-authorization`, `connection`, etc.) are stripped before forwarding upstream so client-to-proxy credentials never leak to the next hop; response headers (`transfer-encoding`, `content-encoding`, `content-length`, etc.) are stripped and `Content-Length` is rewritten to the actual body length
 - Request body handling with a 10 MB cap (returns `413` on overflow); `Content-Length: 0` is handled correctly (no hang)
@@ -196,7 +198,6 @@ Client ──HTTP/S──> auto_squid (proxy :10808)
 | `GET /circuit` | Circuit-breaker + probe state per proxy (`open`, backoff, `probes_sent/ok/skipped`, `single_send_degrades`) |
 | `GET /policies` | Policy-routing config snapshot (match + allowed proxy subset) |
 | `POST /circuit/reset` | Un-break all circuits, keep EWMA quality |
-| `GET /server-stats` | server resource sampling (CPU %, event-loop lag) filled by the bench subprocess; empty in normal runs |
 
 ## Config
 

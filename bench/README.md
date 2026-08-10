@@ -61,6 +61,38 @@ python -m bench.stress --rounds 3
 python -m bench.stress --rounds 5 --mode all
 ```
 
+## 速度特性开关(透传 Router 配置)
+
+压测把生产里每个速度杠杆都透传进被测 Router,开/关对照即该特性的真实收益。全部开关默认关闭(与生产默认一致),对应 `config.yaml` 里的同名字段:
+
+| Flag | Router 配置 | 测什么 |
+|------|-----------|--------|
+| `--conn-pool` | `router.conn_pool.enabled` | CONNECT 上游 TCP 预热池:省"本机→上游"建连 TTFB(HTTPS 短连接收益最大) |
+| `--conn-pool-per-proxy` | `conn_pool.per_proxy` | 每代理预热连接数上限(默认 4) |
+| `--conn-pool-total` | `conn_pool.total` | 全局预热连接 fd 预算(默认 64) |
+| `--conn-pool-refill-target` | `conn_pool.refill_target` | 每代理保持的空闲连接数目标(默认 2) |
+| `--conn-pool-refill-interval` | `conn_pool.refill_interval` | 后台补充预热连接周期秒数(默认 5.0) |
+| `--conn-pool-idle-timeout` | `conn_pool.idle_timeout` | 空闲连接超时秒数(默认 30.0) |
+| `--adaptive-ttl` | `router.adaptive_ttl.enabled` | 自适应域名缓存 TTL:稳定域名 TTL 上浮、抖动域名回落 |
+| `--switch-damping` | `router.switch_damping.enabled` | 域名赢家切换阻尼:新赢家需连续胜出/显著更优才替换,降出口 IP 抖动 |
+| `--concurrency-limit` | `router.concurrency_limit.enabled` | 自适应并发限制:每代理并发上限成功增/失败降,防慢代理被堆死 |
+| `--policies` | `router.policies` | 策略路由:按域名/标签收窄竞速候选集(JSON,见下) |
+| `--http-cache-max-entries` | `router.http_cache.max_entries` | HTTP 响应缓存条目数上限(P2 LRU,默认 10000) |
+| `--http-cache-max-bytes` | `router.http_cache.max_bytes` | HTTP 缓存总字节上限(默认 256 MiB) |
+| `--http-cache-stream-limit` | `router.http_cache.stream_cache_limit` | 单条响应 body 缓冲上限,超过放弃缓存(默认 1 MiB) |
+
+配合既有 `--stagger-*` / `--circuit-*` / `--lb-bias` / `--single-send-degrade-*` / `--dead-proxy`(向 mock 集群注入死代理,测熔断/竞速兜底),`--mode all` 或 `staircase` 是最常用的对照形态。
+
+`--policies` 传 JSON 列表,每项 `{match, proxies}`(`proxies` 可用 `tags` 或 `ids` 收窄),空串=不启用:
+
+```bash
+python -m bench.stress --policies '[{"match":{"domain_suffix":[".cn","baidu.com"]},"proxies":{"tags":{"region":"cn"}}}]'
+python -m bench.stress --conn-pool --conn-pool-refill-interval 0.5 --conn-pool-refill-target 8
+python -m bench.stress --adaptive-ttl --switch-damping --concurrency-limit
+```
+
+开启后看报告里的 **`conn_pool` 组**(hits/misses/new_conns/pool_size_end/creates)与 `cache`/`racing` 组的相对变化评估收益。mock 模式是决定性对照;real 模式网络噪声大,建议用 `--rounds N` 多轮均值。
+
 ## 压测模式
 
 | 模式 | 负载形态 | 测什么 |

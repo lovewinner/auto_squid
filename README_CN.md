@@ -21,6 +21,8 @@
 - 域名级缓存（`cache_ttl`），按域名复用胜出代理
 - 会话粘性（per-client+domain，内存-only，滑动 TTL），粘性代理失败自动回落竞速并回填；5xx 驱逐、周期重竞速、容量上限
 - 内存级 HTTP `GET` 响应缓存，遵循 `Cache-Control`
+- 在途 GET 去重聚合：同 URL 并发 GET 命中未命中缓存时，等待在途的上游请求结果，不再重复打上游（有界等待，超时回落竞速）
+- 写方法缓存失效：`POST`/`PUT`/`DELETE`/`PATCH` 转发前清空该域名下所有已缓存 `GET` 响应，后续 `GET` 不会返回过期内容
 - 可选本机竞速节点（网关与上游一同竞速）
 - Hop-by-hop 头双向过滤：请求头（`proxy-authorization`、`connection` 等）在转发上游前剔除，避免客户端访问本代理的凭据泄漏到下一跳；响应头（`transfer-encoding`、`content-encoding`、`content-length` 等）剔除并按实际 body 长度重写 `Content-Length`
 - 请求体处理设有 10 MB 上限（超限返回 `413`）；`Content-Length: 0` 处理正确（不会卡死）
@@ -194,6 +196,7 @@ router:
 | `GET /quality` | 各代理 EWMA 首字节延迟（秒），竞速排序依据 |
 | `POST /quality/reset` | 清空全部代理 EWMA 质量（网络切换后调用） |
 | `GET /circuit` | 各代理熔断 + 探活状态（`open`、退避、`probes_sent/ok/skipped`、`single_send_degrades`） |
+| `GET /policies` | 策略路由配置快照（匹配条件 + 允许的代理子集） |
 | `POST /circuit/reset` | 手动解除全部熔断（保留 EWMA 质量） |
 
 ## 配置
