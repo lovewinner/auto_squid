@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from auto_squid.proxy_store import ProxyStore
-from auto_squid.router import Router, ProxySelector
+from auto_squid.router import Router, ProxySelector, _hb
 from auto_squid.config_schema import ProxyInfo, PolicyConfig
 from auto_squid.auth import check_auth
 from auto_squid.api import app as api_app, mount
@@ -68,6 +68,77 @@ async def run_mock_proxy(host, port, hit_counter=None):
                 pass
     server = await asyncio.start_server(handle, host=host, port=port)
     return server
+
+
+@pytest.mark.asyncio
+async def test_end_to_end_http_forwarding_utf8_header():
+    """A response header with non-ASCII UTF-8 bytes must be forwarded losslessly.
+
+    Regression: httpx decodes such header bytes as utf-8 → str code points > 255,
+    and the router's latin-1 re-encode used to raise UnicodeEncodeError, failing the
+    whole request after the race was won. The utf-8 bytes must reach the client
+    byte-identical.
+    """
+    hit = []
+    proxy_srv = await run_mock_proxy_utf8_header(HOST, PROXY_PORT)
+    proxy_store = ProxyStore()
+    proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT, db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        reader, writer = await asyncio.open_connection(HOST, ROUTER_PORT)
+        writer.write(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        await writer.drain()
+        status = await reader.readline()
+        assert b'200' in status
+        headers = bytearray()
+        while True:
+            h = await reader.readline()
+            if not h or h in (b"\r\n", b"\n"):
+                break
+            headers += h
+        body = await reader.read()
+        writer.close()
+        await writer.wait_closed()
+        assert b'proxied-utf8' in body
+        # 中文头值 must round-trip byte-for-byte (utf-8 bytes, not mangled).
+        # httpx/our forwarder lowercases header names (standard), so match name
+        # case-insensitively but require the value bytes identical.
+        raw_headers = bytes(headers).lower()
+        assert b'x-upstream-info: ' + "中文头值".encode('utf-8') in raw_headers
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
+
+def test_header_bytes_roundtrip():
+    """_hb() must re-encode header strings losslessly for every httpx decode branch.
+
+    httpx decodes upstream header bytes with an ascii → utf-8 → iso-8859-1 heuristic;
+    the router re-encodes with _hb(), which must reproduce the original wire bytes:
+    - pure ASCII → ascii branch
+    - valid UTF-8 (code points > 255, e.g. a Chinese header value) → utf-8 branch
+    - bytes not valid UTF-8 (each byte maps to a 0-255 code point) → latin-1/iso-8859-1 branch
+    """
+    cases = {
+        b"text/plain": "ascii",
+        "中文头值".encode("utf-8"): "utf-8",
+        b"GB2312 GBK" + "数据".encode("utf-8"): "utf-8 mixed",
+        bytes(range(128, 256)): "iso-8859-1 all high bytes",
+        bytes([0xFF, 0xFE, 0x80]): "invalid utf-8 → latin-1",
+    }
+    for raw, label in cases.items():
+        # mirror httpx's decode heuristic
+        for enc in ("ascii", "utf-8", "iso-8859-1"):
+            try:
+                s = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        assert _hb(s) == raw, f"{label}: {_hb(s)!r} != {raw!r}"
+    # str that cannot be latin-1 encoded must still work (utf-8 fallback)
+    assert _hb("中文") == "中文".encode("utf-8")
 
 
 async def run_local_http_server(host, port):
@@ -189,6 +260,41 @@ async def run_mock_proxy_status(host, port, status=500, pre_header_delay=0.0):
             writer.write(f"HTTP/1.1 {status} {reason}\r\n".encode())
             writer.write(f"Content-Length: {len(body)}\r\n".encode())
             writer.write(b"Content-Type: text/plain\r\n\r\n")
+            writer.write(body)
+            await writer.drain()
+            writer.close()
+        except Exception:
+            try:
+                writer.close()
+            except Exception:
+                pass
+    server = await asyncio.start_server(handle, host=host, port=port)
+    return server
+
+
+async def run_mock_proxy_utf8_header(host, port):
+    """HTTP mock proxy returning a 200 whose headers contain a non-ASCII UTF-8 value.
+
+    Regression for the latin-1 encode crash: httpx decodes valid-UTF-8 header bytes
+    with the utf-8 codec (code points > 255), and the router previously re-encoded
+    them with latin-1 → UnicodeEncodeError after the race was won, killing every
+    request through such an upstream.
+    """
+    async def handle(reader, writer):
+        try:
+            line = await reader.readline()
+            if not line:
+                writer.close()
+                return
+            while True:
+                h = await reader.readline()
+                if not h or h in (b"\r\n", b"\n"):
+                    break
+            body = b"proxied-utf8"
+            # UTF-8 bytes (中文) on the wire — no Content-Length → router uses chunked.
+            writer.write(b"HTTP/1.1 200 OK\r\n")
+            writer.write("X-Upstream-Info: 中文头值".encode('utf-8') + b"\r\n")
+            writer.write(b"Content-Type: text/plain; charset=utf-8\r\n\r\n")
             writer.write(body)
             await writer.drain()
             writer.close()

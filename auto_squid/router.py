@@ -132,6 +132,23 @@ _HOP_BY_HOP_RESPONSE_HEADERS = frozenset({
 })
 
 
+def _hb(v: str) -> bytes:
+    """编码一个响应头字符串为 HTTP 线上的原始字节(lossless)。
+
+    httpx 的 Headers.encoding 启发式按 ascii → utf-8 → iso-8859-1 依次尝试,
+    把上游的原始字节解码成 str:纯 ASCII 走 ascii,含合法 UTF-8 多字节的走
+    utf-8(如响应头里的中文字符串),其余按 iso-8859-1(每字节映射一码点)。
+    latin-1 与 iso-8859-1 完全等价,但 utf-8 解码出的字符串含 >255 的码点,
+    直接 .encode('latin-1') 会抛 UnicodeEncodeError(生产实测:上游带中文的
+    Server/Set-Cookie 头 → 竞速胜出后整请求失败)。先按 latin-1 编码(覆盖
+    iso-8859-1 分支),失败则回退 utf-8(覆盖 utf-8 分支,字节可无损还原)。
+    """
+    try:
+        return v.encode('latin-1')
+    except UnicodeEncodeError:
+        return v.encode('utf-8')
+
+
 class ProxySelector:
     """从 ProxyStore 产出代理 id 的有序列表,供竞速使用。
 
@@ -1137,8 +1154,7 @@ class Router:
                 encoded = base64.b64encode(raw.encode()).decode()
                 auth_hdr = f"Proxy-Authorization: Basic {encoded}\r\n"
             up_writer.write(
-                f"CONNECT {canary} HTTP/1.1\r\nHost: {canary}\r\n"
-                f"{auth_hdr}\r\n".encode('latin-1'))
+                f"CONNECT {canary} HTTP/1.1\r\nHost: ".encode('latin-1') + _hb(canary) + f"\r\n{auth_hdr}\r\n".encode('latin-1'))
             await up_writer.drain()
             status = await asyncio.wait_for(up_reader.readline(), timeout=_PROBE_TIMEOUT)
             if not status or b'200' not in status:
@@ -2209,10 +2225,10 @@ class Router:
         # 内部错误响应(407/502 等)传入 dict,两种都按 (k, v) 迭代即可。
         items = headers.items() if isinstance(headers, dict) else headers
         try:
-            writer.write(f"HTTP/1.1 {status_code} {reason_phrase}\r\n".encode('latin-1'))
+            writer.write(f"HTTP/1.1 {status_code} ".encode('latin-1') + _hb(reason_phrase) + b"\r\n")
             for k, v in items:
                 if k.lower() not in hop_by_hop:
-                    writer.write(f"{k}: {v}\r\n".encode('latin-1'))
+                    writer.write(f"{k}: ".encode('latin-1') + _hb(v) + b"\r\n")
             writer.write(f"Content-Length: {len(body)}\r\n".encode('latin-1'))
             writer.write(b"\r\n")
             writer.write(body)
@@ -2341,7 +2357,7 @@ class Router:
                 raw = f"{proxy_auth['username']}:{proxy_auth['password']}"
                 encoded = base64.b64encode(raw.encode()).decode()
                 auth_hdr = f"Proxy-Authorization: Basic {encoded}\r\n"
-            up_writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n{auth_hdr}\r\n".encode('latin-1'))
+            up_writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: ".encode('latin-1') + _hb(target) + f"\r\n{auth_hdr}\r\n".encode('latin-1'))
             await up_writer.drain()
             self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
             self.upstream_attempts += 1  # 聚合竞速扇出总数(供 /metrics 算放大率)
@@ -2425,7 +2441,7 @@ class Router:
                     await self._write_cached_response(writer, 407, 'Proxy Authentication Required',
                                                {'Proxy-Authenticate': 'Basic realm="auto_squid"',
                                                 'Content-Type': 'text/plain'},
-                                               (reason or 'Authentication required').encode('latin-1'))
+                                               _hb(reason or 'Authentication required'))
                     return
             if first.upper().startswith('CONNECT'):
                 target = first.split(' ')[1]
@@ -2776,11 +2792,11 @@ class Router:
             # 用 multi_items():httpx 的 items() 会把同名头(如多个 Set-Cookie)合并成
             # 逗号拼接的单行值,浏览器据此只解析出第一个 cookie,其余(如 Django 的
             # sessionid)被当未知属性丢弃,导致登录会话丢失。逐条写回保留重复头。
-            client_writer.write(f"HTTP/1.1 {resp.status_code} {resp.reason_phrase}\r\n".encode('latin-1'))
+            client_writer.write(f"HTTP/1.1 {resp.status_code} ".encode('latin-1') + _hb(resp.reason_phrase) + b"\r\n")
             for k, v in resp.headers.multi_items():
                 if k.lower() in _HOP_BY_HOP_RESPONSE_HEADERS:
                     continue
-                client_writer.write(f"{k}: {v}\r\n".encode('latin-1'))
+                client_writer.write(f"{k}: ".encode('latin-1') + _hb(v) + b"\r\n")
             if use_chunked:
                 client_writer.write(b"Transfer-Encoding: chunked\r\n")
             else:
