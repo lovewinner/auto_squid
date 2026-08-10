@@ -285,7 +285,9 @@ class ScenarioResult:
                              "single_send_degrades": None}
             inflight_group = {"max_in_flight": None, "in_flight_end": {}}
             conn_pool_group = {"hits": None, "misses": None, "new_conns": None,
-                               "pool_size_end": None, "creates": None}
+                               "pool_size_end": None, "creates": None,
+                               "target_hits": None, "target_pool_size_end": None,
+                               "target_creates": None, "target_prewarm_dispatched": None}
         else:
             cb, ca = self.counters_before, self.counters_after
             hits = ca.get("http_cache_hits", 0) - cb.get("http_cache_hits", 0)
@@ -327,6 +329,11 @@ class ScenarioResult:
                 "new_conns": ca.get("connect_new_conns", 0) - cb.get("connect_new_conns", 0),
                 "pool_size_end": ca.get("conn_pool_size", 0),
                 "creates": ca.get("conn_pool_creates", 0) - cb.get("conn_pool_creates", 0),
+                # CONNECT 目标半预连接(P2):target_pool_* 差值 + 场景末规模。
+                "target_hits": ca.get("target_pool_hits", 0) - cb.get("target_pool_hits", 0),
+                "target_pool_size_end": ca.get("target_pool_size", 0),
+                "target_creates": ca.get("target_pool_creates", 0) - cb.get("target_pool_creates", 0),
+                "target_prewarm_dispatched": ca.get("target_prewarm_dispatched", 0) - cb.get("target_prewarm_dispatched", 0),
             }
 
         # 瓶颈归因:状态分布含 429/503 → 上游触顶;否则 proxy。
@@ -1322,6 +1329,7 @@ async def amain(args):
             "conn_pool_refill_interval": args.conn_pool_refill_interval,
             "conn_pool_refill_target": args.conn_pool_refill_target,
             "conn_pool_connect_timeout": 10.0,
+            "conn_pool_target_prewarm": args.conn_pool_target_prewarm,
             "http_cache_max_entries": args.http_cache_max_entries,
             "http_cache_max_bytes": args.http_cache_max_bytes,
             "http_cache_stream_limit": args.http_cache_stream_limit,
@@ -1441,6 +1449,9 @@ def main():
                    help="预热池 refill 周期(秒);短场景压测可调小以尽快见到 hits")
     p.add_argument("--conn-pool-idle-timeout", type=float, default=30.0,
                    help="预热池空闲连接超时(秒)")
+    p.add_argument("--conn-pool-target-prewarm", action="store_true",
+                   help="开启 CONNECT 目标半预连接(P2);命中缓存/粘性的高频 target 预热到上游的 TCP,"
+                        "需配合 --conn-pool")
     p.add_argument("--adaptive-ttl", action="store_true",
                    help="开启自适应域名缓存 TTL(P2);稳定域名 TTL 上浮,抖动回落")
     p.add_argument("--switch-damping", action="store_true",

@@ -20,6 +20,7 @@ Lightweight forward proxy with parallel racing, domain-based caching, an HTTP re
 - HTTP and HTTPS (`CONNECT`) forwarding with parallel racing across upstream proxies (EWMA-sorted + staggered start)
 - Domain-level caching (`cache_ttl`) of the winning proxy per domain
 - Session stickiness (per-client+domain, in-memory, sliding TTL) with redispatch on sticky-proxy failure, 5xx eviction, periodic re-race, and a capacity cap
+- CONNECT upstream TCP warm pool (Phase 1, `router.conn_pool`): keeps a few idle TCP connections per upstream so CONNECTs skip the "this host → upstream proxy" connect; target half-preconnection (Phase 2, `conn_pool.target_prewarm`) pre-opens "to upstream" TCP for hot CONNECT targets on domain-cache/sticky hits, shared fd budget + idle timeout
 - In-memory HTTP `GET` response cache with `Cache-Control` awareness
 - In-flight GET coalescing: concurrent requests to the same URL await the in-flight upstream request instead of racing a duplicate (bounded wait, falls back to racing on timeout)
 - Write-method cache invalidation: `POST`/`PUT`/`DELETE`/`PATCH` evict all cached `GET` responses for that domain before forwarding, so subsequent `GET`s don't serve stale content
@@ -229,7 +230,7 @@ router:
   # adaptive_ttl: {enabled: true, min_sec: 60, max_sec: 1800}   # per-domain TTL by stability
   # switch_damping: {enabled: true, min_wins: 2, ratio: 0.8, abs_ms: 30}  # stable egress
   # concurrency_limit: {enabled: true, initial: 16, min: 2, max: 128, add_on_success: 4, mult_on_failure: 0.5, failure_window: 20}
-  # conn_pool: {enabled: true, per_proxy: 4, total: 64, idle_timeout: 30.0, refill_interval: 5.0, refill_target: 2, connect_timeout: 10.0}
+  # conn_pool: {enabled: true, per_proxy: 4, total: 64, idle_timeout: 30.0, refill_interval: 5.0, refill_target: 2, connect_timeout: 10.0, target_prewarm: true}
 logging:
   file: "auto_squid.log"
 ```
@@ -291,6 +292,7 @@ Tuning notes:
 - **`single_send_degrade_fail` is an early warning for the circuit breaker**: set it to `circuit_threshold - 1` (2 with the default 3) so a pinned proxy that starts failing demotes to racing *before* it breaks the circuit.
 - **`lb_bias`** controls how much in-flight backlog penalizes a proxy's race order (`ewma × (1 + active)^bias`). Raise it if slow proxies get hammered; lower it if the fastest proxy is being deprioritized.
 - **Policy routing** (`router.policies`) narrows the racing candidate set per domain/tag, cutting TTFB and `racing.amplification` — see `examples/config.yaml` for the shape.
+- **`conn_pool.target_prewarm`** (Phase 2) needs `conn_pool.enabled`; it pre-opens "to-upstream" TCP for hot CONNECT targets on domain-cache/sticky hits. `conn_pool_total` bounds the combined fd budget of both pools. Watch `/metrics` `target_pool_hits` vs `target_pool_misses` to confirm hot targets actually reuse prewarmed connections.
 
 ## Container deployment (Docker / docker compose)
 

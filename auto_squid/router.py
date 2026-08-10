@@ -512,7 +512,7 @@ class Router:
     生命周期:start() 开始监听 → handle_client 处理每个连接 → stop() 优雅关闭。
     """
 
-    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0):
+    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False):
         """构造路由器。
 
         参数:
@@ -602,6 +602,12 @@ class Router:
             conn_pool_refill_interval: 后台补充周期(秒),0=只取不补。
             conn_pool_refill_target: 每代理保持的空闲连接数目标。
             conn_pool_connect_timeout: 预热/取用建连超时(秒)。
+            conn_pool_target_prewarm: 第二阶段(CONNECT 目标半预连接)。命中域名
+                                缓存/粘性的高频 CONNECT target 在后台提前建立
+                                "到上游代理"的 TCP(不提前 CONNECT 到目标),按
+                                (proxy, target) 键区分,下次命中直接复用该 TCP
+                                发 CONNECT,进一步压低 HTTPS 短连接 TTFB。与
+                                第一阶段共享 per-proxy/全局 fd 预算/空闲超时。
         """
         self.proxy_store = proxy_store
         self.selector = ProxySelector(
@@ -754,6 +760,8 @@ class Router:
         self.conn_pool_refill_interval = max(0.0, conn_pool_refill_interval)
         self.conn_pool_refill_target = max(0, min(self.conn_pool_per_proxy, conn_pool_refill_target))
         self.conn_pool_connect_timeout = max(1.0, conn_pool_connect_timeout)
+        # 第二阶段(CONNECT 目标半预连接):需 conn_pool_enabled 且显式开启。
+        self.conn_pool_target_prewarm = bool(conn_pool_target_prewarm)
         # {proxy_url: [StreamWriter,...]} —— 空闲预热连接。只由事件循环线程读写。
         self._conn_pool: dict[str, list] = {}
         self.conn_pool_creates = 0      # 累计预热建连次数
@@ -761,6 +769,17 @@ class Router:
         self.conn_pool_misses = 0       # 取池未中需新建的次数
         self.conn_pool_expired = 0      # 空闲超时关闭次数
         self._conn_pool_task: Optional[asyncio.Task] = None
+        # {proxy_host:port|target: [StreamWriter,...]} —— 按 CONNECT target 半预
+        # 连接的"到上游代理"TCP(P2,见 _target_pool_*)。命中域名缓存/粘性的
+        # target 后台预热,取用时优先于第一阶段通用池。共享 fd 预算/空闲超时。
+        self._target_pool: dict[str, list] = {}
+        self.target_pool_creates = 0    # 累计 target 半预建连次数
+        self.target_pool_hits = 0       # target 预连接取用成功次数
+        self.target_pool_misses = 0     # 取 target 池未中需新建的次数
+        self.target_pool_expired = 0    # target 预连接空闲超时关闭次数
+        self.target_prewarm_dispatched = 0  # 后台预热协程发起次数
+        self.target_prewarm_success = 0     # 预热建连成功次数
+        self.target_prewarm_failed = 0      # 预热建连失败次数
         # 观测(P1 先观测后实现):CONNECT 到上游的新建 TCP 连接计数(不含预热池
         # 命中)。供压测算 HTTPS 建链成本、验证预热池收益。
         self.connect_new_conns = 0
@@ -1239,6 +1258,15 @@ class Router:
             "conn_pool_misses": self.conn_pool_misses,
             "conn_pool_expired": self.conn_pool_expired,
             "conn_pool_size": sum(len(v) for v in self._conn_pool.values()),
+            "conn_pool_target_prewarm": self.conn_pool_target_prewarm,
+            "target_pool_creates": self.target_pool_creates,
+            "target_pool_hits": self.target_pool_hits,
+            "target_pool_misses": self.target_pool_misses,
+            "target_pool_expired": self.target_pool_expired,
+            "target_pool_size": sum(len(v) for v in self._target_pool.values()),
+            "target_prewarm_dispatched": self.target_prewarm_dispatched,
+            "target_prewarm_success": self.target_prewarm_success,
+            "target_prewarm_failed": self.target_prewarm_failed,
             "connect_new_conns": self.connect_new_conns,
             "probes_sent": self.probes_sent,
             "probes_ok": self.probes_ok,
@@ -1828,39 +1856,64 @@ class Router:
             except Exception:
                 pass
 
-    # ── CONNECT 上游 TCP 预热池(P1)─────────────────────────────
+    # ── CONNECT 上游 TCP 预热池(P1)+ 目标半预连接(P2)────────────
+
+    @staticmethod
+    def _pool_peek(pool: dict, key: str) -> Optional[Tuple[asyncio.StreamReader, asyncio.StreamWriter]]:
+        """从预热池取一条空闲连接 (reader, writer);无则返回 None。
+
+        连接在取用后由调用方发 CONNECT,隧道结束即关闭(不归还——CONNECT 后
+        socket 已被隧道占用)。池中存 (reader, writer) 对:asyncio 的
+        get_extra_info('reader') 不可靠,必须由建连处成对保存。
+        """
+        stack = pool.get(key)
+        while stack:
+            reader, writer = stack.pop()
+            if writer.is_closing():
+                continue  # 已关闭的废弃连接直接丢弃
+            return reader, writer
+        if stack is not None and not stack:
+            pool.pop(key, None)
+        return None
 
     def _conn_pool_peek(self, proxy_host: str, proxy_port: int) -> Optional[Tuple[asyncio.StreamReader, asyncio.StreamWriter]]:
         """从预热池取一条到该上游的空闲连接 (reader, writer);无则返回 None。
 
         取用成功计 hits,需新建计 misses。连接在取用后由调用方发 CONNECT,
-        隧道结束即关闭(不归还——CONNECT 后 socket 已被隧道占用)。池中存
-        (reader, writer) 对:asyncio 的 get_extra_info('reader') 不可靠,必须
-        由建连处成对保存。
+        隧道结束即关闭(不归还——CONNECT 后 socket 已被隧道占用)。
         """
-        key = f"{proxy_host}:{proxy_port}"
-        stack = self._conn_pool.get(key)
-        while stack:
-            reader, writer = stack.pop()
-            if writer.is_closing():
-                continue  # 已关闭的废弃连接直接丢弃
+        got = Router._pool_peek(self._conn_pool, f"{proxy_host}:{proxy_port}")
+        if got is None:
+            self.conn_pool_misses += 1
+        else:
             self.conn_pool_hits += 1
-            return reader, writer
-        if stack is not None and not stack:
-            self._conn_pool.pop(key, None)
-        self.conn_pool_misses += 1
-        return None
+        return got
+
+    def _target_pool_peek(self, proxy_host: str, proxy_port: int, target: str) -> Optional[Tuple[asyncio.StreamReader, asyncio.StreamWriter]]:
+        """从 target 半预连接池取一条到该上游的空闲连接 (reader, writer)。
+
+        键为 "proxy_host:proxy_port|target"——只预连"到上游代理"的 TCP,未发
+        CONNECT,可安全复用于同 target。取用成功计 target_pool_hits,需新建计
+        target_pool_misses。上层优先用此池,其次才回退第一阶段通用池。
+        """
+        got = Router._pool_peek(self._target_pool, f"{proxy_host}:{proxy_port}|{target}")
+        if got is None:
+            self.target_pool_misses += 1
+        else:
+            self.target_pool_hits += 1
+        return got
 
     async def _conn_pool_refill(self):
-        """补充预热连接到目标水位(后台 refill task 周期调用)。
+        """补充第一阶段预热连接到目标水位(后台 refill task 周期调用)。
 
         每代理目标 conn_pool_refill_target 条;全局受 conn_pool_total 钳制。
         建连失败静默(上游临时不可达时下次再补)。空代理/未启用跳过。
         """
         if not self.conn_pool_enabled:
             return
-        # 快照当前空闲总数,防止并发补充超过全局预算。
-        total_idle = sum(len(v) for v in self._conn_pool.values())
+        # 快照当前空闲总数,防止并发补充超过全局预算(两阶段共享 conn_pool_total)。
+        total_idle = sum(len(v) for v in self._conn_pool.values()) \
+            + sum(len(v) for v in self._target_pool.values())
         for proxy in self.proxy_store.list():
             if not proxy.enabled:
                 continue
@@ -1885,35 +1938,102 @@ class Router:
                 if total_idle >= self.conn_pool_total:
                     break
 
-    async def _conn_pool_prune(self):
-        """关闭空闲超时的预热连接(每 refill 周期顺带清理,防 fd 泄漏)。"""
+    async def _target_pool_refill(self, proxy_host: str, proxy_port: int, target: str, cap: int = 1):
+        """为某 (proxy, target) 键补充一条半预连接到目标水位。
+
+        只建立"到上游代理"的 TCP(不提前 CONNECT 到目标),可安全复用于同
+        target。全局受 conn_pool_total 钳制,单键受 cap 钳制(默认 1 条,避免
+        为单个 target 占用过多 fd)。建连失败静默(下次命中再试)。单事件循环
+        线程调用,无需加锁。
+        """
+        if not self.conn_pool_enabled:
+            return 0
+        key = f"{proxy_host}:{proxy_port}|{target}"
+        if len(self._target_pool.get(key, [])) >= cap:
+            return 0
+        # 全局 fd 预算:第一阶段 + 第二阶段共享,超限则不补。
+        total_idle = sum(len(v) for v in self._conn_pool.values()) \
+            + sum(len(v) for v in self._target_pool.values())
+        if total_idle >= self.conn_pool_total:
+            return 0
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(proxy_host, proxy_port),
+                timeout=self.conn_pool_connect_timeout)
+        except (asyncio.TimeoutError, OSError, ConnectionError):
+            self.target_prewarm_failed += 1
+            return 0
+        writer._conn_pool_created = time.monotonic()
+        self._target_pool.setdefault(key, []).append((reader, writer))
+        self.target_pool_creates += 1
+        self.target_prewarm_success += 1
+        return 1
+
+    async def _target_pool_prewarm(self, proxy_host: str, proxy_port: int, target: str, cap: int = 1):
+        """后台协程:为 (proxy, target) 键预热半连接,失败静默(被取消/超时/建连
+        失败都只是少一条预热,不影响主请求)。由命中域名缓存/粘性的 CONNECT 触
+        发,是"fire-and-forget",主请求不 await 本协程。
+        """
+        try:
+            await self._target_pool_refill(proxy_host, proxy_port, target, cap=cap)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.debug("target prewarm failed for %s via %s", target, proxy_host)
+
+    def _spawn_target_prewarm(self, proxy_host: Optional[str], proxy_port: Optional[int], target: str):
+        """命中域名缓存/粘性的 CONNECT → 后台预热 (proxy, target) 半连接。
+
+        仅在第二阶段开启且经上游代理(非本机直连)时触发;计数并记录到
+        _running_tasks(供 stop() 排空),不阻塞主请求路径。
+        """
+        if not (self.conn_pool_enabled and self.conn_pool_target_prewarm):
+            return
+        if proxy_host is None:
+            return  # 本机直连路径无"上游代理"可预热
+        self.target_prewarm_dispatched += 1
+        task = asyncio.create_task(self._target_pool_prewarm(proxy_host, proxy_port, target))
+        self._running_tasks.add(task)
+        task.add_done_callback(self._running_tasks.discard)
+
+    async def _pool_prune(self):
+        """关闭空闲超时的预热连接(两阶段池,每 refill 周期顺带清理,防 fd 泄漏)。
+
+        用 writer._conn_pool_created 记录建连时间戳(两阶段建连处统一打)。
+        """
         now = time.monotonic()
         stale = []
         # 先收集待关连接,再统一重建 dict —— 迭代中 pop 会触发
         # "dictionary changed size during iteration"。
-        for key in list(self._conn_pool.keys()):
-            stack = self._conn_pool[key]
-            alive = []
-            for item in stack:
-                reader, writer = item
-                if writer.is_closing():
-                    continue
-                last = getattr(writer, '_conn_pool_created', 0)
-                if now - last > self.conn_pool_idle_timeout:
-                    stale.append(writer)
-                    self.conn_pool_expired += 1
-                    continue
-                alive.append(item)
-            if alive:
-                self._conn_pool[key] = alive
-            else:
-                self._conn_pool.pop(key, None)
+        for pool, expired_counter in ((self._conn_pool, 'conn_pool_expired'),
+                                      (self._target_pool, 'target_pool_expired')):
+            for key in list(pool.keys()):
+                stack = pool[key]
+                alive = []
+                for item in stack:
+                    reader, writer = item
+                    if writer.is_closing():
+                        continue
+                    last = getattr(writer, '_conn_pool_created', 0)
+                    if now - last > self.conn_pool_idle_timeout:
+                        stale.append(writer)
+                        setattr(self, expired_counter, getattr(self, expired_counter) + 1)
+                        continue
+                    alive.append(item)
+                if alive:
+                    pool[key] = alive
+                else:
+                    pool.pop(key, None)
         for w in stale:
             try:
                 w.close()
                 await w.wait_closed()
             except Exception:
                 pass
+
+    async def _conn_pool_prune(self):
+        """兼容旧调用:第一阶段池清理(委托给 _pool_prune)。"""
+        await self._pool_prune()
 
     async def _conn_pool_loop(self):
         """后台预热循环:周期补充到目标水位并清理过期连接。
@@ -1926,16 +2046,17 @@ class Router:
                 await asyncio.sleep(self.conn_pool_refill_interval)
                 try:
                     await self._conn_pool_refill()
-                    await self._conn_pool_prune()
+                    await self._pool_prune()
                 except Exception:
                     logger.exception("conn pool refill failed")
         except asyncio.CancelledError:
             pass
 
     async def _conn_pool_close_all(self):
-        """关闭全部预热连接(stop 时调用)。"""
-        stacks = list(self._conn_pool.values())
+        """关闭全部预热连接(stop 时调用),含 target 半预连接池。"""
+        stacks = list(self._conn_pool.values()) + list(self._target_pool.values())
         self._conn_pool.clear()
+        self._target_pool.clear()
         for stack in stacks:
             for item in stack:
                 reader, writer = item
@@ -2319,13 +2440,19 @@ class Router:
         connect_timeout = 15
         try:
             if proxy_host is not None:
-                # CONNECT 预热池(P1):优先取已连接到上游代理的空闲连接,省
-                # "本机→上游"建连 TTFB;池无可用时新建(计数 misses)。
+                # CONNECT 预热池(P1)+ 目标半预连接(P2):取用顺序为——
+                # 1) target 半预连接池(按 proxy|target 键,只预连"到上游代理"的
+                #    TCP,未发 CONNECT,可安全复用);2) 第一阶段通用池;3) 新建。
+                # 取用成功即省掉"本机→上游"建连 TTFB。
                 if self.conn_pool_enabled:
-                    pooled = self._conn_pool_peek(proxy_host, proxy_port)
-                    if pooled is not None:
-                        up_reader, up_writer = pooled
-                    else:
+                    up_reader, up_writer = None, None
+                    if self.conn_pool_target_prewarm:
+                        up_reader, up_writer = self._target_pool_peek(proxy_host, proxy_port, target) or (None, None)
+                    if up_reader is None:
+                        pooled = self._conn_pool_peek(proxy_host, proxy_port)
+                        if pooled is not None:
+                            up_reader, up_writer = pooled
+                    if up_reader is None:
                         self.connect_new_conns += 1  # 观测:池未中需新建
                         up_reader, up_writer = await asyncio.wait_for(
                             asyncio.open_connection(proxy_host, proxy_port), timeout=connect_timeout)
@@ -2923,6 +3050,9 @@ class Router:
                         pid, up_reader, up_writer = await self._try_tunnel(sticky_pid, target, None, None, None)
                     else:
                         pid, up_reader, up_writer = await self._try_tunnel(sticky_pid, target, proxy.host, proxy.port, proxy.auth)
+                        # CONNECT 目标半预连接(P2):粘性命中说明该 target 高频,
+                        # 后台预热下一条到上游代理的 TCP(不阻塞本请求)。
+                        self._spawn_target_prewarm(proxy.host, proxy.port, target)
                     logger.debug("proxy %s sticky hit CONNECT %s", pid, target)
                     self.sticky_cache_hits += 1
                     self._bump_sticky(client_ip, target, sticky_pid)
@@ -2947,6 +3077,9 @@ class Router:
                     pid, up_reader, up_writer = await self._try_tunnel(cached_pid, target, None, None, None)
                 else:
                     pid, up_reader, up_writer = await self._try_tunnel(cached_pid, target, proxy.host, proxy.port, proxy.auth)
+                    # CONNECT 目标半预连接(P2):域名缓存命中说明该 target 高频,
+                    # 后台预热下一条到上游代理的 TCP(不阻塞本请求)。
+                    self._spawn_target_prewarm(proxy.host, proxy.port, target)
                 logger.debug("proxy %s cache hit CONNECT %s", pid, target)
                 self._record_sticky(client_ip, target, cached_pid)
                 await self._connect_established(client_writer, up_writer)

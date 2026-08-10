@@ -167,6 +167,12 @@ class ConnPoolConfig(BaseModel):
     refill_interval: 后台补充预热连接的周期(秒,默认 5)。0=只取不补。
     refill_target: 每代理保持的空闲连接数目标(默认 2,受 per_proxy/total 钳制)。
     connect_timeout: 预热/取用建连超时(秒,默认 10)。
+    target_prewarm: 第二阶段(默认关闭)。命中域名缓存/粘性的高频 CONNECT target
+                在后台提前建立"到上游代理"的 TCP(不提前 CONNECT 到目标,避免打
+                到源站),按 (proxy, target) 键区分,下一次同 target 命中时直接
+                复用该 TCP 发 CONNECT,进一步压低 HTTPS 短连接 TTFB。与第一阶段
+                共享 per-proxy 上限 + 全局 fd 预算 + 空闲超时;需 conn_pool.enabled
+                为 True 才生效。
     """
     enabled: bool = Field(False, description="启用 CONNECT 上游 TCP 预热池")
     per_proxy: int = Field(4, description="每代理预热连接数上限")
@@ -175,6 +181,7 @@ class ConnPoolConfig(BaseModel):
     refill_interval: float = Field(5.0, description="后台补充预热连接的周期(秒),0=只取不补")
     refill_target: int = Field(2, description="每代理保持的空闲连接数目标")
     connect_timeout: float = Field(10.0, description="预热/取用建连超时(秒)")
+    target_prewarm: bool = Field(False, description="CONNECT 目标半预连接(第二阶段):命中缓存/粘性的高频 target 提前预热到上游的 TCP")
 
 
 class ConcurrencyLimitConfig(BaseModel):

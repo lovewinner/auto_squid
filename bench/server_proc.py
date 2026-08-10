@@ -236,6 +236,7 @@ async def _serve(config: dict):
                         conn_pool_refill_interval=config.get("conn_pool_refill_interval", 5.0),
                         conn_pool_refill_target=config.get("conn_pool_refill_target", 2),
                         conn_pool_connect_timeout=config.get("conn_pool_connect_timeout", 10.0),
+                        conn_pool_target_prewarm=config.get("conn_pool_target_prewarm", False),
                         http_cache_max_entries=config.get("http_cache_max_entries", 10_000),
                         http_cache_max_bytes=config.get("http_cache_max_bytes", 256 * 1024 * 1024),
                         http_cache_stream_limit=config.get("http_cache_stream_limit", 1024 * 1024),

@@ -3259,3 +3259,189 @@ class TestConnPool:
         assert s['conn_pool_enabled'] is True
         assert s['conn_pool_hits'] == 0
         assert s['conn_pool_size'] == 0
+
+
+class TestTargetPrewarm:
+    """CONNECT 目标半预连接(P2, P3-5 第二阶段):命中域名缓存/粘性的高频
+    CONNECT target 后台提前建立"到上游代理"的 TCP(不提前 CONNECT 到目标),
+    按 (proxy, target) 键区分,取用优先于第一阶段通用池。"""
+
+    def _router(self, **kw):
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host=HOST, port=31991))
+        kw.setdefault('conn_pool_enabled', True)
+        kw.setdefault('conn_pool_target_prewarm', True)
+        kw.setdefault('conn_pool_per_proxy', 4)
+        kw.setdefault('conn_pool_total', 8)
+        kw.setdefault('conn_pool_refill_interval', 0.0)  # 只取不补(测试手动补)
+        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+                      db_path=tempfile.mktemp(suffix='.db'), **kw)
+
+    @pytest.mark.asyncio
+    async def test_prewarm_then_peek_reuses(self):
+        """预热一条到上游代理的 TCP 后,target_pool_peek 取到同一连接(不计 miss)。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router()
+        try:
+            assert await r._target_pool_refill(HOST, 31991, 'example.com:443') == 1
+            assert r.target_pool_creates == 1
+            assert r.target_prewarm_success == 1
+            key = f"{HOST}:31991|example.com:443"
+            assert len(r._target_pool.get(key, [])) == 1
+            got = r._target_pool_peek(HOST, 31991, 'example.com:443')
+            assert got is not None
+            assert r.target_pool_hits == 1
+            assert r.target_pool_misses == 0
+        finally:
+            await r._conn_pool_close_all()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_peek_empty_misses(self):
+        """池空 → target_pool_peek 返回 None 并计 target_pool_misses。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router()
+        try:
+            assert r._target_pool_peek(HOST, 31991, 'example.com:443') is None
+            assert r.target_pool_misses == 1
+        finally:
+            await r._conn_pool_close_all()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_prewarm_skips_disabled_or_budget_full(self):
+        """未启用或全局 fd 预算已满 → 不再预热。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router(conn_pool_enabled=False)
+        try:
+            assert await r._target_pool_refill(HOST, 31991, 'example.com:443') == 0
+            assert r.target_pool_creates == 0
+        finally:
+            await r._conn_pool_close_all()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_prune_closes_idle_target(self):
+        """target 池空闲超时 → prune 关闭并计 target_pool_expired。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router(conn_pool_idle_timeout=1.0)
+        try:
+            assert await r._target_pool_refill(HOST, 31991, 'example.com:443') == 1
+            for stack in r._target_pool.values():
+                for _, w in stack:
+                    w._conn_pool_created = time.monotonic() - 100
+            await r._pool_prune()
+            assert r.target_pool_expired >= 1
+            assert sum(len(v) for v in r._target_pool.values()) == 0
+        finally:
+            await r._conn_pool_close_all()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_combined_budget_respected(self):
+        """第一阶段与 target 池共享 conn_pool_total:target 池占满预算后,第一阶段
+        refill 不再新增连接。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router(conn_pool_total=1, conn_pool_refill_target=2)
+        try:
+            # target 池先占满唯一预算(1)。
+            assert await r._target_pool_refill(HOST, 31991, 'example.com:443') == 1
+            # 第一阶段 refill 应被预算钳制为 0。
+            await r._conn_pool_refill()
+            total = sum(len(v) for v in r._conn_pool.values()) \
+                + sum(len(v) for v in r._target_pool.values())
+            assert total == 1
+        finally:
+            await r._conn_pool_close_all()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    def test_snapshot_exposes_target_pool(self):
+        """snapshot_counters 暴露 target 半预连接池计数与开关。"""
+        r = self._router()
+        s = r.snapshot_counters()
+        assert s['conn_pool_target_prewarm'] is True
+        assert s['target_pool_hits'] == 0
+        assert s['target_pool_size'] == 0
+        assert s['target_prewarm_dispatched'] == 0
+
+    @pytest.mark.asyncio
+    async def test_spawn_dispatches_task(self):
+        """_spawn_target_prewarm 发起后台预热并计入 dispatched(失败静默)。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router()
+        try:
+            r._spawn_target_prewarm(HOST, 31991, 'example.com:443')
+            # 给后台协程一个事件循环机会完成建连。
+            for _ in range(50):
+                if r.target_prewarm_dispatched >= 1 and sum(len(v) for v in r._target_pool.values()) >= 1:
+                    break
+                await asyncio.sleep(0.01)
+            assert r.target_prewarm_dispatched == 1
+            assert r.target_pool_creates == 1
+            assert r.target_prewarm_success == 1
+        finally:
+            # 排空后台预热 task(stop 前先 gather),再关连接。
+            for t in list(r._running_tasks):
+                t.cancel()
+            if r._running_tasks:
+                await asyncio.gather(*r._running_tasks, return_exceptions=True)
+            r._running_tasks.clear()
+            await r._conn_pool_close_all()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_e2e_domain_cache_hit_reuses_prewarmed_conn(self):
+        """端到端:第一次 CONNECT 竞速写域名缓存;第二次命中域名缓存触发预热
+        (miss + 后台建连);第三次命中复用预热的到上游 TCP(target_pool_hits +1,
+        target_pool_misses 不再增长)。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router()
+        await r.start()
+        try:
+            target = b"e2e-preconn.example.com:443"
+            # 1) 竞速 → 写域名缓存(无预热池可复用)。
+            echo1 = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"one")
+            assert echo1 == b"one"
+            assert r.target_pool_hits == 0
+            # 2) 域名缓存命中 → 取池未中(miss),隧道建立后后台预热一条到上游 TCP。
+            echo2 = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"two")
+            assert echo2 == b"two"
+            assert r.target_pool_misses >= 1
+            # 等待后台预热协程完成建连。
+            for _ in range(200):
+                if sum(len(v) for v in r._target_pool.values()) >= 1:
+                    break
+                await asyncio.sleep(0.01)
+            assert r.target_pool_creates >= 1
+            # 3) 域名缓存命中 → 复用预热的到上游 TCP(target_pool_hits +1)。
+            hits_before = r.target_pool_hits
+            misses_before = r.target_pool_misses
+            echo3 = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"three")
+            assert echo3 == b"three"
+            assert r.target_pool_hits == hits_before + 1
+            assert r.target_pool_misses == misses_before
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_spawn_skipped_when_not_enabled(self):
+        """未开启 target_prewarm → 不发起后台预热,dispatched 保持 0。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router(conn_pool_target_prewarm=False)
+        try:
+            r._spawn_target_prewarm(HOST, 31991, 'example.com:443')
+            await asyncio.sleep(0.02)
+            assert r.target_prewarm_dispatched == 0
+            assert r.target_pool_creates == 0
+        finally:
+            await r._conn_pool_close_all()
+            up_srv.close()
+            await up_srv.wait_closed()

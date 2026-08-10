@@ -73,6 +73,7 @@ python -m bench.stress --rounds 5 --mode all
 | `--conn-pool-refill-target` | `conn_pool.refill_target` | 每代理保持的空闲连接数目标(默认 2) |
 | `--conn-pool-refill-interval` | `conn_pool.refill_interval` | 后台补充预热连接周期秒数(默认 5.0) |
 | `--conn-pool-idle-timeout` | `conn_pool.idle_timeout` | 空闲连接超时秒数(默认 30.0) |
+| `--conn-pool-target-prewarm` | `conn_pool.target_prewarm` | CONNECT 目标半预连接(P2):命中缓存/粘性的高频 target 后台预热到上游的 TCP,需配合 `--conn-pool` |
 | `--adaptive-ttl` | `router.adaptive_ttl.enabled` | 自适应域名缓存 TTL:稳定域名 TTL 上浮、抖动域名回落 |
 | `--switch-damping` | `router.switch_damping.enabled` | 域名赢家切换阻尼:新赢家需连续胜出/显著更优才替换,降出口 IP 抖动 |
 | `--concurrency-limit` | `router.concurrency_limit.enabled` | 自适应并发限制:每代理并发上限成功增/失败降,防慢代理被堆死 |
@@ -91,7 +92,7 @@ python -m bench.stress --conn-pool --conn-pool-refill-interval 0.5 --conn-pool-r
 python -m bench.stress --adaptive-ttl --switch-damping --concurrency-limit
 ```
 
-开启后看报告里的 **`conn_pool` 组**(hits/misses/new_conns/pool_size_end/creates)与 `cache`/`racing` 组的相对变化评估收益。mock 模式是决定性对照;real 模式网络噪声大,建议用 `--rounds N` 多轮均值。
+开启后看报告里的 **`conn_pool` 组**(hits/misses/new_conns/pool_size_end/creates)与 `cache`/`racing` 组的相对变化评估收益。开启 `--conn-pool-target-prewarm` 后,该组还会带上 **target 半预连接子计数**(`target_hits`/`target_pool_size_end`/`target_creates`/`target_prewarm_dispatched`)——`target_hits` 高说明高频 CONNECT target 的"到上游"TCP 已被提前建好,省掉了该段建连。mock 模式是决定性对照;real 模式网络噪声大,建议用 `--rounds N` 多轮均值。
 
 ## 压测模式
 

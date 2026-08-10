@@ -50,6 +50,7 @@
 - [x] 域名赢家切换阻尼（switch_damping）：新赢家需连续胜出/显著更优才替换，降出口 IP 抖动
 - [x] 自适应并发限制（concurrency_limit）：每代理并发上限成功增/失败乘性降
 - [x] CONNECT 上游 TCP 预热池（conn_pool）：每代理维护空闲连接，省建连 TTFB
+  - [x] 第二阶段·目标半预连接（conn_pool.target_prewarm）：命中域名缓存/粘性的高频 CONNECT target 后台预建"到上游"TCP，按 (proxy, target) 键区分，取用优先于通用池，共享 fd 预算/空闲超时
 - [x] 会话粘性（per-client+domain，滑动 TTL）：redispatch、5xx 驱逐、recheck 重竞速、容量上限
 - [x] bench 透传全部速度特性开关（--conn-pool / --adaptive-ttl / --switch-damping / --concurrency-limit / --policies / --http-cache-max-*）
 
@@ -69,5 +70,5 @@
 
 ## 当前测试状态
 
-- `tests/test_end_to_end.py` 等：133 个用例，覆盖转发/缓存/竞速/聚合/认证/熔断/探活/粘性/计数/DB 持久化/UTF-8 头安全。
+- `tests/test_end_to_end.py` 等：141 个用例，覆盖转发/缓存/竞速/聚合/认证/熔断/探活/粘性/计数/DB 持久化/UTF-8 头安全/连接预热（通用池 + target 半预连接）。
 - 运行：`.venv/bin/python -m pytest -q`
