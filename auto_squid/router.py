@@ -1895,12 +1895,17 @@ class Router:
         键为 "proxy_host:proxy_port|target"——只预连"到上游代理"的 TCP,未发
         CONNECT,可安全复用于同 target。取用成功计 target_pool_hits,需新建计
         target_pool_misses。上层优先用此池,其次才回退第一阶段通用池。
+        命中/miss 均记 INFO(低频诊断,判断热 target 是否真的复用了预热连接)。
         """
         got = Router._pool_peek(self._target_pool, f"{proxy_host}:{proxy_port}|{target}")
         if got is None:
             self.target_pool_misses += 1
+            logger.info("target pool MISS %s via %s:%s (misses=%d)",
+                        target, proxy_host, proxy_port, self.target_pool_misses)
         else:
             self.target_pool_hits += 1
+            logger.info("target pool HIT  %s via %s:%s (hits=%d)",
+                        target, proxy_host, proxy_port, self.target_pool_hits)
         return got
 
     async def _conn_pool_refill(self):
@@ -1962,6 +1967,8 @@ class Router:
                     timeout=self.conn_pool_connect_timeout)
             except (asyncio.TimeoutError, OSError, ConnectionError):
                 self.target_prewarm_failed += 1
+                logger.info("target prewarm CONNECT-FAIL %s via %s:%s (failed=%d)",
+                            target, proxy_host, proxy_port, self.target_prewarm_failed)
                 break
             writer._conn_pool_created = time.monotonic()
             self._target_pool.setdefault(key, []).append((reader, writer))
@@ -1969,6 +1976,10 @@ class Router:
             self.target_prewarm_success += 1
             made += 1
             total_idle += 1
+        if made:
+            logger.info("target prewarm CREATED %d conn(s) for %s via %s:%s (creates=%d, size=%d)",
+                        made, target, proxy_host, proxy_port,
+                        self.target_pool_creates, len(self._target_pool.get(key, [])))
         return made
 
     async def _target_pool_prewarm(self, proxy_host: str, proxy_port: int, target: str, cap: int = 2):
@@ -1982,7 +1993,7 @@ class Router:
         except asyncio.CancelledError:
             pass
         except Exception:
-            logger.debug("target prewarm failed for %s via %s", target, proxy_host)
+            logger.info("target prewarm FAILED %s via %s:%s", target, proxy_host, proxy_port)
 
     def _spawn_target_prewarm(self, proxy_host: Optional[str], proxy_port: Optional[int], target: str):
         """命中域名缓存/粘性或竞速胜出的 CONNECT → 后台预热 (proxy, target) 半连接。
@@ -1997,6 +2008,8 @@ class Router:
         if proxy_host is None:
             return  # 本机直连路径无"上游代理"可预热
         self.target_prewarm_dispatched += 1
+        logger.info("target prewarm SPAWN %s via %s:%s (dispatched=%d)",
+                    target, proxy_host, proxy_port, self.target_prewarm_dispatched)
         task = asyncio.create_task(self._target_pool_prewarm(proxy_host, proxy_port, target))
         self._running_tasks.add(task)
         task.add_done_callback(self._running_tasks.discard)
@@ -2028,6 +2041,9 @@ class Router:
                 if alive:
                     pool[key] = alive
                 else:
+                    if expired_counter == 'target_pool_expired':
+                        logger.info("target prewarm EXPIRED %s (%s conn(s))",
+                                    key, len(stack))
                     pool.pop(key, None)
         for w in stale:
             try:
