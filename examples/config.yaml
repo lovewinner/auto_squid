@@ -161,11 +161,12 @@ router:
   # 池中连接再发 CONNECT target,省掉"本机→上游代理"的建连 TTFB(HTTPS 短连接
   # 场景收益最大)。带 per-proxy 上限 + 全局 fd 预算 + 空闲超时,防泄漏。
   # 默认关闭。开启后看 /metrics 的 conn_pool_hits/misses 评估收益。
-  # target_prewarm(P2):第二阶段。命中域名缓存/粘性的高频 CONNECT target,后台
-  # 提前建立"到上游代理"的 TCP(不提前 CONNECT 到目标,避免打源站),按
-  # (proxy, target) 键区分,下次命中直接复用该 TCP 发 CONNECT,进一步压低 HTTPS
-  # 短连接 TTFB。与第一阶段共享 per-proxy/全局 fd 预算/空闲超时。需 enabled 为
-  # true 才生效。开启后看 /metrics 的 target_pool_hits / target_prewarm_success。
+  # target_prewarm(P2):第二阶段。命中域名缓存/粘性或竞速胜出的高频 CONNECT
+  # target,后台提前建立"到上游代理"的 TCP(不提前 CONNECT 到目标,避免打源站),
+  # 按 (proxy, target) 键区分,下次命中直接复用该 TCP 发 CONNECT,进一步压低 HTTPS
+  # 短连接 TTFB。每条 target 补 2 条、取走仍留 1 条备用。与第一阶段共享
+  # per-proxy/全局 fd 预算/空闲超时。需 enabled 为 true 才生效。开启后看
+  # /metrics 的 target_pool_hits / target_prewarm_success。
   # conn_pool:
   #   enabled: true
   #   per_proxy: 4

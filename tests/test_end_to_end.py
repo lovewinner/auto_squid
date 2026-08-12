@@ -3279,19 +3279,23 @@ class TestTargetPrewarm:
 
     @pytest.mark.asyncio
     async def test_prewarm_then_peek_reuses(self):
-        """预热一条到上游代理的 TCP 后,target_pool_peek 取到同一连接(不计 miss)。"""
+        """预热补满 cap=2 后,target_pool_peek 取到池中连接(不计 miss),且留 1 条备用。"""
         up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
         r = self._router()
         try:
-            assert await r._target_pool_refill(HOST, 31991, 'example.com:443') == 1
-            assert r.target_pool_creates == 1
-            assert r.target_prewarm_success == 1
+            assert await r._target_pool_refill(HOST, 31991, 'example.com:443') == 2
+            assert r.target_pool_creates == 2
+            assert r.target_prewarm_success == 2
             key = f"{HOST}:31991|example.com:443"
-            assert len(r._target_pool.get(key, [])) == 1
+            assert len(r._target_pool.get(key, [])) == 2
             got = r._target_pool_peek(HOST, 31991, 'example.com:443')
             assert got is not None
             assert r.target_pool_hits == 1
             assert r.target_pool_misses == 0
+            # cap=2:取走 1 条后仍有 1 条备用,下一条同 target 请求可再次命中。
+            got2 = r._target_pool_peek(HOST, 31991, 'example.com:443')
+            assert got2 is not None
+            assert r.target_pool_hits == 2
         finally:
             await r._conn_pool_close_all()
             up_srv.close()
@@ -3329,7 +3333,7 @@ class TestTargetPrewarm:
         up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
         r = self._router(conn_pool_idle_timeout=1.0)
         try:
-            assert await r._target_pool_refill(HOST, 31991, 'example.com:443') == 1
+            assert await r._target_pool_refill(HOST, 31991, 'example.com:443') == 2
             for stack in r._target_pool.values():
                 for _, w in stack:
                     w._conn_pool_created = time.monotonic() - 100
@@ -3376,14 +3380,14 @@ class TestTargetPrewarm:
         r = self._router()
         try:
             r._spawn_target_prewarm(HOST, 31991, 'example.com:443')
-            # 给后台协程一个事件循环机会完成建连。
-            for _ in range(50):
-                if r.target_prewarm_dispatched >= 1 and sum(len(v) for v in r._target_pool.values()) >= 1:
+            # 给后台协程一个事件循环机会完成建连(cap=2 → 补 2 条)。
+            for _ in range(100):
+                if r.target_prewarm_dispatched >= 1 and sum(len(v) for v in r._target_pool.values()) >= 2:
                     break
                 await asyncio.sleep(0.01)
             assert r.target_prewarm_dispatched == 1
-            assert r.target_pool_creates == 1
-            assert r.target_prewarm_success == 1
+            assert r.target_pool_creates == 2
+            assert r.target_prewarm_success == 2
         finally:
             # 排空后台预热 task(stop 前先 gather),再关连接。
             for t in list(r._running_tasks):
@@ -3445,3 +3449,82 @@ class TestTargetPrewarm:
             await r._conn_pool_close_all()
             up_srv.close()
             await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_prewarm_default_cap_refills_two(self):
+        """默认预热 cap=2:_spawn_target_prewarm 后同一 (proxy, target) 键补到 2 条。
+
+        生产实测 cap=1 时 target_pool_hits=1 / misses=71(取走即空→周期 miss);
+        cap=2 让取走 1 条后仍留 1 条备用,显著降低 miss。
+        """
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router(conn_pool_total=8)
+        try:
+            r._spawn_target_prewarm(HOST, 31991, 'example.com:443')
+            for _ in range(200):
+                if sum(len(v) for v in r._target_pool.values()) >= 2:
+                    break
+                await asyncio.sleep(0.01)
+            key = f"{HOST}:31991|example.com:443"
+            assert len(r._target_pool.get(key, [])) == 2, \
+                f"expected cap=2 prewarm, got {len(r._target_pool.get(key, []))}"
+            assert r.target_prewarm_dispatched == 1
+            assert r.target_pool_creates == 2
+            assert r.target_prewarm_success == 2
+        finally:
+            for t in list(r._running_tasks):
+                t.cancel()
+            if r._running_tasks:
+                await asyncio.gather(*r._running_tasks, return_exceptions=True)
+            r._running_tasks.clear()
+            await r._conn_pool_close_all()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_e2e_racing_winner_triggers_prewarm(self):
+        """竞速胜出(非 local)的 CONNECT → 触发 (proxy, target) 预热。
+
+        回归:_handle_connect 竞速赢家分支原本不预热,导致流量主体走竞速时
+        target_prewarm 只服务极少数缓存命中请求(target_pool_hits=1 / misses=71)。
+        需两个竞速候选代理;胜者须是真实上游(非 local)才预热。
+        """
+        up_srv1 = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        up_srv2 = await run_mock_proxy(HOST, 31992, hit_counter=None)
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p1', host=HOST, port=31991))
+        store.add(ProxyInfo(id='p2', host=HOST, port=31992))
+        r = Router(store, listen_host='127.0.0.1', listen_port=10809,
+                   db_path=tempfile.mktemp(suffix='.db'),
+                   conn_pool_enabled=True, conn_pool_target_prewarm=True,
+                   conn_pool_per_proxy=4, conn_pool_total=8,
+                   conn_pool_refill_interval=0.0,  # 只取不补(测试手动补)
+                   enable_local_racing=False,       # 排除 local 直连,确保胜者是上游
+                   stickiness_enabled=False,
+                   max_retries=2)
+        await r.start()
+        try:
+            target = b"race-prewarm.example.com:443"
+            # 首次竞速(域名缓存未建立)→ 胜出后应后台预热 (proxy, target)。
+            echo1 = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"one")
+            assert echo1 == b"one"
+            for _ in range(200):
+                if sum(len(v) for v in r._target_pool.values()) >= 1:
+                    break
+                await asyncio.sleep(0.01)
+            assert r.target_prewarm_dispatched >= 1, "racing winner should trigger prewarm"
+            assert r.target_pool_creates >= 1, "racing winner should warm a (proxy,target) TCP"
+            assert r.target_prewarm_success >= 1
+            # 竞速路径的预热必须落到真实上游代理(键为 "host:port|target")。
+            assert any(v for v in r._target_pool.values()), "prewarmed conn should exist for the racing winner proxy"
+        finally:
+            for t in list(r._running_tasks):
+                t.cancel()
+            if r._running_tasks:
+                await asyncio.gather(*r._running_tasks, return_exceptions=True)
+            r._running_tasks.clear()
+            await r.stop()
+            up_srv1.close()
+            await up_srv1.wait_closed()
+            up_srv2.close()
+            await up_srv2.wait_closed()

@@ -20,7 +20,7 @@
 - HTTP 与 HTTPS（`CONNECT`）转发，**并行竞速多个上游代理**（按 EWMA 排序 + 错峰启动）
 - 域名级缓存（`cache_ttl`），按域名复用胜出代理
 - 会话粘性（per-client+domain，内存-only，滑动 TTL），粘性代理失败自动回落竞速并回填；5xx 驱逐、周期重竞速、容量上限
-- CONNECT 上游 TCP 预热池（第一阶段，`router.conn_pool`）：为每上游维护少量空闲 TCP，CONNECT 跳过"本机→上游代理"建连；目标半预连接（第二阶段，`conn_pool.target_prewarm`）：命中域名缓存/粘性的高频 CONNECT target 后台预建"到上游"的 TCP，与第一阶段共享 fd 预算与空闲超时
+- CONNECT 上游 TCP 预热池（第一阶段，`router.conn_pool`）：为每上游维护少量空闲 TCP，CONNECT 跳过"本机→上游代理"建连；目标半预连接（第二阶段，`conn_pool.target_prewarm`）：命中域名缓存/粘性**或竞速胜出**的高频 CONNECT target 后台预建"到上游"的 TCP（每条 target 补 2 条、取走仍留 1 条备用），与第一阶段共享 fd 预算与空闲超时
 - 内存级 HTTP `GET` 响应缓存，遵循 `Cache-Control`
 - 在途 GET 去重聚合：同 URL 并发 GET 命中未命中缓存时，等待在途的上游请求结果，不再重复打上游（有界等待，超时回落竞速）
 - 写方法缓存失效：`POST`/`PUT`/`DELETE`/`PATCH` 转发前清空该域名下所有已缓存 `GET` 响应，后续 `GET` 不会返回过期内容
@@ -284,7 +284,7 @@ router:
 - **`single_send_degrade_fail` 是熔断的早告警**:建议设为 `circuit_threshold - 1`(默认 3 时取 2),让被钉住代理开始失败时**先**降级回竞速,而不是等熔断。
 - **`lb_bias`** 控制在途积压对竞速排序的惩罚(`ewma × (1 + active)^bias`)。慢代理易被打爆就调高;最快代理被过度避让就调低。
 - **策略路由**(`router.policies`)按域名/标签收窄竞速候选集,直接降低 TTFB 与 `racing.amplification`——形状见 `examples/config.yaml`。
-- **`conn_pool.target_prewarm`**(第二阶段)需 `conn_pool.enabled` 为 true;命中域名缓存/粘性的高频 CONNECT target 后台预建"到上游"的 TCP。`conn_pool.total` 是两阶段合并的全局 fd 预算。看 `/metrics` 的 `target_pool_hits` vs `target_pool_misses` 确认热 target 真的复用了预建连接。
+- **`conn_pool.target_prewarm`**(第二阶段)需 `conn_pool.enabled` 为 true;命中域名缓存/粘性**或竞速胜出**(竞速是多数 CONNECT 流量的主体路径,不加则预热只服务极少数缓存命中请求)的高频 CONNECT target 后台预建"到上游"的 TCP,每条 target 补 2 条、取走仍留 1 条备用。`conn_pool.total` 是两阶段合并的全局 fd 预算。看 `/metrics` 的 `target_pool_hits` vs `target_pool_misses` 确认热 target 真的复用了预建连接。
 
 ## 容器化部署（Docker / docker compose）
 

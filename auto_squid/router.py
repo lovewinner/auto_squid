@@ -1938,41 +1938,44 @@ class Router:
                 if total_idle >= self.conn_pool_total:
                     break
 
-    async def _target_pool_refill(self, proxy_host: str, proxy_port: int, target: str, cap: int = 1):
-        """为某 (proxy, target) 键补充一条半预连接到目标水位。
+    async def _target_pool_refill(self, proxy_host: str, proxy_port: int, target: str, cap: int = 2):
+        """为某 (proxy, target) 键补充半预连接到目标水位(一次调用补到 cap)。
 
         只建立"到上游代理"的 TCP(不提前 CONNECT 到目标),可安全复用于同
-        target。全局受 conn_pool_total 钳制,单键受 cap 钳制(默认 1 条,避免
-        为单个 target 占用过多 fd)。建连失败静默(下次命中再试)。单事件循环
-        线程调用,无需加锁。
+        target。全局受 conn_pool_total 钳制,单键受 cap 钳制(默认 2 条:取走
+        1 条仍留 1 条备用,降低"取走即空→周期 miss";避免为单个 target 占用
+        过多 fd)。建连失败静默(下次命中再试)。单事件循环线程调用,无需加锁。
+        cap 从 1 提升到 2:生产实测 cap=1 时 target_pool_hits=1 / misses=71,
+        单条预热被取走即空,下一条同 target 请求只能回退 miss。
         """
         if not self.conn_pool_enabled:
             return 0
         key = f"{proxy_host}:{proxy_port}|{target}"
-        if len(self._target_pool.get(key, [])) >= cap:
-            return 0
         # 全局 fd 预算:第一阶段 + 第二阶段共享,超限则不补。
         total_idle = sum(len(v) for v in self._conn_pool.values()) \
             + sum(len(v) for v in self._target_pool.values())
-        if total_idle >= self.conn_pool_total:
-            return 0
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(proxy_host, proxy_port),
-                timeout=self.conn_pool_connect_timeout)
-        except (asyncio.TimeoutError, OSError, ConnectionError):
-            self.target_prewarm_failed += 1
-            return 0
-        writer._conn_pool_created = time.monotonic()
-        self._target_pool.setdefault(key, []).append((reader, writer))
-        self.target_pool_creates += 1
-        self.target_prewarm_success += 1
-        return 1
+        made = 0
+        while len(self._target_pool.get(key, [])) < cap and total_idle < self.conn_pool_total:
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(proxy_host, proxy_port),
+                    timeout=self.conn_pool_connect_timeout)
+            except (asyncio.TimeoutError, OSError, ConnectionError):
+                self.target_prewarm_failed += 1
+                break
+            writer._conn_pool_created = time.monotonic()
+            self._target_pool.setdefault(key, []).append((reader, writer))
+            self.target_pool_creates += 1
+            self.target_prewarm_success += 1
+            made += 1
+            total_idle += 1
+        return made
 
-    async def _target_pool_prewarm(self, proxy_host: str, proxy_port: int, target: str, cap: int = 1):
+    async def _target_pool_prewarm(self, proxy_host: str, proxy_port: int, target: str, cap: int = 2):
         """后台协程:为 (proxy, target) 键预热半连接,失败静默(被取消/超时/建连
-        失败都只是少一条预热,不影响主请求)。由命中域名缓存/粘性的 CONNECT 触
-        发,是"fire-and-forget",主请求不 await 本协程。
+        失败都只是少一条预热,不影响主请求)。由命中域名缓存/粘性或竞速胜出的
+        CONNECT 触发,是"fire-and-forget",主请求不 await 本协程。cap=2 与
+        _target_pool_refill 一致(见其 docstring)。
         """
         try:
             await self._target_pool_refill(proxy_host, proxy_port, target, cap=cap)
@@ -1982,10 +1985,12 @@ class Router:
             logger.debug("target prewarm failed for %s via %s", target, proxy_host)
 
     def _spawn_target_prewarm(self, proxy_host: Optional[str], proxy_port: Optional[int], target: str):
-        """命中域名缓存/粘性的 CONNECT → 后台预热 (proxy, target) 半连接。
+        """命中域名缓存/粘性或竞速胜出的 CONNECT → 后台预热 (proxy, target) 半连接。
 
         仅在第二阶段开启且经上游代理(非本机直连)时触发;计数并记录到
-        _running_tasks(供 stop() 排空),不阻塞主请求路径。
+        _running_tasks(供 stop() 排空),不阻塞主请求路径。预热条数由
+        _target_pool_prewarm 默认 cap=2 控制(取走 1 条仍留 1 条备用,降低
+        "取走即空→周期 miss";生产实测 cap=1 时 target_pool_hits=1 / misses=71)。
         """
         if not (self.conn_pool_enabled and self.conn_pool_target_prewarm):
             return
@@ -3129,6 +3134,14 @@ class Router:
             # 败者只记了尝试统计。
             self._record_win_meta(target, pid)
             self._record_sticky(client_ip, target, pid)
+            # CONNECT 目标半预连接(P2):竞速胜出说明该 target 高频且最优代理已
+            # 确定,后台为 (proxy, target) 预热下一条到上游代理的 TCP(不阻塞本
+            # 请求)。注意 pid 可能是 'local'(enable_local_racing 直连),此时无
+            # 上游代理可预热,交由 _spawn_target_prewarm 内部跳过。
+            if pid != 'local':
+                win_proxy = self.proxy_store.get(pid)
+                if win_proxy is not None:
+                    self._spawn_target_prewarm(win_proxy.host, win_proxy.port, target)
             await self._connect_established(client_writer, up_writer)
             await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer)
             return
