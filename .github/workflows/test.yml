@@ -30,4 +30,6 @@ jobs:
         run: uv sync --frozen
 
       - name: Run tests
-        run: uv run pytest -q
+        # pytest-timeout:单个测试超时(60s)自动失败并报出测试名,避免 CI
+        # 因某测试挂起而无限等待(本地 2.98s 全过,CI 曾卡 18 分钟)。
+        run: uv run pytest -q --timeout=60
