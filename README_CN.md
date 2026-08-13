@@ -310,6 +310,10 @@ curl -x http://127.0.0.1:10808 http://www.baidu.com
 
 测试套件覆盖 HTTP/CONNECT 转发、HTTP 响应缓存、域名缓存、本机竞速、`ProxyStore` CRUD、API，以及二进制安全的请求体处理。
 
+CI 通过 GitHub Actions（`.github/workflows/test.yml`）在 **Python 3.11 与 3.12** 双版本跑测试套件，并带单测试超时（`pytest --timeout=60`），挂起的测试会快速失败并报出测试名，而非无限阻塞任务。
+
+> **Python 3.12 兼容性说明**：3.12 中 `StreamWriter.wait_closed()` 与 `Server.wait_closed()` 变得更严格——会等待对端 FIN / 活跃 handler 协程退出。预热池连接是"半连接"（只建 TCP 未发数据），对端永不主动关闭，因此 router 侧用短超时限制关闭等待、测试里的 mock 上游对空闲连接 5s 超时自动关闭（模拟真实上游 idle 超时）。此问题仅在 CI 的 3.12 矩阵暴露——3.11 无此问题。
+
 ## 性能压测
 
 `bench/` 提供一套**可控、可重复、可归因**的压测工具。它启动一组**受控 mock 上游代理**(延迟/响应大小/chunked/失败率可配,每个实例带命中计数器),排除真实网络抖动,再驱动 `Router` 承载负载,输出吞吐、延迟分位、缓存命中率、racing 放大率与资源占用。

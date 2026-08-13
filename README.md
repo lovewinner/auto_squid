@@ -317,6 +317,10 @@ curl -x http://127.0.0.1:10808 http://www.baidu.com
 
 The suite covers HTTP/CONNECT forwarding, the HTTP response cache, the domain cache, local racing, `ProxyStore` CRUD, the API, and binary-safe request body handling.
 
+CI runs the suite on **Python 3.11 and 3.12** via GitHub Actions (`.github/workflows/test.yml`), with a per-test timeout (`pytest --timeout=60`) so a hanging test fails fast instead of blocking the job.
+
+> **Python 3.12 compatibility note**: `StreamWriter.wait_closed()` and `Server.wait_closed()` became stricter in 3.12 — they wait for the peer FIN / active handler coroutines. Prewarm pool connections are "half-open" (TCP established, no data sent), so their peers never close; the router now bounds these with a short timeout, and the mock upstreams in the test suite close idle connections after 5s (mirroring a real upstream's idle timeout). This only surfaced under CI's 3.12 matrix — 3.11 passes without it.
+
 ## Benchmarking
 
 A controlled, repeatable, attributable benchmark harness lives in `bench/`. It spins up **mock upstream proxies** (with configurable latency / response size / chunked / failure rate, each carrying a hit counter) so results are not dominated by real-network jitter, then drives the `Router` under load and reports throughput, latency percentiles, cache hit rate, racing amplification, and resource usage.

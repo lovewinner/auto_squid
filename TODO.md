@@ -57,18 +57,23 @@
 ## 已完成 — 修复
 
 - [x] UnicodeEncodeError：上游返回非 ASCII（如中文）响应头时，httpx utf-8 解码后 latin-1 重编码崩溃。新增 `_hb()`（latin-1 + utf-8 回退），应用到全部上游派生编码点（流式/缓存头、reason phrase、Content-Length、CONNECT Host/target）
+- [x] Python 3.12 预热连接关闭挂起：3.12 的 `StreamWriter.wait_closed()`/`Server.wait_closed()` 变严格——等待对端 FIN / 活跃 handler 协程。预热池"半连接"（只建 TCP 未发数据）对端永不关闭，导致关闭/测试收尾死锁。修复：router 侧 `_conn_pool_close_all`/`_pool_prune` 的 `wait_closed()` 加 0.5s 超时；测试 mock 上游对空闲连接 5s 超时关闭（模拟真实上游 idle 超时）。仅 CI 3.12 矩阵暴露，3.11 无此问题（CI 双版本矩阵的必要性实证）
+
+## 已完成 — 运维与安全（P2）
+
+- [x] CI（`.github/workflows/test.yml`）：GitHub Actions，push master / PR 触发，Python 3.11 + 3.12 双版本跑 144 测试，带 pytest-timeout(60s) 防挂起；uv.lock 已纳入版本管理，`uv sync --frozen` 锁定依赖
 
 ## 待办 — 运维与安全（P2）
 
 - [ ] systemd unit（当前仅 docker-compose 示例，无 systemd 服务文件）
 - [ ] 与真实 Squid 的集成测试（bench 已支持 --upstream real，但缺 CI/集成用例）
-- [ ] CI（当前无 .github/workflows，测试仅本地运行）
 
 ## 工作流备注
 
 - 每个组件配单元测试；测试保持确定性（mock 网络调用）。
+- 生产配置调参记录：`idle_timeout` 30→120→180（目标池命中率 5%→25%）、`single_send_degrade_ratio` 3.0→2.0（降级收敛）。脱敏样例见 `config_xxh_example.yaml`。
 
 ## 当前测试状态
 
 - `tests/test_end_to_end.py` 等：144 个用例，覆盖转发/缓存/竞速/聚合/认证/熔断/探活/粘性/计数/DB 持久化/UTF-8 头安全/连接预热（通用池 + target 半预连接，含竞速胜出触发预热）。
-- 运行：`.venv/bin/python -m pytest -q`
+- 运行：`.venv/bin/python -m pytest -q`；CI 双版本（3.11/3.12）全部通过。
