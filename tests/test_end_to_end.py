@@ -27,13 +27,16 @@ async def run_mock_proxy(host, port, hit_counter=None):
     """HTTP/CONNECT mock proxy. For CONNECT, echoes data back."""
     async def handle(reader, writer):
         try:
-            line = await reader.readline()
+            # 3.12 的 Server.wait_closed() 等待活跃 handler 协程退出;预热连接
+            # 建立后从不发数据,若 readline 无限等则 handler 永不退出,测试卡死。
+            # 设 5s 超时:建立连接但长时间无请求 → 关闭,模拟真实上游 idle 超时。
+            line = await asyncio.wait_for(reader.readline(), timeout=5)
             if not line:
                 writer.close()
                 return
             first = line.decode('latin-1').strip()
             while True:
-                h = await reader.readline()
+                h = await asyncio.wait_for(reader.readline(), timeout=5)
                 if not h or h in (b"\r\n", b"\n"):
                     break
             if first.upper().startswith('CONNECT'):
