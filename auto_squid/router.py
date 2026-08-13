@@ -2048,8 +2048,10 @@ class Router:
         for w in stale:
             try:
                 w.close()
-                await w.wait_closed()
-            except Exception:
+                # 同 _conn_pool_close_all:预热连接对端可能挂起不关,3.12 的
+                # wait_closed() 会严格等对端 FIN 而挂死,用超时保护。
+                await asyncio.wait_for(w.wait_closed(), timeout=0.5)
+            except (asyncio.TimeoutError, Exception):
                 pass
 
     async def _conn_pool_prune(self):
@@ -2074,7 +2076,13 @@ class Router:
             pass
 
     async def _conn_pool_close_all(self):
-        """关闭全部预热连接(stop 时调用),含 target 半预连接池。"""
+        """关闭全部预热连接(stop 时调用),含 target 半预连接池。
+
+        预热连接是"半连接"(只建 TCP 未发数据),对端(mock/真实上游)可能一直
+        挂起等待客户端数据而不主动关闭。Python 3.12 的 StreamWriter.wait_closed()
+        会严格等待对端 FIN 确认,此时会无限挂起(本地 3.11 立即返回,CI 3.12
+        卡死)。故用超时保护:close() 后最多等 0.5s,超时即放弃等待,避免阻塞。
+        """
         stacks = list(self._conn_pool.values()) + list(self._target_pool.values())
         self._conn_pool.clear()
         self._target_pool.clear()
@@ -2083,8 +2091,8 @@ class Router:
                 reader, writer = item
                 try:
                     writer.close()
-                    await writer.wait_closed()
-                except Exception:
+                    await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
+                except (asyncio.TimeoutError, Exception):
                     pass
 
     # ── 通用竞速 / pipe / 响应写入 ──────────────────────────────
