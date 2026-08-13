@@ -1,0 +1,78 @@
+# config_xxh_example.yaml —— 生产 config.yaml 的脱敏样例
+# =====================================================
+# 用途:展示"小红花(xxh)校内生产部署"实际使用的完整配置结构,供部署/排障/调参
+#       参考。本文件为脱敏版本:所有真实凭据已替换为占位符,不包含敏感信息,
+#       可安全纳入 git 管理。
+#
+# 对应真实文件:config.yaml(仓库根目录,git-ignored,含真实凭据,勿提交)。
+# 脱敏项:
+#   - api.auth.username/password  →  占位符
+#   - router.auth.username/password → 占位符
+#   - router.circuit.probe_canary  →  保留(通用可达域名,非敏感)
+# 其余字段(结构/阈值/开关)与当前生产一致,可直接作为部署模板。
+
+# 管理 API 监听配置(独立于代理端口)。生产已开启 api.auth(HTTP Basic)。
+api:
+  host: "0.0.0.0"
+  port: 18080
+  auth:
+    enabled: true
+    username: "<API_USERNAME_PLACEHOLDER>"
+    password: "<API_PASSWORD_PLACEHOLDER>"
+
+# 路由行为配置
+router:
+  # 让网关主机自身作为代理节点直接参与竞速(本机直连,不走上游)
+  enable_local_racing: true
+  # 域名缓存有效期(秒):某代理为某域名竞速胜出后,在有效期内复用同一代理
+  cache_ttl: 900
+  # 竞速首批并行的代理数量;全失败后对剩余代理再竞速兜底
+  max_retries: 3
+  # 错峰启动(RFC 8305):先发最优代理,间隔补发;首个首字节成功即取消其余
+  stagger_start: true
+  stagger_initial: 2        # 先发最优代理,按 interval 补发
+  stagger_interval_ms: 100  # RFC 8305 允许的最短补发间隔
+
+  circuit:
+    # 后台探活周期(秒):每周期对 enabled 代理做轻量 CONNECT 到 canary + 关闭
+    probe_interval_sec: 20
+    # 探活目标:选"本机直连可达、上游代理也可达"的目标。1.1.1.1 在部分网络
+    # 不可达,会把健康上游误判为故障(见 docs 分析)。域名会走 DNS,用可达域名更稳。
+    probe_canary: "www.baidu.com:443"
+    # 连续失败多少次触发熔断(真实请求失败与探活失败共享计数)
+    circuit_threshold: 3
+    # 熔断退避上限(秒):退避指数增长直到此上限
+    circuit_max_backoff: 300
+    # slow-start 爬升窗口(秒):熔断退避到期后,该代理在此窗口内低权重垫底
+    slow_start_window: 60
+    slow_start_success: 3
+    # 加权 least-request 在途惩罚指数(0.5:不要过度避让最快代理)
+    lb_bias: 0.5
+    # 单发降级(质量感知的确定性探路):域名缓存/粘性命中单发时,被钉住代理
+    # 连续失败 ≥ 阈值 或 EWMA 相对钉住时恶化 ratio 倍,主动降级回竞速。
+    # 0=关闭对应维度。fail 建议 = circuit_threshold-1(熔断早告警)。
+    single_send_degrade_fail: 2
+    single_send_degrade_ratio: 2.0
+    single_send_degrade_slack_ms: 10
+
+  # 代理端口(面向客户端的 HTTP/CONNECT 代理端口)客户端认证。生产已开启。
+  auth:
+    enabled: true
+    username: "<ROUTER_USERNAME_PLACEHOLDER>"
+    password: "<ROUTER_PASSWORD_PLACEHOLDER>"
+
+  # 会话粘性(per-client+domain,内存-only,滑动 TTL)
+  stickiness:
+    enabled: true
+    ttl: 1800
+
+  # CONNECT 上游 TCP 预热池(第一阶段 + 第二阶段 target 半预连接)
+  conn_pool:
+    enabled: true           # CONNECT 上游 TCP 预热池(第一阶段)
+    per_proxy: 4
+    total: 64               # 两阶段共享的全局 fd 预算
+    idle_timeout: 180.0     # 空闲连接超时(秒):超时未取用则关闭。已从 30 调至 180(降低预建连接闲置过期)
+    refill_interval: 5.0
+    refill_target: 2
+    connect_timeout: 10.0
+    target_prewarm: true    # 第二阶段:命中缓存/粘性的高频 CONNECT target 预建"到上游"TCP
