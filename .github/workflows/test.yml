@@ -21,7 +21,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v10
+        # setup-uv 的移动 major tag 只到 v7(v8/v9/v10 仅精确版本,无 vN 软链),
+        # 用 @v10 会解析失败。v7 是当前最新有 vN tag 的稳定版。
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
 
