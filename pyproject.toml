@@ -2,6 +2,12 @@
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
+# 只打包 auto_squid 主包;bench 是工具目录(压测脚本),不纳入发行包。
+# setuptools 扁平布局会同时发现 bench 和 auto_squid 两个顶层包而报错,
+# 需显式限定包发现范围。
+[tool.setuptools.packages.find]
+include = ["auto_squid*"]
+
 [project]
 name = "auto-squid"
 version = "0.0.0"
