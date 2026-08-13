@@ -26,9 +26,8 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        # uv.lock 是 git-ignored(见 .gitignore),CI 工作区无锁文件,故不能用
-        # --frozen;直接 uv sync 从 pyproject.toml 解析依赖。
-        run: uv sync
+        # uv.lock 已纳入版本管理,CI 用 --frozen 锁定精确版本(可复现)。
+        run: uv sync --frozen
 
       - name: Run tests
         run: uv run pytest -q

@@ -9,7 +9,6 @@ __pycache__/
 /config.yaml
 *.db
 *.log
-uv.lock
 *.egg-info/
 bench_report.json
 *.db-shm
