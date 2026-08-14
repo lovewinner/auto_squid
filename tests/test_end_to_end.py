@@ -2582,6 +2582,86 @@ class TestInFlightSelection:
             await proxy_srv.wait_closed()
 
 
+class TestWinnerBackfillQualityGate:
+    """方向 A:竞速赢家回填(域名缓存 _record_win_meta / 粘性表 _record_sticky)
+    前的质量闸——赢家显著差于当前最优代理时,不回填,避免慢代理被钉住进入
+    "钉住→降级→回填→再钉住"循环(生产:239-192 EWMA 275ms 反复触发)。"""
+
+    def _router(self, **kw):
+        store = ProxyStore()
+        store.add(ProxyInfo(id='fast', host='h1', port=3128))
+        store.add(ProxyInfo(id='slow', host='h2', port=3128))
+        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+                      db_path=tempfile.mktemp(suffix='.db'),
+                      stickiness_enabled=True, stickiness_ttl=1800,
+                      single_send_degrade_ratio=2.0, single_send_degrade_slack_ms=10.0,
+                      **kw)
+
+    def test_worse_than_best_detects_slow_winner(self):
+        """慢赢家 EWMA 显著差于最优代理 → _worse_than_best 返回 True。"""
+        r = self._router()
+        r.selector.record_ttfb('fast', 0.02)
+        r.selector.record_ttfb('fast', 0.03)  # EWMA ≈ 0.023
+        r.selector.record_ttfb('slow', 0.30)
+        r.selector.record_ttfb('slow', 0.30)  # EWMA ≈ 0.30, > 2× best 且差 277ms
+        assert r._worse_than_best('slow') is True
+        assert r._worse_than_best('fast') is False
+
+    def test_fast_winner_not_blocked(self):
+        """最优代理自己是赢家 → 正常回填(不影响正常路径)。"""
+        r = self._router()
+        r.selector.record_ttfb('fast', 0.02)
+        r.selector.record_ttfb('slow', 0.30)
+        assert r._worse_than_best('fast') is False
+        r._record_win_meta('example.com', 'fast')
+        assert r._get_fresh_proxy('example.com') == 'fast'
+
+    def test_slow_winner_not_pinned_to_domain_cache(self):
+        """慢赢家不进域名缓存 meta(继续竞速,不钉住)。"""
+        r = self._router()
+        r.selector.record_ttfb('fast', 0.02)
+        r.selector.record_ttfb('slow', 0.30)
+        r._record_win_meta('example.com', 'slow')
+        # 慢赢家被拦:域名缓存未钉住,继续走竞速。
+        assert 'example.com' not in r._meta_cache
+        assert r._get_fresh_proxy('example.com') is None
+
+    def test_slow_winner_not_pinned_to_sticky(self):
+        """慢赢家不进粘性表(同一域名回填两处一致)。"""
+        r = self._router()
+        r.selector.record_ttfb('fast', 0.02)
+        r.selector.record_ttfb('slow', 0.30)
+        r._record_sticky('1.2.3.4', 'example.com', 'slow')
+        assert '1.2.3.4|example.com' not in r._sticky_cache
+        assert r._get_sticky_proxy('1.2.3.4', 'example.com') is None
+
+    def test_single_obs_slow_winner_still_blocked(self):
+        """单次观测的慢赢家也拦(竞速首胜常是 1 obs 新代理,不能放行慢者)。"""
+        r = self._router()
+        r.selector.record_ttfb('fast', 0.02)
+        r.selector.record_ttfb('slow', 0.30)  # slow 仅 1 次观测,EWMA=0.30
+        # 即使 obs=1,只要 EWMA 显著差于最优(0.30 > 0.02×2 且差 280ms)就拦。
+        assert r._worse_than_best('slow') is True
+        r._record_win_meta('example.com', 'slow')
+        assert 'example.com' not in r._meta_cache
+
+    def test_recover_fast_after_slow_heals(self):
+        """慢代理恢复(EWMA 回到最优附近)→ 不再被质量闸拦截,可正常回填。"""
+        r = self._router()
+        r.selector.record_ttfb('fast', 0.02)
+        r.selector.record_ttfb('fast', 0.02)  # fast 稳定观测,EWMA≈0.02
+        r.selector.record_ttfb('slow', 0.30)
+        # 慢时被拦。
+        assert r._worse_than_best('slow') is True
+        # 恢复:slow 多次观测到接近 fast 的延迟,EWMA 显著回落。
+        # EWMA alpha=0.3,0.30 收敛到 ≤0.04(fast 0.02×2)需 0.7^n×0.30≤0.04 → n≥6。
+        for _ in range(8):
+            r.selector.record_ttfb('slow', 0.02)
+        assert r._worse_than_best('slow') is False
+        r._record_win_meta('example.com', 'slow')
+        assert r._get_fresh_proxy('example.com') == 'slow'
+
+
 class TestSingleSendDegrade:
     """质量感知的单发降级(Goal #6):域名缓存/粘性命中单发时,被钉住代理
     连续失败上升或 EWMA 恶化 → 主动降级回竞速。

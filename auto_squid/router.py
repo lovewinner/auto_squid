@@ -967,6 +967,38 @@ class Router:
         self.switch_damping_blocks += 1
         return False
 
+    def _worse_than_best(self, pid: str) -> bool:
+        """方向 A:赢家回填前的质量闸——代理 EWMA 是否显著差于当前可用最优代理。
+
+        判定:pid 有 EWMA 观测(不要求 obs>=2——竞速赢家常是刚起步的新代理,
+        首胜时往往只有 1 次观测,若这里苛求 obs 数会让新慢代理绕过闸门被钉住),
+        且当前可用最优代理(ordered_proxies 首位的 EWMA)有观测且 >0 时,若
+        pid EWMA > 最优 EWMA × ratio(默认 2.0) 且差量 > slack
+        (single_send_degrade_slack_ms,防极低延迟误判)→ 视为"显著更慢"。
+        最优代理可能正是 pid 自己(此时不触发);无最优/无观测 → False。
+
+        与 Goal #6 degrade 的语义对比:degrade 是"相对**钉住时刻**的自身基线恶化",
+        这里问"相对**当前最优代理**差多少"。前者兜底"钉住的代理自己变差",后者
+        兜底"赢家本就显著劣于其他代理"(竞速偶发让慢代理赢,却把它回填钉住)。
+        ratio 复用 single_send_degrade_ratio(生产 2.0),语义一致:EWMA 慢 2 倍
+        就认为不该单发。
+        """
+        q = self.selector.get_quality().get(pid)
+        cur = self._proxy_quality_ewma(q)
+        if cur is None:
+            return False
+        best = self.selector.best_proxy()
+        if not best or best == pid:
+            return False
+        best_q = self.selector.get_quality().get(best)
+        best_ewma = self._proxy_quality_ewma(best_q)
+        if best_ewma is None or best_ewma <= 0:
+            return False
+        if self.single_send_degrade_ratio <= 0:
+            return False
+        slack = self.single_send_degrade_slack_ms / 1000.0
+        return cur > best_ewma * self.single_send_degrade_ratio and (cur - best_ewma) > slack
+
     def _record_win_meta(self, domain: str, pid: str):
         """记录某域名确认的"赢家代理",更新 _meta_cache(域名→首选代理)。
 
@@ -977,6 +1009,10 @@ class Router:
         Goal #6:此处是域名缓存钉住时刻——捕获 pid 当前 EWMA 作为 ref_ewma 基线
         (供 _get_fresh_proxy 判定"相对钉住时是否恶化");同时清除 _degraded_single_send
         标记(新赢家已接管,该代理可再次被单发)。
+
+        方向 A:竞速赢家若显著差于当前最优代理(_worse_than_best)→ **不更新**
+        域名缓存。竞速偶发让慢代理赢(其他代理熔断/并发上限被踢出候选)时,避免
+        把劣质赢家钉进域名缓存,让它继续走竞速直到沉淀到健康代理。
 
         P2 自适应 TTL:每次确认赢家时按稳定度演化该域名 TTL——
           - 同代理连续胜出(稳定)→ TTL 上浮,步进 1.5×,封顶 adaptive_ttl_max;
@@ -989,6 +1025,10 @@ class Router:
         """
         if not self._damping_allows_switch(domain, pid):
             return  # 阻尼拦截:保持旧赢家,不替换
+        # 方向 A:竞速赢家显著差于当前最优代理 → 不钉进域名缓存,继续竞速。
+        # (慢代理偶发胜出时,回填会把劣质赢家钉住导致"钉住→降级→回填"循环。)
+        if self._worse_than_best(pid):
+            return
         self._meta_cache[domain] = {
             "default_proxy": pid,
             "updated_at": self._now_utc(),
@@ -1615,6 +1655,10 @@ class Router:
         先清过期条目,仍超则驱逐 updated_at 最旧的一条。
         """
         if not self.stickiness_enabled:
+            return
+        # 方向 A:新赢家显著差于当前最优代理 → 不回填粘性表(继续竞速),避免
+        # 慢代理被钉住进入"钉住→降级→回填→再钉住"循环。
+        if self._worse_than_best(pid):
             return
         key = self._sticky_key(client_ip, domain)
         if key not in self._sticky_cache and len(self._sticky_cache) >= self.stickiness_max_entries:
