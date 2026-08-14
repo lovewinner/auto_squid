@@ -1922,7 +1922,7 @@ class Router:
         return got
 
     def _record_request_activity(self):
-        """记录一次客户端请求到达(refill 空闲感知的喂狗)。
+        """刷新"最近请求"时间戳(refill 空闲感知的活动信号)。
 
         在每个通过认证的 HTTP/CONNECT 首行上调用(见 _handle_client,认证放行后)。
         更新 _last_request_activity;若此前处于"空闲暂停"态则立刻解除,并在
@@ -2644,7 +2644,7 @@ class Router:
                                                 'Content-Type': 'text/plain'},
                                                _hb(reason or 'Authentication required'))
                     return
-            # 有效客户端请求(认证通过):喂狗 refill 空闲感知,解除深夜暂停。
+            # 有效客户端请求(认证通过):刷新 refill 空闲感知的活动时间戳,解除深夜暂停。
             self._record_request_activity()
             if first.upper().startswith('CONNECT'):
                 target = first.split(' ')[1]
