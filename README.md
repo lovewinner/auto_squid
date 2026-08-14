@@ -230,7 +230,7 @@ router:
   # adaptive_ttl: {enabled: true, min_sec: 60, max_sec: 1800}   # per-domain TTL by stability
   # switch_damping: {enabled: true, min_wins: 2, ratio: 0.8, abs_ms: 30}  # stable egress
   # concurrency_limit: {enabled: true, initial: 16, min: 2, max: 128, add_on_success: 4, mult_on_failure: 0.5, failure_window: 20}
-  # conn_pool: {enabled: true, per_proxy: 4, total: 64, idle_timeout: 30.0, refill_interval: 5.0, refill_target: 2, connect_timeout: 10.0, target_prewarm: true, refill_pause_minutes: 60}
+  # conn_pool: {enabled: true, per_proxy: 4, total: 64, idle_timeout: 30.0, refill_interval: 5.0, refill_target: 2, connect_timeout: 10.0, target_prewarm: true, refill_pause_minutes: 60, established_reuse: true}
 logging:
   file: "auto_squid.log"
 ```
@@ -294,6 +294,7 @@ Tuning notes:
 - **Policy routing** (`router.policies`) narrows the racing candidate set per domain/tag, cutting TTFB and `racing.amplification` — see `examples/config.yaml` for the shape.
 - **`conn_pool.target_prewarm`** (Phase 2) needs `conn_pool.enabled`; it pre-opens "to-upstream" TCP for hot CONNECT targets on domain-cache/sticky hits **or when a racing proxy wins** (the dominant path for most CONNECT traffic — without it prewarm only served the few cache-hit requests). Each target is warmed to 2 connections so a peek leaves a spare. `conn_pool_total` bounds the combined fd budget of both pools. Watch `/metrics` `target_pool_hits` vs `target_pool_misses` to confirm hot targets actually reuse prewarmed connections.
 - **`conn_pool.refill_pause_minutes`** (default 60): when no client request has arrived for N consecutive minutes (e.g. overnight), the background refill and target-prewarm **pause** so they stop churning "connect → idle-expire → reconnect" with zero traffic. Production measured ~233 wasted connects/hour per 6 proxies during a 6h idle stretch (100% expired). The pool still drains stale connections while paused (prune runs), and any new request immediately resumes refilling. Set `0` to keep the old always-refill behavior.
+- **`conn_pool.established_reuse`** (default false): reuses *already-CONNECT-handshaked* tunnels. When a tunnel ends cleanly (no residual buffered data on the upstream side), the connection is returned to `_established_pool` instead of closed; the next request for the same `(proxy, target)` reuses it directly, skipping the CONNECT send + 200 check — saving a full round-trip over slow lines (e.g. github). Strict verification discards dirty connections rather than risk data pollution. Watch `/metrics` `established_pool_hits` vs `established_pool_misses` to confirm reuse. Requires `conn_pool.enabled`.
 
 ## Container deployment (Docker / docker compose)
 

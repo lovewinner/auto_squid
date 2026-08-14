@@ -77,3 +77,4 @@ router:
     connect_timeout: 10.0
     target_prewarm: true    # 第二阶段:命中缓存/粘性的高频 CONNECT target 预建"到上游"TCP
     refill_pause_minutes: 60  # 空闲暂停(分钟):连续 N 分钟无请求则挂起 refill/预热,新请求到来恢复。0=不暂停。生产实测:深夜 6h 空转白建 ~1400 条连接(100% 超时被清)
+    established_reuse: true   # 已建握手隧道复用:隧道结束若连接干净则归还池,同 (proxy,target) 复用跳过 CONNECT 握手,省掉重建(慢线路建连收益)

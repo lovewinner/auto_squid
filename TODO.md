@@ -51,6 +51,7 @@
 - [x] 自适应并发限制（concurrency_limit）：每代理并发上限成功增/失败乘性降
 - [x] CONNECT 上游 TCP 预热池（conn_pool）：每代理维护空闲连接，省建连 TTFB
   - [x] 第二阶段·目标半预连接（conn_pool.target_prewarm）：命中域名缓存/粘性或竞速胜出的高频 CONNECT target 后台预建"到上游"TCP（每条补 2 条、取走仍留 1 条备用），按 (proxy, target) 键区分，取用优先于通用池，共享 fd 预算/空闲超时
+  - [x] 第三阶段·已建握手隧道复用（conn_pool.established_reuse）：隧道结束若连接干净（上游无残留缓冲）则归还 `_established_pool` 而非关闭，下次同 (proxy, target) 复用已 CONNECT 握手的连接、跳过握手，省掉慢线路上一次完整往返（github 场景）。`_relay_tunnel` 改用 wait(FIRST_COMPLETED) 任一端结束即取消另一端，客户端断开后立即归还不等上游挂起。严格验证：有残留即丢弃不复用，宁可不复用也不污染
 - [x] 会话粘性（per-client+domain，滑动 TTL）：redispatch、5xx 驱逐、recheck 重竞速、容量上限
 - [x] bench 透传全部速度特性开关（--conn-pool / --adaptive-ttl / --switch-damping / --concurrency-limit / --policies / --http-cache-max-*）
 
@@ -62,7 +63,7 @@
 
 ## 已完成 — 运维与安全（P2）
 
-- [x] CI（`.github/workflows/test.yml`）：GitHub Actions，push master / PR 触发，Python 3.10 + 3.11 + 3.12 三版本跑 149 测试，带 pytest-timeout(60s) 防挂起；uv.lock 已纳入版本管理，`uv sync --frozen` 锁定依赖
+- [x] CI（`.github/workflows/test.yml`）：GitHub Actions，push master / PR 触发，Python 3.10 + 3.11 + 3.12 三版本跑 160 测试，带 pytest-timeout(60s) 防挂起；uv.lock 已纳入版本管理，`uv sync --frozen` 锁定依赖
 
 ## 待办 — 运维与安全（P2）
 
@@ -76,5 +77,5 @@
 
 ## 当前测试状态
 
-- `tests/test_end_to_end.py` 等：149 个用例，覆盖转发/缓存/竞速/聚合/认证/熔断/探活/粘性/计数/DB 持久化/UTF-8 头安全/连接预热（通用池 + target 半预连接，含竞速胜出触发预热）+ refill 空闲暂停（refill_pause_minutes）。
+- `tests/test_end_to_end.py` 等：160 个用例，覆盖转发/缓存/竞速/聚合/认证/熔断/探活/粘性/计数/DB 持久化/UTF-8 头安全/连接预热（通用池 + target 半预连接 + 已建握手隧道复用，含竞速胜出触发预热）+ refill 空闲暂停（refill_pause_minutes）。
 - 运行：`.venv/bin/python -m pytest -q`；CI 三版本（3.10/3.11/3.12）全部通过。

@@ -187,6 +187,7 @@ class ConnPoolConfig(BaseModel):
     connect_timeout: float = Field(10.0, description="预热/取用建连超时(秒)")
     target_prewarm: bool = Field(False, description="CONNECT 目标半预连接(第二阶段):命中缓存/粘性的高频 target 提前预热到上游的 TCP")
     refill_pause_minutes: float = Field(60.0, description="空闲暂停(分钟):连续 N 分钟无客户端请求则挂起 refill/目标预热,新请求到来恢复;0=不暂停")
+    established_reuse: bool = Field(False, description="已建握手隧道复用:隧道结束若连接干净则归还池,下次同 (proxy,target) 请求复用已 CONNECT 握手的连接,跳过握手,省掉重建。仅当 conn_pool.enabled 为 True 时生效")
 
 
 class ConcurrencyLimitConfig(BaseModel):

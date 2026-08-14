@@ -512,7 +512,7 @@ class Router:
     生命周期:start() 开始监听 → handle_client 处理每个连接 → stop() 优雅关闭。
     """
 
-    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False, conn_pool_refill_pause_minutes: float = 60.0):
+    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False, conn_pool_refill_pause_minutes: float = 60.0, conn_pool_established_reuse: bool = False):
         """构造路由器。
 
         参数:
@@ -613,6 +613,11 @@ class Router:
                                 深夜空闲期"建了又过期"的空转浪费(生产实测:6 代理
                                 深夜 6h 白建 ~1400 条连接,100% 超时被清)。新请求
                                 到来立即恢复补充。
+            conn_pool_established_reuse: 已建握手隧道复用(默认关闭)。隧道结束
+                                时若连接干净(无残留数据),归还 _established_pool
+                                而非关闭;下次同 (proxy, target) 请求直接复用已
+                                CONNECT 握手的连接,跳过 CONNECT 发送+200 校验,
+                                省掉重建。仅当 conn_pool_enabled 时生效。
         """
         self.proxy_store = proxy_store
         self.selector = ProxySelector(
@@ -773,6 +778,9 @@ class Router:
         self._last_request_activity = time.monotonic()
         # 第二阶段(CONNECT 目标半预连接):需 conn_pool_enabled 且显式开启。
         self.conn_pool_target_prewarm = bool(conn_pool_target_prewarm)
+        # 已建握手隧道复用:隧道结束时连接干净则归还而非关闭,同 (proxy,target)
+        # 复用跳过 CONNECT 握手。需 conn_pool_enabled 且显式开启。
+        self.conn_pool_established_reuse = bool(conn_pool_established_reuse)
         # {proxy_url: [StreamWriter,...]} —— 空闲预热连接。只由事件循环线程读写。
         self._conn_pool: dict[str, list] = {}
         self.conn_pool_creates = 0      # 累计预热建连次数
@@ -791,6 +799,15 @@ class Router:
         self.target_prewarm_dispatched = 0  # 后台预热协程发起次数
         self.target_prewarm_success = 0     # 预热建连成功次数
         self.target_prewarm_failed = 0      # 预热建连失败次数
+        # 已建握手隧道池(P3-6):{ "proxy_host:port|target": [(reader, writer)] }。
+        # 存"已发 CONNECT 且收到 200"的隧道连接,隧道结束若连接干净则归还,
+        # 下次同 (proxy, target) 直接复用,跳过 CONNECT 握手。与 _target_pool
+        # 区分:后者是"未发 CONNECT 的裸 TCP",取用后必须重新握手。
+        self._established_pool: dict[str, list] = {}
+        self.established_pool_hits = 0      # 已握手连接取用成功次数
+        self.established_pool_misses = 0    # 取已握手池未中需新建/新建握手的次数
+        self.established_pool_expired = 0   # 已握手连接空闲超时关闭次数
+        self.established_pool_returned = 0  # 隧道结束归还次数
         # 观测(P1 先观测后实现):CONNECT 到上游的新建 TCP 连接计数(不含预热池
         # 命中)。供压测算 HTTPS 建链成本、验证预热池收益。
         self.connect_new_conns = 0
@@ -1320,6 +1337,12 @@ class Router:
             "target_prewarm_dispatched": self.target_prewarm_dispatched,
             "target_prewarm_success": self.target_prewarm_success,
             "target_prewarm_failed": self.target_prewarm_failed,
+            "conn_pool_established_reuse": self.conn_pool_established_reuse,
+            "established_pool_hits": self.established_pool_hits,
+            "established_pool_misses": self.established_pool_misses,
+            "established_pool_expired": self.established_pool_expired,
+            "established_pool_returned": self.established_pool_returned,
+            "established_pool_size": sum(len(v) for v in self._established_pool.values()),
             "connect_new_conns": self.connect_new_conns,
             "probes_sent": self.probes_sent,
             "probes_ok": self.probes_ok,
@@ -1916,6 +1939,28 @@ class Router:
     # ── CONNECT 上游 TCP 预热池(P1)+ 目标半预连接(P2)────────────
 
     @staticmethod
+    def _discard_conn(writer: asyncio.StreamWriter):
+        """fire-and-forget 关闭一条废弃连接(同步路径不能用 await 时的清理)。
+
+        已握手池复用前发现脏缓冲 → 丢弃该连接。close 放入后台 task 执行,不阻塞
+        取用热路径;3.12 的 wait_closed() 严格等对端 FIN,用 0.5s 超时保护。
+        """
+        async def _close():
+            try:
+                writer.close()
+                await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
+            except Exception:
+                pass
+        try:
+            asyncio.create_task(_close())
+        except RuntimeError:
+            # 事件循环未运行(如构造期)时直接 close,不等待。
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    @staticmethod
     def _pool_peek(pool: dict, key: str) -> Optional[Tuple[asyncio.StreamReader, asyncio.StreamWriter]]:
         """从预热池取一条空闲连接 (reader, writer);无则返回 None。
 
@@ -1964,6 +2009,34 @@ class Router:
             logger.info("target pool HIT  %s via %s:%s (hits=%d)",
                         target, proxy_host, proxy_port, self.target_pool_hits)
         return got
+
+    def _established_pool_peek(self, proxy_host: str, proxy_port: int, target: str) -> Optional[Tuple[asyncio.StreamReader, asyncio.StreamWriter]]:
+        """从已建握手隧道池取一条到该上游的连接 (reader, writer);无则返回 None。
+
+        键为 "proxy_host:proxy_port|target"。存的是"已发 CONNECT 且收到 200"的
+        隧道连接,复用时**跳过 CONNECT 握手**(连接已处于可透传状态)。取用成功
+        计 established_pool_hits,未中计 established_pool_misses。复用前验证连接
+        干净(无残留缓冲),有残留则视为过期丢弃,避免脏数据污染下一个客户端。
+        仅当 conn_pool_enabled 且 conn_pool_established_reuse 时由调用方使用。
+        """
+        got = Router._pool_peek(self._established_pool, f"{proxy_host}:{proxy_port}|{target}")
+        if got is None:
+            self.established_pool_misses += 1
+            return None
+        reader, writer = got
+        # 严格验证:上游缓冲残留数据 → 连接已脏,丢弃而非复用(宁可不复用也不污染)。
+        # 本方法是同步热路径,关闭用 fire-and-forget 后台任务(不阻塞取用)。
+        if reader.at_eof() or (reader._buffer and len(reader._buffer) > 0):
+            self.established_pool_expired += 1
+            logger.info("established pool DISCARD %s via %s:%s (dirty buffer)", target, proxy_host, proxy_port)
+            _discard_conn(writer)
+            return None
+        # 标记:该连接已建握手,调用方 _try_tunnel 据此跳过 CONNECT 发送/200 校验。
+        writer._established_reused = True
+        self.established_pool_hits += 1
+        logger.info("established pool HIT  %s via %s:%s (hits=%d)",
+                    target, proxy_host, proxy_port, self.established_pool_hits)
+        return reader, writer
 
     def _record_request_activity(self):
         """刷新"最近请求"时间戳(refill 空闲感知的活动信号)。
@@ -2112,7 +2185,8 @@ class Router:
         # 先收集待关连接,再统一重建 dict —— 迭代中 pop 会触发
         # "dictionary changed size during iteration"。
         for pool, expired_counter in ((self._conn_pool, 'conn_pool_expired'),
-                                      (self._target_pool, 'target_pool_expired')):
+                                      (self._target_pool, 'target_pool_expired'),
+                                      (self._established_pool, 'established_pool_expired')):
             for key in list(pool.keys()):
                 stack = pool[key]
                 alive = []
@@ -2131,6 +2205,9 @@ class Router:
                 else:
                     if expired_counter == 'target_pool_expired':
                         logger.info("target prewarm EXPIRED %s (%s conn(s))",
+                                    key, len(stack))
+                    elif expired_counter == 'established_pool_expired':
+                        logger.info("established pool EXPIRED %s (%s conn(s))",
                                     key, len(stack))
                     pool.pop(key, None)
         for w in stale:
@@ -2172,9 +2249,11 @@ class Router:
         会严格等待对端 FIN 确认,此时会无限挂起(本地 3.11 立即返回,CI 3.12
         卡死)。故用超时保护:close() 后最多等 0.5s,超时即放弃等待,避免阻塞。
         """
-        stacks = list(self._conn_pool.values()) + list(self._target_pool.values())
+        stacks = list(self._conn_pool.values()) + list(self._target_pool.values()) \
+            + list(self._established_pool.values())
         self._conn_pool.clear()
         self._target_pool.clear()
+        self._established_pool.clear()
         for stack in stacks:
             for item in stack:
                 reader, writer = item
@@ -2432,11 +2511,13 @@ class Router:
             pass
 
     @staticmethod
-    async def _pipe(reader, writer):
+    async def _pipe(reader, writer, close_writer: bool = True):
         """把 reader 的数据单向搬运到 writer,直至 EOF 或超时/异常。
 
         用于 CONNECT 隧道的双向透传(两个 _pipe 反向组合)。300s 读超时
         防止半开连接永久占用;任何异常都静默关闭 writer。
+        close_writer=False 时结束不关 writer——供隧道归还场景:客户端断开后
+        保留上游连接,由 _relay_tunnel 判断是否归还已握手池。
         """
         try:
             while True:
@@ -2447,11 +2528,12 @@ class Router:
                 await writer.drain()
         except Exception:
             pass
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except Exception:
-            pass
+        if close_writer:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     @staticmethod
     async def _write_cached_response(writer, status_code, reason_phrase, headers, body):
@@ -2564,7 +2646,11 @@ class Router:
                 # 取用成功即省掉"本机→上游"建连 TTFB。
                 if self.conn_pool_enabled:
                     up_reader, up_writer = None, None
-                    if self.conn_pool_target_prewarm:
+                    # 已握手隧道复用:优先取"已发 CONNECT 且收到 200"的连接,命中则
+                    # 跳过下方 CONNECT 握手,直接返回(连接已处于可透传状态)。
+                    if self.conn_pool_established_reuse:
+                        up_reader, up_writer = self._established_pool_peek(proxy_host, proxy_port, target) or (None, None)
+                    if up_reader is None and self.conn_pool_target_prewarm:
                         up_reader, up_writer = self._target_pool_peek(proxy_host, proxy_port, target) or (None, None)
                     if up_reader is None:
                         pooled = self._conn_pool_peek(proxy_host, proxy_port)
@@ -2593,35 +2679,41 @@ class Router:
         except (asyncio.TimeoutError, OSError, ConnectionError) as e:
             raise RuntimeError(f'connect to {proxy_host or target} timed out or failed: {e}') from e
         # 首字节计时:从 CONNECT 发出到收到 200。用于 EWMA 质量跟踪(竞速排序)。
+        # 复用已握手隧道时无 CONNECT 往返,计时为 0(不做 EWMA 观测)。
+        reused_established = (self.conn_pool_established_reuse
+                              and proxy_host is not None
+                              and up_reader is not None
+                              and getattr(up_writer, '_established_reused', False))
         t0 = time.perf_counter()
         # 计入该代理在途数(从 CONNECT 发起到拿到 200/失败/被取消),finally 释放。
         self.selector._inflight_start(pid)
         try:
-            auth_hdr = ""
-            if proxy_auth:
-                raw = f"{proxy_auth['username']}:{proxy_auth['password']}"
-                encoded = base64.b64encode(raw.encode()).decode()
-                auth_hdr = f"Proxy-Authorization: Basic {encoded}\r\n"
-            up_writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: ".encode('latin-1') + _hb(target) + f"\r\n{auth_hdr}\r\n".encode('latin-1'))
-            await up_writer.drain()
-            self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
-            self.upstream_attempts += 1  # 聚合竞速扇出总数(供 /metrics 算放大率)
-            status = await asyncio.wait_for(up_reader.readline(), timeout=connect_timeout)
-            if not status:
-                raise RuntimeError('no response from upstream')
-            status_text = status.decode('latin-1')
-            if '200' not in status_text:
+            if not reused_established:
+                auth_hdr = ""
+                if proxy_auth:
+                    raw = f"{proxy_auth['username']}:{proxy_auth['password']}"
+                    encoded = base64.b64encode(raw.encode()).decode()
+                    auth_hdr = f"Proxy-Authorization: Basic {encoded}\r\n"
+                up_writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: ".encode('latin-1') + _hb(target) + f"\r\n{auth_hdr}\r\n".encode('latin-1'))
+                await up_writer.drain()
+                self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
+                self.upstream_attempts += 1  # 聚合竞速扇出总数(供 /metrics 算放大率)
+                status = await asyncio.wait_for(up_reader.readline(), timeout=connect_timeout)
+                if not status:
+                    raise RuntimeError('no response from upstream')
+                status_text = status.decode('latin-1')
+                if '200' not in status_text:
+                    while True:
+                        h = await up_reader.readline()
+                        if not h or h in (b"\r\n", b"\n"):
+                            break
+                    raise RuntimeError(f'upstream returned non-200 for CONNECT: {status_text.strip()}')
                 while True:
                     h = await up_reader.readline()
                     if not h or h in (b"\r\n", b"\n"):
                         break
-                raise RuntimeError(f'upstream returned non-200 for CONNECT: {status_text.strip()}')
-            while True:
-                h = await up_reader.readline()
-                if not h or h in (b"\r\n", b"\n"):
-                    break
-            self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
-            self.selector.record_ttfb(pid, time.perf_counter() - t0)
+                self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
+                self.selector.record_ttfb(pid, time.perf_counter() - t0)
             # 仅记尝试统计;meta 由 _handle_connect 在确认赢家后调 _record_win_meta。
             self._record_attempt(target, pid)
             # CONNECT 拿到 200 即视为一次成功观测(EWMA + 连续失败归零)。
@@ -3133,19 +3225,55 @@ class Router:
         client_writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
         await client_writer.drain()
 
-    @staticmethod
-    async def _relay_tunnel(client_reader, up_writer, up_reader, client_writer):
-        """双向透传一个已建立的隧道,任一方向结束即关闭上游连接。"""
+    async def _relay_tunnel(self, client_reader, up_writer, up_reader, client_writer,
+                            proxy_host=None, proxy_port=None, target=None):
+        """双向透传一个已建立的隧道。
+
+        任一方向结束即结束透传。若启用了已握手隧道复用(conn_pool_established_reuse
+        且经上游代理)、且上游连接健康(未关闭、无残留缓冲),则归还 _established_pool
+        供下一条同 (proxy, target) 请求复用;否则关闭上游连接。客户端侧连接始终关闭。
+        """
+        # 客户端→上游 方向的 _pipe 结束时**不关上游**(close_writer=False),让
+        # _relay_tunnel 在结束时统一判断归还/关闭;上游→客户端 方向照常关客户端。
+        # wait(FIRST_COMPLETED):任一端结束(客户端断开 EOF / 上游结束 / 超时)
+        # 即返回并取消另一端——客户端断开后不等待上游挂起(上游可能长连不关),
+        # 立即进入 finally 决定归还/关闭。原 gather 会等两个 pipe 都结束,
+        # 若上游长连不关则归还延迟到其 idle 超时。
         try:
-            await asyncio.gather(
-                Router._pipe(client_reader, up_writer),
-                Router._pipe(up_reader, client_writer))
+            done, pending = await asyncio.wait(
+                {asyncio.create_task(Router._pipe(client_reader, up_writer, close_writer=False)),
+                 asyncio.create_task(Router._pipe(up_reader, client_writer))},
+                return_when=asyncio.FIRST_COMPLETED)
+            for t in pending:
+                t.cancel()
+            for t in done:
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
         finally:
-            try:
-                up_writer.close()
-                await up_writer.wait_closed()
-            except Exception:
-                pass
+            # 归还条件:启用复用 + 经上游代理(非本机直连) + 上游连接未关闭。
+            can_reuse = (self.conn_pool_enabled and self.conn_pool_established_reuse
+                         and proxy_host is not None and target is not None
+                         and not up_writer.is_closing())
+            # 严格验证:上游残留缓冲 → 连接已脏,不归还(宁可不复用也不污染)。
+            if can_reuse and up_reader._buffer and len(up_reader._buffer) > 0:
+                logger.info("established pool NOT-RETURN %s via %s:%s (dirty buffer)",
+                            target, proxy_host, proxy_port)
+                can_reuse = False
+            if can_reuse:
+                up_writer._conn_pool_created = time.monotonic()
+                self._established_pool.setdefault(
+                    f"{proxy_host}:{proxy_port}|{target}", []).append((up_reader, up_writer))
+                self.established_pool_returned += 1
+                logger.info("established pool RETURN %s via %s:%s (returned=%d)",
+                            target, proxy_host, proxy_port, self.established_pool_returned)
+            else:
+                try:
+                    up_writer.close()
+                    await asyncio.wait_for(up_writer.wait_closed(), timeout=0.5)
+                except Exception:
+                    pass
 
     async def _handle_connect(self, target: str, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter, client_ip: str = ""):
         """处理 CONNECT 请求:建立到 target 的隧道并双向透传数据。
@@ -3177,7 +3305,10 @@ class Router:
                     self.sticky_cache_hits += 1
                     self._bump_sticky(client_ip, target, sticky_pid)
                     await self._connect_established(client_writer, up_writer)
-                    await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer)
+                    await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer,
+                                             proxy.host if proxy else None,
+                                             proxy.port if proxy else None,
+                                             target)
                     return
                 except Exception:
                     logger.debug("sticky proxy %s failed CONNECT %s", sticky_pid, target)
@@ -3203,7 +3334,10 @@ class Router:
                 logger.debug("proxy %s cache hit CONNECT %s", pid, target)
                 self._record_sticky(client_ip, target, cached_pid)
                 await self._connect_established(client_writer, up_writer)
-                await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer)
+                await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer,
+                                         proxy.host if proxy else None,
+                                         proxy.port if proxy else None,
+                                         target)
                 return
             except Exception:
                 logger.debug("cached proxy %s failed CONNECT %s", cached_pid, target)
@@ -3258,7 +3392,10 @@ class Router:
                 if win_proxy is not None:
                     self._spawn_target_prewarm(win_proxy.host, win_proxy.port, target)
             await self._connect_established(client_writer, up_writer)
-            await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer)
+            await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer,
+                                     win_proxy.host if pid != 'local' and win_proxy is not None else None,
+                                     win_proxy.port if pid != 'local' and win_proxy is not None else None,
+                                     target)
             return
 
         # 4) 全失败:回写 502 并关闭客户端连接。

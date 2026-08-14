@@ -3706,3 +3706,126 @@ class TestTargetPrewarm:
             await up_srv1.wait_closed()
             up_srv2.close()
             await up_srv2.wait_closed()
+
+
+class TestEstablishedTunnelReuse:
+    """已建握手隧道复用(P3-6):CONNECT 隧道结束若连接干净则归还 _established_pool,
+    下次同 (proxy, target) 复用,跳过 CONNECT 握手,省掉慢线路重建。严格验证:
+    有残留缓冲则丢弃不复用,宁可不复用也不污染下一个客户端。"""
+
+    def _router(self, **kw):
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host=HOST, port=31991))
+        kw.setdefault('conn_pool_enabled', True)
+        kw.setdefault('conn_pool_established_reuse', True)
+        kw.setdefault('conn_pool_target_prewarm', False)
+        kw.setdefault('conn_pool_per_proxy', 4)
+        kw.setdefault('conn_pool_total', 8)
+        kw.setdefault('conn_pool_refill_interval', 0.0)  # 只取不补(测试手动)
+        kw.setdefault('conn_pool_idle_timeout', 100.0)   # 长超时,防测试中途过期
+        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+                      db_path=tempfile.mktemp(suffix='.db'), **kw)
+
+    async def _wait_returned(self, r, target, timeout=2.0):
+        """轮询等待隧道归还(归还发生在 send_connect 返回后的异步 finally 里)。"""
+        key = f"{HOST}:31991|{target.decode()}"
+        for _ in range(int(timeout / 0.02)):
+            if r._established_pool.get(key):
+                return True
+            await asyncio.sleep(0.02)
+        return False
+
+    @pytest.mark.asyncio
+    async def test_tunnel_returned_to_pool(self):
+        """隧道结束后连接归还 _established_pool(而非关闭),returned 计数 +1。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router()
+        await r.start()
+        try:
+            target = b"reuse-return.example.com:443"
+            echo = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"one")
+            assert echo == b"one"
+            # 客户端断开 → _relay_tunnel 异步归还已握手连接,轮询等待。
+            assert await self._wait_returned(r, target), "连接应归还到已握手池"
+            assert r.established_pool_returned == 1
+            key = f"{HOST}:31991|reuse-return.example.com:443"
+            assert len(r._established_pool[key]) == 1
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_reuse_skips_connect(self):
+        """第二次同 target 命中已握手池,established_pool_hits +1,不再发 CONNECT。
+
+        用 hit_counter 列表统计 mock 上游收到的 CONNECT 请求数:第二次应不增加。
+        """
+        hit_counter = []
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=hit_counter)
+        r = self._router()
+        await r.start()
+        try:
+            target = b"reuse-skip.example.com:443"
+            # 第一次:建隧道 + CONNECT 计数 +1,结束后归还(异步,轮询等待)。
+            echo1 = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"one")
+            assert echo1 == b"one"
+            assert len(hit_counter) == 1, f"first CONNECT must hit mock, got {len(hit_counter)}"
+            assert await self._wait_returned(r, target)
+            # 第二次:命中已握手池,跳过 CONNECT,mock 收到 CONNECT 数不增。
+            echo2 = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"two")
+            assert echo2 == b"two"
+            assert len(hit_counter) == 1, f"second CONNECT must be reused, got {len(hit_counter)} CONNECTs"
+            # 第一次 peek miss(池空)→ misses=1;第二次命中 → hits=1,misses 不再增。
+            assert r.established_pool_hits == 1
+            assert r.established_pool_misses == 1
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_reuse_disabled_returns_none(self):
+        """established_reuse=False → 不查已握手池,established_pool_misses 不增。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router(conn_pool_established_reuse=False)
+        await r.start()
+        try:
+            target = b"reuse-off.example.com:443"
+            echo = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"x")
+            assert echo == b"x"
+            assert r.established_pool_misses == 0
+            assert r.established_pool_returned == 0
+            assert sum(len(v) for v in r._established_pool.values()) == 0
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_stop_closes_established_pool(self):
+        """stop() 关闭全部已握手连接,池清空。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router()
+        await r.start()
+        try:
+            target = b"reuse-stop.example.com:443"
+            echo = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"x")
+            assert echo == b"x"
+            assert await self._wait_returned(r, target)
+            assert sum(len(v) for v in r._established_pool.values()) == 1
+        finally:
+            await r.stop()
+            # stop() 内部调 _conn_pool_close_all → 已握手池清空。
+            assert sum(len(v) for v in r._established_pool.values()) == 0
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    def test_snapshot_exposes_established_pool(self):
+        """snapshot_counters 暴露 established_pool 计数与开关。"""
+        r = self._router()
+        s = r.snapshot_counters()
+        assert s['conn_pool_established_reuse'] is True
+        assert s['established_pool_hits'] == 0
+        assert s['established_pool_size'] == 0
+        assert s['established_pool_returned'] == 0

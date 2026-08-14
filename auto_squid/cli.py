@@ -145,6 +145,7 @@ def start(config: str = "", proxies: str = "", db: str = "auto_squid.db"):
         conn_pool_connect_timeout=cfg.router.conn_pool.connect_timeout,
         conn_pool_target_prewarm=cfg.router.conn_pool.target_prewarm,
         conn_pool_refill_pause_minutes=cfg.router.conn_pool.refill_pause_minutes,
+        conn_pool_established_reuse=cfg.router.conn_pool.established_reuse,
         policies=list(cfg.router.policies),
     )
     # 把 store/router 注入 FastAPI app 的模块级全局,供各端点使用。

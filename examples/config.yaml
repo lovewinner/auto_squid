@@ -177,6 +177,7 @@ router:
   #   connect_timeout: 10.0
   #   target_prewarm: false
   #   refill_pause_minutes: 60  # 空闲暂停(分钟):连续 N 分钟无请求则挂起 refill/预热,新请求到来恢复;0=不暂停
+  #   established_reuse: false  # 已建握手隧道复用:隧道结束若连接干净则归还池,同 (proxy,target) 复用跳过 CONNECT 握手,省掉重建;0=关闭
 
 # 日志配置;file 为 null 时写默认文件 auto_squid.log
 logging:
