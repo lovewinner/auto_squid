@@ -286,6 +286,7 @@ router:
 - **策略路由**(`router.policies`)按域名/标签收窄竞速候选集,直接降低 TTFB 与 `racing.amplification`——形状见 `examples/config.yaml`。
 - **`conn_pool.target_prewarm`**(第二阶段)需 `conn_pool.enabled` 为 true;命中域名缓存/粘性**或竞速胜出**(竞速是多数 CONNECT 流量的主体路径,不加则预热只服务极少数缓存命中请求)的高频 CONNECT target 后台预建"到上游"的 TCP,每条 target 补 2 条、取走仍留 1 条备用。`conn_pool.total` 是两阶段合并的全局 fd 预算。看 `/metrics` 的 `target_pool_hits` vs `target_pool_misses` 确认热 target 真的复用了预建连接。
 - **`conn_pool.refill_pause_minutes`**(默认 60):连续 N 分钟无客户端请求时(如深夜),后台 refill/目标预热**挂起**,停止"建连→空闲过期→重建"的零流量空转。生产实测:6 代理深夜 6h 空转白建 ~1400 条连接(100% 超时被清,约 233 条/小时)。暂停期间过期连接照常清理(池渐空),任一新请求到来立即恢复补充。设 `0` 保持旧行为(始终 refill)。
+- **`conn_pool.refill_pause_silence_sec`**(默认 120):活动判定静默窗口(秒)。生产实测发现后台心跳(GitHub Desktop 的 `alive.github.com` / Windows 的 `client.wns.windows.com` / Edge 云消息,间隔 3-10 分钟)会持续把"距上次请求"拉近,使 `refill_pause_minutes` 永不触发。为此活动判定改为**密集请求**:仅当距上次请求 ≤ 该窗口才视为活动并刷新时间戳;间隔更大的孤立请求(心跳)不刷新,无法阻止空闲暂停。设 `0` 保持旧行为(任意请求都刷新)。
 - **`conn_pool.established_reuse`**(默认 false):复用**已建 CONNECT 握手**的隧道。隧道结束若上游连接干净(无残留缓冲数据)则归还 `_established_pool` 而非关闭;下次同 `(proxy, target)` 请求直接复用,跳过 CONNECT 发送+200 校验——省掉慢线路上的一次完整往返(如 github)。严格验证:有残留即丢弃不复用,宁可不复用也不污染。看 `/metrics` 的 `established_pool_hits` vs `established_pool_misses` 确认复用。需 `conn_pool.enabled` 为 true。
 
 ## 容器化部署（Docker / docker compose）

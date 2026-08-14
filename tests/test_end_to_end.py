@@ -3395,13 +3395,16 @@ class TestConnPoolIdlePause:
 
     @pytest.mark.asyncio
     async def test_activity_resumes_refill(self):
-        """新请求到来(_record_request_activity)立即解除暂停,refill 恢复。"""
+        """密集请求到来(_record_request_activity,间隔 ≤ 静默窗口)立即解除暂停,
+        refill 恢复。"""
         up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
         r = self._router(conn_pool_refill_pause_minutes=60.0)
         try:
-            # 模拟已空闲 → 随后请求活动解除暂停。
+            # 模拟已空闲 60+ 分钟(回拨活动时间戳)。
             r._last_request_activity = time.monotonic() - 3601
             assert r._conn_pool_idle() is True
+            # 密集请求:时间戳刷新为"现在"(间隔 0 ≤ 120s 静默窗口)→ 解除暂停。
+            r._last_request_activity = time.monotonic()
             r._record_request_activity()
             assert r._conn_pool_idle() is False
             await r._conn_pool_refill()
@@ -3420,7 +3423,8 @@ class TestConnPoolIdlePause:
             r._last_request_activity = time.monotonic() - 3601
             await r._target_pool_refill(HOST, 31991, "www.baidu.com:443")
             assert r.target_pool_creates == 0
-            # 活动后恢复。
+            # 密集请求(间隔 ≤ 静默窗口)恢复预热。
+            r._last_request_activity = time.monotonic()
             r._record_request_activity()
             made = await r._target_pool_refill(HOST, 31991, "www.baidu.com:443")
             assert made == 2
@@ -3436,7 +3440,54 @@ class TestConnPoolIdlePause:
         r._last_request_activity = time.monotonic() - 3601
         s = r.snapshot_counters()
         assert s['conn_pool_refill_pause_minutes'] == 60.0
+        assert s['conn_pool_refill_pause_silence_sec'] == 120.0
         assert s['conn_pool_idle_paused'] is True
+
+    def test_heartbeat_does_not_resume_idle(self):
+        """后台心跳(间隔 > 静默窗口)不刷新活动时间戳,无法解除空闲暂停。"""
+        r = self._router(conn_pool_refill_pause_minutes=60.0,
+                         conn_pool_refill_pause_silence_sec=120.0)
+        # 模拟已空闲 60+ 分钟(回拨活动时间戳),随后一个心跳到达。
+        r._last_request_activity = time.monotonic() - 3601
+        assert r._conn_pool_idle() is True
+        # 心跳距上次活动 60+ 分钟 > 静默窗口(120s):不刷新,时间戳保持陈旧。
+        r._record_request_activity()
+        assert (time.monotonic() - r._last_request_activity) >= 60 * 60
+        assert r._conn_pool_idle() is True
+
+    def test_heartbeat_never_prevents_idle(self):
+        """周期心跳(如 alive.github.com 每 10 分钟)持续到来,空闲判定仍在 60 分钟
+        后触发——心跳不会持续刷新活动时间戳,无法阻止空闲暂停。"""
+        r = self._router(conn_pool_refill_pause_minutes=60.0,
+                         conn_pool_refill_pause_silence_sec=120.0)
+        # 模拟已空闲 60+ 分钟(最后密集请求在 61 分钟前)。
+        r._last_request_activity = time.monotonic() - 3660
+        assert r._conn_pool_idle() is True
+        # 心跳轮番到达(间隔 10 分钟 > 静默窗口):每次都不刷新,时间戳保持陈旧。
+        for _ in range(6):
+            r._record_request_activity()
+        assert (time.monotonic() - r._last_request_activity) >= 60 * 60
+        assert r._conn_pool_idle() is True
+
+    def test_dense_requests_do_not_go_idle(self):
+        """密集请求(间隔 ≤ 静默窗口)刷新活动时间戳,60 分钟内不进入空闲。"""
+        r = self._router(conn_pool_refill_pause_minutes=60.0,
+                         conn_pool_refill_pause_silence_sec=120.0)
+        # 密集请求流:每次间隔 ≤ 120s,时间戳持续刷新为"现在",不进入空闲。
+        for _ in range(10):
+            r._record_request_activity()  # 距上次刷新 < 120s → 刷新
+        assert (time.monotonic() - r._last_request_activity) < 120.0
+        assert r._conn_pool_idle() is False
+
+    def test_silence_zero_keeps_old_behavior(self):
+        """静默窗口=0:任意请求(含心跳)都刷新活动时间戳(旧行为,向后兼容)。"""
+        r = self._router(conn_pool_refill_pause_minutes=60.0,
+                         conn_pool_refill_pause_silence_sec=0.0)
+        r._last_request_activity = time.monotonic() - 3601
+        assert r._conn_pool_idle() is True
+        # 孤立请求(间隔远超 120s)在 silence=0 时仍刷新 → 解除暂停。
+        r._record_request_activity()
+        assert r._conn_pool_idle() is False
 
 
 class TestTargetPrewarm:

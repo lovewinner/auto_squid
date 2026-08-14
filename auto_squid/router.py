@@ -512,7 +512,7 @@ class Router:
     生命周期:start() 开始监听 → handle_client 处理每个连接 → stop() 优雅关闭。
     """
 
-    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False, conn_pool_refill_pause_minutes: float = 60.0, conn_pool_established_reuse: bool = False):
+    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False, conn_pool_refill_pause_minutes: float = 60.0, conn_pool_refill_pause_silence_sec: float = 120.0, conn_pool_established_reuse: bool = False):
         """构造路由器。
 
         参数:
@@ -609,10 +609,16 @@ class Router:
                                 发 CONNECT,进一步压低 HTTPS 短连接 TTFB。与
                                 第一阶段共享 per-proxy/全局 fd 预算/空闲超时。
             conn_pool_refill_pause_minutes: 空闲暂停(分钟,默认 60)。连续 N 分钟
-                                无任何客户端请求时,挂起后台 refill/目标预热,避免
+                                无客户端请求时,挂起后台 refill/目标预热,避免
                                 深夜空闲期"建了又过期"的空转浪费(生产实测:6 代理
                                 深夜 6h 白建 ~1400 条连接,100% 超时被清)。新请求
                                 到来立即恢复补充。
+            conn_pool_refill_pause_silence_sec: 活动判定静默窗口(秒,默认 120)。
+                                生产实测后台心跳(GitHub Desktop 的 alive.github.com
+                                等,间隔 3-10 分钟)会持续刷新"距上次请求",使空闲
+                                暂停永不触发。活动判定改为"密集请求":仅当距上次
+                                请求 ≤ 本窗口才视为活动并刷新时间戳;间隔更大的
+                                孤立请求(心跳)不刷新。0=任意请求都刷新(旧行为)。
             conn_pool_established_reuse: 已建握手隧道复用(默认关闭)。隧道结束
                                 时若连接干净(无残留数据),归还 _established_pool
                                 而非关闭;下次同 (proxy, target) 请求直接复用已
@@ -773,8 +779,16 @@ class Router:
         # 空闲暂停:连续 N 分钟无客户端请求则挂起 refill/目标预热,避免深夜空闲
         # 期"建了又过期"的空转。0=不暂停。新请求到来立即恢复。
         self.conn_pool_refill_pause_minutes = max(0.0, conn_pool_refill_pause_minutes)
-        # 最近一次客户端请求到达时间(monotonic 秒)。_record_request_activity()
-        # 在每个有效请求(通过认证的 HTTP/CONNECT 首行)上更新。
+        # 活动判定静默窗口(秒):仅当距上次请求 ≤ 该窗口才视为"密集活动"并刷新
+        # 活动时间戳。后台心跳(GitHub Desktop 的 alive.github.com / Windows 的
+        # client.wns.windows.com 等,间隔 3-10 分钟)间隔大于窗口,不会刷新——
+        # 防止心跳阻止空闲暂停触发。0=任意请求都刷新(旧行为)。
+        self.conn_pool_refill_pause_silence_sec = max(0.0, conn_pool_refill_pause_silence_sec)
+        # 最近一次"密集客户端请求"到达时间(monotonic 秒)。由 _record_request_
+        # activity() 在每个有效请求(通过认证的 HTTP/CONNECT 首行)上按静默窗口
+        # 判定后更新。初始为当前时刻:新路由器 60 分钟内不暂停(refill 照常),
+        # 与旧语义一致;进程长时间运行后,后台心跳(间隔 3-10 分钟)不刷新活动
+        # 时间戳,自然进入空闲暂停。
         self._last_request_activity = time.monotonic()
         # 第二阶段(CONNECT 目标半预连接):需 conn_pool_enabled 且显式开启。
         self.conn_pool_target_prewarm = bool(conn_pool_target_prewarm)
@@ -1328,6 +1342,7 @@ class Router:
             "conn_pool_size": sum(len(v) for v in self._conn_pool.values()),
             "conn_pool_target_prewarm": self.conn_pool_target_prewarm,
             "conn_pool_refill_pause_minutes": self.conn_pool_refill_pause_minutes,
+            "conn_pool_refill_pause_silence_sec": self.conn_pool_refill_pause_silence_sec,
             "conn_pool_idle_paused": self._conn_pool_idle(),
             "target_pool_creates": self.target_pool_creates,
             "target_pool_hits": self.target_pool_hits,
@@ -2039,22 +2054,35 @@ class Router:
         return reader, writer
 
     def _record_request_activity(self):
-        """刷新"最近请求"时间戳(refill 空闲感知的活动信号)。
+        """刷新"密集请求"时间戳(refill 空闲感知的活动信号)。
 
         在每个通过认证的 HTTP/CONNECT 首行上调用(见 _handle_client,认证放行后)。
-        更新 _last_request_activity;若此前处于"空闲暂停"态则立刻解除,并在
-        logger 留一条 INFO,便于从日志确认恢复时刻。仅在有实际客户端请求的路径
-        调用——探活/预热/本机自连都不算"请求",不应恢复预热。
+        **活动判定为"密集请求"**:仅当距上次活动时间戳 ≤ 静默窗口
+        (conn_pool_refill_pause_silence_sec)时才视为真实活动并刷新时间戳;间隔
+        更大的孤立请求(如后台心跳 alive.github.com 每 3-10 分钟一次)不刷新——
+        否则心跳会持续拉近"距上次请求",使空闲暂停(refill_pause_minutes)永不触发。
+        若此前处于"空闲暂停"态且本次判定为活动,则立刻解除暂停并在 logger 留一条
+        INFO,便于从日志确认恢复时刻。仅在有实际客户端请求的路径调用——探活/预热/
+        本机自连都不算"请求",不应恢复预热。
         """
+        now = time.monotonic()
+        silence = self.conn_pool_refill_pause_silence_sec
+        # 静默窗口>0:仅密集请求(间隔 ≤ 窗口)刷新;孤立请求(心跳)忽略。
+        # 静默窗口=0:任意请求都刷新(旧行为)。
+        if silence > 0 and (now - self._last_request_activity) > silence:
+            return
         was_idle = self._conn_pool_idle()
-        self._last_request_activity = time.monotonic()
+        self._last_request_activity = now
         if was_idle:
             logger.info("conn pool refill resumed by client request (was idle >= %.0fmin)",
                         self.conn_pool_refill_pause_minutes)
 
     def _conn_pool_idle(self) -> bool:
-        """空闲暂停判定:距上次客户端请求已超过 conn_pool_refill_pause_minutes。
+        """空闲暂停判定:距上次"密集请求"已超过 conn_pool_refill_pause_minutes。
 
+        活动判定见 _record_request_activity——后台心跳(间隔 3-10 分钟)不会刷新
+        活动时间戳,因此即使深夜每分钟都有心跳,只要没有"密集请求"持续到来,
+        本判定在距最后密集请求超过阈值后返回 True,refill/目标预热挂起。
         仅当预热池开启且配置了暂停时长才可能返回 True;0(默认关闭该特性)恒
         False——refill/目标预热行为与未加本特性时完全一致,不改变默认语义。
         """
