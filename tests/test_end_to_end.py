@@ -3262,6 +3262,101 @@ class TestConnPool:
         assert s['conn_pool_enabled'] is True
         assert s['conn_pool_hits'] == 0
         assert s['conn_pool_size'] == 0
+        # 空闲暂停字段默认值(60 分钟,与 schema 一致)与当前空闲态暴露。
+        # 新路由器从未"空闲过 60 分钟",故 idle_paused=False。
+        assert s['conn_pool_refill_pause_minutes'] == 60.0
+        assert s['conn_pool_idle_paused'] is False
+
+
+class TestConnPoolIdlePause:
+    """refill 空闲感知(conn_pool.refill_pause_minutes):连续 N 分钟无客户端请求
+    则挂起 refill/目标预热,避免深夜空闲期"建了又过期"的空转浪费;新请求到来
+    立即恢复。"""
+
+    def _router(self, **kw):
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host=HOST, port=31991))
+        kw.setdefault('conn_pool_enabled', True)
+        kw.setdefault('conn_pool_per_proxy', 2)
+        kw.setdefault('conn_pool_total', 8)
+        kw.setdefault('conn_pool_refill_interval', 0.0)  # 只取不补(测试手动补)
+        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+                      db_path=tempfile.mktemp(suffix='.db'), **kw)
+
+    @pytest.mark.asyncio
+    async def test_default_pause_off_keeps_old_behavior(self):
+        """默认 refill_pause_minutes=0 → 不暂停,refill 照常建连(向后兼容)。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router()  # 未传 → 默认 0
+        try:
+            await r._conn_pool_refill()
+            assert r.conn_pool_creates == 2
+        finally:
+            await r._conn_pool_close_all()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_idle_skips_refill(self):
+        """超过 refill_pause_minutes 无请求 → refill 不再建新连。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router(conn_pool_refill_pause_minutes=60.0)
+        try:
+            # 模拟已空闲 60+ 分钟(回拨活动时间戳),触发空闲暂停。
+            r._last_request_activity = time.monotonic() - 3601
+            assert r._conn_pool_idle() is True
+            await r._conn_pool_refill()
+            assert r.conn_pool_creates == 0
+            assert sum(len(v) for v in r._conn_pool.values()) == 0
+        finally:
+            await r._conn_pool_close_all()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_activity_resumes_refill(self):
+        """新请求到来(_record_request_activity)立即解除暂停,refill 恢复。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router(conn_pool_refill_pause_minutes=60.0)
+        try:
+            # 模拟已空闲 → 随后请求活动解除暂停。
+            r._last_request_activity = time.monotonic() - 3601
+            assert r._conn_pool_idle() is True
+            r._record_request_activity()
+            assert r._conn_pool_idle() is False
+            await r._conn_pool_refill()
+            assert r.conn_pool_creates == 2
+        finally:
+            await r._conn_pool_close_all()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_idle_skips_target_prewarm(self):
+        """空闲暂停同样挂起目标预热(第二阶段),不建半连接。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router(conn_pool_refill_pause_minutes=60.0)
+        try:
+            r._last_request_activity = time.monotonic() - 3601
+            await r._target_pool_refill(HOST, 31991, "www.baidu.com:443")
+            assert r.target_pool_creates == 0
+            # 活动后恢复。
+            r._record_request_activity()
+            made = await r._target_pool_refill(HOST, 31991, "www.baidu.com:443")
+            assert made == 2
+            assert r.target_pool_creates == 2
+        finally:
+            await r._conn_pool_close_all()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    def test_snapshot_exposes_pause(self):
+        """snapshot_counters 暴露 refill_pause_minutes 与当前空闲态。"""
+        r = self._router(conn_pool_refill_pause_minutes=60.0)
+        r._last_request_activity = time.monotonic() - 3601
+        s = r.snapshot_counters()
+        assert s['conn_pool_refill_pause_minutes'] == 60.0
+        assert s['conn_pool_idle_paused'] is True
 
 
 class TestTargetPrewarm:

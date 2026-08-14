@@ -285,6 +285,7 @@ router:
 - **`lb_bias`** 控制在途积压对竞速排序的惩罚(`ewma × (1 + active)^bias`)。慢代理易被打爆就调高;最快代理被过度避让就调低。
 - **策略路由**(`router.policies`)按域名/标签收窄竞速候选集,直接降低 TTFB 与 `racing.amplification`——形状见 `examples/config.yaml`。
 - **`conn_pool.target_prewarm`**(第二阶段)需 `conn_pool.enabled` 为 true;命中域名缓存/粘性**或竞速胜出**(竞速是多数 CONNECT 流量的主体路径,不加则预热只服务极少数缓存命中请求)的高频 CONNECT target 后台预建"到上游"的 TCP,每条 target 补 2 条、取走仍留 1 条备用。`conn_pool.total` 是两阶段合并的全局 fd 预算。看 `/metrics` 的 `target_pool_hits` vs `target_pool_misses` 确认热 target 真的复用了预建连接。
+- **`conn_pool.refill_pause_minutes`**(默认 60):连续 N 分钟无客户端请求时(如深夜),后台 refill/目标预热**挂起**,停止"建连→空闲过期→重建"的零流量空转。生产实测:6 代理深夜 6h 空转白建 ~1400 条连接(100% 超时被清,约 233 条/小时)。暂停期间过期连接照常清理(池渐空),任一新请求到来立即恢复补充。设 `0` 保持旧行为(始终 refill)。
 
 ## 容器化部署（Docker / docker compose）
 
@@ -310,7 +311,7 @@ curl -x http://127.0.0.1:10808 http://www.baidu.com
 
 测试套件覆盖 HTTP/CONNECT 转发、HTTP 响应缓存、域名缓存、本机竞速、`ProxyStore` CRUD、API，以及二进制安全的请求体处理。
 
-CI 通过 GitHub Actions（`.github/workflows/test.yml`）在 **Python 3.11 与 3.12** 双版本跑测试套件，并带单测试超时（`pytest --timeout=60`），挂起的测试会快速失败并报出测试名，而非无限阻塞任务。
+CI 通过 GitHub Actions（`.github/workflows/test.yml`）在 **Python 3.10 与 3.11 与 3.12** 三版本跑测试套件，并带单测试超时（`pytest --timeout=60`），挂起的测试会快速失败并报出测试名，而非无限阻塞任务。
 
 > **Python 3.12 兼容性说明**：3.12 中 `StreamWriter.wait_closed()` 与 `Server.wait_closed()` 变得更严格——会等待对端 FIN / 活跃 handler 协程退出。预热池连接是"半连接"（只建 TCP 未发数据），对端永不主动关闭，因此 router 侧用短超时限制关闭等待、测试里的 mock 上游对空闲连接 5s 超时自动关闭（模拟真实上游 idle 超时）。此问题仅在 CI 的 3.12 矩阵暴露——3.11 无此问题。
 

@@ -230,7 +230,7 @@ router:
   # adaptive_ttl: {enabled: true, min_sec: 60, max_sec: 1800}   # per-domain TTL by stability
   # switch_damping: {enabled: true, min_wins: 2, ratio: 0.8, abs_ms: 30}  # stable egress
   # concurrency_limit: {enabled: true, initial: 16, min: 2, max: 128, add_on_success: 4, mult_on_failure: 0.5, failure_window: 20}
-  # conn_pool: {enabled: true, per_proxy: 4, total: 64, idle_timeout: 30.0, refill_interval: 5.0, refill_target: 2, connect_timeout: 10.0, target_prewarm: true}
+  # conn_pool: {enabled: true, per_proxy: 4, total: 64, idle_timeout: 30.0, refill_interval: 5.0, refill_target: 2, connect_timeout: 10.0, target_prewarm: true, refill_pause_minutes: 60}
 logging:
   file: "auto_squid.log"
 ```
@@ -293,6 +293,7 @@ Tuning notes:
 - **`lb_bias`** controls how much in-flight backlog penalizes a proxy's race order (`ewma × (1 + active)^bias`). Raise it if slow proxies get hammered; lower it if the fastest proxy is being deprioritized.
 - **Policy routing** (`router.policies`) narrows the racing candidate set per domain/tag, cutting TTFB and `racing.amplification` — see `examples/config.yaml` for the shape.
 - **`conn_pool.target_prewarm`** (Phase 2) needs `conn_pool.enabled`; it pre-opens "to-upstream" TCP for hot CONNECT targets on domain-cache/sticky hits **or when a racing proxy wins** (the dominant path for most CONNECT traffic — without it prewarm only served the few cache-hit requests). Each target is warmed to 2 connections so a peek leaves a spare. `conn_pool_total` bounds the combined fd budget of both pools. Watch `/metrics` `target_pool_hits` vs `target_pool_misses` to confirm hot targets actually reuse prewarmed connections.
+- **`conn_pool.refill_pause_minutes`** (default 60): when no client request has arrived for N consecutive minutes (e.g. overnight), the background refill and target-prewarm **pause** so they stop churning "connect → idle-expire → reconnect" with zero traffic. Production measured ~233 wasted connects/hour per 6 proxies during a 6h idle stretch (100% expired). The pool still drains stale connections while paused (prune runs), and any new request immediately resumes refilling. Set `0` to keep the old always-refill behavior.
 
 ## Container deployment (Docker / docker compose)
 
@@ -317,7 +318,7 @@ curl -x http://127.0.0.1:10808 http://www.baidu.com
 
 The suite covers HTTP/CONNECT forwarding, the HTTP response cache, the domain cache, local racing, `ProxyStore` CRUD, the API, and binary-safe request body handling.
 
-CI runs the suite on **Python 3.11 and 3.12** via GitHub Actions (`.github/workflows/test.yml`), with a per-test timeout (`pytest --timeout=60`) so a hanging test fails fast instead of blocking the job.
+CI runs the suite on **Python 3.10, 3.11 and 3.12** via GitHub Actions (`.github/workflows/test.yml`), with a per-test timeout (`pytest --timeout=60`) so a hanging test fails fast instead of blocking the job.
 
 > **Python 3.12 compatibility note**: `StreamWriter.wait_closed()` and `Server.wait_closed()` became stricter in 3.12 — they wait for the peer FIN / active handler coroutines. Prewarm pool connections are "half-open" (TCP established, no data sent), so their peers never close; the router now bounds these with a short timeout, and the mock upstreams in the test suite close idle connections after 5s (mirroring a real upstream's idle timeout). This only surfaced under CI's 3.12 matrix — 3.11 passes without it.
 

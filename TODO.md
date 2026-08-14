@@ -58,10 +58,11 @@
 
 - [x] UnicodeEncodeError：上游返回非 ASCII（如中文）响应头时，httpx utf-8 解码后 latin-1 重编码崩溃。新增 `_hb()`（latin-1 + utf-8 回退），应用到全部上游派生编码点（流式/缓存头、reason phrase、Content-Length、CONNECT Host/target）
 - [x] Python 3.12 预热连接关闭挂起：3.12 的 `StreamWriter.wait_closed()`/`Server.wait_closed()` 变严格——等待对端 FIN / 活跃 handler 协程。预热池"半连接"（只建 TCP 未发数据）对端永不关闭，导致关闭/测试收尾死锁。修复：router 侧 `_conn_pool_close_all`/`_pool_prune` 的 `wait_closed()` 加 0.5s 超时；测试 mock 上游对空闲连接 5s 超时关闭（模拟真实上游 idle 超时）。仅 CI 3.12 矩阵暴露，3.11 无此问题（CI 双版本矩阵的必要性实证）
+- [x] 深夜空闲期预热池空转浪费：opt.log 分析发现 01:00-06:59 零请求时段通用池仍按 refill 周期"建连→空闲过期→重建"，6 代理 6h 白建 ~1400 条连接（100% 被清，约 233 条/小时）。修复：`conn_pool.refill_pause_minutes`（默认 60）——连续 N 分钟无客户端请求则挂起 refill/目标预热，新请求到来立即恢复；暂停期间仍照常 prune 清理过期连接。0=不暂停（向后兼容）。已在 `_handle_client` 认证放行处喂狗，探活/预热不算请求活动
 
 ## 已完成 — 运维与安全（P2）
 
-- [x] CI（`.github/workflows/test.yml`）：GitHub Actions，push master / PR 触发，Python 3.11 + 3.12 双版本跑 144 测试，带 pytest-timeout(60s) 防挂起；uv.lock 已纳入版本管理，`uv sync --frozen` 锁定依赖
+- [x] CI（`.github/workflows/test.yml`）：GitHub Actions，push master / PR 触发，Python 3.10 + 3.11 + 3.12 三版本跑 149 测试，带 pytest-timeout(60s) 防挂起；uv.lock 已纳入版本管理，`uv sync --frozen` 锁定依赖
 
 ## 待办 — 运维与安全（P2）
 
@@ -71,9 +72,9 @@
 ## 工作流备注
 
 - 每个组件配单元测试；测试保持确定性（mock 网络调用）。
-- 生产配置调参记录：`idle_timeout` 30→120→180（目标池命中率 5%→25%）、`single_send_degrade_ratio` 3.0→2.0（降级收敛）。脱敏样例见 `config_xxh_example.yaml`。
+- 生产配置调参记录：`idle_timeout` 30→120→180（目标池命中率 5%→25%）、`single_send_degrade_ratio` 3.0→2.0（降级收敛）、`refill_pause_minutes` 60（深夜空转暂停）。脱敏样例见 `config_xxh_example.yaml`。
 
 ## 当前测试状态
 
-- `tests/test_end_to_end.py` 等：144 个用例，覆盖转发/缓存/竞速/聚合/认证/熔断/探活/粘性/计数/DB 持久化/UTF-8 头安全/连接预热（通用池 + target 半预连接，含竞速胜出触发预热）。
-- 运行：`.venv/bin/python -m pytest -q`；CI 双版本（3.11/3.12）全部通过。
+- `tests/test_end_to_end.py` 等：149 个用例，覆盖转发/缓存/竞速/聚合/认证/熔断/探活/粘性/计数/DB 持久化/UTF-8 头安全/连接预热（通用池 + target 半预连接，含竞速胜出触发预热）+ refill 空闲暂停（refill_pause_minutes）。
+- 运行：`.venv/bin/python -m pytest -q`；CI 三版本（3.10/3.11/3.12）全部通过。

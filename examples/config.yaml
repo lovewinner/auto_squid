@@ -176,6 +176,7 @@ router:
   #   refill_target: 2
   #   connect_timeout: 10.0
   #   target_prewarm: false
+  #   refill_pause_minutes: 60  # 空闲暂停(分钟):连续 N 分钟无请求则挂起 refill/预热,新请求到来恢复;0=不暂停
 
 # 日志配置;file 为 null 时写默认文件 auto_squid.log
 logging:

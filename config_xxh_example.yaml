@@ -76,3 +76,4 @@ router:
     refill_target: 2
     connect_timeout: 10.0
     target_prewarm: true    # 第二阶段:命中缓存/粘性的高频 CONNECT target 预建"到上游"TCP
+    refill_pause_minutes: 60  # 空闲暂停(分钟):连续 N 分钟无请求则挂起 refill/预热,新请求到来恢复。0=不暂停。生产实测:深夜 6h 空转白建 ~1400 条连接(100% 超时被清)

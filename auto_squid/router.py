@@ -512,7 +512,7 @@ class Router:
     生命周期:start() 开始监听 → handle_client 处理每个连接 → stop() 优雅关闭。
     """
 
-    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False):
+    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False, conn_pool_refill_pause_minutes: float = 60.0):
         """构造路由器。
 
         参数:
@@ -608,6 +608,11 @@ class Router:
                                 (proxy, target) 键区分,下次命中直接复用该 TCP
                                 发 CONNECT,进一步压低 HTTPS 短连接 TTFB。与
                                 第一阶段共享 per-proxy/全局 fd 预算/空闲超时。
+            conn_pool_refill_pause_minutes: 空闲暂停(分钟,默认 60)。连续 N 分钟
+                                无任何客户端请求时,挂起后台 refill/目标预热,避免
+                                深夜空闲期"建了又过期"的空转浪费(生产实测:6 代理
+                                深夜 6h 白建 ~1400 条连接,100% 超时被清)。新请求
+                                到来立即恢复补充。
         """
         self.proxy_store = proxy_store
         self.selector = ProxySelector(
@@ -760,6 +765,12 @@ class Router:
         self.conn_pool_refill_interval = max(0.0, conn_pool_refill_interval)
         self.conn_pool_refill_target = max(0, min(self.conn_pool_per_proxy, conn_pool_refill_target))
         self.conn_pool_connect_timeout = max(1.0, conn_pool_connect_timeout)
+        # 空闲暂停:连续 N 分钟无客户端请求则挂起 refill/目标预热,避免深夜空闲
+        # 期"建了又过期"的空转。0=不暂停。新请求到来立即恢复。
+        self.conn_pool_refill_pause_minutes = max(0.0, conn_pool_refill_pause_minutes)
+        # 最近一次客户端请求到达时间(monotonic 秒)。_record_request_activity()
+        # 在每个有效请求(通过认证的 HTTP/CONNECT 首行)上更新。
+        self._last_request_activity = time.monotonic()
         # 第二阶段(CONNECT 目标半预连接):需 conn_pool_enabled 且显式开启。
         self.conn_pool_target_prewarm = bool(conn_pool_target_prewarm)
         # {proxy_url: [StreamWriter,...]} —— 空闲预热连接。只由事件循环线程读写。
@@ -1259,6 +1270,8 @@ class Router:
             "conn_pool_expired": self.conn_pool_expired,
             "conn_pool_size": sum(len(v) for v in self._conn_pool.values()),
             "conn_pool_target_prewarm": self.conn_pool_target_prewarm,
+            "conn_pool_refill_pause_minutes": self.conn_pool_refill_pause_minutes,
+            "conn_pool_idle_paused": self._conn_pool_idle(),
             "target_pool_creates": self.target_pool_creates,
             "target_pool_hits": self.target_pool_hits,
             "target_pool_misses": self.target_pool_misses,
@@ -1908,13 +1921,41 @@ class Router:
                         target, proxy_host, proxy_port, self.target_pool_hits)
         return got
 
+    def _record_request_activity(self):
+        """记录一次客户端请求到达(refill 空闲感知的喂狗)。
+
+        在每个通过认证的 HTTP/CONNECT 首行上调用(见 _handle_client,认证放行后)。
+        更新 _last_request_activity;若此前处于"空闲暂停"态则立刻解除,并在
+        logger 留一条 INFO,便于从日志确认恢复时刻。仅在有实际客户端请求的路径
+        调用——探活/预热/本机自连都不算"请求",不应恢复预热。
+        """
+        was_idle = self._conn_pool_idle()
+        self._last_request_activity = time.monotonic()
+        if was_idle:
+            logger.info("conn pool refill resumed by client request (was idle >= %.0fmin)",
+                        self.conn_pool_refill_pause_minutes)
+
+    def _conn_pool_idle(self) -> bool:
+        """空闲暂停判定:距上次客户端请求已超过 conn_pool_refill_pause_minutes。
+
+        仅当预热池开启且配置了暂停时长才可能返回 True;0(默认关闭该特性)恒
+        False——refill/目标预热行为与未加本特性时完全一致,不改变默认语义。
+        """
+        if not self.conn_pool_enabled or self.conn_pool_refill_pause_minutes <= 0:
+            return False
+        return (time.monotonic() - self._last_request_activity) >= self.conn_pool_refill_pause_minutes * 60.0
+
     async def _conn_pool_refill(self):
         """补充第一阶段预热连接到目标水位(后台 refill task 周期调用)。
 
         每代理目标 conn_pool_refill_target 条;全局受 conn_pool_total 钳制。
         建连失败静默(上游临时不可达时下次再补)。空代理/未启用跳过。
+        空闲暂停期间直接返回(不建新连,已有空闲连接照常可用/可过期)。
         """
         if not self.conn_pool_enabled:
+            return
+        # 空闲暂停:深夜无请求时挂起补充,避免"建了又过期"的空转。
+        if self._conn_pool_idle():
             return
         # 快照当前空闲总数,防止并发补充超过全局预算(两阶段共享 conn_pool_total)。
         total_idle = sum(len(v) for v in self._conn_pool.values()) \
@@ -1954,6 +1995,9 @@ class Router:
         单条预热被取走即空,下一条同 target 请求只能回退 miss。
         """
         if not self.conn_pool_enabled:
+            return 0
+        # 空闲暂停:无请求期间不发起目标预热(省建连;已有半连接照常可复用)。
+        if self._conn_pool_idle():
             return 0
         key = f"{proxy_host}:{proxy_port}|{target}"
         # 全局 fd 预算:第一阶段 + 第二阶段共享,超限则不补。
@@ -2062,7 +2106,8 @@ class Router:
         """后台预热循环:周期补充到目标水位并清理过期连接。
 
         捕获异常不退出;被取消静默退出(stop() 会收尾)。refill_interval<=0
-        时 start() 不启动本循环(只取不补)。
+        时 start() 不启动本循环(只取不补)。空闲暂停(refill_pause_minutes)期间
+        只清不补:expired 照常关闭、池渐空,避免深夜空转建连。
         """
         try:
             while True:
@@ -2599,6 +2644,8 @@ class Router:
                                                 'Content-Type': 'text/plain'},
                                                _hb(reason or 'Authentication required'))
                     return
+            # 有效客户端请求(认证通过):喂狗 refill 空闲感知,解除深夜暂停。
+            self._record_request_activity()
             if first.upper().startswith('CONNECT'):
                 target = first.split(' ')[1]
                 await self._handle_connect(target, reader, writer, client_ip)

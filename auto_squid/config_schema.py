@@ -173,6 +173,10 @@ class ConnPoolConfig(BaseModel):
                 复用该 TCP 发 CONNECT,进一步压低 HTTPS 短连接 TTFB。与第一阶段
                 共享 per-proxy 上限 + 全局 fd 预算 + 空闲超时;需 conn_pool.enabled
                 为 True 才生效。
+    refill_pause_minutes: 空闲暂停(分钟,默认 60)。连续 N 分钟无客户端请求时
+                挂起后台 refill/目标预热,避免深夜空闲期"建了又过期"的空转浪费
+                (生产实测:6 代理深夜 6h 白建 ~1400 条连接,100% 超时被清)。
+                新请求到来立即恢复补充。0=不暂停(保持旧行为)。
     """
     enabled: bool = Field(False, description="启用 CONNECT 上游 TCP 预热池")
     per_proxy: int = Field(4, description="每代理预热连接数上限")
@@ -182,6 +186,7 @@ class ConnPoolConfig(BaseModel):
     refill_target: int = Field(2, description="每代理保持的空闲连接数目标")
     connect_timeout: float = Field(10.0, description="预热/取用建连超时(秒)")
     target_prewarm: bool = Field(False, description="CONNECT 目标半预连接(第二阶段):命中缓存/粘性的高频 target 提前预热到上游的 TCP")
+    refill_pause_minutes: float = Field(60.0, description="空闲暂停(分钟):连续 N 分钟无客户端请求则挂起 refill/目标预热,新请求到来恢复;0=不暂停")
 
 
 class ConcurrencyLimitConfig(BaseModel):
