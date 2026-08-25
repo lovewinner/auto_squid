@@ -107,20 +107,6 @@ _PROBE_INTERVAL_DEFAULT = 30.0
 _PROBE_CANARY_DEFAULT = "1.1.1.1:443"
 _PROBE_TIMEOUT = 4.0
 
-# refill 空闲感知的心跳目标黑名单(host 后缀,默认)。后台服务(而非真实用户)
-# 发起的周期请求会持续刷新"最近请求"时间戳,使 refill_pause_minutes 永不触发。
-# 命中这些后缀的目标视为心跳,不刷新活动时间戳;其余目标无论间隔多长都刷新。
-# 可通过 conn_pool.refill_pause_heartbeat_targets 覆盖(空列表 = 不做目标过滤)。
-_DEFAULT_HEARTBEAT_TARGETS = [
-    ".github.com",          # GitHub Desktop: alive.github.com / api.github.com
-    ".wns.windows.com",     # Windows 推送: client.wns.windows.com
-    ".cloudmessaging.edge.microsoft.com",  # Edge/Windows 云消息
-    ".edge.microsoft.com",  # Edge 遥测/云消息
-    ".office.com", ".office.net",          # Office 遥测
-    ".microsoft.com",       # 通用 MS 遥测/登录
-    ".googleusercontent.com",  # Google 推送/遥测
-]
-
 # 加权 least-request 的在途积压惩罚指数(bias,默认 1.0)。
 # 排序权重 = ewma × (1 + active)^bias,即分析 doc 2.2 的 "peak EWMA"(最近 RTT ×
 # 在途数):在途积压多的代理即使延迟历史最快,有效权重也被抬高、排序靠后,竞速选批
@@ -526,7 +512,7 @@ class Router:
     生命周期:start() 开始监听 → handle_client 处理每个连接 → stop() 优雅关闭。
     """
 
-    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False, conn_pool_refill_pause_minutes: float = 60.0, conn_pool_refill_pause_silence_sec: float = 0.0, conn_pool_refill_pause_heartbeat_targets: Optional[List[str]] = None, conn_pool_established_reuse: bool = False):
+    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False, conn_pool_refill_pause_minutes: float = 60.0, conn_pool_refill_pause_silence_sec: float = 120.0, conn_pool_established_reuse: bool = False):
         """构造路由器。
 
         参数:
@@ -627,20 +613,12 @@ class Router:
                                 深夜空闲期"建了又过期"的空转浪费(生产实测:6 代理
                                 深夜 6h 白建 ~1400 条连接,100% 超时被清)。新请求
                                 到来立即恢复补充。
-            conn_pool_refill_pause_silence_sec: 活动判定静默窗口(秒,默认 0=关闭)。
-                                旧方案按间隔一刀切:距上次请求 > 本窗口的孤立请求
-                                (含真实低频请求)不刷新时间戳,会误伤真实流量。
-                                现推荐按目标区分(见 heartbeat_targets),本字段设
-                                0 则不做间隔过滤。
-            conn_pool_refill_pause_heartbeat_targets: 心跳目标黑名单(host 后缀列表,
-                                默认内置 .github.com / .wns.windows.com /
-                                .cloudmessaging.edge.microsoft.com / .edge.microsoft.
-                                com / .office.com / .microsoft.com /
-                                .googleusercontent.com)。目标 host 命中这些后缀视为
-                                后台心跳(如 GitHub Desktop 的 alive.github.com 每
-                                3-10 分钟),不刷新活动时间戳——即使每 3-10 分钟
-                                一轮也不会阻止空闲暂停;其余目标(无论间隔多长)一律
-                                刷新,真实孤立请求不被误伤。
+            conn_pool_refill_pause_silence_sec: 活动判定静默窗口(秒,默认 120)。
+                                生产实测后台心跳(GitHub Desktop 的 alive.github.com
+                                等,间隔 3-10 分钟)会持续刷新"距上次请求",使空闲
+                                暂停永不触发。活动判定改为"密集请求":仅当距上次
+                                请求 ≤ 本窗口才视为活动并刷新时间戳;间隔更大的
+                                孤立请求(心跳)不刷新。0=任意请求都刷新(旧行为)。
             conn_pool_established_reuse: 已建握手隧道复用(默认关闭)。隧道结束
                                 时若连接干净(无残留数据),归还 _established_pool
                                 而非关闭;下次同 (proxy, target) 请求直接复用已
@@ -801,22 +779,16 @@ class Router:
         # 空闲暂停:连续 N 分钟无客户端请求则挂起 refill/目标预热,避免深夜空闲
         # 期"建了又过期"的空转。0=不暂停。新请求到来立即恢复。
         self.conn_pool_refill_pause_minutes = max(0.0, conn_pool_refill_pause_minutes)
-        # 活动判定静默窗口(秒,默认 0=关闭):旧方案的间隔一刀切,距上次请求 >
-        # 窗口的孤立请求(含真实低频请求)不刷新时间戳,会误伤真实流量。推荐按
-        # 目标区分心跳(见 heartbeat_targets),本字段设 0 则不做间隔过滤。
+        # 活动判定静默窗口(秒):仅当距上次请求 ≤ 该窗口才视为"密集活动"并刷新
+        # 活动时间戳。后台心跳(GitHub Desktop 的 alive.github.com / Windows 的
+        # client.wns.windows.com 等,间隔 3-10 分钟)间隔大于窗口,不会刷新——
+        # 防止心跳阻止空闲暂停触发。0=任意请求都刷新(旧行为)。
         self.conn_pool_refill_pause_silence_sec = max(0.0, conn_pool_refill_pause_silence_sec)
-        # 心跳目标黑名单(host 后缀):目标命中视为后台心跳,不刷新活动时间戳,
-        # 防止心跳阻止空闲暂停;其余目标无论间隔多长都刷新,真实孤立请求不被
-        # 误伤。空列表 = 不做目标过滤(旧行为)。
-        # None → 用内置默认黑名单;显式空列表 → 不做目标过滤(向后兼容任意请求都刷新)。
-        self.conn_pool_refill_pause_heartbeat_targets = \
-            [t.lower().strip() for t in (conn_pool_refill_pause_heartbeat_targets
-                                         if conn_pool_refill_pause_heartbeat_targets is not None
-                                         else _DEFAULT_HEARTBEAT_TARGETS)]
-        # 最近一次"非心跳客户端请求"到达时间(monotonic 秒)。由 _record_request_
-        # activity() 在每个有效请求(通过认证的 HTTP/CONNECT 首行)上更新。初始为
-        # 当前时刻:新路由器 60 分钟内不暂停(refill 照常),与旧语义一致;进程长
-        # 时间运行后,后台心跳(命中黑名单目标)不刷新活动时间戳,自然进入空闲暂停。
+        # 最近一次"密集客户端请求"到达时间(monotonic 秒)。由 _record_request_
+        # activity() 在每个有效请求(通过认证的 HTTP/CONNECT 首行)上按静默窗口
+        # 判定后更新。初始为当前时刻:新路由器 60 分钟内不暂停(refill 照常),
+        # 与旧语义一致;进程长时间运行后,后台心跳(间隔 3-10 分钟)不刷新活动
+        # 时间戳,自然进入空闲暂停。
         self._last_request_activity = time.monotonic()
         # 第二阶段(CONNECT 目标半预连接):需 conn_pool_enabled 且显式开启。
         self.conn_pool_target_prewarm = bool(conn_pool_target_prewarm)
@@ -1371,7 +1343,6 @@ class Router:
             "conn_pool_target_prewarm": self.conn_pool_target_prewarm,
             "conn_pool_refill_pause_minutes": self.conn_pool_refill_pause_minutes,
             "conn_pool_refill_pause_silence_sec": self.conn_pool_refill_pause_silence_sec,
-            "conn_pool_refill_pause_heartbeat_targets": list(self.conn_pool_refill_pause_heartbeat_targets),
             "conn_pool_idle_paused": self._conn_pool_idle(),
             "target_pool_creates": self.target_pool_creates,
             "target_pool_hits": self.target_pool_hits,
@@ -2082,56 +2053,36 @@ class Router:
                     target, proxy_host, proxy_port, self.established_pool_hits)
         return reader, writer
 
-    def _is_heartbeat_target(self, target: Optional[str]) -> bool:
-        """判断目标 host 是否属于后台心跳(命中 refill_pause_heartbeat_targets)。
-
-        心跳 = 后台服务(GitHub Desktop / Windows / Edge 云消息)周期性请求,间隔
-        3-10 分钟一轮。命中黑名单后缀视为心跳,不刷新活动时间戳,防止其阻止空闲
-        暂停;其余目标(无论间隔多长)都是真实流量,应刷新。target 形如
-        "host:port" / "host" / "http://url"。空黑名单恒 False(不做目标过滤)。
-        """
-        if not self.conn_pool_refill_pause_heartbeat_targets or not target:
-            return False
-        host = target
-        # 先去 scheme (http:// / https://) 与路径/查询
-        if '://' in host:
-            host = host.split('://', 1)[1].split('/')[0].split('?')[0]
-        # 再去端口 (host:port / [ipv6]:port)——须在 scheme 剥离后,避免误剥 "http:"
-        if ':' in host and not host.startswith('['):
-            host = host.rsplit(':', 1)[0]
-        host = host.lower()
-        for suffix in self.conn_pool_refill_pause_heartbeat_targets:
-            if host == suffix or host.endswith(suffix):
-                return True
-        return False
-
-    def _record_request_activity(self, target: Optional[str] = None):
-        """刷新"真实请求"时间戳(refill 空闲感知的活动信号)。
+    def _record_request_activity(self):
+        """刷新"密集请求"时间戳(refill 空闲感知的活动信号)。
 
         在每个通过认证的 HTTP/CONNECT 首行上调用(见 _handle_client,认证放行后)。
-        **活动判定按目标区分**:命中 refill_pause_heartbeat_targets 的后台心跳目标
-        (如 alive.github.com 每 3-10 分钟)不刷新时间戳——否则心跳会持续拉近"距
-        上次请求",使空闲暂停(refill_pause_minutes)永不触发;其余目标(无论间隔
-        多长)一律刷新,真实孤立请求不被误伤。
+        **活动判定为"密集请求"**:仅当距上次活动时间戳 ≤ 静默窗口
+        (conn_pool_refill_pause_silence_sec)时才视为真实活动并刷新时间戳;间隔
+        更大的孤立请求(如后台心跳 alive.github.com 每 3-10 分钟一次)不刷新——
+        否则心跳会持续拉近"距上次请求",使空闲暂停(refill_pause_minutes)永不触发。
         若此前处于"空闲暂停"态且本次判定为活动,则立刻解除暂停并在 logger 留一条
         INFO,便于从日志确认恢复时刻。仅在有实际客户端请求的路径调用——探活/预热/
         本机自连都不算"请求",不应恢复预热。
         """
-        if self._is_heartbeat_target(target):
+        now = time.monotonic()
+        silence = self.conn_pool_refill_pause_silence_sec
+        # 静默窗口>0:仅密集请求(间隔 ≤ 窗口)刷新;孤立请求(心跳)忽略。
+        # 静默窗口=0:任意请求都刷新(旧行为)。
+        if silence > 0 and (now - self._last_request_activity) > silence:
             return
         was_idle = self._conn_pool_idle()
-        self._last_request_activity = time.monotonic()
+        self._last_request_activity = now
         if was_idle:
             logger.info("conn pool refill resumed by client request (was idle >= %.0fmin)",
                         self.conn_pool_refill_pause_minutes)
 
     def _conn_pool_idle(self) -> bool:
-        """空闲暂停判定:距上次"真实请求"已超过 conn_pool_refill_pause_minutes。
+        """空闲暂停判定:距上次"密集请求"已超过 conn_pool_refill_pause_minutes。
 
-        活动判定见 _record_request_activity——后台心跳(命中黑名单目标,间隔
-        3-10 分钟)不刷新活动时间戳,因此即使深夜每分钟都有心跳,只要没有真实
-        请求到来,本判定在距最后真实请求超过阈值后返回 True,refill/目标预热
-        挂起;任一真实请求(无论间隔)到来立即解除暂停。
+        活动判定见 _record_request_activity——后台心跳(间隔 3-10 分钟)不会刷新
+        活动时间戳,因此即使深夜每分钟都有心跳,只要没有"密集请求"持续到来,
+        本判定在距最后密集请求超过阈值后返回 True,refill/目标预热挂起。
         仅当预热池开启且配置了暂停时长才可能返回 True;0(默认关闭该特性)恒
         False——refill/目标预热行为与未加本特性时完全一致,不改变默认语义。
         """
@@ -2857,53 +2808,49 @@ class Router:
                                                 'Content-Type': 'text/plain'},
                                                _hb(reason or 'Authentication required'))
                     return
-            # 有效客户端请求(认证通过):刷新 refill 空闲感知的活动时间戳,解除深夜
-            # 暂停。按目标区分心跳——CONNECT 取 "host:port",HTTP 从 URL 取 host;
-            # 命中黑名单的后台心跳不刷新(见 _record_request_activity)。
+            # 有效客户端请求(认证通过):刷新 refill 空闲感知的活动时间戳,解除深夜暂停。
+            self._record_request_activity()
             if first.upper().startswith('CONNECT'):
                 target = first.split(' ')[1]
-                self._record_request_activity(target)
                 await self._handle_connect(target, reader, writer, client_ip)
-                return
-            # 首行合法性提前校验(原由 _handle_http_request 做):缺方法/URL
-            # 直接 400,不必再拼包传下去重新解析。
-            parts = first.split(' ')
-            if len(parts) < 3:
-                writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nBad Request")
-                await writer.drain()
-                return
-            method, url = parts[0], parts[1]
-            # HTTP URL → host(供心跳目标判定;无 URL host 时不判,视为真实)。
-            self._record_request_activity(url)
-            body = b''
-            cl = None
-            for k, v in req_headers.items():
-                if k.lower() == 'content-length':
-                    cl = int(v)
-                    break
-            if cl is not None and cl > 0:
-                if cl > MAX_BODY:
-                    writer.write(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 15\r\n\r\nPayload Too Large")
+            else:
+                # 首行合法性提前校验(原由 _handle_http_request 做):缺方法/URL
+                # 直接 400,不必再拼包传下去重新解析。
+                parts = first.split(' ')
+                if len(parts) < 3:
+                    writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nBad Request")
                     await writer.drain()
                     return
-                body = await reader.readexactly(cl)
-            elif cl is None and method.upper() in ('POST', 'PUT', 'PATCH'):
-                # 无 Content-Length 头：分块读取至上限，避免 read(-1) 阻塞到
-                # 客户端关闭连接而破坏 HTTP keep-alive。注意 cl is None 与
-                # cl == 0 不同——后者表示头部存在但 body 为空，应直接用 b''。
-                body = bytearray()
-                while len(body) < MAX_BODY:
-                    chunk = await reader.read(MAX_BODY - len(body))
-                    if not chunk:
+                method, url = parts[0], parts[1]
+                body = b''
+                cl = None
+                for k, v in req_headers.items():
+                    if k.lower() == 'content-length':
+                        cl = int(v)
                         break
-                    body.extend(chunk)
-                if len(body) >= MAX_BODY:
-                    writer.write(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 15\r\n\r\nPayload Too Large")
-                    await writer.drain()
-                    return
-            # 直接传已解析的 method/url/headers/body,不再拼回 request_bytes
-            # 让下游重新 find+decode+split(消除双重解析)。GET(无 body)也走这里。
-            await self._handle_http_request(method, url, req_headers, bytes(body) if isinstance(body, bytearray) else body, writer, client_ip)
+                if cl is not None and cl > 0:
+                    if cl > MAX_BODY:
+                        writer.write(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 15\r\n\r\nPayload Too Large")
+                        await writer.drain()
+                        return
+                    body = await reader.readexactly(cl)
+                elif cl is None and method.upper() in ('POST', 'PUT', 'PATCH'):
+                    # 无 Content-Length 头：分块读取至上限，避免 read(-1) 阻塞到
+                    # 客户端关闭连接而破坏 HTTP keep-alive。注意 cl is None 与
+                    # cl == 0 不同——后者表示头部存在但 body 为空，应直接用 b''。
+                    body = bytearray()
+                    while len(body) < MAX_BODY:
+                        chunk = await reader.read(MAX_BODY - len(body))
+                        if not chunk:
+                            break
+                        body.extend(chunk)
+                    if len(body) >= MAX_BODY:
+                        writer.write(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 15\r\n\r\nPayload Too Large")
+                        await writer.drain()
+                        return
+                # 直接传已解析的 method/url/headers/body,不再拼回 request_bytes
+                # 让下游重新 find+decode+split(消除双重解析)。
+                await self._handle_http_request(method, url, req_headers, bytes(body) if isinstance(body, bytearray) else body, writer, client_ip)
         except Exception:
             logger.exception("error handling client")
         finally:

@@ -176,8 +176,8 @@ router:
   #   refill_target: 2
   #   connect_timeout: 10.0
   #   target_prewarm: false
-  #   refill_pause_minutes: 60  # 空闲暂停(分钟):连续 N 分钟无真实请求则挂起 refill/预热,新请求到来恢复;0=不暂停
-  #   refill_pause_heartbeat_targets: [".github.com", ".wns.windows.com", ".cloudmessaging.edge.microsoft.com", ".edge.microsoft.com"]  # 心跳目标黑名单(host 后缀):命中视为后台心跳不刷新活动时间戳;其余目标无论间隔多长都刷新,真实孤立请求不被误伤;空列表=不做过滤
+  #   refill_pause_minutes: 60  # 空闲暂停(分钟):连续 N 分钟无请求则挂起 refill/预热,新请求到来恢复;0=不暂停
+  #   refill_pause_silence_sec: 120  # 活动判定静默窗口(秒):仅当距上次请求 ≤ 该值才视为"密集活动"并刷新时间戳;后台心跳(间隔 3-10 分钟)不刷新,防止阻止空闲暂停;0=任意请求都刷新
   #   established_reuse: false  # 已建握手隧道复用:隧道结束若连接干净则归还池,同 (proxy,target) 复用跳过 CONNECT 握手,省掉重建;0=关闭
 
 # 日志配置;file 为 null 时写默认文件 auto_squid.log
