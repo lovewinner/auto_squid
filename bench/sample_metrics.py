@@ -80,6 +80,10 @@ FIELD_ORDER = [
     "probes_failed",            # 探活失败
     "probes_skipped",           # 探活跳过(本机不可达 canary)
     "single_send_degrades",     # 单发降级次数(粘性/缓存命中被降级回竞速)
+    # 空闲暂停活动判定(非计数型:状态/配置,增量恒 0,见 NO_DELTA_FIELDS)
+    "conn_pool_idle_paused",    # 当前是否处于空闲暂停态(True=refill/预热已挂起)
+    "conn_pool_refill_pause_activity_window",   # 活动判定窗口(秒)配置值
+    "conn_pool_refill_pause_min_requests",      # 活动判定窗口阈值(K)配置值
 ]
 
 # 字段释义(写到日志文件头,供后续分析阅读)
@@ -109,6 +113,16 @@ FIELD_DOCS = {
     "probes_failed": "探活失败",
     "probes_skipped": "探活跳过",
     "single_send_degrades": "单发降级次数",
+    "conn_pool_idle_paused": "空闲暂停态(True=refill/预热已挂起)",
+    "conn_pool_refill_pause_activity_window": "活动判定窗口(秒)",
+    "conn_pool_refill_pause_min_requests": "活动判定窗口阈值(K)",
+}
+
+# 非计数型字段:增量计算无意义(状态/配置值),采样时 d 恒为 0。
+NO_DELTA_FIELDS = {
+    "conn_pool_idle_paused",
+    "conn_pool_refill_pause_activity_window",
+    "conn_pool_refill_pause_min_requests",
 }
 
 # 优化分析重点关注字段(供 grep 快速定位)
@@ -195,7 +209,9 @@ def main() -> None:
 
     def emit(now: dict, prev_snap: dict) -> dict:
         cnt = snapshot_flat(now.get("counters", {}))
-        diff = {k: cnt[k] - prev_snap.get(k, 0) for k in FIELD_ORDER}
+        # 非计数型字段(空闲暂停态/窗口配置)增量恒 0;其余按差值。
+        diff = {k: (0 if k in NO_DELTA_FIELDS else cnt[k] - prev_snap.get(k, 0))
+                for k in FIELD_ORDER}
         cnt_s = ",".join(fmt_pair(k, cnt[k]) for k in FIELD_ORDER)
         diff_s = ",".join(fmt_pair(k, diff[k]) for k in FIELD_ORDER)
         # 增量字段里,若全 0 则省掉 d 段(信号只关注变化)
