@@ -3349,9 +3349,15 @@ class TestConnPool:
 
 
 class TestConnPoolIdlePause:
-    """refill 空闲感知(conn_pool.refill_pause_minutes):连续 N 分钟无客户端请求
-    则挂起 refill/目标预热,避免深夜空闲期"建了又过期"的空转浪费;新请求到来
-    立即恢复。"""
+    """refill 空闲感知(conn_pool.refill_pause_minutes):连续 N 分钟无"密集活动"
+    (窗口内 ≥ 阈值个客户端请求成簇)则挂起 refill/目标预热,避免深夜空闲期
+    "建了又过期"的空转浪费;真实请求到来立即恢复。
+
+    活动判定为"簇度计数"(refill_pause_activity_window / min_requests):真实流量
+    是簇(一次页面加载数秒内多 hostname 并发 CONNECT),心跳是孤例(窗口内计数
+    1-2)。据此区分——既不误伤真实孤立请求,又免疫后台心跳。窗口计数不启用
+    (窗口=0 或阈值≤1)时任意请求都刷新(旧行为)。
+    """
 
     def _router(self, **kw):
         store = ProxyStore()
@@ -3378,7 +3384,7 @@ class TestConnPoolIdlePause:
 
     @pytest.mark.asyncio
     async def test_idle_skips_refill(self):
-        """超过 refill_pause_minutes 无请求 → refill 不再建新连。"""
+        """超过 refill_pause_minutes 无活动 → refill 不再建新连。"""
         up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
         r = self._router(conn_pool_refill_pause_minutes=60.0)
         try:
@@ -3395,7 +3401,7 @@ class TestConnPoolIdlePause:
 
     @pytest.mark.asyncio
     async def test_activity_resumes_refill(self):
-        """密集请求到来(_record_request_activity,间隔 ≤ 静默窗口)立即解除暂停,
+        """密集活动到来(_record_request_activity,窗口内 ≥ 阈值成簇)立即解除暂停,
         refill 恢复。"""
         up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
         r = self._router(conn_pool_refill_pause_minutes=60.0)
@@ -3403,9 +3409,9 @@ class TestConnPoolIdlePause:
             # 模拟已空闲 60+ 分钟(回拨活动时间戳)。
             r._last_request_activity = time.monotonic() - 3601
             assert r._conn_pool_idle() is True
-            # 密集请求:时间戳刷新为"现在"(间隔 0 ≤ 120s 静默窗口)→ 解除暂停。
-            r._last_request_activity = time.monotonic()
-            r._record_request_activity()
+            # 一簇密集请求:窗口内累计 ≥ K 个 → 刷新活动时间戳,解除暂停。
+            for _ in range(3):
+                r._record_request_activity()
             assert r._conn_pool_idle() is False
             await r._conn_pool_refill()
             assert r.conn_pool_creates == 2
@@ -3423,9 +3429,9 @@ class TestConnPoolIdlePause:
             r._last_request_activity = time.monotonic() - 3601
             await r._target_pool_refill(HOST, 31991, "www.baidu.com:443")
             assert r.target_pool_creates == 0
-            # 密集请求(间隔 ≤ 静默窗口)恢复预热。
-            r._last_request_activity = time.monotonic()
-            r._record_request_activity()
+            # 密集活动(窗口内 ≥ K 成簇)恢复预热。
+            for _ in range(3):
+                r._record_request_activity()
             made = await r._target_pool_refill(HOST, 31991, "www.baidu.com:443")
             assert made == 2
             assert r.target_pool_creates == 2
@@ -3435,22 +3441,22 @@ class TestConnPoolIdlePause:
             await up_srv.wait_closed()
 
     def test_snapshot_exposes_pause(self):
-        """snapshot_counters 暴露 refill_pause_minutes 与当前空闲态。"""
-        r = self._router(conn_pool_refill_pause_minutes=60.0)
+        """snapshot_counters 暴露暂停配置/当前空闲态。"""
+        r = self._router(conn_pool_refill_pause_minutes=60.0,
+                         conn_pool_refill_pause_activity_window=120.0)
         r._last_request_activity = time.monotonic() - 3601
         s = r.snapshot_counters()
         assert s['conn_pool_refill_pause_minutes'] == 60.0
-        assert s['conn_pool_refill_pause_silence_sec'] == 120.0
+        assert s['conn_pool_refill_pause_activity_window'] == 120.0
+        assert s['conn_pool_refill_pause_min_requests'] == 3
         assert s['conn_pool_idle_paused'] is True
 
     def test_heartbeat_does_not_resume_idle(self):
-        """后台心跳(间隔 > 静默窗口)不刷新活动时间戳,无法解除空闲暂停。"""
-        r = self._router(conn_pool_refill_pause_minutes=60.0,
-                         conn_pool_refill_pause_silence_sec=120.0)
-        # 模拟已空闲 60+ 分钟(回拨活动时间戳),随后一个心跳到达。
+        """孤立请求(心跳,窗口内计数 1 < K)不刷新活动时间戳,无法解除空闲暂停。"""
+        r = self._router(conn_pool_refill_pause_minutes=60.0)
         r._last_request_activity = time.monotonic() - 3601
         assert r._conn_pool_idle() is True
-        # 心跳距上次活动 60+ 分钟 > 静默窗口(120s):不刷新,时间戳保持陈旧。
+        # 单个心跳:窗口内计数 1 < K(3),不刷新,时间戳保持陈旧。
         r._record_request_activity()
         assert (time.monotonic() - r._last_request_activity) >= 60 * 60
         assert r._conn_pool_idle() is True
@@ -3458,36 +3464,104 @@ class TestConnPoolIdlePause:
     def test_heartbeat_never_prevents_idle(self):
         """周期心跳(如 alive.github.com 每 10 分钟)持续到来,空闲判定仍在 60 分钟
         后触发——心跳不会持续刷新活动时间戳,无法阻止空闲暂停。"""
-        r = self._router(conn_pool_refill_pause_minutes=60.0,
-                         conn_pool_refill_pause_silence_sec=120.0)
-        # 模拟已空闲 60+ 分钟(最后密集请求在 61 分钟前)。
+        r = self._router(conn_pool_refill_pause_minutes=60.0)
         r._last_request_activity = time.monotonic() - 3660
         assert r._conn_pool_idle() is True
-        # 心跳轮番到达(间隔 10 分钟 > 静默窗口):每次都不刷新,时间戳保持陈旧。
+        # 心跳轮番到达(模拟真实间隔:每次距上次 ≥ 窗口,前一条已滑出窗口,任何
+        # 2 条都构不成"窗口内 ≥ K"的簇),时间戳保持陈旧,不进入空闲。
         for _ in range(6):
-            r._record_request_activity()
+            r._record_request_activity()          # 第 1 条:计数 1 < K,不刷新
+            r._last_request_activity = time.monotonic() - 7200  # 前 1 条已滑出窗口
+            r._activity_timestamps.clear()        # 孤立心跳,清空窗口计数
         assert (time.monotonic() - r._last_request_activity) >= 60 * 60
         assert r._conn_pool_idle() is True
 
     def test_dense_requests_do_not_go_idle(self):
-        """密集请求(间隔 ≤ 静默窗口)刷新活动时间戳,60 分钟内不进入空闲。"""
-        r = self._router(conn_pool_refill_pause_minutes=60.0,
-                         conn_pool_refill_pause_silence_sec=120.0)
-        # 密集请求流:每次间隔 ≤ 120s,时间戳持续刷新为"现在",不进入空闲。
+        """密集请求流(窗口内持续 ≥ K)刷新活动时间戳,60 分钟内不进入空闲。"""
+        r = self._router(conn_pool_refill_pause_minutes=60.0)
         for _ in range(10):
-            r._record_request_activity()  # 距上次刷新 < 120s → 刷新
+            r._record_request_activity()
         assert (time.monotonic() - r._last_request_activity) < 120.0
         assert r._conn_pool_idle() is False
 
-    def test_silence_zero_keeps_old_behavior(self):
-        """静默窗口=0:任意请求(含心跳)都刷新活动时间戳(旧行为,向后兼容)。"""
+    def test_min_requests_one_keeps_old_behavior(self):
+        """阈值 ≤1:窗口计数不启用,任意请求(含心跳)都刷新(旧行为,向后兼容)。"""
         r = self._router(conn_pool_refill_pause_minutes=60.0,
-                         conn_pool_refill_pause_silence_sec=0.0)
+                         conn_pool_refill_pause_min_requests=1)
         r._last_request_activity = time.monotonic() - 3601
         assert r._conn_pool_idle() is True
-        # 孤立请求(间隔远超 120s)在 silence=0 时仍刷新 → 解除暂停。
+        # 孤立请求(单发)在 K=1 时仍刷新 → 解除暂停。
         r._record_request_activity()
         assert r._conn_pool_idle() is False
+
+    def test_legacy_silence_sec_still_maps(self):
+        """旧配置 refill_pause_silence_sec 仍兼容:换算为窗口、且 snapshot 可见。"""
+        # 显式窗口优先(新配置)。
+        r = self._router(conn_pool_refill_pause_minutes=60.0,
+                         conn_pool_refill_pause_activity_window=300.0)
+        assert r.conn_pool_refill_pause_activity_window == 300.0
+        # 仅旧 silence_sec(未显式窗口):换算窗口 = max(30, silence/4)。
+        r2 = self._router(conn_pool_refill_pause_minutes=60.0,
+                          conn_pool_refill_pause_silence_sec=180.0)
+        assert r2.conn_pool_refill_pause_activity_window == 45.0
+        # silence=0(旧"任意刷新")→ 窗口=0,保持不启用。
+        r3 = self._router(conn_pool_refill_pause_minutes=60.0,
+                          conn_pool_refill_pause_silence_sec=0.0)
+        assert r3.conn_pool_refill_pause_activity_window == 0.0
+
+    def test_real_isolated_request_resumes(self):
+        """修复目标:真实孤立请求(此前被 silence_sec 一刀切误伤)如今不误伤——
+        窗口内 ≥ K 个请求(真实页面加载一簇)即使距上次活动很久也能解除暂停。"""
+        r = self._router(conn_pool_refill_pause_minutes=60.0)
+        r._last_request_activity = time.monotonic() - 7200  # 已空闲 2 小时
+        assert r._conn_pool_idle() is True
+        # 模拟一次真实页面加载:数秒内多个 hostname 的 CONNECT 成簇到达。
+        for _ in range(3):
+            r._record_request_activity()
+        assert r._conn_pool_idle() is False
+
+    @pytest.mark.asyncio
+    async def test_idle_pause_does_not_block_requests(self):
+        """方案3 安全属性回归:空闲暂停只挂起后台预建,不卡请求路径。
+
+        空闲暂停期间真实 CONNECT 请求照常工作——取池/新建/复用已握手连接全不
+        受暂停影响(_try_tunnel / _established_pool_peek / 归还均不检查空闲态)。
+        """
+        hit_counter = []
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=hit_counter)
+        r = self._router(conn_pool_refill_pause_minutes=60.0,
+                         conn_pool_established_reuse=True)
+        await r.start()
+        try:
+            target = b"idle-request.example.com:443"
+            # 置为空闲暂停态:距上次活动远超暂停阈值。
+            r._last_request_activity = time.monotonic() - 7200
+            assert r._conn_pool_idle() is True
+            # 真实请求仍照常工作(单发即完成;established_reuse 的 peek 也不查空闲)。
+            echo = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"x")
+            assert echo == b"x"
+            assert r.established_pool_misses == 1
+            # 请求结束后连接照常归还已握手池(不受空闲暂停影响)。
+            assert await self._wait_returned(r, target)
+            assert r.established_pool_returned == 1
+            # 第二条请求照常复用已握手连接。
+            echo2 = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"y")
+            assert echo2 == b"y"
+            assert r.established_pool_hits == 1
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    async def _wait_returned(self, r, target, timeout=2.0):
+        """轮询等待 (proxy,target) 的已握手连接归还池(归还走异步回调)。"""
+        key = f"{HOST}:31991|{target.decode()}"
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if key in r._established_pool and len(r._established_pool[key]) > 0:
+                return True
+            await asyncio.sleep(0.02)
+        return False
 
 
 class TestTargetPrewarm:

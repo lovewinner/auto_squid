@@ -33,6 +33,7 @@
 
 import asyncio
 import base64
+import collections
 import logging
 import random
 import re
@@ -512,7 +513,7 @@ class Router:
     生命周期:start() 开始监听 → handle_client 处理每个连接 → stop() 优雅关闭。
     """
 
-    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False, conn_pool_refill_pause_minutes: float = 60.0, conn_pool_refill_pause_silence_sec: float = 120.0, conn_pool_established_reuse: bool = False):
+    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False, conn_pool_refill_pause_minutes: float = 60.0, conn_pool_refill_pause_silence_sec: float = 120.0, conn_pool_refill_pause_activity_window: Optional[float] = None, conn_pool_refill_pause_min_requests: int = 3, conn_pool_established_reuse: bool = False):
         """构造路由器。
 
         参数:
@@ -613,12 +614,18 @@ class Router:
                                 深夜空闲期"建了又过期"的空转浪费(生产实测:6 代理
                                 深夜 6h 白建 ~1400 条连接,100% 超时被清)。新请求
                                 到来立即恢复补充。
-            conn_pool_refill_pause_silence_sec: 活动判定静默窗口(秒,默认 120)。
-                                生产实测后台心跳(GitHub Desktop 的 alive.github.com
-                                等,间隔 3-10 分钟)会持续刷新"距上次请求",使空闲
-                                暂停永不触发。活动判定改为"密集请求":仅当距上次
-                                请求 ≤ 本窗口才视为活动并刷新时间戳;间隔更大的
-                                孤立请求(心跳)不刷新。0=任意请求都刷新(旧行为)。
+            conn_pool_refill_pause_silence_sec: [已弃用,仅兼容] 旧版"间隔一刀切"
+                                活动判定(默认 120),误伤真实孤立请求。已由窗口计数
+                                取代,本参数仅对旧配置兼容。
+            conn_pool_refill_pause_activity_window: 活动判定窗口(秒,默认 None=
+                                旧 silence_sec 换算或 120s)。窗口内请求数 ≥
+                                min_requests 才算"密集活动"并刷新时间戳;真实流量
+                                是簇(一次页面加载多 hostname 并发,计数高),后台
+                                心跳是孤例(窗口内计数低)——据此区分,既不误伤真实
+                                孤立请求,又免疫心跳。0=不启用窗口计数(任意请求都刷新)。
+            conn_pool_refill_pause_min_requests: 活动判定窗口阈值(默认 3)。
+                                窗口内请求数 ≥ 此值才刷新活动时间戳;≤1 时退化为
+                                "任意请求都刷新"。
             conn_pool_established_reuse: 已建握手隧道复用(默认关闭)。隧道结束
                                 时若连接干净(无残留数据),归还 _established_pool
                                 而非关闭;下次同 (proxy, target) 请求直接复用已
@@ -779,17 +786,35 @@ class Router:
         # 空闲暂停:连续 N 分钟无客户端请求则挂起 refill/目标预热,避免深夜空闲
         # 期"建了又过期"的空转。0=不暂停。新请求到来立即恢复。
         self.conn_pool_refill_pause_minutes = max(0.0, conn_pool_refill_pause_minutes)
-        # 活动判定静默窗口(秒):仅当距上次请求 ≤ 该窗口才视为"密集活动"并刷新
-        # 活动时间戳。后台心跳(GitHub Desktop 的 alive.github.com / Windows 的
-        # client.wns.windows.com 等,间隔 3-10 分钟)间隔大于窗口,不会刷新——
-        # 防止心跳阻止空闲暂停触发。0=任意请求都刷新(旧行为)。
+        # [已弃用] 旧版"间隔一刀切"活动判定窗口(秒),仅对旧配置兼容(换算新
+        # 窗口的保守起点)。新逻辑见下 refill_pause_activity_window。
         self.conn_pool_refill_pause_silence_sec = max(0.0, conn_pool_refill_pause_silence_sec)
+        # 活动判定窗口(秒,窗口计数):窗口内请求数 ≥ min_requests 才算"密集活动"
+        # 并刷新活动时间戳。真实流量是簇(一次页面加载数秒内对多个 hostname 并发
+        # CONNECT,计数 5-30),后台心跳(GitHub Desktop 的 alive.github.com /
+        # Windows 的 client.wns.windows.com 等,间隔 3-10 分钟)是孤例(窗口内计数
+        # 1,极少 2)——据此区分,既不误伤真实孤立请求,又免疫心跳。
+        # None=未显式配置:沿用旧 silence_sec 换算(取 ~1/4 当保守起点,旧"间隔
+        # ≤窗口"的密集密度远低于簇,需收紧)。0=不启用窗口计数(任意请求都刷新)。
+        if conn_pool_refill_pause_activity_window is None:
+            if self.conn_pool_refill_pause_silence_sec > 0:
+                self.conn_pool_refill_pause_activity_window = max(
+                    30.0, self.conn_pool_refill_pause_silence_sec / 4.0)
+            else:
+                self.conn_pool_refill_pause_activity_window = 0.0
+        else:
+            self.conn_pool_refill_pause_activity_window = max(0.0, conn_pool_refill_pause_activity_window)
+        # 窗口阈值:窗口内请求数 ≥ 此值才算"密集活动"。≤1 退化为任意请求都刷新。
+        self.conn_pool_refill_pause_min_requests = max(0, int(conn_pool_refill_pause_min_requests))
         # 最近一次"密集客户端请求"到达时间(monotonic 秒)。由 _record_request_
-        # activity() 在每个有效请求(通过认证的 HTTP/CONNECT 首行)上按静默窗口
+        # activity() 在每个有效请求(通过认证的 HTTP/CONNECT 首行)上按窗口计数
         # 判定后更新。初始为当前时刻:新路由器 60 分钟内不暂停(refill 照常),
-        # 与旧语义一致;进程长时间运行后,后台心跳(间隔 3-10 分钟)不刷新活动
-        # 时间戳,自然进入空闲暂停。
+        # 与旧语义一致;进程长时间运行后,后台心跳(间隔 3-10 分钟)构不成簇,
+        # 不刷新活动时间戳,自然进入空闲暂停。
         self._last_request_activity = time.monotonic()
+        # 窗口计数用的请求到达时间戳队列(monotonic 秒),滑动窗口内计数 ≥ 阈值
+        # 判定活动。上限 1024 防高流量下无界增长(超出后每窗口重算自动恢复)。
+        self._activity_timestamps = collections.deque(maxlen=1024)
         # 第二阶段(CONNECT 目标半预连接):需 conn_pool_enabled 且显式开启。
         self.conn_pool_target_prewarm = bool(conn_pool_target_prewarm)
         # 已建握手隧道复用:隧道结束时连接干净则归还而非关闭,同 (proxy,target)
@@ -1342,7 +1367,8 @@ class Router:
             "conn_pool_size": sum(len(v) for v in self._conn_pool.values()),
             "conn_pool_target_prewarm": self.conn_pool_target_prewarm,
             "conn_pool_refill_pause_minutes": self.conn_pool_refill_pause_minutes,
-            "conn_pool_refill_pause_silence_sec": self.conn_pool_refill_pause_silence_sec,
+            "conn_pool_refill_pause_activity_window": self.conn_pool_refill_pause_activity_window,
+            "conn_pool_refill_pause_min_requests": self.conn_pool_refill_pause_min_requests,
             "conn_pool_idle_paused": self._conn_pool_idle(),
             "target_pool_creates": self.target_pool_creates,
             "target_pool_hits": self.target_pool_hits,
@@ -2054,22 +2080,38 @@ class Router:
         return reader, writer
 
     def _record_request_activity(self):
-        """刷新"密集请求"时间戳(refill 空闲感知的活动信号)。
+        """刷新"密集活动"时间戳(refill 空闲感知的活动信号)。
 
         在每个通过认证的 HTTP/CONNECT 首行上调用(见 _handle_client,认证放行后)。
-        **活动判定为"密集请求"**:仅当距上次活动时间戳 ≤ 静默窗口
-        (conn_pool_refill_pause_silence_sec)时才视为真实活动并刷新时间戳;间隔
-        更大的孤立请求(如后台心跳 alive.github.com 每 3-10 分钟一次)不刷新——
-        否则心跳会持续拉近"距上次请求",使空闲暂停(refill_pause_minutes)永不触发。
+        **活动判定为"簇度计数"**:记录请求到达时间戳,若滑动窗口
+        (conn_pool_refill_pause_activity_window,默认 120s)内请求数 ≥ 阈值
+        (conn_pool_refill_pause_min_requests,默认 3),视为真实活动并刷新活动
+        时间戳。真实流量是簇——一次页面加载数秒内对多个 hostname 并发 CONNECT
+        (计数 5-30);后台心跳(如 alive.github.com 每 3-10 分钟一次)是孤例——
+        窗口内计数 1,极少 2,不达标,不会刷新时间戳,因此无法阻止空闲暂停。
         若此前处于"空闲暂停"态且本次判定为活动,则立刻解除暂停并在 logger 留一条
         INFO,便于从日志确认恢复时刻。仅在有实际客户端请求的路径调用——探活/预热/
-        本机自连都不算"请求",不应恢复预热。
+        本机自连都不算"请求",不应恢复预热。窗口计数不启用(窗口=0 或阈值≤1)时,
+        任意请求都刷新(旧行为)。
         """
         now = time.monotonic()
-        silence = self.conn_pool_refill_pause_silence_sec
-        # 静默窗口>0:仅密集请求(间隔 ≤ 窗口)刷新;孤立请求(心跳)忽略。
-        # 静默窗口=0:任意请求都刷新(旧行为)。
-        if silence > 0 and (now - self._last_request_activity) > silence:
+        window = self.conn_pool_refill_pause_activity_window
+        k = self.conn_pool_refill_pause_min_requests
+        # 窗口计数不启用:任意请求都刷新(向后兼容旧行为)。
+        if window <= 0 or k <= 1:
+            was_idle = self._conn_pool_idle()
+            self._last_request_activity = now
+            if was_idle:
+                logger.info("conn pool refill resumed by client request (was idle >= %.0fmin)",
+                            self.conn_pool_refill_pause_minutes)
+            return
+        # 滑动窗口计数:本请求入队,弹出窗口外的旧时间戳。
+        self._activity_timestamps.append(now)
+        while self._activity_timestamps and \
+                now - self._activity_timestamps[0] > window:
+            self._activity_timestamps.popleft()
+        # 窗口内请求数 ≥ 阈值才算"密集活动"(真实页面加载成簇);心跳孤例不达标。
+        if len(self._activity_timestamps) < k:
             return
         was_idle = self._conn_pool_idle()
         self._last_request_activity = now
@@ -2078,11 +2120,14 @@ class Router:
                         self.conn_pool_refill_pause_minutes)
 
     def _conn_pool_idle(self) -> bool:
-        """空闲暂停判定:距上次"密集请求"已超过 conn_pool_refill_pause_minutes。
+        """空闲暂停判定:距上次"密集活动"已超过 conn_pool_refill_pause_minutes。
 
-        活动判定见 _record_request_activity——后台心跳(间隔 3-10 分钟)不会刷新
-        活动时间戳,因此即使深夜每分钟都有心跳,只要没有"密集请求"持续到来,
-        本判定在距最后密集请求超过阈值后返回 True,refill/目标预热挂起。
+        活动判定见 _record_request_activity——后台心跳(间隔 3-10 分钟,窗口内
+        计数 1-2)构不成簇,不会刷新活动时间戳,因此即使深夜每分钟都有心跳,
+        只要没有"密集活动"(窗口内 ≥ 阈值个真实请求成簇)持续到来,本判定在距
+        最后密集活动超过阈值后返回 True,refill/目标预热挂起。**空闲暂停只挂起
+        后台预建(refill/目标预热),不卡请求路径**:真实请求照常取池/新建/复用
+        已握手连接(见 _try_tunnel / _established_pool_peek,均不检查本判定)。
         仅当预热池开启且配置了暂停时长才可能返回 True;0(默认关闭该特性)恒
         False——refill/目标预热行为与未加本特性时完全一致,不改变默认语义。
         """

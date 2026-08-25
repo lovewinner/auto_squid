@@ -177,12 +177,16 @@ class ConnPoolConfig(BaseModel):
                 挂起后台 refill/目标预热,避免深夜空闲期"建了又过期"的空转浪费
                 (生产实测:6 代理深夜 6h 白建 ~1400 条连接,100% 超时被清)。
                 新请求到来立即恢复补充。0=不暂停(保持旧行为)。
-    refill_pause_silence_sec: 活动判定静默窗口(秒,默认 120)。生产实测发现后台
-                心跳(GitHub Desktop 的 alive.github.com / Windows 的 client.wns.
-                windows.com / Edge 云消息,间隔 3-10 分钟)会把"距上次请求"持续
-                拉近,使 refill_pause_minutes 永不触发。为此活动判定改为"密集请求":
-                仅当距上次请求 ≤ 本窗口才视为活动并刷新时间戳;间隔更大的孤立
-                请求(心跳)不刷新,无法阻止空闲暂停。0=任意请求都刷新(旧行为)。
+    refill_pause_activity_window / refill_pause_min_requests: 活动判定(默认
+                窗口 120s / 阈值 3)。生产实测发现后台心跳(GitHub Desktop 的
+                alive.github.com / Windows 的 client.wns.windows.com / Edge 云消息,
+                间隔 3-10 分钟)会把"距上次请求"持续拉近,使 refill_pause_minutes
+                永不触发;但旧的"间隔一刀切"(refill_pause_silence_sec)又误伤真实
+                孤立请求。为此活动判定改为"簇度计数":窗口内请求数 ≥ 阈值才算
+                活动并刷新时间戳。真实流量是簇(一次页面加载数秒内对多个 hostname
+                并发 CONNECT,计数 5-30),心跳是孤例(窗口内计数 1,极少 2)——
+                据此区分,既不误伤真实请求,又免疫心跳。0=不启用窗口计数(任意
+                请求都刷新,旧行为)。
     """
     enabled: bool = Field(False, description="启用 CONNECT 上游 TCP 预热池")
     per_proxy: int = Field(4, description="每代理预热连接数上限")
@@ -193,7 +197,9 @@ class ConnPoolConfig(BaseModel):
     connect_timeout: float = Field(10.0, description="预热/取用建连超时(秒)")
     target_prewarm: bool = Field(False, description="CONNECT 目标半预连接(第二阶段):命中缓存/粘性的高频 target 提前预热到上游的 TCP")
     refill_pause_minutes: float = Field(60.0, description="空闲暂停(分钟):连续 N 分钟无客户端请求则挂起 refill/目标预热,新请求到来恢复;0=不暂停")
-    refill_pause_silence_sec: float = Field(120.0, description="活动判定静默窗口(秒):距上次请求超过该间隔才视请求为『密集活动』并刷新活动时间戳。后台心跳(如 alive.github.com 每 3-10 分钟一次)间隔大于此值,不会刷新——防止心跳阻止空闲暂停触发。默认 120s(间隔 >2 分钟视为非密集,不刷新)")
+    refill_pause_silence_sec: float = Field(120.0, description="[已弃用,仅作兼容] 旧版活动判定:距上次请求超过该间隔的孤立请求不刷新活动时间戳。已由 refill_pause_activity_window/min_requests 窗口计数取代;本字段对旧配置静默兼容(值仅用于推算 K=1 的窗口,不参与新逻辑)。新配置请改设 refill_pause_activity_window")
+    refill_pause_activity_window: Optional[float] = Field(None, description="活动判定窗口(秒)。窗口计数:窗口内出现 ≥ refill_pause_min_requests 个客户端请求才算『活动』并刷新活动时间戳。真实流量是簇(一次页面加载数秒内多 hostname 并发),窗口内计数高;后台心跳(如 alive.github.com / client.wns.windows.com,间隔 3-10 分钟)是孤例,计数低——据此区分,既不误伤真实孤立请求,又免疫心跳。默认 None=用旧 silence_sec(等价窗口 ≈ silence_sec/4,或 120s);0=不启用窗口计数(任意请求都刷新,旧行为)")
+    refill_pause_min_requests: int = Field(3, description="活动判定窗口阈值(默认 3):窗口(见 refill_pause_activity_window)内请求数 ≥ 此值才刷新活动时间戳。真实页面加载一次 ≥3 个 hostname 的 CONNECT 簇即达标;心跳(孤例)不达标。阈值 ≤1 时退化为『任意请求都刷新』")
     established_reuse: bool = Field(False, description="已建握手隧道复用:隧道结束若连接干净则归还池,下次同 (proxy,target) 请求复用已 CONNECT 握手的连接,跳过握手,省掉重建。仅当 conn_pool.enabled 为 True 时生效")
 
 
