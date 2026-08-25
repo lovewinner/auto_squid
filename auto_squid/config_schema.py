@@ -177,12 +177,19 @@ class ConnPoolConfig(BaseModel):
                 挂起后台 refill/目标预热,避免深夜空闲期"建了又过期"的空转浪费
                 (生产实测:6 代理深夜 6h 白建 ~1400 条连接,100% 超时被清)。
                 新请求到来立即恢复补充。0=不暂停(保持旧行为)。
-    refill_pause_silence_sec: 活动判定静默窗口(秒,默认 120)。生产实测发现后台
+    refill_pause_silence_sec: 活动判定静默窗口(秒,默认 0)。生产实测发现后台
                 心跳(GitHub Desktop 的 alive.github.com / Windows 的 client.wns.
                 windows.com / Edge 云消息,间隔 3-10 分钟)会把"距上次请求"持续
-                拉近,使 refill_pause_minutes 永不触发。为此活动判定改为"密集请求":
-                仅当距上次请求 ≤ 本窗口才视为活动并刷新时间戳;间隔更大的孤立
-                请求(心跳)不刷新,无法阻止空闲暂停。0=任意请求都刷新(旧行为)。
+                拉近,使 refill_pause_minutes 永不触发。本字段为旧方案的间隔一刀切:
+                距上次请求 > 本窗口的孤立请求(含真实请求)一律不刷新,会误伤真实
+                低频流量。**推荐用 refill_pause_heartbeat_targets 按目标区分心跳,
+                而非本字段**。设 0(默认)则不做间隔过滤,任意请求都刷新时间戳,
+                心跳免疫完全交给 heartbeat_targets 黑名单。
+    refill_pause_heartbeat_targets: 心跳目标黑名单(列表,默认内置常见后台推送域名
+                后缀)。目标 host 匹配这些后缀(如 .github.com / .wns.windows.com /
+                .cloudmessaging.edge.microsoft.com / .edge.microsoft.com)视为后台
+                心跳,不刷新活动时间戳——即使每 3-10 分钟一轮也不会阻止空闲暂停;
+                其余目标(无论间隔多长)一律刷新,真实孤立请求不被误伤。
     """
     enabled: bool = Field(False, description="启用 CONNECT 上游 TCP 预热池")
     per_proxy: int = Field(4, description="每代理预热连接数上限")
@@ -193,7 +200,8 @@ class ConnPoolConfig(BaseModel):
     connect_timeout: float = Field(10.0, description="预热/取用建连超时(秒)")
     target_prewarm: bool = Field(False, description="CONNECT 目标半预连接(第二阶段):命中缓存/粘性的高频 target 提前预热到上游的 TCP")
     refill_pause_minutes: float = Field(60.0, description="空闲暂停(分钟):连续 N 分钟无客户端请求则挂起 refill/目标预热,新请求到来恢复;0=不暂停")
-    refill_pause_silence_sec: float = Field(120.0, description="活动判定静默窗口(秒):距上次请求超过该间隔才视请求为『密集活动』并刷新活动时间戳。后台心跳(如 alive.github.com 每 3-10 分钟一次)间隔大于此值,不会刷新——防止心跳阻止空闲暂停触发。默认 120s(间隔 >2 分钟视为非密集,不刷新)")
+    refill_pause_silence_sec: float = Field(0.0, description="活动判定静默窗口(秒,默认 0=关闭):距上次请求超过该间隔的孤立请求不刷新活动时间戳(旧方案的间隔一刀切,会误伤真实低频流量)。推荐用 refill_pause_heartbeat_targets 按目标区分心跳")
+    refill_pause_heartbeat_targets: List[str] = Field(default_factory=lambda: [".github.com", ".wns.windows.com", ".cloudmessaging.edge.microsoft.com", ".edge.microsoft.com", ".office.com", ".office.net", ".microsoft.com", ".googleusercontent.com"], description="心跳目标黑名单(host 后缀):命中视为后台心跳,不刷新活动时间戳。其余目标无论间隔多长都刷新,真实孤立请求不被误伤")
     established_reuse: bool = Field(False, description="已建握手隧道复用:隧道结束若连接干净则归还池,下次同 (proxy,target) 请求复用已 CONNECT 握手的连接,跳过握手,省掉重建。仅当 conn_pool.enabled 为 True 时生效")
 
 

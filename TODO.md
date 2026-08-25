@@ -61,6 +61,7 @@
 - [x] Python 3.12 预热连接关闭挂起：3.12 的 `StreamWriter.wait_closed()`/`Server.wait_closed()` 变严格——等待对端 FIN / 活跃 handler 协程。预热池"半连接"（只建 TCP 未发数据）对端永不关闭，导致关闭/测试收尾死锁。修复：router 侧 `_conn_pool_close_all`/`_pool_prune` 的 `wait_closed()` 加 0.5s 超时；测试 mock 上游对空闲连接 5s 超时关闭（模拟真实上游 idle 超时）。仅 CI 3.12 矩阵暴露，3.11 无此问题（CI 双版本矩阵的必要性实证）
 - [x] 深夜空闲期预热池空转浪费：opt.log 分析发现 01:00-06:59 零请求时段通用池仍按 refill 周期"建连→空闲过期→重建"，6 代理 6h 白建 ~1400 条连接（100% 被清，约 233 条/小时）。修复：`conn_pool.refill_pause_minutes`（默认 60）——连续 N 分钟无客户端请求则挂起 refill/目标预热，新请求到来立即恢复；暂停期间仍照常 prune 清理过期连接。0=不暂停（向后兼容）。已在 `_handle_client` 认证放行处刷新活动时间戳，探活/预热不算请求活动
 - [x] 后台心跳使空闲暂停失效：生产实测发现夜间并非零请求——GitHub Desktop 的 alive.github.com（207 次/夜）/ Windows 的 client.wns.windows.com / Edge 云消息每 3-10 分钟一轮，把"距上次请求"持续拉近，refill_pause_minutes 永不触发（gen7 深夜 conn_pool creates 1855 条 76% 过期、target_pool 95% 过期）。修复：`conn_pool.refill_pause_silence_sec`（默认 120）——活动判定改为"密集请求"，仅当距上次请求 ≤ 窗口才刷新活动时间戳；间隔更大的孤立心跳不刷新，无法阻止空闲暂停。0=任意请求都刷新（向后兼容）
+- [x] 心跳免疫误伤真实孤立请求：生产实测 gen8 224h 中 refill 从未恢复（即使 08-20~08-24 每天 1600-2458 次真实 attempts，conn_c 恒 0）——`silence_sec` 按间隔一刀切把"间隔 >120s 的真实孤立请求"也当心跳忽略。修复：改为按目标区分——新增 `conn_pool.refill_pause_heartbeat_targets`（host 后缀黑名单，默认内置 .github.com / .wns.windows.com / .cloudmessaging.edge.microsoft.com / .edge.microsoft.com 等）。命中黑名单的目标视为后台心跳不刷新活动时间戳；其余目标无论间隔多长都刷新，真实孤立请求不再被误伤。`_record_request_activity` 接收目标参数，`_handle_client` 解析 CONNECT host / HTTP URL 传入。`silence_sec` 默认降为 0（关闭间隔过滤），保留作为可选第二防线。空黑名单 = 不做目标过滤（向后兼容）
 
 ## 已完成 — 运维与安全（P2）
 
@@ -74,9 +75,9 @@
 ## 工作流备注
 
 - 每个组件配单元测试；测试保持确定性（mock 网络调用）。
-- 生产配置调参记录：`idle_timeout` 30→120→180（目标池命中率 5%→25%）、`single_send_degrade_ratio` 3.0→2.0（降级收敛）、`refill_pause_minutes` 60（深夜空转暂停）、`refill_pause_silence_sec` 120（后台心跳免疫）。脱敏样例见 `config_xxh_example.yaml`。
+- 生产配置调参记录：`idle_timeout` 30→120→180（目标池命中率 5%→25%）、`single_send_degrade_ratio` 3.0→2.0（降级收敛）、`refill_pause_minutes` 60（深夜空转暂停）、`refill_pause_heartbeat_targets`（心跳目标黑名单,替换 interval 一刀切,修复真实孤立请求被误伤）。脱敏样例见 `config_xxh_example.yaml`。
 
 ## 当前测试状态
 
-- `tests/test_end_to_end.py` 等：164 个用例，覆盖转发/缓存/竞速/聚合/认证/熔断/探活/粘性/计数/DB 持久化/UTF-8 头安全/连接预热（通用池 + target 半预连接 + 已建握手隧道复用，含竞速胜出触发预热）+ refill 空闲暂停（refill_pause_minutes + 心跳免疫的 refill_pause_silence_sec）。
+- `tests/test_end_to_end.py` 等：165 个用例，覆盖转发/缓存/竞速/聚合/认证/熔断/探活/粘性/计数/DB 持久化/UTF-8 头安全/连接预热（通用池 + target 半预连接 + 已建握手隧道复用，含竞速胜出触发预热）+ refill 空闲暂停（refill_pause_minutes + 心跳目标黑名单 refill_pause_heartbeat_targets，含 host 解析边界）。
 - 运行：`.venv/bin/python -m pytest -q`；CI 三版本（3.10/3.11/3.12）全部通过。

@@ -3395,7 +3395,7 @@ class TestConnPoolIdlePause:
 
     @pytest.mark.asyncio
     async def test_activity_resumes_refill(self):
-        """密集请求到来(_record_request_activity,间隔 ≤ 静默窗口)立即解除暂停,
+        """真实请求到来(_record_request_activity,非心跳目标)立即解除暂停,
         refill 恢复。"""
         up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
         r = self._router(conn_pool_refill_pause_minutes=60.0)
@@ -3403,9 +3403,8 @@ class TestConnPoolIdlePause:
             # 模拟已空闲 60+ 分钟(回拨活动时间戳)。
             r._last_request_activity = time.monotonic() - 3601
             assert r._conn_pool_idle() is True
-            # 密集请求:时间戳刷新为"现在"(间隔 0 ≤ 120s 静默窗口)→ 解除暂停。
-            r._last_request_activity = time.monotonic()
-            r._record_request_activity()
+            # 真实请求(目标缺省视为非心跳)→ 刷新 → 解除暂停。
+            r._record_request_activity("www.baidu.com:443")
             assert r._conn_pool_idle() is False
             await r._conn_pool_refill()
             assert r.conn_pool_creates == 2
@@ -3423,9 +3422,8 @@ class TestConnPoolIdlePause:
             r._last_request_activity = time.monotonic() - 3601
             await r._target_pool_refill(HOST, 31991, "www.baidu.com:443")
             assert r.target_pool_creates == 0
-            # 密集请求(间隔 ≤ 静默窗口)恢复预热。
-            r._last_request_activity = time.monotonic()
-            r._record_request_activity()
+            # 真实请求(非心跳目标)恢复预热。
+            r._record_request_activity("www.baidu.com:443")
             made = await r._target_pool_refill(HOST, 31991, "www.baidu.com:443")
             assert made == 2
             assert r.target_pool_creates == 2
@@ -3440,54 +3438,75 @@ class TestConnPoolIdlePause:
         r._last_request_activity = time.monotonic() - 3601
         s = r.snapshot_counters()
         assert s['conn_pool_refill_pause_minutes'] == 60.0
-        assert s['conn_pool_refill_pause_silence_sec'] == 120.0
+        assert s['conn_pool_refill_pause_silence_sec'] == 0.0  # 默认关闭间隔过滤
+        assert '.github.com' in s['conn_pool_refill_pause_heartbeat_targets']
         assert s['conn_pool_idle_paused'] is True
 
-    def test_heartbeat_does_not_resume_idle(self):
-        """后台心跳(间隔 > 静默窗口)不刷新活动时间戳,无法解除空闲暂停。"""
-        r = self._router(conn_pool_refill_pause_minutes=60.0,
-                         conn_pool_refill_pause_silence_sec=120.0)
+    def test_heartbeat_target_does_not_refresh(self):
+        """命中心跳黑名单的目标(alive.github.com)不刷新活动时间戳,无法解除暂停。"""
+        r = self._router(conn_pool_refill_pause_minutes=60.0)
         # 模拟已空闲 60+ 分钟(回拨活动时间戳),随后一个心跳到达。
         r._last_request_activity = time.monotonic() - 3601
         assert r._conn_pool_idle() is True
-        # 心跳距上次活动 60+ 分钟 > 静默窗口(120s):不刷新,时间戳保持陈旧。
-        r._record_request_activity()
+        # 心跳目标:不刷新,时间戳保持陈旧。
+        r._record_request_activity("alive.github.com:443")
         assert (time.monotonic() - r._last_request_activity) >= 60 * 60
         assert r._conn_pool_idle() is True
 
     def test_heartbeat_never_prevents_idle(self):
-        """周期心跳(如 alive.github.com 每 10 分钟)持续到来,空闲判定仍在 60 分钟
-        后触发——心跳不会持续刷新活动时间戳,无法阻止空闲暂停。"""
-        r = self._router(conn_pool_refill_pause_minutes=60.0,
-                         conn_pool_refill_pause_silence_sec=120.0)
-        # 模拟已空闲 60+ 分钟(最后密集请求在 61 分钟前)。
+        """周期心跳(alive.github.com 每轮到达)持续到来,空闲判定仍在 60 分钟
+        后触发——心跳不刷新活动时间戳,无法阻止空闲暂停。"""
+        r = self._router(conn_pool_refill_pause_minutes=60.0)
+        # 模拟已空闲 60+ 分钟(最后真实请求在 61 分钟前)。
         r._last_request_activity = time.monotonic() - 3660
         assert r._conn_pool_idle() is True
-        # 心跳轮番到达(间隔 10 分钟 > 静默窗口):每次都不刷新,时间戳保持陈旧。
+        # 心跳轮番到达(命中黑名单):每次都不刷新,时间戳保持陈旧。
         for _ in range(6):
-            r._record_request_activity()
+            r._record_request_activity("alive.github.com:443")
         assert (time.monotonic() - r._last_request_activity) >= 60 * 60
         assert r._conn_pool_idle() is True
 
-    def test_dense_requests_do_not_go_idle(self):
-        """密集请求(间隔 ≤ 静默窗口)刷新活动时间戳,60 分钟内不进入空闲。"""
-        r = self._router(conn_pool_refill_pause_minutes=60.0,
-                         conn_pool_refill_pause_silence_sec=120.0)
-        # 密集请求流:每次间隔 ≤ 120s,时间戳持续刷新为"现在",不进入空闲。
-        for _ in range(10):
-            r._record_request_activity()  # 距上次刷新 < 120s → 刷新
-        assert (time.monotonic() - r._last_request_activity) < 120.0
+    def test_real_isolated_request_resumes(self):
+        """真实孤立请求(非心跳目标,间隔多长都行)刷新活动时间戳,解除暂停——
+        不再被间隔一刀切误伤(旧 silence_sec 方案的缺陷)。"""
+        r = self._router(conn_pool_refill_pause_minutes=60.0)
+        # 模拟已空闲 60+ 分钟(回拨活动时间戳)。
+        r._last_request_activity = time.monotonic() - 5400
+        assert r._conn_pool_idle() is True
+        # 真实请求:间隔远超 120s 但目标非心跳 → 刷新 → 解除暂停。
+        r._record_request_activity("www.baidu.com:443")
         assert r._conn_pool_idle() is False
+        assert (time.monotonic() - r._last_request_activity) < 60.0
 
-    def test_silence_zero_keeps_old_behavior(self):
-        """静默窗口=0:任意请求(含心跳)都刷新活动时间戳(旧行为,向后兼容)。"""
+    def test_empty_heartbeat_targets_no_filter(self):
+        """心跳黑名单为空列表 = 不做目标过滤,任意请求都刷新(向后兼容)。"""
         r = self._router(conn_pool_refill_pause_minutes=60.0,
-                         conn_pool_refill_pause_silence_sec=0.0)
+                         conn_pool_refill_pause_heartbeat_targets=[])
         r._last_request_activity = time.monotonic() - 3601
         assert r._conn_pool_idle() is True
-        # 孤立请求(间隔远超 120s)在 silence=0 时仍刷新 → 解除暂停。
-        r._record_request_activity()
+        # 即使目标看似心跳(alive.github.com),空黑名单下也刷新 → 解除暂停。
+        r._record_request_activity("alive.github.com:443")
         assert r._conn_pool_idle() is False
+
+    def test_is_heartbeat_target_parsing(self):
+        """_is_heartbeat_target 正确解析 host(端口/URL/scheme/大小写/子域)。"""
+        r = self._router(conn_pool_refill_pause_minutes=60.0,
+                         conn_pool_refill_pause_heartbeat_targets=[".github.com", ".wns.windows.com"])
+        # 命中:子域 + 端口
+        assert r._is_heartbeat_target("alive.github.com:443") is True
+        # 命中:HTTP URL(scheme + 路径)
+        assert r._is_heartbeat_target("http://api.github.com/path?x=1") is True
+        # 命中:大小写不敏感
+        assert r._is_heartbeat_target("ALIVE.GITHUB.COM:443") is True
+        # 命中:精确裸 host(无端口)
+        assert r._is_heartbeat_target("client.wns.windows.com") is True
+        # 未命中:同后缀前缀但非黑名单(黑名单是后缀匹配,非中间匹配)
+        assert r._is_heartbeat_target("notgithub.com:443") is False
+        # 未命中:真实目标
+        assert r._is_heartbeat_target("www.baidu.com:443") is False
+        # 未命中:None/空
+        assert r._is_heartbeat_target(None) is False
+        assert r._is_heartbeat_target("") is False
 
 
 class TestTargetPrewarm:
