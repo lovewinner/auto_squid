@@ -79,9 +79,17 @@ _INVALIDATING_METHODS = frozenset({'POST', 'PUT', 'DELETE', 'PATCH'})
 # 在途 GET 去重聚合的等待超时(秒)。waiter 发现同 URL 有在途请求时 await 其
 # Future;超过该阈值仍未完成(首个请求上游慢)则放弃聚合、自行竞速,避免在
 # 慢上游下 waiter 长时间挂住连接导致 fd 堆积(压测曾观测 fd_peak 冲到 300+)。
-# 200ms→100ms:降低超时开销对 P99 长尾的影响(rate 场景 P99 均值 275ms 中
-# 约 200ms 来自超时等待),代价是聚合窗口更短、高频并发下聚合率略降。
-_AGG_WAIT_TIMEOUT = 0.1
+# 2026-08-26(#8):0.1s → 3.0s。0.1s 比典型上游 TTFB 还短,waiter 几乎总是
+# 超时回退竞速,并发同 URL 时对上游形成 stampede(且 _record_attempt 还会扇出
+# 误触熔断),聚合等于死代码——提升到秒级让聚合在真实 TTFB 窗口内真正生效,
+# 同时保留有界等待(3s 后仍放弃,连接不长期挂死)。
+_AGG_WAIT_TIMEOUT = 3.0
+
+# 客户端单请求头数量与总字节上限(#6)。readline 每行 64KB,行数无上限——
+# 慢速 loris 式攻击发大量小 header 行会让 bytearray 无界增长。超限拒绝并关闭
+# 连接(log warning)。100 行/64KB 对正常客户端(含各浏览器/工具)远宽裕。
+_MAX_REQUEST_HEADER_LINES = 100
+_MAX_REQUEST_HEADER_BYTES = 64 * 1024
 
 # 败者清理后台 task 的软上限。超过则在 _race 里就地排空一次,防止持续高吞吐
 # 下 _pending_cleanups 无界堆积(soak 模式曾观测 fd_peak 冲到 569)。
@@ -2903,12 +2911,25 @@ class Router:
             if not line:
                 return
             first = line.decode('latin-1').strip()
+            # 客户端请求头有界读:每行受 readline 64KB 限制,但行数无上限——慢速
+            # loris 式攻击发大量小 header 行会让 headers bytearray 无界增长。
+            # 双上限:header 数量(100)与累计总字节(64KB),任何一项超限拒绝并关连接
+            # (拒绝而非容忍慢读——请求不合法,不必然回 431)。字节上限取 64KB,
+            # 单行已被主机背压限制,blocking 客户端最多消耗 64KB×100,有界。
             headers = bytearray()
+            header_lines = 0
             while True:
                 h = await reader.readline()
-                if not h or h in (b"\r\n", b"\n"):
+                if not h:
+                    break
+                if h in (b"\r\n", b"\n"):
                     break
                 headers.extend(h)
+                header_lines += 1
+                if header_lines > _MAX_REQUEST_HEADER_LINES or len(headers) > _MAX_REQUEST_HEADER_BYTES:
+                    logger.warning("rejecting client %s: header limit exceeded (lines=%d bytes=%d)",
+                                   peer, header_lines, len(headers))
+                    raise ConnectionError('request header limit exceeded')
             logger.debug("first line: %s", first)
             # 一次性把请求头字节解析成 dict(键保留原大小写),auth 与 body
             # 长度判定及下游转发共用此 dict,不再各自重新 decode+split 头部。
@@ -3301,6 +3322,7 @@ class Router:
 
         buffered = bytearray()
         buffering = True
+        streamed = 0
         try:
             async for chunk in resp.aiter_raw():
                 if buffering:
@@ -3321,6 +3343,8 @@ class Router:
                         await client_writer.drain()
                     except (BrokenPipeError, ConnectionError, OSError):
                         client_disconnected = True
+                if use_chunked is False:
+                    streamed += len(chunk)
             if use_chunked and not client_disconnected:
                 try:
                     client_writer.write(b"0\r\n\r\n")
@@ -3328,8 +3352,21 @@ class Router:
                 except (BrokenPipeError, ConnectionError, OSError):
                     client_disconnected = True
         except Exception:
-            # 上游读取异常:尽量关闭,客户端会得到截断响应。
             client_disconnected = True
+            # aiter_raw 抛异常(最常见:上游 Content-Length 未流式完就断开的截断响应,
+            # httpcore 的 RemoteProtocolError)。客户端已拿到 200 头部,无法撤回,收到
+            # 的是截断 body——交由下方统一长度校验暴露,失败观测由竞速 fail 回调记录。
+        # 截断响应检测(#7):上游 Content-Length 声明 N 但实际流式字节 <N——循环正常
+        # 走完或 aiter_raw 提前抛异常都会在这里比对。客户端已收到响应头,无法撤回,
+        # 只能记 warn(URL + 承诺/实际长度)并关闭上游连接,暴露问题。客户端断开不
+        # 在此列:断开后循环仍排空上游 body,streamed 会到 CL,不误报。
+        if use_chunked is False and streamed != int(upstream_cl):
+            logger.warning("truncated upstream response for %s: content-length=%s, streamed=%d",
+                           url, upstream_cl, streamed)
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
         # 返回缓冲:仅当未超上限且仍在 buffering 状态。
         if buffering:
             return bytes(buffered)

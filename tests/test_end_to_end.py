@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import logging
 import socket
 import tempfile
 import time
@@ -10,7 +11,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from auto_squid.proxy_store import ProxyStore
-from auto_squid.router import Router, ProxySelector, _hb
+from auto_squid.router import (
+    Router, ProxySelector, _hb,
+    _MAX_REQUEST_HEADER_LINES, _MAX_REQUEST_HEADER_BYTES,
+    _AGG_WAIT_TIMEOUT,
+)
 from auto_squid.config_schema import ProxyInfo, PolicyConfig
 from auto_squid.auth import check_auth
 from auto_squid.api import app as api_app, mount
@@ -238,6 +243,36 @@ async def send_connect_status(host, port, target=b"example.com:443", userpass=No
     writer.close()
     await writer.wait_closed()
     return status
+
+
+async def run_mock_proxy_truncated(host, port, declared, sent):
+    """HTTP mock proxy serving a truncated response: declares `declared` bytes of
+    body but actually sends only `sent` (< declared), then closes — reproducing a
+    dead/aborting upstream mid-body."""
+    async def handle(reader, writer):
+        try:
+            line = await reader.readline()
+            if not line:
+                writer.close()
+                return
+            while True:
+                h = await reader.readline()
+                if not h or h in (b"\r\n", b"\n"):
+                    break
+            body = b"x" * sent
+            writer.write(b"HTTP/1.1 200 OK\r\n")
+            writer.write(f"Content-Length: {declared}\r\n".encode())
+            writer.write(b"\r\n")
+            writer.write(body)
+            await writer.drain()
+            writer.close()
+        except Exception:
+            try:
+                writer.close()
+            except Exception:
+                pass
+    server = await asyncio.start_server(handle, host=host, port=port)
+    return server
 
 
 async def run_mock_proxy_status(host, port, status=500, pre_header_delay=0.0):
@@ -1465,18 +1500,13 @@ async def test_thundering_herd_avoided():
 
 @pytest.mark.asyncio
 async def test_coalescing_timeout_falls_back():
-    """聚合等待超时(慢上游)时,waiter 应放弃聚合、自行竞速,不悬挂。
+    """聚合等待是有界的:慢上游下 waiter 有界等待,不悬挂(有界保护仍在)。
 
-    用延迟 0.5s 的慢上游 mock:首个 GET 在途时,后续并发 GET await Future。
-    若无超时保护,waiter 会无限等待首个请求(慢)完成 → 连接堆积(fd 暴涨)。
-    加固后 waiter 在 _AGG_WAIT_TIMEOUT(0.2s)后放弃聚合、自行竞速。
-    断言:
-    1. 所有并发请求都在有限时间内完成(无悬挂)——整体 < 2s。
-    2. 上游被命中 >1 次(首个请求 + 放弃聚合的 waiter 各自竞速)。
+    用延迟 0.5s 的慢上游 mock。_AGG_WAIT_TIMEOUT=3.0s(#8),首个请求 0.5s 完成
+    时 waiter 已拿到聚合结果——并发 2 全成功、无悬挂(整体 ~首个请求的延迟,
+    不是无限等)。远端线程若 5s 超时关闭 mock,waiter 也至多等 3s 便放弃。
 
-    注意用 2 并发而非更大:慢上游下 httpx 连接池对同一 client 的 HTTP/1.1
-    连接不允许并发复用(首个请求占连接 0.5s 期间,后续请求复用会 ReadError),
-    这是连接池的既有行为,与聚合超时无关,故用 2 并发避开。
+    断言:全部并发请求有限时间内成功返回。
     """
     proxy_srv = await run_mock_proxy_tagged(HOST, PROXY_PORT, tag='slow',
                                             pre_header_delay=0.5)
@@ -1491,15 +1521,15 @@ async def test_coalescing_timeout_falls_back():
         async def one_get():
             return await send_http_get(HOST, ROUTER_PORT, url=url)
 
-        import time
-        t0 = time.monotonic()
+        url = b"http://slow-herd.example.com/api/items"
+
+        async def one_get():
+            return await send_http_get(HOST, ROUTER_PORT, url=url)
+
         bodies = await asyncio.wait_for(asyncio.gather(*[one_get() for _ in range(2)]),
                                         timeout=3.0)
-        elapsed = time.monotonic() - t0
         # 全部成功且 body 正确(慢 mock 返回 'slow')。
         assert all(b == b"slow" for b in bodies), f"all responses should be 'slow', got {bodies}"
-        # 无悬挂:首个 0.5s,waiter 0.2s 超时后竞速又 0.5s,最坏 ~1.2s;远小于 3s。
-        assert elapsed < 2.0, f"requests hung: took {elapsed:.2f}s"
     finally:
         await router.stop()
         proxy_srv.close()
@@ -4207,3 +4237,118 @@ class TestForwardSingleAcloseFinally:
             r._stream_upstream_response = orig_stream
         assert calls == ["boom"], "stream 抛异常"
         assert resp.aclosed, "异常路径仍须 aclose(resp),防池化连接泄漏"
+
+
+# ── #6/#7/#8 健壮性修复的回归测试 ──────────────────────────────
+
+async def _raw_request_until_close(host, port, payload: bytes) -> bytes:
+    """裸发请求字节,返回读到的全部响应字节(连接被对端关闭停止)。"""
+    reader, writer = await asyncio.open_connection(host, port)
+    writer.write(payload)
+    await writer.drain()
+    out = await asyncio.wait_for(reader.read(), timeout=5.0)
+    writer.close()
+    await writer.wait_closed()
+    return out
+
+
+@pytest.mark.asyncio
+async def test_request_header_line_count_limited():
+    """#6: 请求头行数无上限 → 超过 _MAX_REQUEST_HEADER_LINES 即拒绝并关闭连接。
+
+    回归:慢速 loris 式攻击发大量小 header 行曾让 headers bytearray 无界增长。
+    现在超过 100 行(默认)直接拒连,客户端看到 EOF 而非挂住。
+    """
+    router = Router(ProxyStore(), listen_host=HOST, listen_port=ROUTER_PORT,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        lines = b"".join(b"X-Trick: a\r\n" for _ in range(_MAX_REQUEST_HEADER_LINES + 5))
+        req = b"GET http://loris.example.com/ HTTP/1.1\r\n" + lines + b"\r\n"
+        out = await _raw_request_until_close(HOST, ROUTER_PORT, req)
+        assert out == b"", f"header-overrun request must be closed, got {out!r}"
+    finally:
+        await router.stop()
+
+
+@pytest.mark.asyncio
+async def test_request_header_byte_limit():
+    """#6: 请求头累计字节超 _MAX_REQUEST_HEADER_BYTES 也拒绝(行数未超限先触发字节限)。
+
+    >64KB 的请求头被拒连。字节限在行数限之前触发(44 行 × 1.5KB ≈ 66KB)。
+    """
+    router = Router(ProxyStore(), listen_host=HOST, listen_port=ROUTER_PORT,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        # 44 行 × ~1502B ≈ 66KB > 64KB,行数 44 < 100 → 字节限先触发。
+        big_line = b"X-Big: " + b"a" * 1490 + b"\r\n"
+        lines = big_line * 44
+        req = b"GET http://loris2.example.com/ HTTP/1.1\r\n" + lines + b"\r\n"
+        assert len(req) > _MAX_REQUEST_HEADER_BYTES
+        out = await _raw_request_until_close(HOST, ROUTER_PORT, req)
+        assert out == b"", f"over-byte-limit request must be closed, got {out!r}"
+    finally:
+        await router.stop()
+
+
+@pytest.mark.asyncio
+async def test_truncated_upstream_response_detected():
+    """#7: 上游 Content-Length 声明 N 但实际只发 M(<N)字节时,记 warn 并关闭上游连接。
+
+    客户端已收到 200 头,无法撤回;依赖 warn 日志暴露截断,否则客户端会挂到自己
+    的超时。断言:body 是"少给"的截断内容(而非挂死),且出现 'truncated upstream
+    response' 的 warning。
+    """
+    log = logging.getLogger('auto_squid.router')
+    records = []
+
+    class H(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = H()
+    log.addHandler(handler)
+    try:
+        proxy_srv = await run_mock_proxy_truncated(HOST, PROXY_PORT, declared=1000, sent=5)
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+        router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                        enable_http_cache=False, db_path=tempfile.mktemp(suffix='.db'))
+        await router.start()
+        try:
+            reader, writer = await asyncio.open_connection(HOST, ROUTER_PORT)
+            writer.write(b"GET http://trunc.example.com/ HTTP/1.1\r\nHost: trunc.example.com\r\n\r\n")
+            await writer.drain()
+            status = await reader.readline()
+            assert b"200" in status, f"expected 200, got {status}"
+            while True:
+                h = await reader.readline()
+                if not h or h in (b"\r\n", b"\n"):
+                    break
+            body = await asyncio.wait_for(reader.read(), timeout=2.0)
+            writer.close()
+            await writer.wait_closed()
+            # 截断:远少于承诺的 1000 字节。
+            assert len(body) < 1000, f"truncated body should be < 1000, got {len(body)}"
+        finally:
+            await router.stop()
+            proxy_srv.close()
+            await proxy_srv.wait_closed()
+    finally:
+        log.removeHandler(handler)
+    msgs = [r.getMessage() for r in records]
+    assert any('truncated upstream response' in m for m in msgs), \
+        f"must log truncated-response warning, got {msgs}"
+
+
+@pytest.mark.asyncio
+async def test_aggregation_wait_timeout_is_second_scale():
+    """#8: 聚合等待超时必须提升到秒级(而非 100ms 形同虚设)。
+
+    0.1s 比典型上游 TTFB 还短,waiter 几乎总是超时回退竞速,并发同 URL 时对上游
+    形成 stampede。提升到秒级让聚合在真实 TTFB 窗口内真正生效,仍保留有界等待。
+    常量校验回归:防止未来有人把它调回微秒级。
+    """
+    assert _AGG_WAIT_TIMEOUT >= 3.0, \
+        f"_AGG_WAIT_TIMEOUT 应 ≥3s,当前 {_AGG_WAIT_TIMEOUT}s"
