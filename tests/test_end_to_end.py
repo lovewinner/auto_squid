@@ -3336,7 +3336,7 @@ class TestConnPool:
             for stack in r._conn_pool.values():
                 for _, w in stack:
                     w._conn_pool_created = time.monotonic() - 100
-            await r._conn_pool_prune()
+            await r._pool_prune()
             assert r.conn_pool_expired >= 1
             assert sum(len(v) for v in r._conn_pool.values()) == 0
         finally:
@@ -4106,6 +4106,176 @@ class TestEstablishedTunnelReuse:
             await r.stop()
             up_srv.close()
             await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_dead_probe_tunnel_falls_back_without_nameerror(self):
+        """复用候选在活性探测时判死 → _discard_conn 丢弃并回落新建(回归 #14)。
+
+        修复前 Router 的 `_discard_conn(up_writer)` 以裸名调用(类内裸名不查类作用域)
+        → 命中的就是 NameError。本测试构造"通过 peek 干净检查(at_eof=False、无残留
+        缓冲)但活性探测必死(reader 带 RST 异常)"的复用候选:探测抛异常 → 判死 →
+        丢弃 → 回落新建 CONNECT,客户端仍拿到 echo,established_pool_expired 计数。
+        """
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router()
+        await r.start()
+        try:
+            target = b"reuse-dead.example.com:443"
+            # 第一次:正常隧道 → 归还 established 池。
+            echo1 = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"one")
+            assert echo1 == b"one"
+            assert await self._wait_returned(r, target)
+            key = f"{HOST}:31991|{target.decode()}"
+            # 手动造一条"已 RST"的候选(模拟对端静默 RST 却又过了 peek 干净检查):
+            # at_eof()=False、无残留缓冲 → _established_pool_peek 放行;read(1)
+            # 抛出 -> _established_alive 判死。
+            dead_r, dead_w = await asyncio.open_connection(HOST, 31991)
+            dead_r.set_exception(ConnectionResetError("peer reset"))
+            r._established_pool[key].append((dead_r, dead_w))
+            # 第二次:peek 拿到死候选 → 探测判死 → _discard_conn → 回落 _conn_pool/新建。
+            echo2 = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"two")
+            assert echo2 == b"two", "死隧道探测后必须正常回落新建,且不再触发 NameError"
+            assert r.established_pool_expired >= 1, "死连接应计入 expired(探测判死丢弃)"
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+
+class TestRouterConfigPassThrough:
+    """回归 #15:Router(router_cfg=...) 与逐 kwarg 构造完全等价(配置单一真相源)。
+
+    cli.py 删掉了 ~55 kwarg 手工映射,改为把 RouterConfig 整块传入。测试钉死:
+    ① 两条构造路径的 snapshot_counters() 与关键配置属性一致;
+    ② router_cfg 优先于同名 kwarg(不靠位置/默认值猜);
+    ③ 池成员经 __getattr__/__setattr__ 白名单转发到 self.pools(同一对象)。
+    """
+
+    @staticmethod
+    def _cfg_kwargs(cfg: RouterConfig) -> dict:
+        """把 RouterConfig 还原成旧 Router(**kwargs) 的扁平 dict(镜像 #15 拆掉的映射)。"""
+        c, cc, auth, stick = cfg, cfg.circuit, cfg.auth, cfg.stickiness
+        hc, at, sd, cl, pc = (cfg.http_cache, cfg.adaptive_ttl, cfg.switch_damping,
+                              cfg.concurrency_limit, cfg.conn_pool)
+        return dict(
+            max_retries=c.max_retries, cache_ttl=c.cache_ttl,
+            enable_local_racing=c.enable_local_racing,
+            stagger_start=c.stagger_start, stagger_initial=c.stagger_initial,
+            stagger_interval_ms=c.stagger_interval_ms,
+            probe_interval_sec=cc.probe_interval_sec, probe_canary=cc.probe_canary,
+            probe_canaries=[p.model_dump() for p in cc.probe_canaries],
+            circuit_threshold=cc.circuit_threshold, circuit_max_backoff=cc.circuit_max_backoff,
+            slow_start_window=cc.slow_start_window, slow_start_success=cc.slow_start_success,
+            lb_bias=cc.lb_bias,
+            single_send_degrade_fail=cc.single_send_degrade_fail,
+            single_send_degrade_ratio=cc.single_send_degrade_ratio,
+            single_send_degrade_slack_ms=cc.single_send_degrade_slack_ms,
+            auth_enabled=auth.enabled, auth_username=auth.username, auth_password=auth.password,
+            enable_http_cache=hc.enabled, http_cache_ttl=hc.ttl,
+            http_cache_max_entries=hc.max_entries, http_cache_max_bytes=hc.max_bytes,
+            http_cache_stream_limit=hc.stream_cache_limit,
+            stickiness_enabled=stick.enabled, stickiness_ttl=stick.ttl,
+            stickiness_recheck_hits=stick.recheck_hits, stickiness_max_entries=stick.max_entries,
+            adaptive_ttl=at.enabled, adaptive_ttl_min=at.min_sec, adaptive_ttl_max=at.max_sec,
+            switch_damping=sd.enabled, switch_damping_min_wins=sd.min_wins,
+            switch_damping_ratio=sd.ratio, switch_damping_abs_ms=sd.abs_ms,
+            concurrency_limit_enabled=cl.enabled, concurrency_limit_initial=cl.initial,
+            concurrency_limit_min=cl.min, concurrency_limit_max=cl.max,
+            concurrency_add_on_success=cl.add_on_success, concurrency_mult_on_failure=cl.mult_on_failure,
+            concurrency_failure_window=cl.failure_window,
+            conn_pool_enabled=pc.enabled, conn_pool_per_proxy=pc.per_proxy,
+            conn_pool_total=pc.total, conn_pool_idle_timeout=pc.idle_timeout,
+            conn_pool_refill_interval=pc.refill_interval, conn_pool_refill_target=pc.refill_target,
+            conn_pool_connect_timeout=pc.connect_timeout, conn_pool_target_prewarm=pc.target_prewarm,
+            conn_pool_refill_pause_minutes=pc.refill_pause_minutes,
+            conn_pool_refill_pause_silence_sec=pc.refill_pause_silence_sec,
+            conn_pool_refill_pause_activity_window=pc.refill_pause_activity_window,
+            conn_pool_refill_pause_min_requests=pc.refill_pause_min_requests,
+            conn_pool_established_reuse=pc.established_reuse,
+            policies=list(c.policies),
+        )
+
+    @staticmethod
+    def _make_cfg() -> RouterConfig:
+        """一份区分度足够高的 RouterConfig(每条路径都偏离默认值,防"都默认所以相等")。"""
+        return RouterConfig(
+            max_retries=5, cache_ttl=900, enable_local_racing=True,
+            stagger_start=False, stagger_initial=2, stagger_interval_ms=300,
+            circuit=dict(
+                probe_interval_sec=0.0, probe_canary="canary.example:443",
+                circuit_threshold=4, circuit_max_backoff=120.0,
+                slow_start_window=30.0, slow_start_success=2, lb_bias=0.5,
+                single_send_degrade_fail=2, single_send_degrade_ratio=2.5,
+                single_send_degrade_slack_ms=20.0),
+            auth=dict(enabled=True, username="u", password="p"),
+            http_cache=dict(enabled=False),
+            stickiness=dict(enabled=True, ttl=900.0, recheck_hits=50, max_entries=5000),
+            adaptive_ttl=dict(enabled=True, min_sec=30.0, max_sec=1200.0),
+            switch_damping=dict(enabled=True, min_wins=3, ratio=0.7, abs_ms=15.0),
+            concurrency_limit=dict(enabled=True, initial=8, min=1, max=32,
+                                   add_on_success=2, mult_on_failure=0.6, failure_window=10),
+            conn_pool=dict(enabled=True, per_proxy=3, total=20, idle_timeout=15.0,
+                           refill_interval=2.0, refill_target=1, connect_timeout=5.0,
+                           target_prewarm=True, established_reuse=True,
+                           refill_pause_minutes=0.0),
+        )
+
+    def _router(self, **kw) -> Router:
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host=HOST, port=31991))
+        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+                      db_path=tempfile.mktemp(suffix='.db'), **kw)
+
+    def test_router_cfg_equals_kwargs(self):
+        """同 RouterConfig:router_cfg= 与全 kwarg 两条构造路径完全等价。"""
+        cfg = self._make_cfg()
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host=HOST, port=31991))
+        r_cfg = Router(store, listen_host='127.0.0.1', listen_port=10809,
+                       db_path=tempfile.mktemp(suffix='.db'), router_cfg=cfg)
+        r_kw = Router(store, listen_host='127.0.0.1', listen_port=10809,
+                      db_path=tempfile.mktemp(suffix='.db'), **self._cfg_kwargs(cfg))
+        try:
+            assert r_cfg.snapshot_counters() == r_kw.snapshot_counters(), \
+                "router_cfg= 与逐 kwarg 构造的 snapshot_counters 必须一致"
+            # 关键配置属性逐一比对(r_cfg vs r_kw;Router 自有属性直接比,selector 上的
+            # 质控/熔断属性经 r.selector 比)。
+            for attr in ('max_retries', 'cache_ttl', 'stagger_interval', 'probe_interval_sec',
+                         'conn_pool_enabled', 'conn_pool_total', 'conn_pool_established_reuse'):
+                assert getattr(r_cfg, attr) == getattr(r_kw, attr), f"{attr} 两条构造路径不一致"
+            for attr in ('circuit_threshold', 'circuit_max_backoff', 'slow_start_window',
+                         'slow_start_success', 'lb_bias'):
+                assert getattr(r_cfg.selector, attr) == getattr(r_kw.selector, attr), \
+                    f"selector.{attr} 两条构造路径不一致"
+            assert r_cfg.conn_pool_total == 20 and r_cfg.max_retries == 5
+            assert r_cfg.conn_pool_established_reuse is True
+        finally:
+            r_cfg._db.close()
+            r_kw._db.close()
+
+    def test_router_cfg_overrides_kwargs(self):
+        """router_cfg 优先于同名 kwarg(配置单一真相源:显式的整块配置覆盖散参)。"""
+        cfg = self._make_cfg()  # max_retries=5
+        r = self._router(max_retries=3, router_cfg=cfg)
+        try:
+            assert r.max_retries == 5, "router_cfg.max_retries(=5) 应覆盖 kwarg max_retries(=3)"
+            assert r.cache_ttl == cfg.cache_ttl
+        finally:
+            r._db.close()
+
+    def test_pool_forward_identity(self):
+        """池成员转发到 self.pools 的同一对象(白名单 __getattr__/__setattr__)。"""
+        r = self._router(conn_pool_enabled=True, conn_pool_established_reuse=True)
+        try:
+            assert r._conn_pool is r.pools._conn_pool
+            assert r._target_pool is r.pools._target_pool
+            assert r._established_pool is r.pools._established_pool
+            assert r.conn_pool_creates == r.pools.conn_pool_creates == 0
+            # set 经 __setattr__ 转发到 pools。
+            r.conn_pool_creates = 7
+            assert r.pools.conn_pool_creates == 7 and r.conn_pool_creates == 7
+        finally:
+            r._db.close()
 
 
 class TestRaceStaggeredCleanupOnAllFail:

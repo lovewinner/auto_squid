@@ -60,6 +60,7 @@
 - [x] 聚合去重超时提升（2026-08-26，#8）：`_AGG_WAIT_TIMEOUT` 0.1s → 3.0s——0.1s 比典型上游 TTFB 还短,waiter 几乎每次都超时回退竞速,并发同 URL 时去重等于死代码且扇出误触熔断;提到秒级让聚合在真实 TTFB 窗口内生效,保留有界等待。`test_coalescing_timeout_falls_back` 改述为新语义;新增常量回归 `test_aggregation_wait_timeout_is_second_scale`。178 全过
 - [x] 配置模型 `extra="forbid"` + 跨字段校验（2026-08-26，#12）：新增 `ConfigBase`（`ConfigDict(extra="forbid")`）,全部配置模型改继承它——拼错键（`stagger_inital`）在启动即硬报错,不再静默落默认;数据模型（ProxyInfo/ProbeCanaryConfig）保持宽松不误伤。`@model_validator`:stagger_initial>=1 且<=max_retries、adaptive_ttl.min<=max（enabled 时）、concurrency_limit.min<=initial<=max（enabled 时）、conn_pool.target_prewarm/established_reuse 依赖 enabled=True、logging.level 合法性。回归 14 个。196 全过
 - [x] `logging.level` 生效 + 配置加载友好退出（2026-08-26，#13）：`setup_logging` 文件 handler 级别改用 cfg.logging.level（默认 INFO 行为不变;配 DEBUG 开 per-request 日志）,auto_squid logger 同步跟随。`_load_config` 包 try/except:YAML 缺失/语法错/pydantic 校验失败→打印 `config error: ...` 并 `sys.exit(2)`,不再抛裸 traceback。回归 5 个。196 全过
+- [x] 连接池子系统拆分 pools.py + cli 配置整块透传 + 死代码清理（2026-08-27，#14/#15/#16）：新建 `auto_squid/pools.py` `ConnectionPools`,把三池（`_conn_pool`/`_target_pool`/`_established_pool`）+ 全部计数器 + 配置 + 空闲暂停 + refill 循环统一;Router 缩掉 ~490 行,经 `_POOL_FORWARD` 白名单 `__getattr__/__setattr__` 转发（热路径 ~43 处 `self._conn_pool`/`self.conn_pool_creates` 等引用原样解析到 pools,零改动）;#2 三处手写预算快照统一走 `_total_idle()`;Prewarm task 注册留 Router 侧 `_running_tasks`,pools 只自管 refill 循环;`start()/stop()` 收敛为 `self.pools.start()/stop()`。**顺带修复生产隐患**:`_discard_conn` 裸名调用 `NameError`（类内裸名不查类作用域,死连接回落必崩）抽成 pools.py 模块级函数。`router_cfg: Optional[RouterConfig]` 参数让 cli.py 删掉 ~55 kwarg 手工透传（`Router(proxy_store, listen_host=…, listen_port=…, db_path=…, router_cfg=cfg.router)`）,Router 内部解包出旧 kwarg 同名局部变量,主体一行不改;测试 `Router(**kwargs)` 构造兼容。删 `_conn_pool_prune`（零生产调用）、保留 `refill_pause_silence_sec` kwarg 兼容。回归 5 个（等价性/覆盖/转发同一性/死探测回落不 NameError/keepalive）。**200 全过**
 - [x] 会话粘性（per-client+domain，滑动 TTL）：redispatch、5xx 驱逐、recheck 重竞速、容量上限
 - [x] bench 透传全部速度特性开关（--conn-pool / --adaptive-ttl / --switch-damping / --concurrency-limit / --policies / --http-cache-max-*）
 
@@ -86,5 +87,5 @@
 
 ## 当前测试状态
 
-- `tests/test_end_to_end.py` 等：**196** 个用例，覆盖转发/缓存/竞速/聚合/认证/熔断/探活/粘性/计数/DB 持久化/UTF-8 头安全/连接预热（通用池 + target 半预连接 + 已建握手隧道复用，含竞速胜出触发预热）+ refill 空闲暂停（refill_pause_minutes + 簇度活动判定 refill_pause_activity_window/min_requests，含"空闲暂停不卡请求路径"回归）+ 健壮性（请求头行数/字节上限、截断响应检测、聚合超时秒级）+ 配置层（extra="forbid" 拼错键拒绝/跨字段校验/cli 退出码 2/logging.level 生效）。
+- `tests/test_end_to_end.py` 等：**200** 个用例，覆盖转发/缓存/竞速/聚合/认证/熔断/探活/粘性/计数/DB 持久化/UTF-8 头安全/连接预热（通用池 + target 半预连接 + 已建握手隧道复用，含竞速胜出触发预热）+ refill 空闲暂停（refill_pause_minutes + 簇度活动判定 refill_pause_activity_window/min_requests，含"空闲暂停不卡请求路径"回归）+ 健壮性（请求头行数/字节上限、截断响应检测、聚合超时秒级）+ 配置层（extra="forbid" 拼错键拒绝/跨字段校验/cli 退出码 2/logging.level 生效）+ 连接池拆分回归（router_cfg= vs kwarg 等价 / 覆盖 / 池转发同一性 / 死连接探测回落不 NameError）。
 - 运行：`.venv/bin/python -m pytest -q`；CI 三版本（3.10/3.11/3.12）全部通过。
