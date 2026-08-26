@@ -53,6 +53,8 @@
   - [x] 第二阶段·目标半预连接（conn_pool.target_prewarm）：命中域名缓存/粘性或竞速胜出的高频 CONNECT target 后台预建"到上游"TCP（每条补 2 条、取走仍留 1 条备用），按 (proxy, target) 键区分，取用优先于通用池，共享 fd 预算/空闲超时
   - [x] 第三阶段·已建握手隧道复用（conn_pool.established_reuse）：隧道结束若连接干净（上游无残留缓冲）则归还 `_established_pool` 而非关闭，下次同 (proxy, target) 复用已 CONNECT 握手的连接、跳过握手，省掉慢线路上一次完整往返（github 场景）。`_relay_tunnel` 改用 wait(FIRST_COMPLETED) 任一端结束即取消另一端，客户端断开后立即归还不等上游挂起。严格验证：有残留即丢弃不复用，宁可不复用也不污染
   - [x] 已建握手池缺陷修复（2026-08-26）：① fd 预算：归还路径加 `conn_pool_total` 全局预算 + per-key cap=2（`_ESTABLISHED_KEY_CAP`）检查，超限 close 不复用；两处 refill 预算快照纳入 `_established_pool`（三池同口径）。② 死隧道赢得竞速：新增 `_established_alive`（read(1)+50ms 探测）在复用前判死（FIN→b''/RST→异常 均回落新建），杜绝"复用路径无 I/O、1 tick 赢竞速"。③ 半开兜底：归还连接设 `SO_KEEPALIVE`（`_set_pool_keepalive`，KEEPIDLE 60s）由 OS 判死。171 测试全过（新增探测三态/cap 并发/预算注入/keepalive 4 个）
+  - [x] 全失败 5xx resp 泄漏修复（2026-08-26，#3）：`_race_staggered` 全体候选返回 5xx（无赢家）走到底时，`completed` 里持有 5xx resp 的任务从未 aclose → 累积耗尽 httpx 连接池。修复：`return winner` 前 `if completed and cleanup: self._spawn_cleanup(completed, cleanup)`。回归 2 个（全 5xx 清理 + 赢家路径不破坏）
+  - [x] _forward_single aclose 收进 finally（2026-08-26，#4）：`_stream_upstream_response` 抛 BaseException 时 `resp.aclose()` 被跳过 → 池化连接泄漏。修复：stream/缓存/return 收进 try，aclose 收进 finally。回归 1 个（stream 抛 CancelledError → aclose 仍执行）。174 全过
 - [x] 会话粘性（per-client+domain，滑动 TTL）：redispatch、5xx 驱逐、recheck 重竞速、容量上限
 - [x] bench 透传全部速度特性开关（--conn-pool / --adaptive-ttl / --switch-damping / --concurrency-limit / --policies / --http-cache-max-*）
 

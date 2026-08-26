@@ -4074,3 +4074,136 @@ class TestEstablishedTunnelReuse:
             await r.stop()
             up_srv.close()
             await up_srv.wait_closed()
+
+
+class TestRaceStaggeredCleanupOnAllFail:
+    """回归:#3 _race_staggered 全失败时,completed 里失败的 5xx resp 候选必须被清理。"""
+
+    @pytest.mark.asyncio
+    async def test_all_fail_triggers_cleanup(self):
+        """全部候选返回 5xx(无赢家)→ cleanup 下放处理 completed,而非泄漏 resp。
+
+        monkeypatch _spawn_cleanup 捕获调用:全 5xx 走到底 return 时,completed
+        里持有 5xx resp 的任务须触发清理(这正是泄漏源——resp 占 httpx 连接池)。
+        """
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='p1', host='127.0.0.1', port=31341))
+        ps.add(ProxyInfo(id='p2', host='127.0.0.1', port=31342))
+        r = Router(ps, listen_host='127.0.0.1', listen_port=10819,
+                   max_retries=2, enable_http_cache=False, stagger_start=True,
+                   db_path=tempfile.mktemp(suffix='.db'))
+        rented = []
+        cleaned = []
+
+        class FakeResp5xx:
+            def __init__(self):
+                self.status_code = 500
+                self.aclosed = False
+
+            async def aclose(self):
+                self.aclosed = True
+
+        async def fivexx(place, method, url, headers, body):
+            # 成功返回 HTTP 结果元组 (pid, method, url, resp, client);resp 为 5xx,
+            # 被 _is_acceptable_win 拒绝 → 留在 completed、占用连接(candidate 的形状)。
+            return place, method, url, FakeResp5xx(), object()
+
+        r._make_race_task = lambda place, method, url, headers, body: \
+            asyncio.create_task(fivexx(place, method, url, headers, body))
+
+        async def cleanup_cb(result):
+            cleaned.append(result)
+
+        def spy_cleanup(losers, cleanup):
+            rented.append(len(losers))
+            # 放行真正的 _spawn_cleanup(保持与线上一致;闭包捕获原方法)。
+            return Router._spawn_cleanup(r, losers, cleanup)
+
+        r._spawn_cleanup = spy_cleanup
+        win = await r._race_staggered(['p1', 'p2'], initial=1, interval=0.01,
+                                      cleanup=cleanup_cb)
+        assert win is None, "全部候选 5xx 应返回 None"
+        # 全失败路径下,completed 里的 5xx 候选须触发 cleanup(否则 resp 泄漏)。
+        # 正确形态:_spawn_cleanup 调 1 次,completed 一次性涵盖全部 2 个候选。
+        assert rented, "all-fail path must spawn cleanup for completed 5xx candidates"
+        assert rented[0] == 2, f"both p1,p2 returned 5xx → one cleanup covering 2, got {rented}"
+        # 真正等清理 task 落地:cleanup 回调应对每个 5xx 候选执行(2 次)。
+        for _ in range(int(0.5 / 0.02)):
+            if len(cleaned) >= 2:
+                break
+            await asyncio.sleep(0.02)
+        assert len(cleaned) >= 2, f"cleanup callback must run for both 5xx candidates, got {len(cleaned)}"
+
+    @pytest.mark.asyncio
+    async def test_winner_path_also_cleans_losers(self):
+        """有赢家路径不受影响:败者照旧下放清理,赢家返回。"""
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='ok', host='127.0.0.1', port=31343))
+        ps.add(ProxyInfo(id='dead', host='127.0.0.1', port=31344))
+        r = Router(ps, listen_host='127.0.0.1', listen_port=10819,
+                   max_retries=2, enable_http_cache=False, stagger_start=True,
+                   db_path=tempfile.mktemp(suffix='.db'))
+        rented = []
+
+        async def ok_and_dead(place, method, url, headers, body):
+            if place == 'ok':
+                return 'ok', method, url, object(), object()
+            raise RuntimeError("dead")
+
+        r._make_race_task = lambda place, method, url, headers, body: \
+            asyncio.create_task(ok_and_dead(place, method, url, headers, body))
+
+        def spy_cleanup(losers, cleanup):
+            rented.append(len(losers))
+            return Router._spawn_cleanup(r, losers, cleanup)
+
+        r._spawn_cleanup = spy_cleanup
+        win = await r._race_staggered(['ok', 'dead'], initial=2, interval=0.01)
+        assert win is not None and win[0] == 'ok', "ok 应赢"
+        # 赢家路径:败者(dead)进入 cleanup——这是既有行为,回归确认未破坏。
+        assert any(n >= 1 for n in rented), f"winner path should clean dead loser, got {rented}"
+
+
+class TestForwardSingleAcloseFinally:
+    """回归:#4 _forward_single 在 _stream_upstream_response 抛异常时仍 aclose resp。"""
+
+    @pytest.mark.asyncio
+    async def test_stream_raise_still_aclose(self):
+        """_stream_upstream_response 抛异常(BaseException 语义)→ resp.aclose() 仍被调。"""
+        ps = ProxyStore()
+        r = Router(ps, listen_host='127.0.0.1', listen_port=10819,
+                   enable_http_cache=False, db_path=tempfile.mktemp(suffix='.db'))
+
+        class FakeResp:
+            """最小 fake:持有 status_code/headers,aclose 可观测。"""
+            def __init__(self):
+                self.status_code = 200
+                self.reason_phrase = "OK"
+                self.headers = type("H", (), {"multi_items": lambda self: [("x", "y")]})()
+                self.aclosed = False
+
+            async def aclose(self):
+                self.aclosed = True
+
+        resp = FakeResp()
+
+        class FakeWriter:
+            async def drain(self):
+                pass
+
+        calls = []
+
+        async def boom(writer, resp_, method, url):
+            calls.append("boom")
+            raise asyncio.CancelledError  # BaseException,不被 except Exception 捕获
+
+        orig_stream = r._stream_upstream_response
+        r._stream_upstream_response = boom
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await r._forward_single(None, "GET", "http://x.test/", {}, b"",
+                                        "x.test", instantiated=("pid", resp))
+        finally:
+            r._stream_upstream_response = orig_stream
+        assert calls == ["boom"], "stream 抛异常"
+        assert resp.aclosed, "异常路径仍须 aclose(resp),防池化连接泄漏"

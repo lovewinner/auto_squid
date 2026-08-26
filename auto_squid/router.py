@@ -2552,6 +2552,12 @@ class Router:
             # 无胜者(完成候选均失败/被取消):定时补发下一个候选(若有)。
             if unlaunched:
                 running.add(self._make_race_task(unlaunched.pop(), method, url, headers, body))
+        # 全部候选耗尽仍无胜者:completed 里那些"拿到 5xx 响应头但被判非胜"的任务
+        # 持有流式 resp(占 httpx 连接池连接),必须下放清理,否则反复全失败累积到
+        # 连接池耗尽。winner 分支已在上面处理了 completed(经 losers),_race 的
+        # 竞速任务失败路径也会自清——这里只兜底走到底仍无胜者这个唯一出口。
+        if completed and cleanup:
+            self._spawn_cleanup(completed, cleanup)
         return winner
 
     def _spawn_cleanup(self, losers: set, cleanup):
@@ -3146,15 +3152,19 @@ class Router:
                 self.sticky_cache_hits += 1
             else:
                 self.domain_cache_hits += 1
-        buffered = await self._stream_upstream_response(writer, resp, method, url)
         try:
-            await resp.aclose()
-        except Exception:
-            pass
-        if buffered is not None and resp.status_code in CACHEABLE_STATUS:
-            self._http_cache_set(method, url, resp.status_code, resp.reason_phrase,
-                                 list(resp.headers.multi_items()), buffered)
-        return resp.status_code
+            buffered = await self._stream_upstream_response(writer, resp, method, url)
+            if buffered is not None and resp.status_code in CACHEABLE_STATUS:
+                self._http_cache_set(method, url, resp.status_code, resp.reason_phrase,
+                                     list(resp.headers.multi_items()), buffered)
+            return resp.status_code
+        finally:
+            # 无论 _stream_upstream_response 是否抛 BaseException,都释放流式 resp 及其
+            # 池化连接——否则异常路径会泄漏 httpx 连接池连接(每代理上限 200)。
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
 
     async def _forward_upstream(self, writer, method: str, url: str, hdrs: dict, body, domain: str, client_ip: str = ""):
         """把请求转发上游(会话粘性单发 → 域名缓存单发 → 竞速 → 兜底竞速 → 502)。
