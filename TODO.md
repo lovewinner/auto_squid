@@ -74,7 +74,7 @@
 ## 工作流备注
 
 - 每个组件配单元测试；测试保持确定性（mock 网络调用）。
-- 生产配置调参记录：`idle_timeout` 30→120→180（目标池命中率 5%→25%）、`single_send_degrade_ratio` 3.0→2.0（降级收敛）、`refill_pause_minutes` 60（深夜空转暂停）、`refill_pause_activity_window` 120 + `refill_pause_min_requests` 3（簇度活动判定：免疫心跳且不误伤真实孤立请求）。脱敏样例见 `config_xxh_example.yaml`。
+- 生产配置调参记录：`idle_timeout` 30→120→180（目标池命中率 5%→25%）、`single_send_degrade_ratio` 3.0→2.0（降级收敛）、`refill_pause_minutes` 60（深夜空转暂停）→ **0（2026-08-26 废弃：夜间心跳 2-5 分钟一簇，暂停永不触发；空转成本实测可接受，池峰值 12/64）**。`refill_pause_activity_window` 120 + `refill_pause_min_requests` 3（簇度活动判定）保留但随 pause=0 停用。脱敏样例见 `config_xxh_example.yaml`。
 
 ## 当前测试状态
 
