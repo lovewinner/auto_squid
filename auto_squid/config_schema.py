@@ -12,16 +12,27 @@
 """
 
 from typing import Dict, List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-class ListenConfig(BaseModel):
+class ConfigBase(BaseModel):
+    """配置模型基类:#12 把关。
+
+    顶层/嵌套**配置**模型一律 `extra="forbid"`:拼错键(stagger_inital)或
+    升级后改名(yaml 里残留旧键)在启动即硬报错,不再 pydantic 默认忽略未知键
+    静默落默认。数据模型(ProxyInfo / ProbeCanaryConfig,由 proxies.yaml / 管理
+    API 喂入)故意保持宽松,避免误伤运行时数据。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+
+class ListenConfig(ConfigBase):
     """代理端口的监听配置(面向客户端的 HTTP/CONNECT 代理端口)。"""
     host: str = Field("0.0.0.0")
     port: int = Field(10808)
 
 
-class APIConfig(BaseModel):
+class APIConfig(ConfigBase):
     """管理 API 的监听配置(独立于代理端口,默认 18080)。
 
     `auth` 复用 AuthConfig(默认关闭):开启后除 /health 外全部端点需 HTTP
@@ -34,10 +45,21 @@ class APIConfig(BaseModel):
                                description="管理 API 的 HTTP Basic 认证配置(默认关闭)")
 
 
-class LoggingConfig(BaseModel):
+class LoggingConfig(ConfigBase):
     """日志配置。`file` 为 None 时写默认文件 `auto_squid.log`。"""
     level: str = Field("INFO")
     file: Optional[str] = Field(None)
+
+    # 合法级别集合(#13):把 level 拼写错误在加载期暴露,而不是静默落默认。
+    _VALID_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+
+    @model_validator(mode="after")
+    def _check_level(self):
+        if self.level.upper() not in self._VALID_LEVELS:
+            raise ValueError(
+                f"invalid logging.level {self.level!r} (expect one of "
+                f"{sorted(self._VALID_LEVELS)})")
+        return self
 
 
 class ProxyInfo(BaseModel):
@@ -57,7 +79,7 @@ class ProxyInfo(BaseModel):
     tags: Optional[Dict[str, str]] = None
 
 
-class AuthConfig(BaseModel):
+class AuthConfig(ConfigBase):
     """HTTP Basic 认证配置,同时用于:
     - 客户端访问**代理端口**的认证(开启后客户端每个请求都需带
       `Proxy-Authorization` 头,见 auth.check_auth);
@@ -70,7 +92,7 @@ class AuthConfig(BaseModel):
     password: str = Field("")
 
 
-class PolicyProxiesConfig(BaseModel):
+class PolicyProxiesConfig(ConfigBase):
     """策略命中后允许使用的代理集合:按 tags 或按 ids 收窄(两者都给则取并集)。
 
     tags 匹配 ProxyInfo.tags(如 region=cn);ids 直接列出代理 id。两者都缺省
@@ -80,7 +102,7 @@ class PolicyProxiesConfig(BaseModel):
     ids: Optional[List[str]] = Field(None, description="允许的代理 id 列表")
 
 
-class PolicyMatchConfig(BaseModel):
+class PolicyMatchConfig(ConfigBase):
     """策略匹配条件(目标域名维度)。任一子条件命中即匹配(OR)。
 
     host 提取规则:HTTP 用 URL hostname,CONNECT 用 target 去端口后的 host,
@@ -91,7 +113,7 @@ class PolicyMatchConfig(BaseModel):
     domain_regex: List[str] = Field(default_factory=list, description="域名正则(re.search)")
 
 
-class PolicyConfig(BaseModel):
+class PolicyConfig(ConfigBase):
     """一条策略路由:目标域名命中 match → 只在该子集代理中竞速/单发。
 
     作用于竞速候选收窄、域名缓存与粘性的取用校验(三者一致,防旧缓存绕过新
@@ -101,7 +123,7 @@ class PolicyConfig(BaseModel):
     proxies: PolicyProxiesConfig = Field(default_factory=PolicyProxiesConfig)
 
 
-class StickinessConfig(BaseModel):
+class StickinessConfig(ConfigBase):
     """会话粘性配置(per-client+domain 维度,内存-only)。
 
     enabled:    是否启用会话粘性。启用后同一客户端 IP 访问同一域名/目标时,
@@ -121,7 +143,7 @@ class StickinessConfig(BaseModel):
     max_entries: int = Field(100_000, description="粘性表最大条目数,超出驱逐最旧(内存保护)")
 
 
-class HttpCacheConfig(BaseModel):
+class HttpCacheConfig(ConfigBase):
     """HTTP 响应缓存配置(P2:LRU + 容量上限)。
 
     enabled:            总开关。False 时 _http_cache_get 一律未命中(压测隔离
@@ -155,7 +177,7 @@ class ProbeCanaryConfig(BaseModel):
     tags: Optional[Dict[str, str]] = Field(None, description="适用代理标签,全命中即选")
 
 
-class ConnPoolConfig(BaseModel):
+class ConnPoolConfig(ConfigBase):
     """CONNECT 上游 TCP 预热池(P1)。
 
     enabled:      总开关(默认关闭)。开启后为每个上游代理维护少量空闲 TCP
@@ -202,8 +224,17 @@ class ConnPoolConfig(BaseModel):
     refill_pause_min_requests: int = Field(3, description="活动判定窗口阈值(默认 3):窗口(见 refill_pause_activity_window)内请求数 ≥ 此值才刷新活动时间戳。真实页面加载一次 ≥3 个 hostname 的 CONNECT 簇即达标;心跳(孤例)不达标。阈值 ≤1 时退化为『任意请求都刷新』")
     established_reuse: bool = Field(False, description="已建握手隧道复用:隧道结束若连接干净则归还池,下次同 (proxy,target) 请求复用已 CONNECT 握手的连接,跳过握手,省掉重建。仅当 conn_pool.enabled 为 True 时生效")
 
+    @model_validator(mode="after")
+    def _gate_on_enabled(self):
+        # 第二阶段/第三阶段依赖总开关:#12 把它们配置成隐性依赖会给出费解的静默失效
+        # (开了 target_prewarm 却没开 enabled,功能不生效且无日志)。这里显式硬报错。
+        if (self.target_prewarm or self.established_reuse) and not self.enabled:
+            raise ValueError(
+                "conn_pool.target_prewarm / established_reuse require conn_pool.enabled=True")
+        return self
 
-class ConcurrencyLimitConfig(BaseModel):
+
+class ConcurrencyLimitConfig(ConfigBase):
     """自适应并发限制(P3):每代理并发上限随稳定性加减。
 
     enabled:  总开关(默认关闭)。
@@ -223,7 +254,7 @@ class ConcurrencyLimitConfig(BaseModel):
     failure_window: int = Field(20, description="EWMA 恶化比较的观测窗口")
 
 
-class SwitchDampingConfig(BaseModel):
+class SwitchDampingConfig(ConfigBase):
     """域名赢家切换阻尼(P3)。
 
     enabled:  总开关(默认关闭)。开启后新赢家不能因单次竞速抖动就替换稳定
@@ -239,7 +270,7 @@ class SwitchDampingConfig(BaseModel):
     abs_ms: float = Field(30.0, description="新赢家快 ≥ 该毫秒立即切换(0=关闭)")
 
 
-class AdaptiveTTLConfig(BaseModel):
+class AdaptiveTTLConfig(ConfigBase):
     """自适应域名缓存 TTL(P2)。
 
     enabled:  总开关(默认关闭,保持全局固定 cache_ttl 的旧行为)。
@@ -251,7 +282,7 @@ class AdaptiveTTLConfig(BaseModel):
     max_sec: float = Field(1800.0, description="每域名 TTL 上限(秒)")
 
 
-class CircuitConfig(BaseModel):
+class CircuitConfig(ConfigBase):
     """熔断器 + 后台探活 + slow-start + in-flight 选批配置(router.circuit)。
 
     probe_interval_sec: 后台探活周期(秒)。每周期对 enabled 代理做轻量 CONNECT
@@ -294,7 +325,7 @@ class CircuitConfig(BaseModel):
     single_send_degrade_slack_ms: float = Field(10.0, description="EWMA 降级绝对下限(毫秒)")
 
 
-class RouterConfig(BaseModel):
+class RouterConfig(ConfigBase):
     """路由行为配置。
 
     cache_ttl:           域名缓存有效期(秒)。某代理为某域名竞速胜出后,
@@ -330,8 +361,28 @@ class RouterConfig(BaseModel):
     concurrency_limit: ConcurrencyLimitConfig = Field(default_factory=ConcurrencyLimitConfig, description="自适应并发限制(见 ConcurrencyLimitConfig)")
     conn_pool: ConnPoolConfig = Field(default_factory=ConnPoolConfig, description="CONNECT 上游 TCP 预热池(见 ConnPoolConfig)")
 
+    @model_validator(mode="after")
+    def _check_cross_field(self):
+        # #12 跨字段一致性:无效/自我矛盾配置在启动即硬报错,而不是带病运行。
+        if self.stagger_initial < 1:
+            raise ValueError("router.stagger_initial must be >= 1")
+        if self.stagger_initial > self.max_retries:
+            raise ValueError(
+                f"router.stagger_initial ({self.stagger_initial}) must be <= "
+                f"max_retries ({self.max_retries})")
+        if self.adaptive_ttl.enabled and self.adaptive_ttl.min_sec > self.adaptive_ttl.max_sec:
+            raise ValueError(
+                f"router.adaptive_ttl.min_sec ({self.adaptive_ttl.min_sec}) must be <= "
+                f"max_sec ({self.adaptive_ttl.max_sec})")
+        cl = self.concurrency_limit
+        if cl.enabled and not (cl.min <= cl.initial <= cl.max):
+            raise ValueError(
+                f"concurrency_limit.min={cl.min}, initial={cl.initial}, max={cl.max} "
+                f"must satisfy min <= initial <= max")
+        return self
 
-class Config(BaseModel):
+
+class Config(ConfigBase):
     """顶层配置,各字段均有默认值。"""
     listen: ListenConfig = Field(default_factory=ListenConfig)
     api: APIConfig = Field(default_factory=APIConfig)

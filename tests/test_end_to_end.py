@@ -16,7 +16,9 @@ from auto_squid.router import (
     _MAX_REQUEST_HEADER_LINES, _MAX_REQUEST_HEADER_BYTES,
     _AGG_WAIT_TIMEOUT,
 )
-from auto_squid.config_schema import ProxyInfo, PolicyConfig
+from auto_squid.config_schema import (
+    ProxyInfo, PolicyConfig, Config, RouterConfig, ConnPoolConfig, LoggingConfig,
+)
 from auto_squid.auth import check_auth
 from auto_squid.api import app as api_app, mount
 
@@ -4352,3 +4354,180 @@ async def test_aggregation_wait_timeout_is_second_scale():
     """
     assert _AGG_WAIT_TIMEOUT >= 3.0, \
         f"_AGG_WAIT_TIMEOUT 应 ≥3s,当前 {_AGG_WAIT_TIMEOUT}s"
+
+
+# ── #12 extra="forbid" + 跨字段校验 / #13 logging.level ────────────
+
+class TestConfigSchemaStrict:
+    """#12: 配置模型一律 extra="forbid",拼错键在启动即硬报错;跨字段一致性校验。"""
+
+    def test_unknown_top_level_key_rejected(self):
+        with pytest.raises(Exception) as ei:
+            Config(**{"router": {}, "bogus_top_key": 1})
+        assert "bogus_top_key" in str(ei.value)
+
+    def test_unknown_nested_key_rejected(self):
+        """stagger_inital(拼错)→ RouterConfig 报错,不再静默落默认。"""
+        with pytest.raises(Exception) as ei:
+            RouterConfig(stagger_inital=5)
+        assert "stagger_inital" in str(ei.value)
+
+    def test_conn_pool_typo_rejected(self):
+        with pytest.raises(Exception) as ei:
+            ConnPoolConfig(enabled=True, refil_interval=1.0)  # refill 拼错
+        assert "refil_interval" in str(ei.value)
+
+    def test_unknown_key_in_example_config_still_loads(self):
+        """脱敏样例配置经 extra="forbid" 后仍能原样加载(无过期残留键)。"""
+        import yaml
+        from pathlib import Path
+        cfg = Config(**yaml.safe_load(Path("config_xxh_example.yaml").read_text()))
+        assert cfg.router.conn_pool.enabled
+        assert cfg.router.conn_pool.established_reuse
+        assert cfg.router.stagger_initial == 2
+
+    @pytest.mark.asyncio
+    async def test_stagger_initial_over_max_retries_rejected(self):
+        with pytest.raises(Exception) as ei:
+            RouterConfig(stagger_initial=5, max_retries=3)
+        assert "stagger_initial" in str(ei.value)
+
+    @pytest.mark.asyncio
+    async def test_stagger_initial_zero_rejected(self):
+        with pytest.raises(Exception) as ei:
+            RouterConfig(stagger_initial=0, max_retries=3)
+        assert "stagger_initial" in str(ei.value)
+
+    def test_adaptive_ttl_min_gt_max_rejected(self):
+        with pytest.raises(Exception) as ei:
+            RouterConfig(adaptive_ttl={"enabled": True, "min_sec": 900, "max_sec": 60})
+        assert "min_sec" in str(ei.value)
+
+    def test_concurrency_limit_out_of_order_rejected(self):
+        with pytest.raises(Exception) as ei:
+            RouterConfig(concurrency_limit={
+                "enabled": True, "min": 4, "initial": 2, "max": 8})
+        assert "min <= initial <= max" in str(ei.value)
+
+    def test_conn_pool_stage_requires_enabled(self):
+        # target_prewarm 依赖 enabled(第二/三阶段隐性依赖显式化)。
+        with pytest.raises(Exception) as ei:
+            ConnPoolConfig(enabled=False, target_prewarm=True)
+        assert "conn_pool.enabled" in str(ei.value)
+        with pytest.raises(Exception) as ei:
+            ConnPoolConfig(enabled=False, established_reuse=True)
+        assert "conn_pool.enabled" in str(ei.value)
+
+    def test_conn_pool_enabled_allows_stages(self):
+        ConnPoolConfig(enabled=True, target_prewarm=True, established_reuse=True)
+
+    def test_logging_bad_level_rejected(self):
+        with pytest.raises(Exception) as ei:
+            LoggingConfig(level="WRAN")
+        assert "logging.level" in str(ei.value)
+
+    def test_proxy_info_stays_lenient(self):
+        """数据模型保持宽松:proxies.yaml 的旧键/额外键不阻塞(与配置模型分开)。"""
+        p = ProxyInfo(id="x", host="h", port=3128, future_key="whatever")
+        assert p.id == "x"
+
+
+class TestCliConfigErrorExit:
+    """#13: 配置加载失败(坏 YAML / 未知键)→ 打印可读错误,不抛裸 traceback。"""
+
+    def _run_load(self, tmp_path, content=None, flag_path=None):
+        import subprocess, sys
+        import auto_squid.cli  # noqa: F401  确保可导入(不 import 则 cli 未走)
+        cfg_path = tmp_path / ("config.yaml" if content is not None else "missing.yaml")
+        if content is not None:
+            cfg_path.write_text(content)
+        target = str(flag_path) if flag_path else str(cfg_path)
+        import auto_squid.cli as cli
+        return cli._load_config(target)
+
+    def test_bad_yaml_exits_code_2(self, tmp_path):
+        import subprocess, sys, textwrap
+        p = tmp_path / "bad.yaml"
+        p.write_text("router: [unclosed\n")
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "from auto_squid.cli import _load_config; _load_config('%(p)s')" % {"p": p}],
+            capture_output=True, text=True)
+        assert r.returncode == 2
+        assert "config error" in r.stderr
+
+    def test_unknown_key_exits_code_2(self, tmp_path):
+        import subprocess, sys
+        p = tmp_path / "cfg.yaml"
+        p.write_text("router:\n  max_retries: 3\n  bogus_opt: 1\n")
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "from auto_squid.cli import _load_config; _load_config('%(p)s')" % {"p": p}],
+            capture_output=True, text=True)
+        assert r.returncode == 2
+        assert "config error" in r.stderr
+        assert "bogus_opt" in r.stderr
+
+    def test_missing_file_exits_code_2(self, tmp_path):
+        import subprocess, sys
+        p = tmp_path / "nope.yaml"
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "from auto_squid.cli import _load_config; _load_config('%(p)s')" % {"p": p}],
+            capture_output=True, text=True)
+        assert r.returncode == 2
+        assert "config error" in r.stderr
+
+    def test_valid_config_returns_config(self, tmp_path):
+        p = tmp_path / "good.yaml"
+        p.write_text("logging:\n  level: INFO\n")
+        cfg = self._run_load(tmp_path, content="logging:\n  level: INFO\n",
+                             flag_path=p)
+        assert cfg is not None
+        assert cfg.logging.level == "INFO"
+
+
+class TestSetupLoggingLevel:
+    """#13: `logging.level` 配置控制文件 handler 与 auto_squid logger 级别。
+
+    曾是硬编码 INFO:设 DEBUG 没反应。现在 logging.level: DEBUG 应让 per-request
+    DEBUG 日志进文件;是 INFO 则 DEBUG 被短路。
+    """
+
+    @staticmethod
+    def _reset_logging():
+        import logging as _l
+        root = _l.getLogger()
+        for h in list(root.handlers):
+            root.removeHandler(h)
+        # 清除 cli.py 里显式钉死的子 logger 级别,避免跨测试串扰。
+        for name in ("httpx", "httpcore", "uvicorn", "uvicorn.access",
+                     "asyncio", "auto_squid"):
+            _l.getLogger(name).setLevel(_l.NOTSET)
+
+    def _setup(self, tmp_path, level):
+        from auto_squid.cli import setup_logging
+        cfg = Config(logging={"level": level, "file": str(tmp_path / "test.log")})
+        self._reset_logging()
+        setup_logging(cfg)
+        return cfg
+
+    def test_debug_level_writes_debug_to_file(self, tmp_path):
+        cfg = self._setup(tmp_path, "DEBUG")
+        log_path = tmp_path / "test.log"
+        rlog = logging.getLogger("auto_squid.router")
+        rlog.debug("per-request debug marker zzz")
+        rlog.info("info marker")
+        assert any("per-request debug marker zzz" in ln for ln in log_path.read_text().splitlines())
+        self._reset_logging()
+
+    def test_info_level_short_circuits_debug(self, tmp_path):
+        cfg = self._setup(tmp_path, "INFO")
+        log_path = tmp_path / "test.log"
+        rlog = logging.getLogger("auto_squid.router")
+        rlog.debug("debug marker that must NOT appear qqq")
+        rlog.info("info marker should appear")
+        body = log_path.read_text()
+        assert "debug marker that must NOT appear qqq" not in body
+        assert "info marker should appear" in body
+        self._reset_logging()

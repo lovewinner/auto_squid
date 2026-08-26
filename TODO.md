@@ -58,6 +58,8 @@
 - [x] 请求头行数/总字节无上限修复（2026-08-26，#6）：`handle_client` 读请求头循环加 `_MAX_REQUEST_HEADER_LINES=100`（行数）与 `_MAX_REQUEST_HEADER_BYTES=64KB`（累计字节）双上限,超限 log warning + 拒连（finally 统一关闭）。慢速 loris 式攻击发大量小 header 行不再让 bytearray 无界增长。回归 2 个（行数超限 / 字节先于行数触发）。
 - [x] 截断上游响应检测（2026-08-26，#7）：`_stream_upstream_response` 累计流式字节 `streamed`,循环结束（含 aiter_raw 抛异常的 RemoteProtocolError 截断）统一比对:non-chunked 且 `streamed != int(upstream_cl)` → `logger.warning`（"truncated upstream response" 带 URL/承诺/实际长度）+ `aclose()` 掐断残留传输。客户端已拿 200 头无法撤回,靠 warn 暴露问题。客户端断开不误报（断开后仍排空上游 body）。回归 1 个（declared=1000/sent=5 → warn）。
 - [x] 聚合去重超时提升（2026-08-26，#8）：`_AGG_WAIT_TIMEOUT` 0.1s → 3.0s——0.1s 比典型上游 TTFB 还短,waiter 几乎每次都超时回退竞速,并发同 URL 时去重等于死代码且扇出误触熔断;提到秒级让聚合在真实 TTFB 窗口内生效,保留有界等待。`test_coalescing_timeout_falls_back` 改述为新语义;新增常量回归 `test_aggregation_wait_timeout_is_second_scale`。178 全过
+- [x] 配置模型 `extra="forbid"` + 跨字段校验（2026-08-26，#12）：新增 `ConfigBase`（`ConfigDict(extra="forbid")`）,全部配置模型改继承它——拼错键（`stagger_inital`）在启动即硬报错,不再静默落默认;数据模型（ProxyInfo/ProbeCanaryConfig）保持宽松不误伤。`@model_validator`:stagger_initial>=1 且<=max_retries、adaptive_ttl.min<=max（enabled 时）、concurrency_limit.min<=initial<=max（enabled 时）、conn_pool.target_prewarm/established_reuse 依赖 enabled=True、logging.level 合法性。回归 14 个。196 全过
+- [x] `logging.level` 生效 + 配置加载友好退出（2026-08-26，#13）：`setup_logging` 文件 handler 级别改用 cfg.logging.level（默认 INFO 行为不变;配 DEBUG 开 per-request 日志）,auto_squid logger 同步跟随。`_load_config` 包 try/except:YAML 缺失/语法错/pydantic 校验失败→打印 `config error: ...` 并 `sys.exit(2)`,不再抛裸 traceback。回归 5 个。196 全过
 - [x] 会话粘性（per-client+domain，滑动 TTL）：redispatch、5xx 驱逐、recheck 重竞速、容量上限
 - [x] bench 透传全部速度特性开关（--conn-pool / --adaptive-ttl / --switch-damping / --concurrency-limit / --policies / --http-cache-max-*）
 
@@ -84,5 +86,5 @@
 
 ## 当前测试状态
 
-- `tests/test_end_to_end.py` 等：**178** 个用例，覆盖转发/缓存/竞速/聚合/认证/熔断/探活/粘性/计数/DB 持久化/UTF-8 头安全/连接预热（通用池 + target 半预连接 + 已建握手隧道复用，含竞速胜出触发预热）+ refill 空闲暂停（refill_pause_minutes + 簇度活动判定 refill_pause_activity_window/min_requests，含"空闲暂停不卡请求路径"回归）+ 健壮性（请求头行数/字节上限、截断响应检测、聚合超时秒级）。
+- `tests/test_end_to_end.py` 等：**196** 个用例，覆盖转发/缓存/竞速/聚合/认证/熔断/探活/粘性/计数/DB 持久化/UTF-8 头安全/连接预热（通用池 + target 半预连接 + 已建握手隧道复用，含竞速胜出触发预热）+ refill 空闲暂停（refill_pause_minutes + 簇度活动判定 refill_pause_activity_window/min_requests，含"空闲暂停不卡请求路径"回归）+ 健壮性（请求头行数/字节上限、截断响应检测、聚合超时秒级）+ 配置层（extra="forbid" 拼错键拒绝/跨字段校验/cli 退出码 2/logging.level 生效）。
 - 运行：`.venv/bin/python -m pytest -q`；CI 三版本（3.10/3.11/3.12）全部通过。

@@ -34,35 +34,55 @@ def _load_config(config_path: str) -> Config:
     """加载配置:显式 --config > 当前目录 config.yaml > 全默认 Config()。
 
     用 YAML 文件时按顶层键构造 Config(缺省字段走默认值)。
+
+    #13:YAML 缺失/语法错/键位错配(#12 的 extra="forbid")统一打印可读的
+    错误并退出码 2 —— 不再抛裸 traceback(运维面对的是配置文件,不是 Python)。
     """
-    if config_path:
-        return Config(**yaml.safe_load(Path(config_path).read_text()))
-    default_yaml = Path("config.yaml")
-    if default_yaml.exists():
-        return Config(**yaml.safe_load(default_yaml.read_text()))
-    return Config()
+    try:
+        if config_path:
+            return Config(**yaml.safe_load(Path(config_path).read_text()))
+        default_yaml = Path("config.yaml")
+        if default_yaml.exists():
+            return Config(**yaml.safe_load(default_yaml.read_text()))
+        return Config()
+    except FileNotFoundError as e:
+        print(f"config error: {e}", file=sys.stderr)
+        sys.exit(2)
+    except yaml.YAMLError as e:
+        print(f"config error: bad YAML: {e}", file=sys.stderr)
+        sys.exit(2)
+    except Exception as e:
+        # pydantic ValidationError(extra 键 / 跨字段校验失败)也落到这里。
+        _ = str(e).splitlines()[:12]
+        print("config error: invalid configuration:", file=sys.stderr)
+        for line in _:
+            print(f"  {line}", file=sys.stderr)
+        sys.exit(2)
 
 
 def setup_logging(cfg: Config):
-    """配置根日志:控制台只输出 WARNING 及以上,文件输出 INFO 及以上。
+    """配置根日志:控制台只输出 WARNING 及以上,文件按 cfg.logging.level。
 
-    之所以压低控制台级别:代理转发量大,INFO 会刷屏;但文件保留 INFO
-    便于事后排查(竞速命中、认证拒绝等)。
+    控制台级别刻意压低(代理转发量大,INFO 会刷屏);文件 handler 级别由
+    `cfg.logging.level` 控制(#13:此前硬编码 INFO,设 DEBUG 没反应)。默认
+    INFO,行为不变;想开 per-request 调试日志,配置 logging.level: DEBUG 即
+    会同时提升文件级别与 auto_squid logger,两者一致。
     """
     root = logging.getLogger()
     # 根 logger 设为 DEBUG,让各 handler 各自按级别过滤。
     root.setLevel(logging.DEBUG)
 
-    # 控制台:WARNING 起,精简格式,只看错误与警告。
+    # 控制台:WARNING 起(不受 logging.level 影响,转发量大 INFO 会刷屏),精简格式。
     console = logging.StreamHandler(sys.stderr)
     console.setLevel(logging.WARNING)
     console.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
     root.addHandler(console)
 
-    # 文件:INFO 起,带时间戳,追加模式。cfg.logging.file 为 None 时用默认文件名。
+    # 文件:级别随 cfg.logging.level(#13),带时间戳,追加模式。default INFO。
+    level = getattr(logging, cfg.logging.level.upper(), logging.INFO)
     log_path = cfg.logging.file or "auto_squid.log"
     fh = logging.FileHandler(log_path, mode="a")
-    fh.setLevel(logging.INFO)
+    fh.setLevel(level)
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s:%(name)s:%(message)s"))
     root.addHandler(fh)
 
@@ -73,10 +93,10 @@ def setup_logging(cfg: Config):
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     logging.getLogger("asyncio").setLevel(logging.ERROR)
     # router 的每请求日志(client connected / cache hit / racing win)已降级为
-    # DEBUG。把 auto_squid logger 置于 INFO,DEBUG 在 logger 层即被短路,不再
-    # 构造格式化参数——250 rps 下每秒数百次 log 调用的隐藏成本由此消除。
-    # 启动(Router listening)与认证拒绝仍为 INFO,文件里保留审计轨迹。
-    logging.getLogger("auto_squid").setLevel(logging.INFO)
+    # DEBUG。auto_squid logger 级别跟随 cfg.logging.level:默认 INFO 时 DEBUG
+    # 在 logger 层即被短路,不构造格式化参数(250 rps 下每秒数百次 log 调用的
+    # 隐藏成本由此消除);配 DEBUG 则打开 per-request 调试,与文件级别一致。
+    logging.getLogger("auto_squid").setLevel(level)
 
 
 app = typer.Typer()
