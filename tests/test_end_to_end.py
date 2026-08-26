@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import socket
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
@@ -3954,3 +3955,122 @@ class TestEstablishedTunnelReuse:
         assert s['established_pool_hits'] == 0
         assert s['established_pool_size'] == 0
         assert s['established_pool_returned'] == 0
+
+    @pytest.mark.asyncio
+    async def test_established_alive_probe_states(self):
+        """复用前活性探测三态:活(read 超时)→True;EOF(FIN)→False;脏残留→False。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router()
+        await r.start()
+        try:
+            # 活:对端空闲无数据 → read(1) 阻塞到超时 → 判活。
+            alive_r, alive_w = await asyncio.open_connection(HOST, 31991)
+            try:
+                assert await r._established_alive(alive_r, alive_w) is True
+            finally:
+                alive_w.close()
+            # EOF:对端已 FIN(数据读尽)→ read(1) 返回 b'' → 判死。
+            eof_r, eof_w = await asyncio.open_connection(HOST, 31991)
+            eof_r.feed_eof()
+            try:
+                assert await r._established_alive(eof_r, eof_w) is False
+            finally:
+                eof_w.close()
+            # 脏残留:上游残余缓冲数据 → read(1) 返回该字节 → 判死。
+            dirty_r, dirty_w = await asyncio.open_connection(HOST, 31991)
+            dirty_r.feed_data(b"X")
+            try:
+                assert await r._established_alive(dirty_r, dirty_w) is False
+            finally:
+                dirty_w.close()
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_cap_limits_pool_per_key(self):
+        """established 池单键上限=_ESTABLISHED_KEY_CAP(2):并发隧道归还超限被关闭。
+
+        并发 4 条同 (proxy,target) 隧道全新建(mock 的 CONNECT 计数 4),结束后
+        归还受 cap 限制:池最多驻 2 条,established_pool_returned 不超过 2。
+        """
+        hit_counter = []
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=hit_counter)
+        r = self._router()
+        await r.start()
+        try:
+            target = b"reuse-cap.example.com:443"
+
+            async def one(_i):
+                return await send_connect(HOST, ROUTER_PORT, target=target, payload=b"x")
+
+            echoes = await asyncio.gather(*[one(i) for i in range(4)])
+            assert echoes == [b"x"] * 4, f"all 4 tunnels must echo, got {echoes}"
+            key = f"{HOST}:31991|{target.decode()}"
+            # 等异步 finally 归还全部完成。
+            for _ in range(int(2.0 / 0.02)):
+                if r.established_pool_returned >= 2:
+                    break
+                await asyncio.sleep(0.02)
+            # 池大小受 per-key cap 约束:最多 2,不会涨到 4。
+            assert len(r._established_pool.get(key, [])) <= 2, \
+                f"per-key cap breached: {len(r._established_pool.get(key, []))}"
+            # hit_counter 应到 4:每次并发都是新建(池空启动,cap 限制下不无限复用)。
+            assert len(hit_counter) == 4
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_budget_includes_established_pool(self):
+        """established 池计入全局 conn_pool_total:预算耗尽时归还被 SKIP(close)。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        # conn_pool_total=1:先手动灌满 _conn_pool(占走全部预算),再归还 established
+        # 连接应超预算被关闭,而不是新增到已握手池。
+        r = self._router(conn_pool_total=1)
+        await r.start()
+        try:
+            # 手动注入 1 条到"其它 target"的目标池 key,占走全部预算(total=1)。
+            # 不能用 _conn_pool 的 proxy-key:当前 CONNECT 会 peek 通用池把它取走,
+            # 归还时预算又归零。用不同 target 的目标池 key 既能占预算、又不会被取用。
+            fake_r, fake_w = await asyncio.open_connection(HOST, 31991)
+            fake_w._conn_pool_created = time.monotonic()
+            r._target_pool[f"{HOST}:31991|other-target:443"] = [(fake_r, fake_w)]
+
+            target = b"reuse-budget.example.com:443"
+            echo = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"y")
+            assert echo == b"y"
+            # 归还应被预算检查拦下:established 池保持空。
+            await asyncio.sleep(0.2)
+            assert sum(len(v) for v in r._established_pool.values()) == 0, \
+                "established pool must stay empty when global budget is exhausted"
+            assert r.established_pool_returned == 0
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_pool_keepalive_set_on_return(self):
+        """归还到 established 池的连接设了 SO_KEEPALIVE(OS 兜底判死半开)。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router()
+        await r.start()
+        try:
+            target = b"reuse-keepalive.example.com:443"
+            echo = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"k")
+            assert echo == b"k"
+            assert await self._wait_returned(r, target)
+            key = f"{HOST}:31991|{target.decode()}"
+            _reader, writer = r._established_pool[key][0]
+            sock = writer.get_extra_info('socket')
+            assert sock is not None
+            if hasattr(socket, 'SO_KEEPALIVE'):
+                ka = sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE)
+                assert ka == 1, f"SO_KEEPALIVE should be 1, got {ka}"
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()

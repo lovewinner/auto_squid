@@ -87,6 +87,17 @@ _AGG_WAIT_TIMEOUT = 0.1
 # 下 _pending_cleanups 无界堆积(soak 模式曾观测 fd_peak 冲到 569)。
 _MAX_PENDING_CLEANUPS = 64
 
+# 已建握手隧道池(_established_pool)的 per-key 驻池上限。与 _target_pool_refill 的
+# cap=2 对齐:取走 1 条仍留 1 条备用,降低"取走即空→周期 miss";避免单 target
+# 占用过多 fd。全局仍受 conn_pool_total 钳制(归还/快照均计入)。
+_ESTABLISHED_KEY_CAP = 2
+
+# 复用已建握手连接前的活性探测超时(秒)。用 read(1)(read(0) 在 asyncio 会直接返回
+# b"" 不碰网络,做不了探测):对端 FIN→返回 b""(判死),RST→抛异常(判死),连接活且
+# 无数据→阻塞到超时(可复用)。纯半开靠 SO_KEEPALIVE 由 OS 兜底。50ms 足够廉价,
+# 不拖 TTFB。
+_ESTABLISHED_PROBE_TIMEOUT = 0.05
+
 # 错峰启动(staggered start,RFC 8305 §5)的配置下限。
 # 默认间隔 250ms,下限 100ms(绝对值下限 10ms,防止丢包率高时拥塞崩溃),上限 2s。
 # stagger_interval 由 __init__ 钳制到此区间,配置传 0/负值时落到默认。
@@ -1814,6 +1825,28 @@ class Router:
             except (OSError, AttributeError):
                 pass
 
+    @staticmethod
+    def _set_pool_keepalive(writer):
+        """对驻池连接设 SO_KEEPALIVE:OS 在 TCP_KEEPIDLE 后探测半开连接。
+
+        已握手隧道池(_established_pool)的复用前活性探测(read(1)+超时)只能查出对端
+        已发 FIN/RST 的死连接;纯半开(对端静默、连接仍 ESTABLISHED)会让 read 一直
+        阻塞到超时而误判"活"。启用 SO_KEEPALIVE 后 OS 在 KEEPIDLE(60s)后发探测包,
+        对端不可达即判死(RST/错误),进程内 read 随即收到异常——在驻池期间就把半开
+        清掉,而不是等到复用后首包才暴露。失败静默(部分平台/socket 阶段无 socket)。
+        """
+        try:
+            sock = writer.get_extra_info('socket')
+            if sock is None:
+                return
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            if hasattr(socket, 'TCP_KEEPIDLE'):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+            if hasattr(socket, 'TCP_KEEPINTVL'):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+        except (OSError, AttributeError):
+            pass
+
     # ── HTTP GET 缓存 ──────────────────────────────────────────
 
     def _http_cache_key(self, method: str, url: str) -> str:
@@ -2079,6 +2112,33 @@ class Router:
                     target, proxy_host, proxy_port, self.established_pool_hits)
         return reader, writer
 
+    async def _established_alive(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> bool:
+        """复用已握手连接前的廉价活性探测(不超过 _ESTABLISHED_PROBE_TIMEOUT)。
+
+        用 read(1):asyncio 的 read(0) 会在方法开头直接返回 b"" 不碰网络(故不可做
+        探测);read(1) 才真正阻塞等待数据/EOF:
+        - 超时(连接活且无数据)→ 可复用(探测被 wait_for 取消,未消费任何字节,无
+          状态残留,`_waiter` 置空即可);
+        - 返回 b""(对端已 FIN)→ 死,不可复用;
+        - 抛出(对端已 RST,reader._exception 设置)→ 死,不可复用;
+        - 返回非空 1 字节(上游残余/对端推送)→ 已脏,不可复用且该字节丢失可接受
+          (连接整条丢弃,宁可不复用也不污染)。
+
+        纯半开(对端静默、无 FIN 无数据)会让 read(1) 阻塞到超时 → 误判"活",由归还
+        时设的 SO_KEEPALIVE 由 OS 兜底判死(KEEPIDLE 60s 后探测)。返回 False 时
+        调用方负责丢弃连接并回落新建。
+        """
+        try:
+            data = await asyncio.wait_for(reader.read(1), timeout=_ESTABLISHED_PROBE_TIMEOUT)
+        except asyncio.TimeoutError:
+            return True          # 活且无数据,探测未消费任何字节
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False         # read 抛异常 → 对端已关/RST
+        # read(1) 返回了字节或 EOF
+        return False
+
     def _record_request_activity(self):
         """刷新"密集活动"时间戳(refill 空闲感知的活动信号)。
 
@@ -2147,9 +2207,10 @@ class Router:
         # 空闲暂停:深夜无请求时挂起补充,避免"建了又过期"的空转。
         if self._conn_pool_idle():
             return
-        # 快照当前空闲总数,防止并发补充超过全局预算(两阶段共享 conn_pool_total)。
+        # 快照当前空闲总数,防止并发补充超过全局预算(三池共享 conn_pool_total)。
         total_idle = sum(len(v) for v in self._conn_pool.values()) \
-            + sum(len(v) for v in self._target_pool.values())
+            + sum(len(v) for v in self._target_pool.values()) \
+            + sum(len(v) for v in self._established_pool.values())
         for proxy in self.proxy_store.list():
             if not proxy.enabled:
                 continue
@@ -2190,9 +2251,10 @@ class Router:
         if self._conn_pool_idle():
             return 0
         key = f"{proxy_host}:{proxy_port}|{target}"
-        # 全局 fd 预算:第一阶段 + 第二阶段共享,超限则不补。
+        # 全局 fd 预算:三池共享 conn_pool_total,超限则不补。
         total_idle = sum(len(v) for v in self._conn_pool.values()) \
-            + sum(len(v) for v in self._target_pool.values())
+            + sum(len(v) for v in self._target_pool.values()) \
+            + sum(len(v) for v in self._established_pool.values())
         made = 0
         while len(self._target_pool.get(key, [])) < cap and total_idle < self.conn_pool_total:
             try:
@@ -2723,6 +2785,14 @@ class Router:
                     # 跳过下方 CONNECT 握手,直接返回(连接已处于可透传状态)。
                     if self.conn_pool_established_reuse:
                         up_reader, up_writer = self._established_pool_peek(proxy_host, proxy_port, target) or (None, None)
+                        if up_reader is not None and not await self._established_alive(up_reader, up_writer):
+                            # 死/脏连接:丢弃(peek 已计 hits),不跳过多余 I/O、不影响下
+                            # 一候选判定——回落后续池/新建。避免一个 tick 赢竞速。
+                            self.established_pool_expired += 1
+                            logger.info("established pool DEAD-ON-PROBE %s via %s:%s",
+                                        target, proxy_host, proxy_port)
+                            _discard_conn(up_writer)
+                            up_reader = up_writer = None
                     if up_reader is None and self.conn_pool_target_prewarm:
                         up_reader, up_writer = self._target_pool_peek(proxy_host, proxy_port, target) or (None, None)
                     if up_reader is None:
@@ -3335,9 +3405,22 @@ class Router:
                             target, proxy_host, proxy_port)
                 can_reuse = False
             if can_reuse:
+                key = f"{proxy_host}:{proxy_port}|{target}"
+                # 预算/cap 检查:established 池计入全局 conn_pool_total(与另两池同口径),
+                # 单键再受 _ESTABLISHED_KEY_CAP 上限。超限则关闭不复用——宁可这次不省
+                # 建连也不让 fd 无界增长。
+                total_now = (sum(len(v) for v in self._conn_pool.values())
+                             + sum(len(v) for v in self._target_pool.values())
+                             + sum(len(v) for v in self._established_pool.values()))
+                if total_now >= self.conn_pool_total \
+                        or len(self._established_pool.get(key, [])) >= _ESTABLISHED_KEY_CAP:
+                    logger.info("established pool SKIP-RETURN %s via %s:%s (over budget/cap, returned=%d)",
+                                target, proxy_host, proxy_port, self.established_pool_returned)
+                    can_reuse = False
+            if can_reuse:
+                self._set_pool_keepalive(up_writer)
                 up_writer._conn_pool_created = time.monotonic()
-                self._established_pool.setdefault(
-                    f"{proxy_host}:{proxy_port}|{target}", []).append((up_reader, up_writer))
+                self._established_pool.setdefault(key, []).append((up_reader, up_writer))
                 self.established_pool_returned += 1
                 logger.info("established pool RETURN %s via %s:%s (returned=%d)",
                             target, proxy_host, proxy_port, self.established_pool_returned)

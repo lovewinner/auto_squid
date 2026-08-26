@@ -76,7 +76,7 @@ router:
     refill_target: 2
     connect_timeout: 10.0
     target_prewarm: true    # 第二阶段:命中缓存/粘性的高频 CONNECT target 预建"到上游"TCP
-    refill_pause_minutes: 60  # 空闲暂停(分钟):连续 N 分钟无"密集活动"(窗口内 ≥ 阈值个请求成簇)则挂起 refill/预热,新请求到来恢复。0=不暂停。生产实测:深夜 6h 空转白建 ~1400 条连接(100% 超时被清)
-    refill_pause_activity_window: 120  # 活动判定窗口(秒):窗口内请求数 ≥ refill_pause_min_requests 才算"密集活动"并刷新时间戳。真实流量是簇(一次页面加载多 hostname 并发 CONNECT,计数 5-30),后台心跳是孤例(计数 1-2)——据此区分,既不误伤真实孤立请求(旧 silence_sec 间隔一刀切会误伤间隔>120s 的真实请求)又免疫心跳。0=任意请求都刷新(旧行为)
-    refill_pause_min_requests: 3  # 活动判定窗口阈值:窗口内请求数 ≥ 此值才刷新活动时间戳;≤1 退化为任意请求都刷新
-    established_reuse: true   # 已建握手隧道复用:隧道结束若连接干净则归还池,同 (proxy,target) 复用跳过 CONNECT 握手,省掉重建(慢线路建连收益)
+    refill_pause_minutes: 0  # 空闲暂停(分钟):2026-08-26 已废弃置 0(不暂停)。生产实测:夜间心跳 2-5 分钟一簇,暂停永不触发;空转成本可接受(池峰值 12/64)。>0 时:连续 N 分钟无"密集活动"则挂起 refill/预热(保留机制供明确零流量场景)
+    refill_pause_activity_window: 120  # 活动判定窗口(秒):随 pause=0 停用,保留字段。窗口内请求数 ≥ min_requests 才算"密集活动"并刷新时间戳
+    refill_pause_min_requests: 3  # 活动判定窗口阈值:随 pause=0 停用,保留字段
+    established_reuse: true   # 已建握手隧道复用:隧道结束若连接干净则归还池,同 (proxy,target) 复用跳过 CONNECT 握手,省掉重建。受 conn_pool_total 全局预算 + per-key cap=2 约束;复用前 read(1) 活性探测 + SO_KEEPALIVE 判死,杜绝死隧道赢得竞速
