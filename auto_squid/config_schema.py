@@ -209,6 +209,12 @@ class ConnPoolConfig(ConfigBase):
                 并发 CONNECT,计数 5-30),心跳是孤例(窗口内计数 1,极少 2)——
                 据此区分,既不误伤真实请求,又免疫心跳。0=不启用窗口计数(任意
                 请求都刷新,旧行为)。
+    cluster_predict / cluster_window_sec / cluster_predict_topk / cluster_min_support /
+                请求簇预测预热(默认关闭):按客户端窗口的 CONNECT 簇共现规律学习
+                全局共现图,下次页面加载开口即预测同簇下一批 co-target 并提前预建
+                到上游的裸 TCP(不 CONNECT 源站)。错预建 30s 空闲即被淘汰,预算共享
+                conn_pool.total。cluster_predict 需 conn_pool.enabled +
+                target_prewarm 同时开启。
     """
     enabled: bool = Field(False, description="启用 CONNECT 上游 TCP 预热池")
     per_proxy: int = Field(4, description="每代理预热连接数上限")
@@ -223,14 +229,25 @@ class ConnPoolConfig(ConfigBase):
     refill_pause_activity_window: Optional[float] = Field(None, description="活动判定窗口(秒)。窗口计数:窗口内出现 ≥ refill_pause_min_requests 个客户端请求才算『活动』并刷新活动时间戳。真实流量是簇(一次页面加载数秒内多 hostname 并发),窗口内计数高;后台心跳(如 alive.github.com / client.wns.windows.com,间隔 3-10 分钟)是孤例,计数低——据此区分,既不误伤真实孤立请求,又免疫心跳。默认 None=用旧 silence_sec(等价窗口 ≈ silence_sec/4,或 120s);0=不启用窗口计数(任意请求都刷新,旧行为)")
     refill_pause_min_requests: int = Field(3, description="活动判定窗口阈值(默认 3):窗口(见 refill_pause_activity_window)内请求数 ≥ 此值才刷新活动时间戳。真实页面加载一次 ≥3 个 hostname 的 CONNECT 簇即达标;心跳(孤例)不达标。阈值 ≤1 时退化为『任意请求都刷新』")
     established_reuse: bool = Field(False, description="已建握手隧道复用:隧道结束若连接干净则归还池,下次同 (proxy,target) 请求复用已 CONNECT 握手的连接,跳过握手,省掉重建。仅当 conn_pool.enabled 为 True 时生效")
+    cluster_predict: bool = Field(False, description="请求簇预测预热:按客户端窗口的 CONNECT 簇共现规律,在窗口开口预测同簇下一批 co-target 并提前预建到上游代理的 TCP(不 CONNECT 源站)。仅当 conn_pool.enabled 且 target_prewarm 为 True 时生效")
+    cluster_window_sec: float = Field(2.0, description="簇窗口宽(秒):同一客户端窗口内观察到的目标算一簇;下一请求距上一请求超过窗口宽则关闭并学习上一窗口")
+    cluster_predict_topk: int = Field(3, description="窗口开口时预测的 co-target 数上限(按共现支持度取前 K,跳过当前窗口已观察的目标)")
+    cluster_min_support: int = Field(2, description="co 关系需达到的最低共现窗口数才产生预测(免疫单次偶然共现)")
+    cluster_graph_ttl_sec: int = Field(86400, description="共现图条目的 TTL(秒):超过未再共现的 (src→co) 边被周期清理")
+    cluster_graph_max_entries: int = Field(100_000, description="共现图边数硬上限,超限驱逐 last_seen 最旧的边(防高基数 URL 内存无界,仿 sticky max_entries)")
+    cluster_predict_throttle_sec: float = Field(30.0, description="同一 (src→co) 对的预测节流间隔(秒):节流内不重复发射,防 reload 反复预建")
 
     @model_validator(mode="after")
     def _gate_on_enabled(self):
-        # 第二阶段/第三阶段依赖总开关:#12 把它们配置成隐性依赖会给出费解的静默失效
-        # (开了 target_prewarm 却没开 enabled,功能不生效且无日志)。这里显式硬报错。
+        # 第二/三阶段与集群预测依赖总开关:#12 把它们配成隐性依赖会给出费解的静默
+        # 失效(开了 target_prewarm 却没开 enabled,功能不生效且无日志)。这里显式硬报错。
         if (self.target_prewarm or self.established_reuse) and not self.enabled:
             raise ValueError(
                 "conn_pool.target_prewarm / established_reuse require conn_pool.enabled=True")
+        if self.cluster_predict and not self.enabled:
+            raise ValueError("conn_pool.cluster_predict requires conn_pool.enabled=True")
+        if self.cluster_predict and not self.target_prewarm:
+            raise ValueError("conn_pool.cluster_predict requires conn_pool.target_prewarm=True")
         return self
 
 

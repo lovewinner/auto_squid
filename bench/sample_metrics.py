@@ -73,6 +73,12 @@ FIELD_ORDER = [
     "target_prewarm_dispatched",# 预热协程发起次数
     "target_prewarm_success",   # 预热建连成功次数
     "target_prewarm_failed",    # 预热建连失败次数
+    # 请求簇预测预热(ClusterGraph)
+    "cluster_predict",          # 簇预测预热是否启用(状态)
+    "cluster_windows_learned",  # 已学习的簇窗口数(共现学习量)
+    "cluster_predictions",      # 预测发射次数(含节流跳过前的候选集)
+    "cluster_prewarm_spawned",  # 预测实际发起的预热数(重点指标:预测预建量)
+    "cluster_graph_size",       # 共现图边数(记忆规模,应受 max_entries 约束)
     # 熔断/探活
     "circuit_open_count",       # 当前熔断的代理数
     "probes_sent",              # 后台探活已发
@@ -107,6 +113,11 @@ FIELD_DOCS = {
     "target_prewarm_dispatched": "预热协程发起次数",
     "target_prewarm_success": "预热建连成功次数",
     "target_prewarm_failed": "预热建连失败次数",
+    "cluster_predict": "簇预测预热是否启用(状态)",
+    "cluster_windows_learned": "已学习的簇窗口数",
+    "cluster_predictions": "预测发射次数",
+    "cluster_prewarm_spawned": "预测实际发起的预热数",
+    "cluster_graph_size": "共现图边数",
     "circuit_open_count": "熔断中的代理数",
     "probes_sent": "探活已发",
     "probes_ok": "探活成功",
@@ -123,6 +134,7 @@ NO_DELTA_FIELDS = {
     "conn_pool_idle_paused",
     "conn_pool_refill_pause_activity_window",
     "conn_pool_refill_pause_min_requests",
+    "cluster_predict",
 }
 
 # 优化分析重点关注字段(供 grep 快速定位)
@@ -133,6 +145,8 @@ FOCUS = [
     "conn_pool_hits",
     "conn_pool_expired",
     "racing_invocations",
+    "cluster_prewarm_spawned",
+    "cluster_predictions",
 ]
 
 

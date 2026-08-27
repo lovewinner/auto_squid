@@ -16,6 +16,7 @@ from auto_squid.router import (
     _MAX_REQUEST_HEADER_LINES, _MAX_REQUEST_HEADER_BYTES,
     _AGG_WAIT_TIMEOUT,
 )
+from auto_squid.cluster import ClusterGraph
 from auto_squid.config_schema import (
     ProxyInfo, PolicyConfig, Config, RouterConfig, ConnPoolConfig, LoggingConfig,
 )
@@ -4142,6 +4143,228 @@ class TestEstablishedTunnelReuse:
             await up_srv.wait_closed()
 
 
+class TestClusterPredictor:
+    """请求簇预测预热(ClusterGraph):客户端窗口分组、全局共现图学习、窗口开口
+    预测并提前预建同簇 co-target 的 TCP。单元级直接构造 ClusterGraph + 记录式
+    spawn stub 驱动(注入合成时钟,零事件循环噪音);E2E 级用 send_connect 打真实
+    CONNECT 到 mock 上游,验证预测预建最终落入 (proxy, co-target) 目标池。"""
+
+    @staticmethod
+    def _graph(**kw) -> ClusterGraph:
+        """直接构造 ClusterGraph(默认 enabled + 一个可解析的代理 p)。"""
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host=HOST, port=31991))
+        kw.setdefault('enabled', True)
+        return ClusterGraph(store, **kw)
+
+    @staticmethod
+    def _stub_spawn():
+        """记录式 spawn stub:(host, port, target) → 追加到 calls。"""
+        class _Stub:
+            def __init__(self):
+                self.calls = []
+            def __call__(self, host, port, target):
+                self.calls.append((host, port, target))
+        return _Stub()
+
+    @staticmethod
+    def _observe_window(g, ip, targets, pid='p', t0=10.0):
+        """把 targets 作为一簇观察进同一窗口(全部落在窗口宽内),不关窗。"""
+        for t in targets:
+            g.observe(ip, t, pid, now=t0)
+        return t0
+
+    @classmethod
+    def _learn(cls, g, ip, targets, pid='p', t0=10.0):
+        """观察一簇目标后,用超过窗口宽的下一请求触发批量关闭学习(窗内共现入图)。
+
+        各测试调用需递增 t0(步长 ≥ 12s > window_sec + close 偏移),避免后续观察
+        误入上一关窗标记的窗口中。
+        """
+        cls._observe_window(g, ip, targets, pid, t0)
+        g.observe(ip, 'close-marker.example:443', pid, now=t0 + 10.0)
+
+    def test_window_groups_burst(self):
+        """同一客户端 2s 内的并发 CONNECT 归同一窗口(簇),不提前关窗学习。"""
+        g = self._graph(min_support=1)
+        try:
+            g.observe('9.9.9.9', 'a.com:443', 'p', now=10.0)
+            g.observe('9.9.9.9', 'b.com:443', 'p', now=10.05)   # 距 a 0.05s < 2s → 同窗
+            g.observe('9.9.9.9', 'c.com:443', 'p', now=10.1)
+            assert g.cluster_windows_learned == 0               # 窗口未关即未学习
+            g.observe('9.9.9.9', 'a.com:443', 'p', now=13.0)   # 距首请求 3s > 2s → 关窗学习
+            assert g.cluster_windows_learned == 1
+            assert g._active_windows['9.9.9.9'].observed == [('a.com:443', 'p')]
+        finally:
+            g.reset()
+
+    def test_learn_cooccurrence_on_window_close(self):
+        """窗口关闭学习共现:同窗 (a,b,c) → 双向边 hits=1(去重)、probe_pid 正确。"""
+        g = self._graph()
+        try:
+            g.observe('9.9.9.9', 'a.com:443', 'p', now=10.0)
+            g.observe('9.9.9.9', 'b.com:443', 'p', now=10.05)
+            g.observe('9.9.9.9', 'c.com:443', 'p', now=10.1)
+            g.observe('9.9.9.9', 'a.com:443', 'p', now=10.2)   # 同窗重复 → 去重,不双倍计数
+            g.observe('9.9.9.9', 'x.example:443', 'p', now=20.0)  # 距首请求 > 窗口宽 → 关窗学习
+            assert g.cluster_windows_learned == 1
+            snap = g.get_cluster_cache()
+            assert snap['a.com:443']['b.com:443'] == (1, 'p')
+            assert snap['b.com:443']['a.com:443'] == (1, 'p')
+            assert snap['b.com:443']['c.com:443'] == (1, 'p')
+            assert snap['a.com:443']['c.com:443'] == (1, 'p')
+            # 关窗触发器(x.example)不在被学窗口内 → 不产生任何边。
+            assert 'a.com:443' not in snap.get('x.example:443', {})
+        finally:
+            g.reset()
+
+    def test_min_support_gates_prediction(self):
+        """min_support:单次共现(< 阈值)不预测;达到支持度后窗口开口即发射。"""
+        # 情形 1:min_support=1,一次学习即可预测。
+        spawn = self._stub_spawn()
+        g = self._graph(min_support=1, prewarm_spawn=spawn)
+        try:
+            self._learn(g, '7.7.7.7', ['a.com:443', 'b.com:443'], t0=10.0)
+            assert g.cluster_windows_learned == 1
+            g.observe('7.7.7.7', 'a.com:443', 'p', now=30.0)   # 新窗开口带 pid → 预测 b
+            assert g.cluster_predictions == 1
+            assert g.cluster_prewarm_spawned == 1
+            assert spawn.calls == [(HOST, 31991, 'b.com:443')]
+        finally:
+            g.reset()
+        # 情形 2:min_support=2,首次共现不预测,第二次学习后才发射。
+        spawn2 = self._stub_spawn()
+        g = self._graph(min_support=2, prewarm_spawn=spawn2)
+        try:
+            self._learn(g, '7.7.7.7', ['a.com:443', 'b.com:443'], t0=10.0)
+            g.observe('7.7.7.7', 'a.com:443', 'p', now=30.0)   # 支持度 1 < 2 → 不发射
+            assert g.cluster_predictions == 0
+            assert g.cluster_prewarm_spawned == 0
+            assert spawn2.calls == []
+            self._learn(g, '7.7.7.7', ['a.com:443', 'b.com:443'], t0=40.0)
+            g.observe('7.7.7.7', 'a.com:443', 'p', now=60.0)   # 支持度 2 → 发射
+            assert g.cluster_predictions == 1
+            assert g.cluster_prewarm_spawned == 1
+            assert spawn2.calls == [(HOST, 31991, 'b.com:443')]
+        finally:
+            g.reset()
+
+    def test_prediction_skips_co_in_window(self):
+        """窗口开口预测跳过当前窗口已观察的目标;按 probe_pid 解析到 (host, port) 发射。"""
+        spawn = self._stub_spawn()
+        g = self._graph(min_support=1, prewarm_spawn=spawn)
+        try:
+            self._learn(g, '7.7.7.7', ['a.com:443', 'b.com:443', 'c.com:443'], t0=10.0)
+            g.observe('7.7.7.7', 'a.com:443', 'p', now=30.0)   # 新窗开口:a 首带 pid → 预测 co
+            assert spawn.calls == [(HOST, 31991, 'b.com:443'), (HOST, 31991, 'c.com:443')]
+            g.observe('7.7.7.7', 'b.com:443', 'p', now=30.05)  # b 已真实到达,窗内已含 → 不重预测
+            g.observe('7.7.7.7', 'c.com:443', 'p', now=30.1)
+            assert g.cluster_predictions == 1                  # 整窗至多预测一次
+        finally:
+            g.reset()
+
+    def test_throttle_suppresses_reload_repredict(self):
+        """同 (src→co) 对在节流窗内不重复发射,防 reload 反复预建。"""
+        spawn = self._stub_spawn()
+        g = self._graph(min_support=1, prewarm_spawn=spawn, throttle_sec=30.0)
+        try:
+            self._learn(g, '7.7.7.7', ['a.com:443', 'b.com:443'], t0=10.0)
+            g.observe('7.7.7.7', 'a.com:443', 'p', now=30.0)   # 预测 b,节流开始(now=30)
+            assert g.cluster_predictions == 1
+            assert len(spawn.calls) == 1
+            self._learn(g, '7.7.7.7', ['a.com:443', 'b.com:443'], t0=40.0)
+            g.observe('7.7.7.7', 'a.com:443', 'p', now=55.0)   # 距上次 25s < 30s → 节流跳过
+            assert g.cluster_predictions == 1
+            assert len(spawn.calls) == 1
+            self._learn(g, '7.7.7.7', ['a.com:443', 'b.com:443'], t0=70.0)
+            g.observe('7.7.7.7', 'a.com:443', 'p', now=90.0)   # 距上次 60s > 30s → 恢复发射
+            assert g.cluster_predictions == 2
+            assert len(spawn.calls) == 2
+        finally:
+            g.reset()
+
+    def test_graph_cap_lru_evicts_oldest(self):
+        """边数超 max_entries → 淘汰 last_seen 最旧的边(LRU 上限,仿 sticky)。"""
+        g = self._graph(max_entries=3)
+        try:
+            self._learn(g, '6.6.6.6', ['a.com:443', 'b.com:443'], t0=10.0)  # a|b、b|a
+            self._learn(g, '6.6.6.6', ['a.com:443', 'c.com:443'], t0=30.0)  # +a|c、c|a → 4 边 > 3
+            assert g.graph_size() == 3                       # 超限即淘汰最旧(a→b,last_seen=10)
+            snap = g.get_cluster_cache()
+            assert 'b.com:443' in snap                        # b→a 仍在(direction 各自独立)
+            assert 'b.com:443' not in snap['a.com:443']       # a→b 已被 LRU 淘汰
+            assert snap['a.com:443'] == {'c.com:443': (1, 'p')}
+        finally:
+            g.reset()
+
+    def test_prune_ttl_and_stale_window_close(self):
+        """prune:TTL 过期边清理;越过窗口宽未关的陈旧窗口兜底关窗学习。"""
+        spawn = self._stub_spawn()
+        g = self._graph(prewarm_spawn=spawn, ttl_sec=3600)
+        try:
+            self._learn(g, '7.7.7.7', ['a.com:443', 'b.com:443'], t0=10.0)  # 关窗时刻 20.0 → 边 last_seen=20
+            assert g.graph_size() == 2
+            g.prune(now=20.0 + 3600 + 1)                     # 距 last_seen 超过 ttl → 边清理
+            assert g.graph_size() == 0
+            # 陈旧窗口:观察后不关,prune 兜底关闭并学习(c,d 同窗共现)。
+            g.observe('5.5.5.5', 'c.com:443', 'p', now=1000.0)
+            g.observe('5.5.5.5', 'd.com:443', 'p', now=1001.0)
+            assert g.cluster_windows_learned == 1            # 仅 a|b 一窗已学
+            g.prune(now=1010.0)                              # 1010-1000=10s > 2s → 关窗
+            assert g.cluster_windows_learned == 2
+            assert g.graph_size() == 2                       # c|d、d|c 双向边
+        finally:
+            g.reset()
+
+    @pytest.mark.asyncio
+    async def test_e2e_learn_then_predict_prewarms(self):
+        """端到端:一个窗口内两个 CONNECT('page-a','page-b')同簇入窗学习;再开新窗
+        先连 page-a → 预测 page-b 并预建 (proxy, page-b) 的 TCP 进 _target_pool。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router()
+        await r.start()
+        key = f"{HOST}:31991|page-b.example.com:443"
+        try:
+            # 第一窗:page-a 与 page-b 同簇学习(同 client_ip,两个 CONNECT 间隔远小于
+            # cluster_window_sec=2s → 同一窗口)。flush 周期 5s 太久,直接 sleep 越过
+            # 窗口宽后手动 prune 关窗学习。
+            await send_connect(HOST, ROUTER_PORT, target=b"page-a.example.com:443", payload=b"a")
+            await send_connect(HOST, ROUTER_PORT, target=b"page-b.example.com:443", payload=b"b")
+            await asyncio.sleep(2.2)          # > cluster_window_sec(2.0)
+            r.cluster.prune()
+            assert r.cluster_windows_learned == 1, "第一窗 (page-a,page-b) 应已学习"
+            assert r.cluster_prewarm_spawned == 0
+            # 第二窗:先连 page-a → 窗口开口预测 page-b 并预建(经 _spawn_target_prewarm)。
+            await send_connect(HOST, ROUTER_PORT, target=b"page-a.example.com:443", payload=b"a2")
+            for _ in range(200):
+                if r.cluster_prewarm_spawned >= 1 and len(r._target_pool.get(key, [])) >= 1:
+                    break
+                await asyncio.sleep(0.01)
+            assert r.cluster_predictions >= 1, "窗口开口应预测 page-a 的 co-target"
+            assert r.cluster_prewarm_spawned >= 1, "预测应实际发射预建"
+            assert len(r._target_pool.get(key, [])) >= 1, "预测预建应落入 (proxy, page-b) 目标池"
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @staticmethod
+    def _router(**kw) -> Router:
+        """e2e 用 Router:enable 全链(cluster 依赖 conn_pool.enabled + target_prewarm)。"""
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host=HOST, port=31991))
+        kw.setdefault('conn_pool_enabled', True)
+        kw.setdefault('conn_pool_target_prewarm', True)
+        kw.setdefault('cluster_predict', True)
+        # e2e 只有一窗学习,min_support 默认 2 会门住预测 → 降到 1。
+        kw.setdefault('cluster_min_support', 1)
+        kw.setdefault('conn_pool_per_proxy', 4)
+        kw.setdefault('conn_pool_total', 8)
+        kw.setdefault('conn_pool_refill_interval', 0.0)  # 只取不补(测试手动触发)
+        return Router(store, listen_host='127.0.0.1', listen_port=ROUTER_PORT,
+                      db_path=tempfile.mktemp(suffix='.db'), **kw)
+
+
 class TestRouterConfigPassThrough:
     """回归 #15:Router(router_cfg=...) 与逐 kwarg 构造完全等价(配置单一真相源)。
 
@@ -4192,6 +4415,11 @@ class TestRouterConfigPassThrough:
             conn_pool_refill_pause_activity_window=pc.refill_pause_activity_window,
             conn_pool_refill_pause_min_requests=pc.refill_pause_min_requests,
             conn_pool_established_reuse=pc.established_reuse,
+            cluster_predict=pc.cluster_predict, cluster_window_sec=pc.cluster_window_sec,
+            cluster_predict_topk=pc.cluster_predict_topk, cluster_min_support=pc.cluster_min_support,
+            cluster_graph_ttl_sec=pc.cluster_graph_ttl_sec,
+            cluster_graph_max_entries=pc.cluster_graph_max_entries,
+            cluster_predict_throttle_sec=pc.cluster_predict_throttle_sec,
             policies=list(c.policies),
         )
 
@@ -4217,7 +4445,11 @@ class TestRouterConfigPassThrough:
             conn_pool=dict(enabled=True, per_proxy=3, total=20, idle_timeout=15.0,
                            refill_interval=2.0, refill_target=1, connect_timeout=5.0,
                            target_prewarm=True, established_reuse=True,
-                           refill_pause_minutes=0.0),
+                           refill_pause_minutes=0.0,
+                           cluster_predict=True, cluster_window_sec=3.5,
+                           cluster_predict_topk=5, cluster_min_support=3,
+                           cluster_graph_max_entries=5000, cluster_graph_ttl_sec=7200,
+                           cluster_predict_throttle_sec=15.0),
         )
 
     def _router(self, **kw) -> Router:
@@ -4588,8 +4820,25 @@ class TestConfigSchemaStrict:
             ConnPoolConfig(enabled=False, established_reuse=True)
         assert "conn_pool.enabled" in str(ei.value)
 
+    def test_conn_pool_cluster_requires_enabled(self):
+        # cluster_predict 依赖 conn_pool.enabled(第三阶段隐性依赖显式化)。
+        with pytest.raises(Exception) as ei:
+            ConnPoolConfig(enabled=False, cluster_predict=True)
+        assert "conn_pool.cluster_predict" in str(ei.value)
+
+    def test_conn_pool_cluster_requires_target_prewarm(self):
+        # cluster_predict 依赖 conn_pool.target_prewarm(预测预建经由目标池发射)。
+        with pytest.raises(Exception) as ei:
+            ConnPoolConfig(enabled=True, cluster_predict=True, target_prewarm=False)
+        assert "conn_pool.cluster_predict" in str(ei.value)
+
+    def test_conn_pool_cluster_requires_both_gates(self):
+        """cluster_predict 在 enabled+target_prewarm 齐开时通过(全链依赖满足)。"""
+        ConnPoolConfig(enabled=True, target_prewarm=True, cluster_predict=True)
+
     def test_conn_pool_enabled_allows_stages(self):
         ConnPoolConfig(enabled=True, target_prewarm=True, established_reuse=True)
+        ConnPoolConfig(enabled=True, target_prewarm=True, cluster_predict=True)
 
     def test_logging_bad_level_rejected(self):
         with pytest.raises(Exception) as ei:

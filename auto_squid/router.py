@@ -52,6 +52,7 @@ from .selector import (ProxySelector, _CIRCUIT_THRESHOLD, _CIRCUIT_MAX_BACKOFF,
                        _SLOW_START_WINDOW, _SLOW_START_SUCCESS, _LB_BIAS_DEFAULT)
 from .http_cache import HttpCache, CACHEABLE_STATUS, _INVALIDATING_METHODS
 from .sticky import StickyCache
+from .cluster import ClusterGraph
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +151,7 @@ class Router:
     生命周期:start() 开始监听 → handle_client 处理每个连接 → stop() 优雅关闭。
     """
 
-    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False, conn_pool_refill_pause_minutes: float = 60.0, conn_pool_refill_pause_silence_sec: float = 120.0, conn_pool_refill_pause_activity_window: Optional[float] = None, conn_pool_refill_pause_min_requests: int = 3, conn_pool_established_reuse: bool = False, router_cfg: Optional[RouterConfig] = None):
+    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False, conn_pool_refill_pause_minutes: float = 60.0, conn_pool_refill_pause_silence_sec: float = 120.0, conn_pool_refill_pause_activity_window: Optional[float] = None, conn_pool_refill_pause_min_requests: int = 3, conn_pool_established_reuse: bool = False, cluster_predict: bool = False, cluster_window_sec: float = 2.0, cluster_predict_topk: int = 3, cluster_min_support: int = 2, cluster_graph_ttl_sec: int = 86400, cluster_graph_max_entries: int = 100_000, cluster_predict_throttle_sec: float = 30.0, router_cfg: Optional[RouterConfig] = None):
         """构造路由器。
 
         参数:
@@ -315,6 +316,13 @@ class Router:
             conn_pool_refill_pause_activity_window = pc.refill_pause_activity_window
             conn_pool_refill_pause_min_requests = pc.refill_pause_min_requests
             conn_pool_established_reuse = pc.established_reuse
+            cluster_predict = pc.cluster_predict
+            cluster_window_sec = pc.cluster_window_sec
+            cluster_predict_topk = pc.cluster_predict_topk
+            cluster_min_support = pc.cluster_min_support
+            cluster_graph_ttl_sec = pc.cluster_graph_ttl_sec
+            cluster_graph_max_entries = pc.cluster_graph_max_entries
+            cluster_predict_throttle_sec = pc.cluster_predict_throttle_sec
             policies = list(c.policies)
         self.proxy_store = proxy_store
         self.selector = ProxySelector(
@@ -472,6 +480,22 @@ class Router:
             pause_minutes=conn_pool_refill_pause_minutes, pause_silence_sec=conn_pool_refill_pause_silence_sec,
             pause_activity_window=conn_pool_refill_pause_activity_window,
             pause_min_requests=conn_pool_refill_pause_min_requests)
+
+        # ── 请求簇预测预热(ClusterGraph,#新增:观察见 _cluster_observe)──────
+        # 全局共现图 + 客户端瞬态窗口(不超过 window_sec)。总闸 = conn_pool 第二
+        # 阶段开启且启用 cluster_predict(未启用时 observe 为近乎空操作,零状态)。
+        # prewarm_spawn 注入 Router._spawn_target_prewarm(绑定方法)——预测只走
+        # 既有预建通道,受 conn_pool 门/fd 预算/空闲暂停约束,错预建 30s 自动回收。
+        self.cluster = ClusterGraph(
+            proxy_store,
+            enabled=(cluster_predict and conn_pool_enabled and conn_pool_target_prewarm),
+            window_sec=cluster_window_sec,
+            predict_topk=cluster_predict_topk,
+            min_support=cluster_min_support,
+            ttl_sec=cluster_graph_ttl_sec,
+            max_entries=cluster_graph_max_entries,
+            throttle_sec=cluster_predict_throttle_sec,
+            prewarm_spawn=self._spawn_target_prewarm)
 
         # ── 数据持久化 ──────────────────────────────────────────
         self._db_path = db_path
@@ -762,6 +786,7 @@ class Router:
                 try:
                     self._flush_to_db()
                     self._prune_sticky()
+                    self.cluster.prune()
                 except Exception:
                     logger.exception("background flush failed")
         except asyncio.CancelledError:
@@ -987,6 +1012,11 @@ class Router:
             "target_prewarm_dispatched": self.target_prewarm_dispatched,
             "target_prewarm_success": self.target_prewarm_success,
             "target_prewarm_failed": self.target_prewarm_failed,
+            "cluster_predict": self.cluster.enabled,
+            "cluster_windows_learned": self.cluster.cluster_windows_learned,
+            "cluster_predictions": self.cluster.cluster_predictions,
+            "cluster_prewarm_spawned": self.cluster.cluster_prewarm_spawned,
+            "cluster_graph_size": self.cluster.graph_size(),
             "conn_pool_established_reuse": self.conn_pool_established_reuse,
             "established_pool_hits": self.established_pool_hits,
             "established_pool_misses": self.established_pool_misses,
@@ -2423,6 +2453,9 @@ class Router:
                         # CONNECT 目标半预连接(P2):粘性命中说明该 target 高频,
                         # 后台预热下一条到上游代理的 TCP(不阻塞本请求)。
                         self._spawn_target_prewarm(proxy.host, proxy.port, target)
+                    # 请求簇预测预热:把该 target 连同胜出代理记入客户端窗口(windows
+                    # 关闭时学习全局共现图;开启新窗口时预测同簇 co-target 预建)。
+                    self.cluster.observe(client_ip, target, sticky_pid)
                     logger.debug("proxy %s sticky hit CONNECT %s", pid, target)
                     self.sticky_cache_hits += 1
                     self._bump_sticky(client_ip, target, sticky_pid)
@@ -2453,6 +2486,8 @@ class Router:
                     # CONNECT 目标半预连接(P2):域名缓存命中说明该 target 高频,
                     # 后台预热下一条到上游代理的 TCP(不阻塞本请求)。
                     self._spawn_target_prewarm(proxy.host, proxy.port, target)
+                # 请求簇预测预热:域缓存命中即 target 高频,同 sticky 分支记入客户端窗口。
+                self.cluster.observe(client_ip, target, cached_pid)
                 logger.debug("proxy %s cache hit CONNECT %s", pid, target)
                 self._record_sticky(client_ip, target, cached_pid)
                 await self._connect_established(client_writer, up_writer)
@@ -2513,6 +2548,8 @@ class Router:
                 win_proxy = self.proxy_store.get(pid)
                 if win_proxy is not None:
                     self._spawn_target_prewarm(win_proxy.host, win_proxy.port, target)
+            # 请求簇预测预热:竞速胜出同样记入客户端窗口(页面的每一跳都是一簇一员)。
+            self.cluster.observe(client_ip, target, pid)
             await self._connect_established(client_writer, up_writer)
             await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer,
                                      win_proxy.host if pid != 'local' and win_proxy is not None else None,
@@ -2520,7 +2557,9 @@ class Router:
                                      target)
             return
 
-        # 4) 全失败:回写 502 并关闭客户端连接。
+        # 4) 全失败:回写 502 并关闭客户端连接。仍记入客户端窗口(浏览器可能再次
+        #    连接;pid=None 使该目标不进预测,但簇成员关系仍被学习)。
+        self.cluster.observe(client_ip, target, None)
         logger.error("all proxies failed for CONNECT to %s", target)
         try:
             client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n\r\nBad Gateway")
@@ -2570,6 +2609,9 @@ class Router:
         # 关闭 CONNECT 预热池(P1):停补充循环,关闭全部预热连接。
         # (#14 pools 自管 refill 循环 task,stop() 收敛在此)
         await self.pools.stop()
+        # 请求簇预测预热:停用即清空瞬态窗口与共现图(簇是瞬态观察,不落盘)。
+        if self.cluster.enabled:
+            self.cluster.reset()
         # 排空竞速败者的后台清理 task:它们正在 aclose 流式 resp / 关上游裸连接,
         # 必须在 _db.close() 前完成,否则连接泄漏(ResourceWarning)。
         if self._pending_cleanups:
@@ -2638,21 +2680,29 @@ class Router:
         '_get_sticky_proxy', '_sticky_recheck_due', '_sticky_degrade_due',
         '_record_sticky', '_bump_sticky', '_evict_sticky', '_evict_oldest_sticky',
         '_prune_sticky'})
+        # 请求簇预测预热(#新增):ClusterGraph(self.cluster) 持有窗口/图/计数,
+        # 白名单成员转发到协作对象,观察点与快照引用原样解析。
+    _CLUSTER_FORWARD = frozenset({
+        'cluster_windows_learned', 'cluster_predictions', 'cluster_prewarm_spawned',
+        '_active_windows', '_cooccur', '_last_predict',
+        'observe', 'maybe_predict', 'prune', 'reset', 'graph_size', 'get_cluster_cache'})
 
     def __getattr__(self, name):
         # 仅在实例属性/类属性都未命中时被调用(正常查找失败);白名单成员转发到
-        # 对应协作类(pools/httpcache/sticky)。
+        # 对应协作类(pools/httpcache/sticky/cluster)。
         if name in Router._POOL_FORWARD:
             return getattr(self.pools, name)
         if name in Router._CACHE_FORWARD:
             return getattr(self.httpcache, name)
         if name in Router._STICKY_FORWARD:
             return getattr(self.sticky, name)
+        if name in Router._CLUSTER_FORWARD:
+            return getattr(self.cluster, name)
         raise AttributeError(f"{type(self).__name__} has no attribute {name!r}")
 
     def __setattr__(self, name, value):
-        # 构造期协作类(self.pools/self.httpcache/self.sticky)尚未存在时走正常
-        # 赋值;建好后白名单成员 set 到对应协作类(如 sticky_cache_hits += 1
+        # 构造期协作类(self.pools/self.httpcache/self.sticky/self.cluster)尚未存在时
+        # 走正常赋值;建好后白名单成员 set 到对应协作类(如 sticky_cache_hits += 1
         # 读转发 get + set 转发到 sticky,不重绑 Router 上的名字)。
         if name in Router._POOL_FORWARD and 'pools' in self.__dict__:
             setattr(self.pools, name, value)
@@ -2662,6 +2712,9 @@ class Router:
             return
         if name in Router._STICKY_FORWARD and 'sticky' in self.__dict__:
             setattr(self.sticky, name, value)
+            return
+        if name in Router._CLUSTER_FORWARD and 'cluster' in self.__dict__:
+            setattr(self.cluster, name, value)
             return
         super().__setattr__(name, value)
 
