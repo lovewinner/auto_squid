@@ -34,7 +34,6 @@
 import asyncio
 import base64
 import logging
-import random
 import re
 import socket
 import sqlite3
@@ -49,6 +48,10 @@ from .proxy_store import ProxyStore
 from .auth import check_auth
 from .config_schema import PolicyConfig, RouterConfig
 from .pools import ConnectionPools, _discard_conn, _ESTABLISHED_KEY_CAP, _ESTABLISHED_PROBE_TIMEOUT
+from .selector import (ProxySelector, _CIRCUIT_THRESHOLD, _CIRCUIT_MAX_BACKOFF,
+                       _SLOW_START_WINDOW, _SLOW_START_SUCCESS, _LB_BIAS_DEFAULT)
+from .http_cache import HttpCache, CACHEABLE_STATUS, _INVALIDATING_METHODS
+from .sticky import StickyCache
 
 logger = logging.getLogger(__name__)
 
@@ -63,18 +66,9 @@ STREAM_CACHE_LIMIT = 1 * 1024 * 1024  # 1 MiB
 # 后台 flush 周期(秒):把内存里累积的胜出统计/元数据批量落盘。
 FLUSH_INTERVAL = 5.0
 
-# 可缓存的响应状态码。除 2xx 外,纳入幂等的 3xx 重定向(301/302/304)与
-# 404/410——这些对象在真实流量中占比高且高度幂等:真实源站对随机路径常回
-# 301/302/404,原"仅 2xx"策略使 HTTP 响应缓存对真实流量几乎完全失效
-# (压测见 http_cache_entries_end 恒为 0)。5xx/4xx 中仅 404/410 安全可缓存
-# (其余如 502 可能瞬态,缓存会放大故障)。
-CACHEABLE_STATUS = frozenset({200, 203, 300, 301, 302, 304, 404, 410})
-
-# 会改写资源的请求方法。命中即失效该 URL 的 GET 响应缓存,使随后的 GET
-# 回源拿到变更后的内容,而不是 60s TTL 内返回变更前的旧响应体。缓存键为
-# "GET:<url>",写方法不会被缓存(_http_cache_set 对非 GET 直接 return),
-# 故失效只需按同一 URL 删 GET 条目;无需前缀扫描。
-_INVALIDATING_METHODS = frozenset({'POST', 'PUT', 'DELETE', 'PATCH'})
+# 可缓存状态码(CACHEABLE_STATUS)与写方法(_INVALIDATING_METHODS)随 http_cache
+# 拆分搬入 http_cache.py,顶部 re-import(http_cache 方法与 _handle_http_request/
+# _forward_single 两端共用)。
 
 # 在途 GET 去重聚合的等待超时(秒)。waiter 发现同 URL 有在途请求时 await 其
 # Future;超过该阈值仍未完成(首个请求上游慢)则放弃聚合、自行竞速,避免在
@@ -108,25 +102,10 @@ _STAGGER_MIN_MS = 100
 _STAGGER_ABS_MIN_MS = 10
 _STAGGER_MAX_MS = 2000
 
-# 熔断器默认参数。连续失败 _CIRCUIT_THRESHOLD 次后熔断,退避期 circuit_until 按
-# 指数增长(初始 1s,每次翻倍,上限 _CIRCUIT_MAX_BACKOFF)。退避期内该代理不参与
-# 竞速/单发。退避到期后置 started_at=now 进入 slow-start:排序垫底、低权重,累计
-# _SLOW_START_SUCCESS 次成功(或窗口期满)才恢复完整权重,防冷启动被打懵。
-_CIRCUIT_THRESHOLD = 3
-_CIRCUIT_MAX_BACKOFF = 300.0
-_SLOW_START_WINDOW = 60.0
-_SLOW_START_SUCCESS = 3
 # 后台探活周期(秒)与 canary 目标。0=关闭主动探活(仅真实请求驱动熔断)。
 _PROBE_INTERVAL_DEFAULT = 30.0
 _PROBE_CANARY_DEFAULT = "1.1.1.1:443"
 _PROBE_TIMEOUT = 4.0
-
-# 加权 least-request 的在途积压惩罚指数(bias,默认 1.0)。
-# 排序权重 = ewma × (1 + active)^bias,即分析 doc 2.2 的 "peak EWMA"(最近 RTT ×
-# 在途数):在途积压多的代理即使延迟历史最快,有效权重也被抬高、排序靠后,竞速选批
-# 天然避开——保护慢代理不被打爆(Envoy LeastRequest 的 weight/(active+1)^bias
-# 公式的对偶,此处以乘法形式作用于延迟权重)。bias=0 时退化为纯 EWMA 排序。
-_LB_BIAS_DEFAULT = 1.0
 
 # Hop-by-hop 请求头：只服务于"客户端→本代理"这一跳，绝不能转发给上游。
 # 特别是 Proxy-Authorization——若把客户端访问本代理的凭据透传到上游，
@@ -163,363 +142,8 @@ def _hb(v: str) -> bytes:
         return v.encode('utf-8')
 
 
-class ProxySelector:
-    """从 ProxyStore 产出代理 id 的有序列表,供竞速使用。
-
-    策略:取所有 enabled 代理,剔除熔断中的代理,按加权 least-request 权重排序
-    ——权重 = ewma × (1 + active)^lb_bias,快速者靠前、在途积压多者被压低
-    (least-active 语义),同权重代理间随机打乱以均衡负载;slow-start 恢复期
-    (熔断退避刚结束)的代理垫底。竞速顺序决定"谁先到/是否白占竞速槽"——把扇出
-    集中到快且空闲的优质代理,减少失败/积压代理在竞速中的无谓参与。
-    """
-
-    # EWMA 平滑系数:新观测占 0.3,历史占 0.7。取值参考 Finagle 峰值 EWMA 的
-    # 常见做法,兼顾对新网络状况的响应速度与对抖动的抑制。
-    EWMA_ALPHA = 0.3
-
-    # 熔断退避指数:每次熔断退避期 * _CIRCUIT_BACKOFF_MULT,下一周期翻倍。
-    _CIRCUIT_BACKOFF_MULT = 2.0
-
-    def __init__(self, proxy_store: ProxyStore,
-                 circuit_threshold: int = _CIRCUIT_THRESHOLD,
-                 circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF,
-                 slow_start_window: float = _SLOW_START_WINDOW,
-                 slow_start_success: int = _SLOW_START_SUCCESS,
-                 lb_bias: float = _LB_BIAS_DEFAULT,
-                 concurrency_limit_enabled: bool = False,
-                 concurrency_limit_initial: int = 16,
-                 concurrency_limit_min: int = 2,
-                 concurrency_limit_max: int = 128,
-                 concurrency_add_on_success: int = 4,
-                 concurrency_mult_on_failure: float = 0.5,
-                 concurrency_failure_window: int = 20):
-        self.proxy_store = proxy_store
-        self.circuit_threshold = max(1, circuit_threshold)
-        self.circuit_max_backoff = max(1.0, circuit_max_backoff)
-        self.slow_start_window = max(1.0, slow_start_window)
-        self.slow_start_success = max(1, slow_start_success)
-        # 加权 least-request 的在途惩罚指数(见 _LB_BIAS_DEFAULT)。
-        # 排序权重 = ewma × (1 + active)^bias;bias=0 退化为纯 EWMA 排序。
-        self.lb_bias = max(0.0, lb_bias)
-        # ── 自适应并发限制(P3)────────────────────────────────
-        # 每代理并发上限,成功加性增/失败乘性降,防慢代理被请求堆死。
-        self.concurrency_enabled = concurrency_limit_enabled
-        self._conc_initial = max(1, concurrency_limit_initial)
-        self._conc_min = max(1, min(concurrency_limit_min, self._conc_initial))
-        self._conc_max = max(self._conc_initial, concurrency_limit_max)
-        self._conc_add = max(1, concurrency_add_on_success)
-        self._conc_mult = max(0.0, min(1.0, concurrency_mult_on_failure))
-        self._conc_win = max(1, concurrency_failure_window)
-        # {pid: {"limit": int, "ok": int, "fail": int}} —— ok/fail 为最近窗口计数。
-        self._conc: dict[str, dict[str, float]] = {}
-        # 每代理质量: {pid: {"ewma_ttfb": float(秒), "obs": int}}。
-        #   obs = 成功观测计数(EWMA 样本数),供单发降级判定把"当前 EWMA"与该代理
-        #   被钉住时的基线 EWMA 对比(见 Router._single_send_degraded)。obs==1 时
-        #   EWMA 直接等于该次观测,可直接参与对比;仅存有观测的代理,无观测的代理
-        #   在排序时视为"未知质量"(排在新手区)。
-        self._quality: dict[str, dict[str, float]] = {}
-        # 每代理熔断/慢启动状态(与 _quality 分开维护,含未观测过的新代理):
-        #   {pid: {"consec_fail": int, "open_until": float(monotonic 秒), "backoff": float}}
-        self._circuit: dict[str, dict[str, float]] = {}
-        # 每代理当前在途请求数(P2C/least-active 选批依据)。
-        # 由 Router._try_http/_try_tunnel 在候选"发起→结束(成功/失败/取消)"的生命
-        # 周期内 self._inflight_start/_inflight_finish 增减,含竞速与单发两条路径。
-        self._in_flight: dict[str, int] = {}
-        # 在途数高水位(历史峰值,供 /metrics 观察选批负载压力)。
-        self.max_in_flight = 0
-        # 累计熔断开启次数(供 /metrics /circuit 观察熔断活动)。
-        self.circuit_open_count = 0
-
-    def get_quality(self) -> dict[str, dict[str, float]]:
-        """返回质量表快照(供 /metrics / 仪表盘展示,读内存无锁)。"""
-        return {pid: dict(q) for pid, q in self._quality.items()}
-
-    # ── in-flight 计数(P2C / least-active 选批依据)──────────────
-
-    def _inflight_start(self, pid: str):
-        """发起一次上游尝试:在途数 +1,并推进高水位。热路径,O(1),无锁。"""
-        n = self._in_flight.get(pid, 0) + 1
-        self._in_flight[pid] = n
-        if n > self.max_in_flight:
-            self.max_in_flight = n
-
-    def _inflight_finish(self, pid: str):
-        """结束一次上游尝试(成功/失败/被取消):在途数 -1。
-
-        由 _try_http/_try_tunnel 的 finally 调用,保证竞速取消也释放计数。
-        只在确有发起(started)时递减;防御性下限 0,防止并发异常路径下计数漂移。
-        """
-        n = max(0, self._in_flight.get(pid, 0) - 1)
-        if n == 0:
-            self._in_flight.pop(pid, None)
-        else:
-            self._in_flight[pid] = n
-
-    def get_in_flight(self) -> dict[str, int]:
-        """返回当前在途数快照 {pid: n}(供 /metrics / 仪表盘,读内存无锁)。"""
-        return dict(self._in_flight)
-
-    # ── 自适应并发限制(P3)────────────────────────────────────
-
-    def _conc_state(self, pid: str) -> dict[str, float]:
-        """惰性取(或建)某代理的并发限制状态。"""
-        s = self._conc.get(pid)
-        if s is None:
-            s = {"limit": float(self._conc_initial), "ok": 0.0, "fail": 0.0}
-            self._conc[pid] = s
-        return s
-
-    def _at_concurrency_limit(self, pid: str) -> bool:
-        """该代理当前在途数是否达到并发上限。"""
-        if not self.concurrency_enabled:
-            return False
-        s = self._conc_state(pid)
-        return self._in_flight.get(pid, 0) >= int(s["limit"])
-
-    def _conc_observe_success(self, pid: str):
-        """成功观测:窗口内累计成功;达标(成功 ≥ 窗口)且稳定 → 加性提升上限。
-
-        只增不降,上限封顶 _conc_max。用 EWMA 作为稳定度参考:仅当当前观测数
-        >= 窗口时才提升,避免冷启动即打满。
-        """
-        if not self.concurrency_enabled:
-            return
-        s = self._conc_state(pid)
-        s["ok"] = int(s.get("ok", 0)) + 1
-        s["fail"] = 0  # 成功清零失败窗口
-        if s["ok"] >= self._conc_win and int(s["limit"]) < self._conc_max:
-            s["limit"] = min(float(self._conc_max), int(s["limit"]) + self._conc_add)
-            s["ok"] = 0
-
-    def _conc_observe_failure(self, pid: str):
-        """失败观测:乘性降低上限(触底 _conc_min),并清成功窗口。"""
-        if not self.concurrency_enabled:
-            return
-        s = self._conc_state(pid)
-        s["fail"] = int(s.get("fail", 0)) + 1
-        if s["fail"] >= 1:
-            new_limit = max(float(self._conc_min), int(s["limit"]) * self._conc_mult)
-            s["limit"] = new_limit
-            s["fail"] = 0
-            s["ok"] = 0
-
-    def get_concurrency_limits(self) -> dict[str, int]:
-        """返回当前每代理并发上限快照 {pid: limit}(供 /metrics / 仪表盘)。"""
-        return {pid: int(s["limit"]) for pid, s in self._conc.items()}
-
-    def record_ttfb(self, pid: str, ttfb: float):
-        """记录一次成功请求的首字节耗时(秒),更新该代理的 EWMA。
-
-        EWMA 公式:无历史时直接取当前值;有历史时 ewma = (1-alpha)*old + alpha*new。
-        obs 计数随每次观测 +1(EWMA 样本数),供单发降级判定读取。
-        """
-        q = self._quality.get(pid)
-        if q is None:
-            self._quality[pid] = {"ewma_ttfb": ttfb, "obs": 1}
-            self._conc_observe_success(pid)
-            return
-        old = q["ewma_ttfb"]
-        q["ewma_ttfb"] = (1.0 - self.EWMA_ALPHA) * old + self.EWMA_ALPHA * ttfb
-        q["obs"] = int(q.get("obs", 0)) + 1
-        self._conc_observe_success(pid)
-
-    def reset_quality(self):
-        """清空全部质量数据(RFC 8305 §4:历史 RTT 不可跨网络沿用)。
-
-        网络切换/代理分组变化后调用,让排序回到无偏状态重新学习。熔断/慢启动
-        状态一并清空(旧网络的连续失败计数对当前网络无意义)。
-        """
-        self._quality.clear()
-        self._circuit.clear()
-        self._in_flight.clear()
-        self._conc.clear()  # 并发上限随质量重学(P3)
-
-    def reset_circuits(self):
-        """手动解除全部代理的熔断并清空连续失败计数(运维介入后调用)。
-
-        与 reset_quality 的区别:不动 EWMA(延迟历史仍有效),只清熔断状态。
-        """
-        self._circuit.clear()
-
-    # ── 熔断器 / slow-start ────────────────────────────────────
-
-    def _circuit_state(self, pid: str) -> dict[str, float]:
-        """惰性取(或建)某代理的熔断状态 dict,避免在 __init__ 枚举代理。"""
-        s = self._circuit.get(pid)
-        if s is None:
-            s = {"consec_fail": 0, "open_until": 0.0, "backoff": 0.0}
-            self._circuit[pid] = s
-        return s
-
-    def record_failure(self, pid: str):
-        """记录一次上游失败(连接失败/超时/5xx)。连续失败达阈值即熔断。
-
-        退避期指数增长:首熔断 backoff=1s,此后每次新熔断翻倍(上限
-        circuit_max_backoff)。退避期内 open_until 未到,该代理不参与竞速/单发。
-        """
-        self._conc_observe_failure(pid)  # 自适应并发:失败 → 乘性降低上限(P3)
-        s = self._circuit_state(pid)
-        s["consec_fail"] = int(s.get("consec_fail", 0)) + 1
-        if s["consec_fail"] >= self.circuit_threshold:
-            backoff = (float(s.get("backoff", 0.0)) or 1.0) * self._CIRCUIT_BACKOFF_MULT
-            s["backoff"] = min(self.circuit_max_backoff, backoff)
-            s["open_until"] = time.monotonic() + s["backoff"]
-            s["consec_fail"] = 0  # 熔断后计数清零,恢复后的失败重新累计
-            self.circuit_open_count += 1
-            logger.warning("circuit opened for proxy %s, backoff=%.1fs", pid, s["backoff"])
-
-    def record_success(self, pid: str):
-        """记录一次上游成功,连续失败计数归零。
-
-        若正处于 slow-start 恢复期(backoff 期满但未完成爬升),累计成功次数,
-        达标即恢复完整权重。若此前无慢启动标记,本方法无副作用。
-        """
-        s = self._circuit.get(pid)
-        if s is None:
-            return
-        s["consec_fail"] = 0
-        if self._in_slow_start(pid, s):
-            s["slow_start_ok"] = int(s.get("slow_start_ok", 0)) + 1
-
-    def _in_slow_start(self, pid: str, s: Optional[dict] = None) -> bool:
-        """是否处于 slow-start 恢复期:退避刚结束(started_at 新鲜)且累计成功不足。
-
-        慢启动只在"熔断退避到期后的恢复阶段"触发,与冷启动(从未观测)无关。
-        判断依据:慢启动窗口(默认 60s)内且成功数未达阈值。窗口期内任一时刻
-        累计 slow_start_ok 达标即退出(由 record_success 判断)。
-        """
-        s = s or self._circuit.get(pid)
-        if not s:
-            return False
-        started_at = s.get("started_at")
-        if not started_at:
-            return False
-        if time.monotonic() - started_at >= self.slow_start_window:
-            return False
-        return int(s.get("slow_start_ok", 0)) < self.slow_start_success
-
-    def _rearm_slow_start(self, pid: str):
-        """熔断退避到期后,把代理置入 slow-start 恢复期(权重垫底,爬升中)。
-
-        重置 started_at=now、累计成功归零。在退避期满的下一次排序/取用路径上
-        触发一次,不单独起 task。
-        """
-        s = self._circuit_state(pid)
-        s["started_at"] = time.monotonic()
-        s["slow_start_ok"] = 0
-        s["consec_fail"] = 0
-
-    def is_circuit_open(self, pid: str) -> bool:
-        """该代理是否处于熔断退避期(open_until 未到)。已过期自动解除。
-
-        退避到期后清 open_until 并置入 slow-start 恢复期(started_at=now),此
-        后返回 False(可再次参与排序,但垫底)。整个过程在排序/取用路径上惰性
-        触发,不单独起 task。
-        """
-        s = self._circuit.get(pid)
-        if not s:
-            return False
-        open_until = s.get("open_until", 0.0)
-        if open_until and time.monotonic() < open_until:
-            return True
-        if open_until:  # 退避刚到期:进入 slow-start 恢复期(仅一次,清 open_until)。
-            s["open_until"] = 0.0
-            self._rearm_slow_start(pid)
-        return False
-
-    def get_circuit_state(self) -> dict[str, dict]:
-        """返回全部熔断状态快照(供 /circuit API / 仪表盘),含退避剩余时间。
-
-        返回结构:{pid: {"open": bool, "open_until": float 或 None, "backoff": float,
-                        "consec_fail": int, "slow_start": bool}}。
-        """
-        now = time.monotonic()
-        out = {}
-        for pid in self._circuit:
-            s = self._circuit[pid]
-            open_until = s.get("open_until", 0.0)
-            open_now = bool(open_until and now < open_until)
-            out[pid] = {
-                "open": open_now,
-                "open_until": open_until or None,
-                "backoff": s.get("backoff", 0.0),
-                "consec_fail": int(s.get("consec_fail", 0)),
-                "slow_start": self._in_slow_start(pid, s),
-            }
-        return out
-
-    # ── 排序 ───────────────────────────────────────────────────
-
-    def _quality_rank(self, pid: str) -> tuple:
-        """排序键:无观测(未知质量)的代理排最后,EWMA 小者靠前。
-
-        返回 (未知标记, ewma) 二元组,让排序稳定:未知质量统一放尾部。
-        """
-        q = self._quality.get(pid)
-        if q is None:
-            return (1, 0.0)
-        return (0, q["ewma_ttfb"])
-
-    def _weighted_rank(self, pid: str) -> float:
-        """加权 least-request 排序权重:ewma × (1 + active)^lb_bias。
-
-        无观测(未知质量)的代理排新手区、由 _quality_rank 的未知标记兜底,
-        此处不参与加权(不曾在途/无 EWMA 的新代理直接给 0 权重,靠前尝试)。
-        在途积压惩罚随 active 指数放大:fast 代理同时背上大量在途请求时,
-        (1+active)^bias 的权重把它从"首批竞速"的位置挤下去,让轻载代理顶上
-        ——正是"保护慢代理不被打爆"的 least-active 语义(Envoy LeastRequest
-        的 weight/(active+1)^bias 对偶,见 _LB_BIAS_DEFAULT)。bias=0 时恒为
-        ewma,退化为纯 EWMA 排序(RFC 8305 §4 RTT 排序)。
-        """
-        q = self._quality.get(pid)
-        if q is None:
-            return 0.0
-        w = q["ewma_ttfb"]
-        if self.lb_bias > 0:
-            active = self._in_flight.get(pid, 0)
-            if active:
-                w *= (1.0 + active) ** self.lb_bias
-        return w
-
-    def _slow_start_rank(self, pid: str) -> int:
-        """slow-start 排序档位:恢复期代理垫底(档 1),正常代理靠前(档 0)。
-
-        slow-start 是恢复阶段的**临时低权重**——把恢复中的代理从"排第一被首批
-        竞速/被单发抢打"的位置挪开,先让一两个请求试水,成功若干次后再回到
-        正常排序。若此时恢复代理碰巧排在前 max_retries 内仍可能被竞速选中,但
-        竞速首字节判胜 + 扇出集中在健康代理,试水代价被天然稀释。
-        """
-        return 1 if self._in_slow_start(pid) else 0
-
-    def ordered_proxies(self) -> List[str]:
-        """返回按加权 least-request 权重(快且不忙者靠前)排序的已启用代理列表。
-
-        - 剔除熔断退避期内的代理(open_until 未到);
-        - 按 slow-start 档位分层(恢复期代理垫底),层内按加权权重排:
-          权重 = ewma × (1 + active)^lb_bias——快而空闲的代理靠前,背上大量
-          在途积压的代理被压低(least-active 语义,保护慢代理不被打爆);
-        - 同权重段随机打乱,均衡负载的同时保持"快且不忙者先竞速"。
-        退避到期的代理在此被解熔断并置入 slow-start(is_circuit_open 副作用)。
-        """
-        proxies = self.proxy_store.list()
-        enabled = [p for p in proxies if p.enabled]
-        # 过滤熔断中的代理(is_circuit_open 同时处理退避到期解熔断)。
-        enabled = [p for p in enabled if not self.is_circuit_open(p.id)]
-        # 自适应并发限制(P3):在途已达上限的代理不参与候选(防慢代理被堆死)。
-        if self.concurrency_enabled:
-            enabled = [p for p in enabled if not self._at_concurrency_limit(p.id)]
-        random.shuffle(enabled)
-        enabled.sort(key=lambda p: (self._slow_start_rank(p.id),
-                                    self._quality_rank(p.id)[0],  # 未知质量垫底
-                                    self._weighted_rank(p.id)))
-        return [p.id for p in enabled]
-
-    def best_proxy(self) -> Optional[str]:
-        """返回按 EWMA 排序后的首个代理 id(无代理时返回 None)。"""
-        lst = self.ordered_proxies()
-        return lst[0] if lst else None
-
-
+# ProxySelector 已随 #14 拆分搬入 auto_squid/selector.py(顶部 re-import);
+# Router 构造在此经 self.selector = ProxySelector(...) 持有其协作对象。
 class Router:
     """代理路由器:监听端口、处理客户端连接、竞速转发、维护统计与缓存。
 
@@ -732,7 +356,6 @@ class Router:
         # 熔断开启计数归 ProxySelector 维护(开启时刻在 record_failure 内),经
         # snapshot_counters 经 selector.circuit_open_count 读取。
         self.enable_local_racing = enable_local_racing
-        self.enable_http_cache = enable_http_cache
         # ── 错峰启动(RFC 8305 §5)──
         # 竞速首批不再同时全发:先发最优 stagger_initial 个,间隔 stagger_interval_ms
         # 补发下一个,首个首字节成功即取消其余。interval 钳制到 RFC 8305 参数区间
@@ -769,18 +392,10 @@ class Router:
         self.switch_damping_blocks = 0   # 被阻尼挡下的替换次数
         self.switch_damping_fast_swaps = 0  # 因 EWMA 显著优势直接切换的次数
         # ── 会话粘性 ────────────────────────────────────────────
-        # 键 = "{client_ip}|{domain}",值 = {"proxy_id": pid, "updated_at": ts}。
-        # 纯内存、滑动 TTL:同一客户端+域名复用上次胜出的代理,保持 egress IP
-        # 稳定;粘性代理失败则驱逐并回落竞速(redispatch)。仿 _meta_cache 模式,
-        # 但不落盘(粘性是瞬态,重启即清)。
-        self.stickiness_enabled = stickiness_enabled
-        self.stickiness_ttl = stickiness_ttl
-        self.stickiness_recheck_hits = stickiness_recheck_hits
-        self.stickiness_max_entries = stickiness_max_entries
-        self._sticky_cache: dict[str, dict[str, object]] = {}
-        self.sticky_cache_hits = 0
-        self.sticky_evictions = 0       # 粘性表驱逐次数(5xx/失败/超容量)
-        # 单发降级触发次数(Goal #6,供 /metrics / 仪表盘观察降级活动)。
+        # 粘性表(_sticky_cache/配置/方法)已随 #14 拆分搬入 StickyCache(self.sticky),
+        # 经类尾 _STICKY_FORWARD 白名单 __getattr__/__setattr__ 转发。构造放在
+        # _degraded_single_send 之后(sticky 的 _sticky_degrade_due 与其共享同一 set)。
+        # 本行仅保留"单发降级触发次数"计数器(Router 决策链自增,snapshot 直读)。
         self.single_send_degrades = 0
         # ── 单发降级(质量感知的确定性探路,Goal #6)─────────────────
         # 域名缓存/粘性命中单发时,若被钉住代理"最近失败率上升(连续失败)"
@@ -795,6 +410,19 @@ class Router:
         # 重新可单发,无需冷却),此集合只供 /metrics /circuit 展示"当前被判定降级的
         # 代理";由 _record_win_meta(新赢家接管)或 reset_proxy_quality 清除。
         self._degraded_single_send: set[str] = set()
+        # ── 会话粘性协作类(StickyCache,#14)──────────────────────
+        # 键 = "{client_ip}|{domain}",值 = {"proxy_id": pid, "updated_at": ts}。
+        # 纯内存、滑动 TTL:同一客户端+域名复用上次胜出的代理,保持 egress IP
+        # 稳定;粘性代理失败则驱逐并回落竞速(redispatch)。仿 _meta_cache 模式,
+        # 但不落盘(粘性是瞬态,重启即清)。决策链成员经 sticky 背引用(router)
+        # 读取;self._degraded_single_send 以引用共享给 sticky 的降级判定。
+        self.sticky = StickyCache(
+            self,
+            enable_local_racing=enable_local_racing,
+            enabled=stickiness_enabled,
+            ttl=stickiness_ttl,
+            recheck_hits=stickiness_recheck_hits,
+            max_entries=stickiness_max_entries)
         # ── 策略路由(P1)───────────────────────────────────────
         # 按目标域名收窄候选代理集。不配置(policies 为空)→ 对所有 enabled
         # 代理统一竞速,等价旧行为。预编译正则避免每请求重编译;条目为
@@ -905,30 +533,17 @@ class Router:
         # 不阻塞赢家首字节(见 _race / _drain_losers)。stop() 收尾时排空,防泄漏。
         self._pending_cleanups: set = set()
 
-        # ── HTTP 响应缓存 ───────────────────────────────────────
-        # P2:LRU + 容量上限。普通 dict 升级为 OrderedDict + 访问时间戳:
-        #   - _http_cache_get 命中时刷新 last_access(滑动 TTL + LRU 顺序);
-        #   - _http_cache_set 写入前检查 max_entries / max_bytes,超限淘汰
-        #     last_access 最旧的条目(避免高基数 URL 下内存无界增长)。
-        # 二级索引 _http_cache_domain_index 与淘汰同步维护,防漏删。
-        self._http_cache: dict[str, dict] = {}
-        self._http_cache_ttl = max(1, http_cache_ttl)
-        self._http_cache_max_entries = max(1, http_cache_max_entries)
-        self._http_cache_max_bytes = max(1, http_cache_max_bytes)
-        # 流式转发时响应 body 的缓冲上限(超过放弃缓存该响应)。原为模块常量
-        # STREAM_CACHE_LIMIT,现由配置 http_cache.stream_cache_limit 控制。
-        self._stream_cache_limit = max(1024, http_cache_stream_limit)
-        self._http_cache_bytes = 0           # 当前缓存 body 总字节数
-        self.http_cache_evictions = 0        # 累计淘汰次数(LRU 或 TTL)
-        # 二级索引: domain → set[缓存键]。使 _http_cache_invalidate 从 O(N) 降为
-        # O(K)(K=该域名条目数)。_http_cache_set 写入时同步更新,_http_cache_get
-        # 过期清除时同步删除。索引与主 dict 无锁(均在同一个 asyncio 线程)。
-        self._http_cache_domain_index: dict[str, set[str]] = {}
-        # 在途 GET 去重聚合(Cache Stampede Protection): key = _http_cache_key('GET', url)
-        # → 该 URL 首个转发上游的请求持有的 Future。同 URL 并发 GET 发现已有在途请求
-        # 则 await 该 Future 拿首个请求的结果,不重复发上游。Future 结果为
-        # (status_code, reason_phrase, headers, content) 或 None(上游失败,waiter 自行竞速)。
-        self._inflight_futures: dict[str, asyncio.Future] = {}
+        # ── HTTP 响应缓存(HttpCache,#14)────────────────────────
+        # 缓存(_http_cache/配置/二级索引/LRU/在途聚合)已随 #14 拆分搬入
+        # HttpCache(self.httpcache),经类尾 _CACHE_FORWARD 白名单 __getattr__/
+        # __setattr__ 转发。http_cache_hits/misses 计数留在 Router(在上方初始化,
+        # flow 直接自增,snapshot_counters 直读)。enable_http_cache 门随类单源。
+        self.httpcache = HttpCache(
+            enable_http_cache=enable_http_cache,
+            ttl=http_cache_ttl,
+            max_entries=http_cache_max_entries,
+            max_bytes=http_cache_max_bytes,
+            stream_limit=http_cache_stream_limit)
 
     # ── DB helpers ──────────────────────────────────────────────
 
@@ -1589,208 +1204,10 @@ class Router:
             return self.cache_ttl
         return self._domain_ttl_cache.get(domain, self.cache_ttl)
 
-    # ── 会话粘性 ────────────────────────────────────────────────
-
-    def get_sticky_cache(self) -> dict[str, dict[str, object]]:
-        """返回全量会话粘性表快照 {key: {proxy_id, updated_at, hits}}。
-
-        供管理 API / 仪表盘展示。读内存镜像,无锁无 I/O。
-        """
-        return {k: dict(v) for k, v in self._sticky_cache.items()}
-
-    @staticmethod
-    def _sticky_key(client_ip: str, domain: str) -> str:
-        """会话粘性键:"客户端IP|域名"。hostname/IP 均不含 '|',分隔安全。"""
-        return f"{client_ip}|{domain}"
-
-    def _evict_sticky_key(self, key: str):
-        """按 key 驱逐粘性条目并计入驱逐统计(所有驱逐路径共用)。"""
-        if self._sticky_cache.pop(key, None) is not None:
-            self.sticky_evictions += 1
-
-    def _get_sticky_proxy(self, client_ip: str, domain: str) -> Optional[str]:
-        """返回客户端+域名在 stickiness_ttl 内的粘性代理 id;未启用/过期/代理
-        失效/重评估到期 返回 None(并把失效/过期条目就地驱逐)。
-
-        纯内存读取。TTL 为滑动制:命中后由 _bump_sticky 刷新 updated_at 并累加
-        hits,活跃会话不过期;到期后重新走竞速。取回时校验代理仍在 ProxyStore
-        且 enabled——内存-only 的表可能在代理被删除/停用后残留,必须就地驱逐。
-        本机竞速胜者('local')不经过 proxy_store(直连),仅当 enable_local_racing
-        时才视为有效,否则视作失效条目驱逐(A1)。
-        """
-        if not self.stickiness_enabled:
-            return None
-        key = self._sticky_key(client_ip, domain)
-        entry = self._sticky_cache.get(key)
-        if not entry:
-            return None
-        pid = entry["proxy_id"]
-        if pid == 'local':
-            if not self.enable_local_racing:
-                self._evict_sticky_key(key)
-                return None
-        else:
-            proxy = self.proxy_store.get(pid)
-            if not proxy or not proxy.enabled:
-                self._evict_sticky_key(key)
-                return None
-        try:
-            dt = datetime.fromisoformat(entry["updated_at"])
-            if (datetime.now(timezone.utc) - dt).total_seconds() >= self.stickiness_ttl:
-                self._evict_sticky_key(key)
-                return None
-        except Exception:
-            self._evict_sticky_key(key)
-            return None
-        # 熔断中的代理不作粘性单发:直接驱逐(退回竞速找健康代理),避免对
-        # 已确认故障的代理持续单发。local 不经 selector,跳过该检查(A1)。
-        if pid != 'local' and self.selector.is_circuit_open(pid):
-            self._evict_sticky_key(key)
-            return None
-        # 策略路由(P1):命中策略但粘性代理不在允许子集内 → 视为 miss 驱逐并
-        # 回落竞速(防旧粘性绕过新策略;与域名缓存同一套策略校验)。
-        if self._policies and not self._policy_allows_sticky(domain, pid):
-            self._evict_sticky_key(key)
-            return None
-        # B2:命中次数达到阈值 → 触发探路重竞速(不驱逐,由调用方依据
-        # _sticky_recheck_due 决定跳过域名缓存直接竞速)。
-        if self._sticky_recheck_due(client_ip, domain):
-            return None
-        # Goal #6:质量感知粘性。被钉住代理最近失败率上升 / EWMA 恶化 → 驱逐
-        # 并回落竞速(调用方 _evict_sticky + 跳过域名缓存直接竞速)。local 直连
-        # 不经 selector,跳过降级判定(A1)。
-        if pid != 'local' and self._sticky_degrade_due(client_ip, domain):
-            return None
-        return pid
-
-    def _sticky_recheck_due(self, client_ip: str, domain: str) -> bool:
-        """该客户端+域名是否到了"探路重竞速"时机(粘性命中 recheck_hits 次)。
-
-        仅当 sticky_recheck_hits > 0 且条目仍处于 TTL 内且 hits 达到阈值时为真。
-        调用方发现为真后应驱逐该条目并跳过域名缓存直接竞速,用新赢家替换可能
-        已变慢的粘性代理。
-        """
-        if not self.stickiness_enabled or self.stickiness_recheck_hits <= 0:
-            return False
-        entry = self._sticky_cache.get(self._sticky_key(client_ip, domain))
-        if not entry:
-            return False
-        try:
-            if int(entry.get("hits", 0)) < self.stickiness_recheck_hits:
-                return False
-            dt = datetime.fromisoformat(entry["updated_at"])
-            return (datetime.now(timezone.utc) - dt).total_seconds() < self.stickiness_ttl
-        except Exception:
-            return False
-
-    def _sticky_degrade_due(self, client_ip: str, domain: str) -> bool:
-        """粘性单发是否该因"代理质量恶化"降级回竞速(Goal #6)。
-
-        与 _sticky_recheck_due(B2,命中计数触发)互补:B2 是"达到 N 次命中后周期
-        性重探路",这里是"被钉住代理已被质量模型判定不稳定"——两者任一命中都
-        应放弃粘性单发,驱逐条目并跳过域名缓存直接竞速,让竞速赢家重新钉住。
-        基线 ref_ewma 在钉住时刻捕获(见 _record_sticky),粘性命中仅滑动 TTL
-        不刷新基线,保证"恶化"是相对钉住时的初始状态,而非相对最近一次命中。
-        """
-        if not self.stickiness_enabled:
-            return False
-        entry = self._sticky_cache.get(self._sticky_key(client_ip, domain))
-        if not entry:
-            return False
-        pid = entry["proxy_id"]
-        if pid == 'local':
-            return False  # 本机直连不经 selector,跳过降级判定(A1)
-        if not self._single_send_degraded(pid, entry.get("ref_ewma")):
-            return False
-        self._degraded_single_send.add(pid)
-        return True
-
-    def _record_sticky(self, client_ip: str, domain: str, pid: str):
-        """记录客户端+域名的粘性代理(刷新 updated_at,hits 归零)。
-
-        仅由确认的赢家(粘性单发成功 / 竞速赢家 / 域名缓存单发成功)调用,新
-        赢家从 0 开始重新计数。未启用时为空操作。写前检查容量上限(B1):超限
-        先清过期条目,仍超则驱逐 updated_at 最旧的一条。
-        """
-        if not self.stickiness_enabled:
-            return
-        # 方向 A:新赢家显著差于当前最优代理 → 不回填粘性表(继续竞速),避免
-        # 慢代理被钉住进入"钉住→降级→回填→再钉住"循环。
-        if self._worse_than_best(pid):
-            return
-        key = self._sticky_key(client_ip, domain)
-        if key not in self._sticky_cache and len(self._sticky_cache) >= self.stickiness_max_entries:
-            self._prune_sticky()
-            if len(self._sticky_cache) >= self.stickiness_max_entries:
-                self._evict_oldest_sticky()
-        self._sticky_cache[key] = {
-            "proxy_id": pid,
-            "updated_at": self._now_utc(),
-            "hits": 0,
-            # Goal #6:钉住时刻的 EWMA 基线,供 _sticky_degrade_due 判定"相对钉住
-            # 时是否恶化"。粘性命中(_bump_sticky)只滑动 TTL,不刷新基线。
-            "ref_ewma": self._proxy_quality_ewma(self.selector.get_quality().get(pid)),
-        }
-
-    def _bump_sticky(self, client_ip: str, domain: str, pid: str):
-        """粘性命中成功:刷新 updated_at(滑动 TTL)并累加 hits(B2)。
-
-        区别于 _record_sticky:hits 只增不减(新赢家才归零),保证 recheck_hits
-        阈值可被持续命中累计触发。条目被并发驱逐时退化为重新记录。
-        """
-        key = self._sticky_key(client_ip, domain)
-        entry = self._sticky_cache.get(key)
-        if entry is None:
-            self._record_sticky(client_ip, domain, pid)
-            return
-        entry["proxy_id"] = pid
-        entry["updated_at"] = self._now_utc()
-        entry["hits"] = int(entry.get("hits", 0)) + 1
-
-    def _evict_sticky(self, client_ip: str, domain: str):
-        """驱逐客户端+域名的粘性条目(粘性代理单发失败/5xx 时调用)。"""
-        self._evict_sticky_key(self._sticky_key(client_ip, domain))
-
-    def _evict_oldest_sticky(self):
-        """容量保护:驱逐 updated_at 最旧的一条粘性条目(计入驱逐统计)。
-
-        ISO-8601 UTC 时间戳同格式下按字典序比较即时间序,无需解析。
-        """
-        if not self._sticky_cache:
-            return
-        oldest_key = min(self._sticky_cache, key=lambda k: self._sticky_cache[k].get("updated_at", ""))
-        self._evict_sticky_key(oldest_key)
-
-    def _prune_sticky(self):
-        """清扫过期/指向失效代理的粘性条目,限制内存无界增长。
-
-        由后台 _flush_loop 周期调用,也由 _record_sticky 在超容量时先调用。
-        粘性键集合(客户端 IP)可能远大于域名集合,若放任不管会缓慢累积;
-        过期清扫把表规模收敛到"最近 TTL 内活跃的客户端+域名"。
-        """
-        if not self._sticky_cache:
-            return
-        now = datetime.now(timezone.utc)
-        stale = []
-        for key, entry in self._sticky_cache.items():
-            pid = entry["proxy_id"]
-            if pid == 'local':
-                if not self.enable_local_racing:
-                    stale.append(key)
-                continue
-            proxy = self.proxy_store.get(pid)
-            if not proxy or not proxy.enabled:
-                stale.append(key)
-                continue
-            try:
-                dt = datetime.fromisoformat(entry["updated_at"])
-                if (now - dt).total_seconds() >= self.stickiness_ttl:
-                    stale.append(key)
-            except Exception:
-                stale.append(key)
-        for key in stale:
-            self._evict_sticky_key(key)
-
+    # ── 会话粘性(StickyCache,#14)───────────────────────────
+    # get_sticky_cache/_get_sticky_proxy/_record_sticky/_prune_sticky 等方法
+    # 已随 #14 拆分搬入 StickyCache(self.sticky),经类尾 _STICKY_FORWARD
+    # 白名单 __getattr__ 转发。决策链成员经 sticky 背引用(router)读取。
     # ── TCP 调优 ────────────────────────────────────────────────
 
     @staticmethod
@@ -1830,118 +1247,10 @@ class Router:
         except (OSError, AttributeError):
             pass
 
-    # ── HTTP GET 缓存 ──────────────────────────────────────────
-
-    def _http_cache_key(self, method: str, url: str) -> str:
-        """响应缓存键:"方法:URL"。仅 GET 缓存,故方法实际恒为 GET。"""
-        return f"{method}:{url}"
-
-    def _http_cache_get(self, method: str, url: str) -> Optional[dict]:
-        """取 GET 的缓存响应;非 GET 或未命中或已过期返回 None。过期项顺便清除。
-
-        enable_http_cache=False 时一律未命中(用于压测隔离缓存层,测纯路由性能)。
-        P2:命中刷新 last_access(滑动 TTL 兼作 LRU 顺序);过期项按 LRU 淘汰
-        路径清除(同步维护 _http_cache_bytes 与二级索引)。
-        """
-        if not self.enable_http_cache or method != 'GET':
-            return None
-        key = self._http_cache_key(method, url)
-        entry = self._http_cache.get(key)
-        if not entry:
-            return None
-        now = time.time()
-        if now - entry['cached_at'] > self._http_cache_ttl:
-            self._http_cache_remove(key)
-            return None
-        entry['last_access'] = now  # 滑动 TTL + LRU 顺序
-        return entry
-
-    def _http_cache_remove(self, key: str) -> None:
-        """从 _http_cache 删除 key,同步维护字节计数与 _http_cache_domain_index。
-
-        所有删除路径统一走这里(过期清除、LRU 淘汰、写方法按域名失效),确保
-        _http_cache_bytes 与二级索引不漏不重。返回是否删除了条目。
-        """
-        entry = self._http_cache.pop(key, None)
-        if entry is None:
-            return False
-        self._http_cache_bytes -= len(entry.get('content', b'') or b'')
-        cached_url = key[len('GET:'):] if key.startswith('GET:') else key
-        cached_host = urllib.parse.urlparse(cached_url).hostname or cached_url
-        idx = self._http_cache_domain_index.get(cached_host)
-        if idx:
-            idx.discard(key)
-            if not idx:
-                del self._http_cache_domain_index[cached_host]
-        return True
-
-    def _http_cache_set(self, method: str, url: str, status_code, reason_phrase, headers, content) -> None:
-        """缓存一个 GET 可缓存响应(状态码、原因、头、body、时间戳)。
-
-        可缓存状态码由调用方按 CACHEABLE_STATUS 判断。无论上游是否给出
-        Content-Length,都遵循 Cache-Control 的 no-store/no-cache/private:
-        本代理是共享缓存(为多客户端服务),private 明确禁止共享缓存存储,
-        no-store/no-cache 同理。原实现仅在缺 Content-Length 时查 Cache-Control,
-        扩展到 3xx/404 后必须无条件查,否则会把源站标 private 的 302 也缓存。
-
-        P2:写入前按 max_entries / max_bytes 做 LRU 淘汰(淘汰 last_access 最旧
-        的条目),并维护 _http_cache_bytes。单一超大响应(>max_bytes 的一半)不缓存,
-        避免单条即打满总预算。更新已有 key 时先归还旧字节再计入新字节。
-        """
-        if method != 'GET':
-            return
-        # 共享缓存必须尊重源站的 Cache-Control 禁存指令(无论是否有
-        # Content-Length)。no-cache 在此保守按"不存"处理:本代理不做再校验
-        # (发条件请求),存了也只是徒增一次过期清除,不如直接不存。
-        # headers 为 list[(name, value)](保留重复头)或 dict,两种都按 (k, v) 迭代。
-        items = headers.items() if isinstance(headers, dict) else headers
-        cc = next((v for k, v in items if k.lower() == 'cache-control'), '')
-        if 'no-store' in cc or 'no-cache' in cc or 'private' in cc:
-            return
-        size = len(content or b'')
-        if size > self._http_cache_max_bytes // 2:
-            return  # 单一超大响应不缓存
-        now = time.time()
-        key = self._http_cache_key(method, url)
-        # 更新已有 key:先归还旧字节,避免重复计数。
-        old = self._http_cache.get(key)
-        if old is not None:
-            self._http_cache_bytes -= len(old.get('content', b'') or b'')
-        self._http_cache[key] = {
-            'status_code': status_code,
-            'reason_phrase': reason_phrase,
-            'headers': headers,
-            'content': content,
-            'cached_at': now,
-            'last_access': now,
-        }
-        self._http_cache_bytes += size
-        # 容量保护(LRU):条目数或字节数超限 → 淘汰 last_access 最旧的条目,
-        # 直至回到上限以内。单次 O(N),写入远低于读取频率,可接受。
-        while len(self._http_cache) > self._http_cache_max_entries \
-                or self._http_cache_bytes > self._http_cache_max_bytes:
-            oldest = min(self._http_cache, key=lambda k: self._http_cache[k].get('last_access', 0.0))
-            self._http_cache_remove(oldest)
-            self.http_cache_evictions += 1
-        # 同步更新二级索引:缓存键 -> 域名,供 O(1) 域名级批量失效。
-        cached_host = urllib.parse.urlparse(url).hostname or url
-        self._http_cache_domain_index.setdefault(cached_host, set()).add(key)
-
-    def _http_cache_invalidate(self, domain: str) -> None:
-        """清空某域名下所有 GET 响应缓存条目(利用二级索引 O(K),K=该域名条目数)。
-
-        写方法(POST/PUT/DELETE/PATCH)改写资源后调用。按域名而非按 URL 失效:
-        添加动作常打 POST /api/items,而刷新的列表页是 GET /,两者 URL 不同,
-        按 URL 精确失效会漏掉列表页缓存,导致刷新仍返回旧内容。整域清空可覆盖
-        同站任意路径的 GET。利用 _http_cache_domain_index 直接取该域名下所有
-        缓存键,避免 O(N) 遍历全量缓存与逐条重复 urlparse。
-        提前(转发前)失效:即便写请求最终失败,后果也仅是下次 GET 多回源一次,
-        不会返回错误内容。enable_http_cache=False 时缓存本就空,此处为空操作。
-        """
-        stale = self._http_cache_domain_index.pop(domain, set())
-        for key in stale:
-            self._http_cache_remove(key)
-
+    # ── HTTP GET 缓存(HttpCache,#14)────────────────────────
+    # _http_cache_key/_get/_remove/_set/_invalidate 已随 #14 拆分搬入
+    # HttpCache(self.httpcache),经类尾 _CACHE_FORWARD 白名单 __getattr__
+    # 转发。_write_cached_response/流式缓冲/flow 编排留 Router。
     # ── 上游连接池 ──────────────────────────────────────────────
 
     def _client_key(self, pid: str, proxy_url: Optional[str]) -> str:
@@ -3290,12 +2599,14 @@ class Router:
         self._db.close()
 
 
-    # ── #14 pools.py 白名单转发 ─────────────────────────────────
-    # ConnectionPools(self.pools) 持有全部池状态/计数器/配置/方法;Router 用
-    # __getattr__/__setattr__ 把白名单成员转发到 pools,使热路径与 ~40 处测试
-    # 的 self._conn_pool / self.conn_pool_creates / self._pool_prune() 等引用
-    # 原样解析到 pools,Router 编排代码零改动。未在名单内的名字(如 prewarm/
-    # _set_nodelay/handle_client 等)走正常属性查找。
+    # ── #14 白名单转发(pools/httpcache/sticky)──────────────
+    # ConnectionPools(self.pools) / HttpCache(self.httpcache) / StickyCache(self.sticky)
+    # 持有各自子系统的状态/计数器/配置/方法;Router 用 __getattr__/__setattr__ 把
+    # 白名单成员转发到对应协作类,使热路径与测试的 self._conn_pool /
+    # self._http_cache_set() / self._sticky_cache 等引用原样解析到协作对象,Router
+    # 编排代码零改动。三张名单两两不相交;未在名单内的名字(如 prewarm/
+    # _set_nodelay/handle_client 等)走正常属性查找。构造期协作类尚未创建时的
+    # 转发名赋值走 __setattr__ 守卫(对应协作名不在 self.__dict__ → super().__setattr__)。
 
     _POOL_FORWARD = frozenset({'_conn_pool', '_target_pool', '_established_pool',
         'conn_pool_enabled', 'conn_pool_per_proxy', 'conn_pool_total', 'conn_pool_idle_timeout',
@@ -3313,16 +2624,44 @@ class Router:
         '_target_pool_refill', '_pool_prune', '_conn_pool_close_all', '_established_alive',
         '_conn_pool_peek', '_target_pool_peek', '_established_pool_peek'})
 
+    _CACHE_FORWARD = frozenset({'_http_cache', '_http_cache_ttl', '_http_cache_max_entries',
+        '_http_cache_max_bytes', '_stream_cache_limit', '_http_cache_bytes',
+        'http_cache_evictions', '_http_cache_domain_index', '_inflight_futures',
+        'enable_http_cache',
+        '_http_cache_key', '_http_cache_get', '_http_cache_remove',
+        '_http_cache_set', '_http_cache_invalidate'})
+
+    _STICKY_FORWARD = frozenset({'stickiness_enabled', 'stickiness_ttl', 'stickiness_recheck_hits',
+        'stickiness_max_entries', '_sticky_cache', 'sticky_cache_hits',
+        'sticky_evictions',
+        'get_sticky_cache', '_sticky_key', '_evict_sticky_key',
+        '_get_sticky_proxy', '_sticky_recheck_due', '_sticky_degrade_due',
+        '_record_sticky', '_bump_sticky', '_evict_sticky', '_evict_oldest_sticky',
+        '_prune_sticky'})
+
     def __getattr__(self, name):
-        # 仅在实例属性/类属性都未命中时被调用(正常查找失败);池成员转发到 pools。
+        # 仅在实例属性/类属性都未命中时被调用(正常查找失败);白名单成员转发到
+        # 对应协作类(pools/httpcache/sticky)。
         if name in Router._POOL_FORWARD:
             return getattr(self.pools, name)
+        if name in Router._CACHE_FORWARD:
+            return getattr(self.httpcache, name)
+        if name in Router._STICKY_FORWARD:
+            return getattr(self.sticky, name)
         raise AttributeError(f"{type(self).__name__} has no attribute {name!r}")
 
     def __setattr__(self, name, value):
-        # 构造期 self.pools 尚未存在时走正常赋值;建好后池白名单成员 set 到 pools。
+        # 构造期协作类(self.pools/self.httpcache/self.sticky)尚未存在时走正常
+        # 赋值;建好后白名单成员 set 到对应协作类(如 sticky_cache_hits += 1
+        # 读转发 get + set 转发到 sticky,不重绑 Router 上的名字)。
         if name in Router._POOL_FORWARD and 'pools' in self.__dict__:
             setattr(self.pools, name, value)
+            return
+        if name in Router._CACHE_FORWARD and 'httpcache' in self.__dict__:
+            setattr(self.httpcache, name, value)
+            return
+        if name in Router._STICKY_FORWARD and 'sticky' in self.__dict__:
+            setattr(self.sticky, name, value)
             return
         super().__setattr__(name, value)
 
