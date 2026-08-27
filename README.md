@@ -174,10 +174,26 @@ Client ──HTTP/S──> auto_squid (proxy :10808)
 
 - **HTTP requests**: raced via `httpx.AsyncClient` (streaming, one long-lived pooled client per upstream); winning response is written back, loser responses are closed
 - **CONNECT requests**: raced via raw `asyncio.open_connection` tunnels with connect/read timeouts
-- **Selection**: `ProxySelector.ordered_proxies()` returns a randomly shuffled list of enabled proxies; the first `max_retries` race, then any remaining proxies race as a fallback
+- **Selection**: `ProxySelector` produces the racing order — enabled proxies, circuit-open excluded, sorted by weighted least-request (`ewma × (1 + active)^bias`, fast-and-idle first) with slow-start-recovering and unknown-quality proxies demoted; the first `max_retries` form the first (staggered) batch, then any remaining proxies race as a fallback
 - **Domain cache**: after a win, the winning proxy is recorded in `domain_meta` and reused for the domain until `cache_ttl` expires
 - **Session stickiness**: same client IP + domain/target reuses the last winning proxy (single-send, beats the domain cache); a failing sticky proxy evicts its entry and falls back to racing, and the winner repopulates the table
 - **Stats**: `request_counts` (wins), `attempted_counts` (total attempts) per proxy; `domain_stats` (wins per domain per proxy) in SQLite
+
+### Module layout
+
+The router is split into a thin orchestration shell plus focused collaborator modules. Each collaborator owns its state and methods; `Router` forwards the hot-path member names to them via whitelist `__getattr__`/`__setattr__`, so callers (`api.py`, tests, benches) keep using the same attribute names.
+
+| File | Holds |
+|------|-------|
+| `router.py` | `Router` — client handling, racing, domain cache, single-send degrade, policy routing, SQLite persistence, and the forwarding shim to the collaborators |
+| `selector.py` | `ProxySelector` — per-proxy EWMA latency, circuit breaker + slow-start, adaptive concurrency limit, warm-up order |
+| `pools.py` | `ConnectionPools` — the three CONNECT warm pools (generic, target prewarm, established-handshake reuse) |
+| `sticky.py` | `StickyCache` — per-client+domain session stickiness table |
+| `http_cache.py` | `HttpCache` — GET response cache (LRU, in-flight coalescing, write-method invalidation) |
+| `config_schema.py` | `Config` / `RouterConfig` / … pydantic models (`extra="forbid"`, cross-field validation) |
+| `api.py` / `cli.py` | Management API + dashboard; entry point (uvloop, config loading, uvicorn) |
+
+The domain-cache cluster (`_meta_cache`, adaptive TTL, switch damping, quality-driven single-send degrade, SQLite persistence) stays in `Router` — it is entangled with the win-recording decision chain and read directly by `api.py`.
 
 ## API Endpoints
 
@@ -318,7 +334,7 @@ curl -x http://127.0.0.1:10808 http://www.baidu.com
 .venv/bin/python -m pytest -q
 ```
 
-The suite covers HTTP/CONNECT forwarding, the HTTP response cache, the domain cache, local racing, `ProxyStore` CRUD, the API, and binary-safe request body handling.
+The suite (200 tests) covers HTTP/CONNECT forwarding, the HTTP response cache (incl. LRU/eviction and in-flight coalescing), the domain cache, racing/aggregation timeouts, client auth, circuit breaker / probing / EWMA selection / in-flight weighting, session stickiness (incl. quality-driven single-send degrade), per-domain stats + SQLite persistence, UTF-8 header safety, binary-safe request body handling, connection warm pools + established-handshake reuse + idle pause (with the "pause never blocks the request path" guarantee), robustness (request-header limits, truncated-response detection), the config layer (`extra="forbid"` rejects typos, cross-field validation, exit code 2), and the module-split regressions (router_cfg= vs kwarg equivalence and pool/cache/sticky forwarding identity).
 
 CI runs the suite on **Python 3.10, 3.11 and 3.12** via GitHub Actions (`.github/workflows/test.yml`), with a per-test timeout (`pytest --timeout=60`) so a hanging test fails fast instead of blocking the job.
 

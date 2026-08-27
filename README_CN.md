@@ -174,10 +174,26 @@ router:
 
 - **HTTP 请求**：通过 `httpx.AsyncClient` 并行竞速（流式，每个上游一个长驻池化 client），胜出响应回写，落败响应关闭
 - **CONNECT 请求**：通过 `asyncio.open_connection` 隧道并行竞速，带连接/读取超时
-- **选择**：`ProxySelector.ordered_proxies()` 返回随机打乱的已启用代理列表；前 `max_retries` 个先竞速，失败后再对剩余代理竞速兜底
+- **选择**：`ProxySelector` 产出竞速顺序——已启用代理、剔除熔断中者，按加权 least-request（`ewma × (1 + active)^bias`，快且空闲者靠前）排序，slow-start 恢复期与未知质量代理垫底；前 `max_retries` 个组成首批（错峰启动），失败后再对剩余代理竞速兜底
 - **域名缓存**：胜出后把代理记入 `domain_meta`，在 `cache_ttl` 有效期内对该域名复用
 - **会话粘性**：同一客户端 IP + 域名/目标复用上次胜出的代理单发（跳过竞速），优先级高于域名缓存；粘性代理失败则驱逐该条目并回落竞速（redispatch），竞速赢家回填粘性表
 - **统计**：`request_counts` 各代理胜出次数，`attempted_counts` 各代理尝试次数；`domain_stats` 各域名下各代理胜出次数（SQLite 持久化）
+
+### 模块结构
+
+路由核心被拆成一个薄编排层 + 若干聚焦的协作类模块。每个协作类持有自己的状态与方法；`Router` 经白名单 `__getattr__`/`__setattr__` 把热路径成员名转发到对应协作对象——`api.py`/测试/压测的调用方继续用同名属性，无需改动。
+
+| 文件 | 负责 |
+|------|------|
+| `router.py` | `Router`——客户端处理、竞速、域名缓存、单发降级、策略路由、SQLite 持久化，以及到各协作类的转发 shim |
+| `selector.py` | `ProxySelector`——每代理 EWMA 延迟、熔断 + slow-start、自适应并发限制、竞速排序 |
+| `pools.py` | `ConnectionPools`——三套 CONNECT 预热池（通用池 / 目标半预连接 / 已建握手复用） |
+| `sticky.py` | `StickyCache`——per-client+domain 会话粘性表 |
+| `http_cache.py` | `HttpCache`——GET 响应缓存（LRU、在途去重聚合、写方法失效） |
+| `config_schema.py` | `Config` / `RouterConfig` / … pydantic 模型（`extra="forbid"`、跨字段校验） |
+| `api.py` / `cli.py` | 管理 API + 仪表盘；入口（uvloop、配置加载、uvicorn） |
+
+domain_cache 簇（`_meta_cache`、自适应 TTL、切换阻尼、质量感知单发降级、SQLite 持久化）仍留在 `Router`——它与胜出记录决策链紧耦合且被 `api.py` 直读。
 
 ## API 端点
 
@@ -311,7 +327,7 @@ curl -x http://127.0.0.1:10808 http://www.baidu.com
 .venv/bin/python -m pytest -q
 ```
 
-测试套件覆盖 HTTP/CONNECT 转发、HTTP 响应缓存、域名缓存、本机竞速、`ProxyStore` CRUD、API，以及二进制安全的请求体处理。
+测试套件（**200** 个用例）覆盖 HTTP/CONNECT 转发、HTTP 响应缓存（含 LRU/淘汰与在途去重聚合）、域名缓存、竞速/聚合超时、客户端认证、熔断/探活/EWMA 选路/在途加权、会话粘性（含质量感知单发降级）、域名统计 + SQLite 持久化、UTF-8 头安全、二进制安全的请求体处理、连接预热（通用池 + target 半预连接 + 已建握手隧道复用）+ 空闲暂停（含"暂停不卡请求路径"回归）、健壮性（请求头行数/字节上限、截断响应检测）、配置层（`extra="forbid"` 拒绝拼错键、跨字段校验、退出码 2），以及模块拆分回归（`router_cfg=` vs kwarg 等价、池/缓存/粘性转发同一性）。
 
 CI 通过 GitHub Actions（`.github/workflows/test.yml`）在 **Python 3.10 与 3.11 与 3.12** 三版本跑测试套件，并带单测试超时（`pytest --timeout=60`），挂起的测试会快速失败并报出测试名，而非无限阻塞任务。
 
