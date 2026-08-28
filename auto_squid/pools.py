@@ -140,6 +140,13 @@ class ConnectionPools:
         self.cluster_pool_creates = 0   # 预测预建的 target 连接数(cluster 专属)
         self.cluster_pool_hits = 0      # 取用命中中被预测预建命中的次数
         self.cluster_pool_expired = 0   # 空闲超时关闭中被预测预建关闭的次数
+        # C 探针(读写点:_target_pool_peek / _target_pool_refill / _pool_prune):
+        # 区分 cluster 预建空转的病因——时序没赶上 vs 代理桶不匹配。
+        self.cluster_pool_timing_miss = 0  # miss:该桶有 cluster 预建但此刻全灭(时序没赶上)
+        self.cluster_pool_bucket_miss = 0  # miss:该桶从未有 cluster 预建(代理桶不匹配)
+        self.cluster_pool_consumed_expired = 0  # 被消费后另行空转的预建被 prune 关闭(极少数)
+        # 键级"该桶是否出现过 cluster 预建"的标记(诊断读,不进 snapshot)。
+        self._target_pool_cluster_ever: dict = {}
         self.target_prewarm_dispatched = 0  # 后台预热协程发起次数
         self.target_prewarm_success = 0     # 预热建连成功次数
         self.target_prewarm_failed = 0      # 预热建连失败次数
@@ -201,10 +208,25 @@ class ConnectionPools:
         writer 保存;命中时若取到的恰是 cluster 预测预建的连接,额外计
         cluster_pool_hits —— 该计数 / cluster_pool_creates 即 cluster 专属
         命中率(把被动预建的贡献从 target_pool_hits 里剥离)。
+
+        诊断探针(C):区分 cluster 预建空转的两类病因——
+        - 取用 miss 且该键曾有过 cluster 预建(_target_pool_cluster_ever)
+          → 时序没赶上(预建存在但真实请求到达时已被取空/prune 清理);
+        - miss 且键从未出现过 cluster 预建(标记缺失)→ "代理桶不匹配"(真实胜出代理
+          的桶里根本没有 cluster 预建,预建躺在别的 (proxy|target) 桶里永不命中)。
+        取用命中时,给被消费的 cluster 预建连接补 `_consumed_unexpired=True` 标记,
+        _pool_prune 据此把"被真实消费后置空转"与"从未被消费直接空转"分开计数。
         """
-        got = self._pool_peek(self._target_pool, f"{proxy_host}:{proxy_port}|{target}")
+        key = f"{proxy_host}:{proxy_port}|{target}"
+        got = self._pool_peek(self._target_pool, key)
         if got is None:
             self.target_pool_misses += 1
+            if self._target_pool_cluster_ever.get(key, 0) > 0:
+                # 时序 miss:该桶出现过 cluster 预建但此刻为空(被取走/被 prune 清)。
+                self.cluster_pool_timing_miss += 1
+            else:
+                # 桶不匹配:该桶从未有 cluster 预建(真实请求走的代理不是预测那个)。
+                self.cluster_pool_bucket_miss += 1
             logger.info("target pool MISS %s via %s:%s (misses=%d)",
                         target, proxy_host, proxy_port, self.target_pool_misses)
         else:
@@ -212,6 +234,7 @@ class ConnectionPools:
             reader, writer = got
             if getattr(writer, '_cluster_prewarmed', False):
                 self.cluster_pool_hits += 1
+                writer._consumed_unexpired = True
             logger.info("target pool HIT  %s via %s:%s (hits=%d)",
                         target, proxy_host, proxy_port, self.target_pool_hits)
         return got
@@ -417,6 +440,9 @@ class ConnectionPools:
             if source == 'cluster':
                 writer._cluster_prewarmed = True
                 self.cluster_pool_creates += 1
+                # 键级标记:该 (proxy|target) 桶出现过 cluster 预建。取用该键 miss
+                # 时据此分诊"时序没赶上"(标记存在)vs"代理桶不匹配"(标记缺失)。
+                self._target_pool_cluster_ever[key] = 1
             self._target_pool.setdefault(key, []).append((reader, writer))
             self.target_pool_creates += 1
             self.target_prewarm_success += 1
@@ -472,6 +498,10 @@ class ConnectionPools:
                         if expired_counter == 'target_pool_expired' \
                                 and getattr(writer, '_cluster_prewarmed', False):
                             self.cluster_pool_expired += 1
+                            # 区分"被真实请求消费后再空转"(曾被打 _consumed_unexpired 标)
+                            # 与"从未被消费直接空转"(case 1)。前者极罕见,后者是主存量。
+                            if getattr(writer, '_consumed_unexpired', False):
+                                self.cluster_pool_consumed_expired += 1
                         continue
                     alive.append(item)
                 if alive:

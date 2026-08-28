@@ -4393,6 +4393,57 @@ class TestClusterPredictor:
             await up_srv.wait_closed()
 
     @pytest.mark.asyncio
+    async def test_probe_distinguishes_timing_from_bucket_miss(self):
+        """探针(C):区分 cluster 预建空转的病因——
+        键曾在 cluster 预建但取用为空 → timing_miss(时序没赶上);
+        键从未有 cluster 预建 → bucket_miss(代理桶不匹配)。
+        计数是全局的(非按键),故断言用探测操作前后的增量,不用绝对 0/1。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router(cluster_predict=True, cluster_min_support=1)
+        await r.start()
+        key_b = f"{HOST}:31991|pg-probe-b.example.com:443"
+        try:
+            # 第一窗学习 (pg-probe-a, pg-probe-b) 同簇。
+            await send_connect(HOST, ROUTER_PORT, target=b"pg-probe-a.example.com:443", payload=b"a")
+            await send_connect(HOST, ROUTER_PORT, target=b"pg-probe-b.example.com:443", payload=b"b")
+            await asyncio.sleep(2.2)
+            r.cluster.prune()
+            await r._conn_pool_close_all()   # 去掉第一窗被动预建,清空池
+            # 第二窗先连 pg-probe-a → 预测预建 pg-probe-b(cluster 来源,timing 标记出现)。
+            await send_connect(HOST, ROUTER_PORT, target=b"pg-probe-a.example.com:443", payload=b"a2")
+            for _ in range(200):
+                if len(r._target_pool.get(key_b, [])) >= 1:
+                    break
+                await asyncio.sleep(0.01)
+            assert r.cluster_pool_creates >= 1, "应出现 cluster 预建"
+            # 池里有预建但连接是裸的(r.pools 侧)。标记随键映射由 pools 持有,经
+            # _POOL_FORWARD 可读(诊断只读)。
+            assert r._target_pool_cluster_ever.get(key_b) == 1, "桶应打上 cluster 预建标记"
+            # 此刻忽略全局已累积的 miss(timing/bucket 都是全局计数),只测增量。
+            tm0, bm0 = r.cluster_pool_timing_miss, r.cluster_pool_bucket_miss
+            # 强制该 cluster 连接过期(不消费) → prune 关闭 → consumed_expired 不增。
+            for stack in r._target_pool.values():
+                for _, w in stack:
+                    w._conn_pool_created = time.monotonic() - 100
+            await r._pool_prune()
+            assert r.cluster_pool_expired >= 1
+            assert r.cluster_pool_consumed_expired == 0, "未消费直接空转不应计入 consumed_expired"
+            # 池空且该桶有 cluster 预建标记 → 此 miss 归 timing_miss。
+            got = r._target_pool_peek(HOST, 31991, 'pg-probe-b.example.com:443')
+            assert got is None
+            assert r.cluster_pool_timing_miss == tm0 + 1
+            assert r.cluster_pool_bucket_miss == bm0, "有 cluster 预建的桶不累计 bucket_miss"
+            # 另一桶从未有 cluster 预建 → 此 miss 归 bucket_miss。
+            got2 = r._target_pool_peek(HOST, 31991, 'pg-bucketmiss.example.com:443')
+            assert got2 is None
+            assert r.cluster_pool_bucket_miss == bm0 + 1
+            assert r.cluster_pool_timing_miss == tm0 + 1
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
     async def test_passive_prewarm_not_counted_as_cluster(self):
         """归因:被动预建(竞速胜出/域缓存触发,source 默认 'passive')不打 cluster 标签,
         命中复用也不计 cluster_pool_hits——cluster 计数只归预测预建。"""
@@ -4428,6 +4479,9 @@ class TestClusterPredictor:
         assert s['cluster_pool_creates'] == 0
         assert s['cluster_pool_hits'] == 0
         assert s['cluster_pool_expired'] == 0
+        assert s['cluster_pool_timing_miss'] == 0
+        assert s['cluster_pool_bucket_miss'] == 0
+        assert s['cluster_pool_consumed_expired'] == 0
 
     @staticmethod
     def _router(**kw) -> Router:

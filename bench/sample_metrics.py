@@ -73,6 +73,9 @@ FIELD_ORDER = [
     "cluster_pool_creates",     # 目标池中 cluster 预测预建条数(cluster 专属)
     "cluster_pool_hits",        # 命中中被预测预建命中的次数 → /creates = cluster 命中率
     "cluster_pool_expired",     # 空闲超时关闭中预测预建关闭的条数
+    "cluster_pool_timing_miss", # 探针:miss 且该桶有 cluster 预建(时序没赶上)
+    "cluster_pool_bucket_miss", # 探针:miss 且该桶无 cluster 预建(代理桶不匹配)
+    "cluster_pool_consumed_expired", # 被真实消费后再空转被关(极少)
     "target_prewarm_dispatched",# 预热协程发起次数
     "target_prewarm_success",   # 预热建连成功次数
     "target_prewarm_failed",    # 预热建连失败次数
@@ -116,6 +119,9 @@ FIELD_DOCS = {
     "cluster_pool_creates": "目标池中 cluster 预测预建条数",
     "cluster_pool_hits": "命中中被预测预建命中的次数(/creates=cluster 命中率)",
     "cluster_pool_expired": "空闲超时关闭中预测预建关闭的条数",
+    "cluster_pool_timing_miss": "探针:miss 且该桶有 cluster 预建(时序没赶上)",
+    "cluster_pool_bucket_miss": "探针:miss 且该桶无 cluster 预建(代理桶不匹配)",
+    "cluster_pool_consumed_expired": "被真实消费后再空转被关(极少)",
     "target_prewarm_dispatched": "预热协程发起次数",
     "target_prewarm_success": "预热建连成功次数",
     "target_prewarm_failed": "预热建连失败次数",
@@ -151,6 +157,8 @@ FOCUS = [
     "cluster_pool_hits",
     "cluster_pool_creates",
     "cluster_pool_expired",
+    "cluster_pool_timing_miss",
+    "cluster_pool_bucket_miss",
     "conn_pool_hits",
     "conn_pool_expired",
     "racing_invocations",
