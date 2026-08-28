@@ -210,11 +210,14 @@ class ConnPoolConfig(ConfigBase):
                 据此区分,既不误伤真实请求,又免疫心跳。0=不启用窗口计数(任意
                 请求都刷新,旧行为)。
     cluster_predict / cluster_window_sec / cluster_predict_topk / cluster_min_support /
+    cluster_proxy_fanout /
                 请求簇预测预热(默认关闭):按客户端窗口的 CONNECT 簇共现规律学习
                 全局共现图,下次页面加载开口即预测同簇下一批 co-target 并提前预建
                 到上游的裸 TCP(不 CONNECT 源站)。错预建 30s 空闲即被淘汰,预算共享
                 conn_pool.total。cluster_predict 需 conn_pool.enabled +
-                target_prewarm 同时开启。
+                target_prewarm 同时开启。多桶并行预建 cluster_proxy_fanout 把同
+                co-target 摊到胜出代理直方图 top-N 桶(默认 2),提升落中真实胜出桶
+                概率,fd 预算 conn_pool.total 逐条兜底。
     """
     enabled: bool = Field(False, description="启用 CONNECT 上游 TCP 预热池")
     per_proxy: int = Field(4, description="每代理预热连接数上限")
@@ -236,6 +239,8 @@ class ConnPoolConfig(ConfigBase):
     cluster_graph_ttl_sec: int = Field(86400, description="共现图条目的 TTL(秒):超过未再共现的 (src→co) 边被周期清理")
     cluster_graph_max_entries: int = Field(100_000, description="共现图边数硬上限,超限驱逐 last_seen 最旧的边(防高基数 URL 内存无界,仿 sticky max_entries)")
     cluster_predict_throttle_sec: float = Field(30.0, description="同一 (src→co) 对的预测节流间隔(秒):节流内不重复发射,防 reload 反复预建")
+    cluster_proxy_fanout: int = Field(2, description="多桶并行预建(方案 A):同 co-target 预测时并行预建的候选代理桶数上限(1=旧单桶行为)。每条共现边记胜出代理 id 直方图,预测摊到计数最高的前 N 个桶,显著提升落在真实胜出桶的概率(探针显示桶错配是主病因)。fd 预算 conn_pool.total 逐条兜底,超预算即静默少建")
+    cluster_probe_decay_sec: float = Field(3600.0, description="胜出代理直方图计数的衰减半衰(秒):计数按指数遗忘窗衰减,保留近期谁常胜,防冷启动早期偶然胜出长期霸榜")
 
     @model_validator(mode="after")
     def _gate_on_enabled(self):

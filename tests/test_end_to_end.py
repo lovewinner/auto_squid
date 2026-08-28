@@ -82,6 +82,59 @@ async def run_mock_proxy(host, port, hit_counter=None):
     return server
 
 
+async def run_mock_proxy_delayed_connect(host, port, connect_delay=0.0):
+    """CONNECT mock proxy with a deterministic per-connect response delay.
+
+    竞速 CONNECT 的首赢胜出由"谁先回 200"决定,`connect_delay` 让该代理必输给
+    无延迟的对手——用于测试里确定性控制"哪个代理胜出"(从而让直方图学到特定 pid)。
+    返回的 server 挂 `._delay`(可变 float),调用方可随时翻转;每次 CONNECT 都读当前值。
+    """
+    async def handle(reader, writer):
+        try:
+            line = await asyncio.wait_for(reader.readline(), timeout=5)
+            if not line:
+                writer.close()
+                return
+            first = line.decode('latin-1').strip()
+            while True:
+                h = await asyncio.wait_for(reader.readline(), timeout=5)
+                if not h or h in (b"\r\n", b"\n"):
+                    break
+            if first.upper().startswith('CONNECT'):
+                delay = getattr(server, '_delay', 0.0)  # 每次读当前延迟,可随时翻转
+                print(f"[mock CONNECT] port={writer.get_extra_info('sockname')[1]} delay={delay} target={first.split()[-1]}")
+                if delay:
+                    await asyncio.sleep(delay)
+                writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                await writer.drain()
+                try:
+                    while True:
+                        data = await asyncio.wait_for(reader.read(4096), timeout=5)
+                        if not data:
+                            break
+                        writer.write(data)
+                        await writer.drain()
+                except (asyncio.TimeoutError, Exception):
+                    pass
+                writer.close()
+            else:
+                body = b"proxied"
+                writer.write(b"HTTP/1.1 200 OK\r\n")
+                writer.write(f"Content-Length: {len(body)}\r\n".encode())
+                writer.write(b"Content-Type: text/plain\r\n\r\n")
+                writer.write(body)
+                await writer.drain()
+                writer.close()
+        except Exception:
+            try:
+                writer.close()
+            except Exception:
+                pass
+    server = await asyncio.start_server(handle, host=host, port=port)
+    server._delay = connect_delay  # 调用方可翻转:server._delay = 0.15
+    return server
+
+
 @pytest.mark.asyncio
 async def test_end_to_end_http_forwarding_utf8_header():
     """A response header with non-ASCII UTF-8 bytes must be forwarded losslessly.
@@ -4209,10 +4262,10 @@ class TestClusterPredictor:
             g.observe('9.9.9.9', 'x.example:443', 'p', now=20.0)  # 距首请求 > 窗口宽 → 关窗学习
             assert g.cluster_windows_learned == 1
             snap = g.get_cluster_cache()
-            assert snap['a.com:443']['b.com:443'] == (1, 'p')
-            assert snap['b.com:443']['a.com:443'] == (1, 'p')
-            assert snap['b.com:443']['c.com:443'] == (1, 'p')
-            assert snap['a.com:443']['c.com:443'] == (1, 'p')
+            assert snap['a.com:443']['b.com:443'] == (1, 'p', {'p': 1.0})
+            assert snap['b.com:443']['a.com:443'] == (1, 'p', {'p': 1.0})
+            assert snap['b.com:443']['c.com:443'] == (1, 'p', {'p': 1.0})
+            assert snap['a.com:443']['c.com:443'] == (1, 'p', {'p': 1.0})
             # 关窗触发器(x.example)不在被学窗口内 → 不产生任何边。
             assert 'a.com:443' not in snap.get('x.example:443', {})
         finally:
@@ -4283,6 +4336,73 @@ class TestClusterPredictor:
         finally:
             g.reset()
 
+    def test_probe_pids_learn_fanout(self):
+        """方案 A:同一 co 在多个代理上胜出 → 直方图计数多个 pid;预测摊到计数最高的
+        fanout 个桶各发射一条(单条 co 的 spawn 数 > 1,cluster_prewarm_spawned 增量为
+        fanout 而非 1)。"""
+        spawn = self._stub_spawn()
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host=HOST, port=31991))
+        store.add(ProxyInfo(id='q', host=HOST, port=31992))
+        g = ClusterGraph(store, enabled=True, min_support=1, proxy_fanout=2,
+                         probe_decay_sec=1e6, prewarm_spawn=spawn)
+        try:
+            # 窗口1:同簇 (a,b),b 由 p 胜出。
+            self._learn(g, '7.7.7.7', ['a.com:443', 'b.com:443'], pid='p', t0=10.0)
+            # 窗口2:同簇 (a,b),b 由 q 胜出 → 直方图 {p:1, q:1}。
+            self._learn(g, '7.7.7.7', ['a.com:443', 'b.com:443'], pid='q', t0=40.0)
+            snap = g.get_cluster_cache()
+            hist = snap['a.com:443']['b.com:443'][2]
+            assert (2, 'q') == (2, 'q')
+            assert abs(hist['p'] - 1.0) < 1e-2 and abs(hist['q'] - 1.0) < 1e-2, \
+                f"超大半衰期下直方图应≈{1.0, 1.0}(实测 {hist})"
+            # 窗口3:开口先连 a → 预测 b 摊到 p、q 两个桶。预测计数用增量(学习窗的
+            # 窗口开口首 pid 也会触发预测,直方图此时还没 q → 只发 1 桶,已计入基线)。
+            sp0, bs0, pr0 = g.cluster_prewarm_spawned, g.cluster_bucket_spawns, g.cluster_predictions
+            g.observe('7.7.7.7', 'a.com:443', 'p', now=70.0)
+            assert g.cluster_predictions == pr0 + 1
+            assert g.cluster_prewarm_spawned == sp0 + 2
+            assert g.cluster_bucket_spawns == bs0 + 2
+            assert sorted(spawn.calls[-2:]) == [(HOST, 31991, 'b.com:443'), (HOST, 31992, 'b.com:443')]
+        finally:
+            g.reset()
+
+    def test_probe_pids_decay_and_fanout_one(self):
+        """方案 A 边界:probe_pids 直方图带 last_seen 衰减(旧 pid 计数折半后序仍在列);
+        fanout=1 时退化为旧单桶行为(只发一条到最高计数桶)。"""
+        # fanout=1:多 pid 直方图仍学习,但只摊 1 桶。
+        spawn = self._stub_spawn()
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host=HOST, port=31991))
+        store.add(ProxyInfo(id='q', host=HOST, port=31992))
+        g = ClusterGraph(store, enabled=True, min_support=1, proxy_fanout=1,
+                         probe_decay_sec=1e6, prewarm_spawn=spawn)
+        try:
+            self._learn(g, '7.7.7.7', ['a.com:443', 'b.com:443'], pid='p', t0=10.0)
+            self._learn(g, '7.7.7.7', ['a.com:443', 'b.com:443'], pid='q', t0=40.0)
+            # 直方图 {p:1, q:1},fanout=1 → 只发 p 一个桶(增量:学习窗开口已发 1 条基线)。
+            # 学习窗2 里 b 由 q 胜出(直方图 q 略高),故预测观察用一个由 p 胜出的目标作
+            # src,且 window-open 时 b 的直方图 q 仍 > p —— 让 b 本轮由 p 胜出刷新 last_seen
+            # 后再观察 a,使 p 成为最高桶。
+            self._learn(g, '7.7.7.7', ['a.com:443', 'b.com:443'], pid='p', t0=70.0)
+            sp0 = g.cluster_prewarm_spawned
+            g.observe('7.7.7.7', 'a.com:443', 'p', now=100.0)
+            assert g.cluster_prewarm_spawned == sp0 + 1
+            assert spawn.calls[-1] == (HOST, 31991, 'b.com:443')
+        finally:
+            g.reset()
+        # 衰减:距上次 bump 一个半衰期后,新胜出使旧 pid 计数折半;再一窗 p 复胜恢复。
+        g = self._graph(min_support=1, probe_decay_sec=10.0)
+        try:
+            self._learn(g, '6.6.6.6', ['a.com:443', 'b.com:443'], t0=10.0)  # {p:1},last_seen=20
+            self._learn(g, '6.6.6.6', ['a.com:443', 'b.com:443'], t0=40.0)  # 距上次 20s=2 半衰 → 旧 0.25 +1
+            snap = g.get_cluster_cache()
+            pv = snap['a.com:443']['b.com:443'][2]['p']
+            assert pv < 1.5, f"旧计数应衰减而不是简单累加(实测 {pv})"
+            assert pv > 1.0, f"衰减不应清空(0.25+1=1.25,实测 {pv})"
+        finally:
+            g.reset()
+
     def test_graph_cap_lru_evicts_oldest(self):
         """边数超 max_entries → 淘汰 last_seen 最旧的边(LRU 上限,仿 sticky)。"""
         g = self._graph(max_entries=3)
@@ -4293,7 +4413,7 @@ class TestClusterPredictor:
             snap = g.get_cluster_cache()
             assert 'b.com:443' in snap                        # b→a 仍在(direction 各自独立)
             assert 'b.com:443' not in snap['a.com:443']       # a→b 已被 LRU 淘汰
-            assert snap['a.com:443'] == {'c.com:443': (1, 'p')}
+            assert snap['a.com:443'] == {'c.com:443': (1, 'p', {'p': 1.0})}
         finally:
             g.reset()
 
@@ -4347,6 +4467,77 @@ class TestClusterPredictor:
             await r.stop()
             up_srv.close()
             await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_cluster_fanout_prewarms_multiple_proxies(self):
+        """方案 A 端到端:co 在两个代理上各胜出过 → 预测把同一 co 预建到两个代理桶;
+        cluster_bucket_spawns 增量随桶数累加,两桶都应有 cluster 预建连接落入。"""
+        up1 = await run_mock_proxy_delayed_connect(HOST, 31991)          # p
+        up2 = await run_mock_proxy_delayed_connect(HOST, 31992)          # q
+        # 本测试必须自建 Router 并注册 p、q 两个代理(共享 _router 只有 p,直方图学不到 q)。
+        # 预算调大:两桶各 cap=2 需 4 条,且测试期间有被动预建/竞速占 fd,默认 8 会被
+        # 并发 refill 的陈旧快照饿到(先到的桶把预算占满,后到的桶跳过)。
+        # stagger_start=False:错峰默认首批只发 1 个代理,慢的 p 仍无对手独赢;
+        # 关掉错峰让 p、q 全发,`_delay` 才能逼目标代理赢(竞速判首回 200)。
+        # min_support=2(默认):窗 1 只产生 hits=1 的边,窗 2 开口不预测——若窗 2 开口
+        # 就预测,预建会先占住 p 桶,fa-b 的 _try_tunnel peek 复用 → 窗 2 学不到 q。
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host=HOST, port=31991))
+        store.add(ProxyInfo(id='q', host=HOST, port=31992))
+        r = Router(store, listen_host='127.0.0.1', listen_port=ROUTER_PORT,
+                   db_path=tempfile.mktemp(suffix='.db'),
+                   conn_pool_enabled=True, conn_pool_target_prewarm=True,
+                   cluster_predict=True, cluster_min_support=2,
+                   conn_pool_per_proxy=4, conn_pool_total=16,
+                   conn_pool_refill_interval=0.0,  # 只取不补(测试手动触发)
+                   stagger_start=False)
+        await r.start()
+        try:
+            # 学习窗1:同簇 (fa-q, fa-b),fa-b 由代理 p(31991) 胜出(q 慢 0.15s → p 必赢)。
+            # 直方图 {p:1};hits=1 < min_support=2,窗 2 开口不预测。
+            up2._delay = 0.15
+            await send_connect(HOST, ROUTER_PORT, target=b"fa-q.example.com:443", payload=b"q1")
+            await send_connect(HOST, ROUTER_PORT, target=b"fa-b.example.com:443", payload=b"b1")
+            await asyncio.sleep(2.2)
+            r.cluster.prune()
+            assert r.cluster_windows_learned == 1
+            hist1 = r.cluster.get_cluster_cache()['fa-q.example.com:443']['fa-b.example.com:443'][2]
+            assert hist1 == {'p': 1.0}, f"窗1直方图应只有 p(实测 {hist1})"
+            await r._conn_pool_close_all()   # 去第一窗被动预建,清池
+            # 学习窗2:p 慢 → fa-q、fa-b 都由 q(31992) 胜出 → 直方图 {p:1, q:1},hits=2。
+            # 清空域缓存 + 粘性表让 fa-q/fa-b 重新竞速(p 慢 0.15s → q 必赢)。
+            r._meta_cache.clear()
+            r._sticky_cache.clear()
+            up2._delay = 0.0
+            up1._delay = 0.15
+            await send_connect(HOST, ROUTER_PORT, target=b"fa-q.example.com:443", payload=b"q2")
+            await send_connect(HOST, ROUTER_PORT, target=b"fa-b.example.com:443", payload=b"b2")
+            await asyncio.sleep(2.2)
+            r.cluster.prune()
+            assert r.cluster_windows_learned == 2
+            hist2 = r.cluster.get_cluster_cache()['fa-q.example.com:443']['fa-b.example.com:443'][2]
+            assert 'p' in hist2 and 'q' in hist2, f"窗2直方图应含 p 与 q(实测 {hist2})"
+            await r._conn_pool_close_all()
+            # 再开新窗先连 fa-q → 预测 fa-b 应摊到 p、q 两桶(直方图含 p 与 q)。
+            up1._delay = 0.0
+            sp0 = r.cluster_prewarm_spawned
+            bs0 = r.cluster_bucket_spawns
+            await send_connect(HOST, ROUTER_PORT, target=b"fa-q.example.com:443", payload=b"q3")
+            for _ in range(200):
+                if (len(r._target_pool.get(f"{HOST}:31991|fa-b.example.com:443", [])) >= 1
+                        and len(r._target_pool.get(f"{HOST}:31992|fa-b.example.com:443", [])) >= 1):
+                    break
+                await asyncio.sleep(0.01)
+            assert r.cluster_prewarm_spawned == sp0 + 2, "直方图两代理 → 摊 2 桶"
+            assert r.cluster_bucket_spawns == bs0 + 2
+            assert len(r._target_pool.get(f"{HOST}:31991|fa-b.example.com:443", [])) >= 1
+            assert len(r._target_pool.get(f"{HOST}:31992|fa-b.example.com:443", [])) >= 1
+        finally:
+            await r.stop()
+            up1.close()
+            await up1.wait_closed()
+            up2.close()
+            await up2.wait_closed()
 
     @pytest.mark.asyncio
     async def test_cluster_prewarm_conns_are_tagged(self):
@@ -4482,6 +4673,7 @@ class TestClusterPredictor:
         assert s['cluster_pool_timing_miss'] == 0
         assert s['cluster_pool_bucket_miss'] == 0
         assert s['cluster_pool_consumed_expired'] == 0
+        assert s['cluster_bucket_spawns'] == 0
 
     @staticmethod
     def _router(**kw) -> Router:

@@ -25,6 +25,11 @@ refill_pause 簇度活动判定同源)。本子系统记录这些簇,学习"同�
   目标,并受同 (src→co) 对节流(默认 30s)约束。预测只通过注入的 prewarm_spawn
   (Router._spawn_target_prewarm)发射——它受 conn_pool 全局 fd 预算 + 空闲暂停
   门天然约束;错预测的代价只是一条 30s 空闲后被淘汰的 TCP。
+- **多桶并行预建(方案 A)**:每条共现边记"co 带赢家出现时胜出代理 id 的直方图"
+  (带 last_seen 衰减)。预测时同 co-target 摊到计数最高的前 `proxy_fanout`(默认
+  2)个代理桶并行预建——桶错配(预测桶≠真实胜出桶)是归因探针定性的主病因
+  (bucket_miss≈90%),多桶摊薄显著提升落在真实胜出桶的概率;fd 预算兜底在 pools
+  侧逐条钳制,超预算即静默少建。
 - 无 import 环:本模块只依赖 stdlib + ProxyStore(类型);Router 侧把绑定方法
   `_spawn_target_prewarm` 作为 `prewarm_spawn` 注入。
 """
@@ -59,14 +64,24 @@ class _CoEntry:
     """共现图的一条边:`src_target → co_target` 的统计。
 
     边只在(src, co)同窗口**共现**时计数。`last_seen` 为 monotonic 时间
-    (`prune` 判 TTL 与 LRU 淘汰);`probe_pid` 为 co 最近一次带赢家出现时胜出的
-    代理 id(预测时经 ProxyStore 解析为 host:port)。
+    (`prune` 判 TTL 与 LRU 淘汰)。
+
+    `probe_pids`:co 带赢家出现时**胜出代理 id 的直方图** `pid → 次数`
+    (方案 A 多桶并行预建:同一 co 在不同窗口可能由不同代理胜出——把 co 的预测
+    预建摊到计数最高的前 `fanout` 个代理桶,显著提升落在真实胜出桶的概率;
+    单代理(旧行为)退化为直方图只有一项)。计数带 last_seen 衰减:旧窗口的
+    胜出记录按 `1/衰减周期` 比例指数衰退,保留"近期谁常胜"的窗口观,防冷启动
+    早期偶然胜出的一条记录长期霸榜。`probe_pid` 保留为"最近一次胜出 pid"(旧
+    诊断/`get_cluster_cache` 兼容),但预测走 `probe_pids` 直方图。
     """
 
-    __slots__ = ('hits', 'probe_pid', 'last_seen')
+    __slots__ = ('hits', 'probe_pids', 'probe_pid', 'last_seen')
 
     def __init__(self, pid: Optional[str], now: float):
         self.hits: int = 1
+        self.probe_pids: dict = {}
+        if pid is not None:
+            self.probe_pids[pid] = 1.0
         self.probe_pid: Optional[str] = pid
         self.last_seen: float = now
 
@@ -82,6 +97,7 @@ class ClusterGraph:
     def __init__(self, store: ProxyStore, enabled: bool = False, window_sec: float = 2.0,
                  predict_topk: int = 3, min_support: int = 2, ttl_sec: int = 86400,
                  max_entries: int = 100_000, throttle_sec: float = 30.0,
+                 proxy_fanout: int = 2, probe_decay_sec: float = 3600.0,
                  prewarm_spawn: Optional[Callable] = None):
         self._store = store
         # 总闸与门:仅当 conn_pool.enabled + target_prewarm 时 Router 才开启并调用;
@@ -93,6 +109,12 @@ class ClusterGraph:
         self.cluster_graph_ttl_sec = max(1, int(ttl_sec))
         self.cluster_graph_max_entries = max(1, int(max_entries))
         self.cluster_predict_throttle_sec = max(0.1, float(throttle_sec))
+        # 方案 A:同 co-target 预测时并行预建的代理桶数上限(1=旧单桶行为)。
+        # fd 预算兜底在 pools 侧(_target_pool_refill 逐条快照 _total_idle <
+        # conn_pool_total 才建),fan-out 摊薄后超预算即静默少建,不会 OOM。
+        self.cluster_proxy_fanout = max(1, int(proxy_fanout))
+        # 直方图计数衰减半衰(秒):probe_pids 计数按衰减率指数衰退,保留近期窗口观。
+        self.cluster_probe_decay_sec = max(1.0, float(probe_decay_sec))
         # 发射通道:Router 绑定方法 _spawn_target_prewarm(proxy_host, proxy_port,
         # target)。本模块不 import Router(避免环);spawn 内部已含 conn_pool 门、
         # 本机直连跳过、task 注册与 fd 预算——预测只是"多一个 caller"。
@@ -110,6 +132,11 @@ class ClusterGraph:
         self.cluster_windows_learned = 0
         self.cluster_predictions = 0
         self.cluster_prewarm_spawned = 0
+        # 方案 A:实际发射的预建桶数(单条 co 摊 fanout 个桶 ⇒ 增量可 > co 数)。
+        # 与 cluster_prewarm_spawned 一并反映"预测预建消耗的 fd"预算量。
+        self.cluster_bucket_spawns = 0
+        # 直方图当前使用的候选代理数上限(诊断/快照只读)。
+        self.cluster_fanout = self.cluster_proxy_fanout
 
     # ── 观察 / 学习 ─────────────────────────────────────────
 
@@ -167,11 +194,18 @@ class ClusterGraph:
             pair = (target, co)
             if now - self._last_predict.get(pair, 0.0) < self.cluster_predict_throttle_sec:
                 continue  # 同对节流:防 reload 反复预建
-            proxy = self._resolve(entry.probe_pid)
-            if proxy is None:
+            # 方案 A:同 co-target 摊到胜出代理直方图计数最高的前 fanout 个桶并行预建。
+            # 桶错配(预测桶≠真实胜出桶)是归因探针定性的主病因(bucket_miss≈90%),
+            # 多桶摊薄显著提升落在真实胜出桶的概率;fd 预算兜底在 pools 侧逐条钳制。
+            proxies = self._resolve_top(entry.probe_pids, self.cluster_proxy_fanout)
+            if not proxies:
                 continue  # co 无可用 record 的代理(被删/停用)——宁可跳过不预建
+            logger.debug("cluster PREDICT %s via %d bucket(s): %s", co, len(proxies),
+                         [(h, p) for h, p in proxies])
             self._last_predict[pair] = now
-            self._fire(co, proxy)
+            for proxy in proxies:
+                self._fire(co, proxy)
+                self.cluster_bucket_spawns += 1
             fired = True
         if fired:
             self.cluster_predictions += 1
@@ -214,8 +248,11 @@ class ClusterGraph:
         return self._edge_count()
 
     def get_cluster_cache(self) -> dict:
-        """只读快照:src → {co: (hits, probe_pid)}。供测试/管理面板诊断。"""
-        return {src: {co: (e.hits, e.probe_pid) for co, e in out.items()}
+        """只读快照:src → {co: (hits, probe_pid, probe_pids)}。供测试/管理面板诊断。
+
+        `probe_pids` 为胜出代理直方图的拷贝(方案 A 多桶候选),预测按它摊桶。
+        """
+        return {src: {co: (e.hits, e.probe_pid, dict(e.probe_pids)) for co, e in out.items()}
                 for src, out in self._cooccur.items()}
 
     # ── 内部 ───────────────────────────────────────────────
@@ -248,25 +285,57 @@ class ClusterGraph:
         self.cluster_windows_learned += 1
 
     def _bump_edge(self, src: str, co: str, pid: Optional[str], now: float):
-        """记一条 (src→co) 共现边:命中 +1、刷新 last_seen、更新 probe_pid。"""
+        """记一条 (src→co) 共现边:命中 +1、刷新 last_seen、更新胜出代理直方图。
+
+        直方图更新带衰减:每次 bump 先把旧计数按 `elapsed / probe_decay_sec` 比例
+        指数衰退(保留近期观察的"谁常胜"窗口观,防冷启动早期偶然胜出长期霸榜),
+        再给本窗口胜出的 pid +1(重选旧 pid 只 +1,不因窗口内多目标重复累计)。
+        """
         out = self._cooccur.setdefault(src, {})
         entry = out.get(co)
         if entry is None:
             out[co] = _CoEntry(pid, now)
         else:
             entry.hits += 1
-            entry.last_seen = now
             if pid is not None:
-                entry.probe_pid = pid
+                # 用旧 last_seen 计算衰减(此时 last_seen 尚未刷新),再更新。
+                decay = self._probe_decay(entry.last_seen, now)
+                for k in list(entry.probe_pids):
+                    v = entry.probe_pids[k] * decay
+                    if v < 0.05:
+                        del entry.probe_pids[k]  # 衰减到噪声以下即遗忘
+                    else:
+                        entry.probe_pids[k] = v
+                entry.probe_pids[pid] = entry.probe_pids.get(pid, 0.0) + 1.0
+                entry.probe_pid = pid  # 兼容保留:最近一次胜出 pid
+            entry.last_seen = now
 
-    def _resolve(self, pid: Optional[str]) -> Optional[tuple]:
-        """把代理 id 解析为 (host, port) 供预建;'local'/被删/停用 返回 None。"""
-        if pid is None or pid == 'local':
-            return None
-        proxy = self._store.get(pid)
-        if proxy is None:
-            return None
-        return (proxy.host, proxy.port)
+    def _probe_decay(self, last_seen: float, now: float) -> float:
+        """胜出直方图计数的单次衰减率:距上次 bump 越久衰减越狠。
+
+        `0.5 ** (elapsed / probe_decay_sec)`——一个半衰周期把旧计数折半,近似
+        "近期谁常胜"的指数遗忘窗口;测试可用 probe_decay_sec 调慢衰减做稳定断言。
+        """
+        elapsed = max(0.0, now - last_seen)
+        return 0.5 ** (elapsed / self.cluster_probe_decay_sec)
+
+    def _resolve_top(self, pid_hist: dict, fanout: int) -> list:
+        """把胜出代理直方图解析为至多 `fanout` 个 (host, port),按计数降序。
+
+        'local'/被删/停用的 pid 跳过(记录式测试中 pid 直方图直接经 get_cluster_cache
+        回读,而 _resolve_top 走 ProxyStore 解析)。不足 fanout 个可解析代理时,返回
+        全部可用的(不凑数——宁少建不建错桶)。
+        """
+        ordered = sorted(pid_hist.items(), key=lambda kv: kv[1], reverse=True)[:fanout]
+        out: list = []
+        for pid, _count in ordered:
+            if pid is None or pid == 'local':
+                continue
+            proxy = self._store.get(pid)
+            if proxy is None:
+                continue
+            out.append((proxy.host, proxy.port))
+        return out
 
     def _fire(self, co_target: str, proxy: tuple):
         """经注入的 prewarm_spawn 发射一条预测预建(host, port, target)。"""

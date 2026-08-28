@@ -84,6 +84,7 @@ FIELD_ORDER = [
     "cluster_windows_learned",  # 已学习的簇窗口数(共现学习量)
     "cluster_predictions",      # 预测发射次数(含节流跳过前的候选集)
     "cluster_prewarm_spawned",  # 预测实际发起的预热数(重点指标:预测预建量)
+    "cluster_bucket_spawns",    # 预测发射的桶数(同 co 摊 fanout 个桶 ⇒ ≥ prewarm_spawned)
     "cluster_graph_size",       # 共现图边数(记忆规模,应受 max_entries 约束)
     # 熔断/探活
     "circuit_open_count",       # 当前熔断的代理数
@@ -129,6 +130,7 @@ FIELD_DOCS = {
     "cluster_windows_learned": "已学习的簇窗口数",
     "cluster_predictions": "预测发射次数",
     "cluster_prewarm_spawned": "预测实际发起的预热数",
+    "cluster_bucket_spawns": "预测发射的桶数(同 co 摊 fanout 个桶 ⇒ ≥ prewarm_spawned)",
     "cluster_graph_size": "共现图边数",
     "circuit_open_count": "熔断中的代理数",
     "probes_sent": "探活已发",
@@ -163,6 +165,7 @@ FOCUS = [
     "conn_pool_expired",
     "racing_invocations",
     "cluster_prewarm_spawned",
+    "cluster_bucket_spawns",
     "cluster_predictions",
 ]
 
