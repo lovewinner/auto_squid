@@ -3736,6 +3736,40 @@ class TestTargetPrewarm:
             await up_srv.wait_closed()
 
     @pytest.mark.asyncio
+    async def test_cluster_prewarm_outlives_passive_prune(self):
+        """cluster 预建独立空闲超时:同键 cluster 预建比被动预建活得更久。
+
+        _pool_prune 按连接级 _cluster_prewarmed 标签选超时——cluster 连接用
+        cluster_pool_idle_timeout(默认 600s),被动/通用池连接仍用
+        conn_pool_idle_timeout。同键混装(先 cluster 后 passive)验证两段超时并存。
+        """
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router(conn_pool_idle_timeout=1.0, cluster_pool_idle_timeout=1000.0)
+        try:
+            key = f"{HOST}:31991|split-timeout.example.com:443"
+            # 先 cluster 补满 2 条(打 _cluster_prewarmed),再 passive 补到 cap=4。
+            # 顺序不能反:refill 按 cap 是"目标水位"不是增量,若先 passive 建满 2 条,
+            # 后续 cluster 会因 cap=2 不再补(0 条 cluster 连接)。
+            assert await r._target_pool_refill(HOST, 31991, 'split-timeout.example.com:443',
+                                               cap=2, source='cluster') == 2
+            assert await r._target_pool_refill(HOST, 31991, 'split-timeout.example.com:443',
+                                               cap=4, source='passive') == 2
+            assert len(r._target_pool[key]) == 4
+            # 全部伪造为 50s 前建连:超过被动超时(1s),未到 cluster 超时(1000s)。
+            for stack in r._target_pool.values():
+                for _, w in stack:
+                    w._conn_pool_created = time.monotonic() - 50
+            await r._pool_prune()
+            assert r.target_pool_expired >= 2      # 被动 2 条被关
+            assert r.cluster_pool_expired == 0     # cluster 2 条存活(独立超时生效)
+            assert len(r._target_pool[key]) == 2
+            assert all(getattr(w, '_cluster_prewarmed', False) for _, w in r._target_pool[key])
+        finally:
+            await r._conn_pool_close_all()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
     async def test_combined_budget_respected(self):
         """第一阶段与 target 池共享 conn_pool_total:target 池占满预算后,第一阶段
         refill 不再新增连接。"""
@@ -4367,6 +4401,26 @@ class TestClusterPredictor:
         finally:
             g.reset()
 
+    def test_bucket_spawns_equals_len_proxies(self):
+        """cluster_bucket_spawns 语义:一次预测摊 N 个可解析代理桶 → 增量恰为 N,
+        与实际发射条数(cluster_prewarm_spawned)一致但独立计数(不随 _fire 重复累加)。"""
+        spawn = self._stub_spawn()
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host=HOST, port=31991))
+        store.add(ProxyInfo(id='q', host=HOST, port=31992))
+        g = ClusterGraph(store, enabled=True, min_support=1, proxy_fanout=2,
+                         probe_decay_sec=1e6, prewarm_spawn=spawn)
+        try:
+            self._learn(g, '7.7.7.7', ['a.com:443', 'b.com:443'], pid='p', t0=10.0)
+            self._learn(g, '7.7.7.7', ['a.com:443', 'b.com:443'], pid='q', t0=40.0)
+            sp0, bs0 = g.cluster_prewarm_spawned, g.cluster_bucket_spawns
+            g.observe('7.7.7.7', 'a.com:443', 'p', now=70.0)
+            assert g.cluster_prewarm_spawned - sp0 == 2
+            assert g.cluster_bucket_spawns - bs0 == 2
+            assert g.cluster_bucket_spawns == g.cluster_prewarm_spawned
+        finally:
+            g.reset()
+
     def test_probe_pids_decay_and_fanout_one(self):
         """方案 A 边界:probe_pids 直方图带 last_seen 衰减(旧 pid 计数折半后序仍在列);
         fanout=1 时退化为旧单桶行为(只发一条到最高计数桶)。"""
@@ -4613,9 +4667,11 @@ class TestClusterPredictor:
             # 此刻忽略全局已累积的 miss(timing/bucket 都是全局计数),只测增量。
             tm0, bm0 = r.cluster_pool_timing_miss, r.cluster_pool_bucket_miss
             # 强制该 cluster 连接过期(不消费) → prune 关闭 → consumed_expired 不增。
+            # 注意:cluster 连接用独立超时 cluster_pool_idle_timeout(默认 600s),
+            # 伪造时间必须超过它才能被 prune 关掉(而非被动超时 180s)。
             for stack in r._target_pool.values():
                 for _, w in stack:
-                    w._conn_pool_created = time.monotonic() - 100
+                    w._conn_pool_created = time.monotonic() - 900
             await r._pool_prune()
             assert r.cluster_pool_expired >= 1
             assert r.cluster_pool_consumed_expired == 0, "未消费直接空转不应计入 consumed_expired"
@@ -4747,6 +4803,9 @@ class TestRouterConfigPassThrough:
             cluster_graph_ttl_sec=pc.cluster_graph_ttl_sec,
             cluster_graph_max_entries=pc.cluster_graph_max_entries,
             cluster_predict_throttle_sec=pc.cluster_predict_throttle_sec,
+            cluster_proxy_fanout=pc.cluster_proxy_fanout,
+            cluster_probe_decay_sec=pc.cluster_probe_decay_sec,
+            cluster_pool_idle_timeout=pc.cluster_pool_idle_timeout,
             policies=list(c.policies),
         )
 
@@ -4776,7 +4835,9 @@ class TestRouterConfigPassThrough:
                            cluster_predict=True, cluster_window_sec=3.5,
                            cluster_predict_topk=5, cluster_min_support=3,
                            cluster_graph_max_entries=5000, cluster_graph_ttl_sec=7200,
-                           cluster_predict_throttle_sec=15.0),
+                           cluster_predict_throttle_sec=15.0,
+                           cluster_proxy_fanout=3, cluster_probe_decay_sec=1234.0,
+                           cluster_pool_idle_timeout=1234.0),
         )
 
     def _router(self, **kw) -> Router:
@@ -4800,7 +4861,9 @@ class TestRouterConfigPassThrough:
             # 关键配置属性逐一比对(r_cfg vs r_kw;Router 自有属性直接比,selector 上的
             # 质控/熔断属性经 r.selector 比)。
             for attr in ('max_retries', 'cache_ttl', 'stagger_interval', 'probe_interval_sec',
-                         'conn_pool_enabled', 'conn_pool_total', 'conn_pool_established_reuse'):
+                         'conn_pool_enabled', 'conn_pool_total', 'conn_pool_established_reuse',
+                         'conn_pool_idle_timeout', 'cluster_proxy_fanout', 'cluster_probe_decay_sec',
+                         'cluster_pool_idle_timeout'):
                 assert getattr(r_cfg, attr) == getattr(r_kw, attr), f"{attr} 两条构造路径不一致"
             for attr in ('circuit_threshold', 'circuit_max_backoff', 'slow_start_window',
                          'slow_start_success', 'lb_bias'):

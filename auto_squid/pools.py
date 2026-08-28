@@ -72,12 +72,18 @@ class ConnectionPools:
     def __init__(self, proxy_store, enabled, per_proxy, total, idle_timeout,
                  refill_interval, refill_target, connect_timeout, target_prewarm,
                  established_reuse, pause_minutes, pause_silence_sec,
-                 pause_activity_window, pause_min_requests):
+                 pause_activity_window, pause_min_requests,
+                 idle_timeout_cluster=600.0):
         self.proxy_store = proxy_store
         self.conn_pool_enabled = bool(enabled)
         self.conn_pool_per_proxy = max(1, int(per_proxy))
         self.conn_pool_total = max(1, int(total))
         self.conn_pool_idle_timeout = max(1.0, float(idle_timeout))
+        # cluster 预测预建连接的独立空闲超时(默认 600s):预测预建比被动预建早建
+        # 得多,统一用 conn_pool_idle_timeout(生产 180s)常在真实 co-target 到达前
+        # 被清 → timing_miss。预测连接打 _cluster_prewarmed 标签,_pool_prune 按
+        # 连接级标签选超时;本值独立于被动预建的空闲超时。
+        self.cluster_pool_idle_timeout = max(1.0, float(idle_timeout_cluster))
         self.conn_pool_refill_interval = max(0.0, float(refill_interval))
         self.conn_pool_refill_target = max(0, min(self.conn_pool_per_proxy, int(refill_target)))
         self.conn_pool_connect_timeout = max(1.0, float(connect_timeout))
@@ -492,7 +498,10 @@ class ConnectionPools:
                     if writer.is_closing():
                         continue
                     last = getattr(writer, '_conn_pool_created', 0)
-                    if now - last > self.conn_pool_idle_timeout:
+                    timeout = (self.cluster_pool_idle_timeout
+                               if getattr(writer, '_cluster_prewarmed', False)
+                               else self.conn_pool_idle_timeout)
+                    if now - last > timeout:
                         stale.append(writer)
                         setattr(self, expired_counter, getattr(self, expired_counter) + 1)
                         if expired_counter == 'target_pool_expired' \

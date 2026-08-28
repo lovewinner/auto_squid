@@ -85,6 +85,7 @@ FIELD_ORDER = [
     "cluster_predictions",      # 预测发射次数(含节流跳过前的候选集)
     "cluster_prewarm_spawned",  # 预测实际发起的预热数(重点指标:预测预建量)
     "cluster_bucket_spawns",    # 预测发射的桶数(同 co 摊 fanout 个桶 ⇒ ≥ prewarm_spawned)
+    "cluster_pool_idle_timeout",# cluster 预测预建连接的空闲超时(秒,状态字段)
     "cluster_graph_size",       # 共现图边数(记忆规模,应受 max_entries 约束)
     # 熔断/探活
     "circuit_open_count",       # 当前熔断的代理数
@@ -131,6 +132,7 @@ FIELD_DOCS = {
     "cluster_predictions": "预测发射次数",
     "cluster_prewarm_spawned": "预测实际发起的预热数",
     "cluster_bucket_spawns": "预测发射的桶数(同 co 摊 fanout 个桶 ⇒ ≥ prewarm_spawned)",
+    "cluster_pool_idle_timeout": "cluster 预测预建连接的空闲超时(秒)",
     "cluster_graph_size": "共现图边数",
     "circuit_open_count": "熔断中的代理数",
     "probes_sent": "探活已发",
@@ -149,6 +151,7 @@ NO_DELTA_FIELDS = {
     "conn_pool_refill_pause_activity_window",
     "conn_pool_refill_pause_min_requests",
     "cluster_predict",
+    "cluster_pool_idle_timeout",
 }
 
 # 优化分析重点关注字段(供 grep 快速定位)

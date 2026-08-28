@@ -97,7 +97,7 @@ class ClusterGraph:
     def __init__(self, store: ProxyStore, enabled: bool = False, window_sec: float = 2.0,
                  predict_topk: int = 3, min_support: int = 2, ttl_sec: int = 86400,
                  max_entries: int = 100_000, throttle_sec: float = 30.0,
-                 proxy_fanout: int = 2, probe_decay_sec: float = 3600.0,
+                 proxy_fanout: int = 3, probe_decay_sec: float = 3600.0,
                  prewarm_spawn: Optional[Callable] = None):
         self._store = store
         # 总闸与门:仅当 conn_pool.enabled + target_prewarm 时 Router 才开启并调用;
@@ -203,9 +203,11 @@ class ClusterGraph:
             logger.debug("cluster PREDICT %s via %d bucket(s): %s", co, len(proxies),
                          [(h, p) for h, p in proxies])
             self._last_predict[pair] = now
+            # 摊桶数(意图预建的候选代理数)在发射前一次性记:与 cluster_prewarm_spawned
+            # (实际发射条数,见 _fire)解耦——前者随 fanout 摊宽,后者恒等于发射条数。
+            self.cluster_bucket_spawns += len(proxies)
             for proxy in proxies:
                 self._fire(co, proxy)
-                self.cluster_bucket_spawns += 1
             fired = True
         if fired:
             self.cluster_predictions += 1

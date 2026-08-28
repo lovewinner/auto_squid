@@ -241,6 +241,7 @@ class ConnPoolConfig(ConfigBase):
     cluster_predict_throttle_sec: float = Field(30.0, description="同一 (src→co) 对的预测节流间隔(秒):节流内不重复发射,防 reload 反复预建")
     cluster_proxy_fanout: int = Field(2, description="多桶并行预建(方案 A):同 co-target 预测时并行预建的候选代理桶数上限(1=旧单桶行为)。每条共现边记胜出代理 id 直方图,预测摊到计数最高的前 N 个桶,显著提升落在真实胜出桶的概率(探针显示桶错配是主病因)。fd 预算 conn_pool.total 逐条兜底,超预算即静默少建")
     cluster_probe_decay_sec: float = Field(3600.0, description="胜出代理直方图计数的衰减半衰(秒):计数按指数遗忘窗衰减,保留近期谁常胜,防冷启动早期偶然胜出长期霸榜")
+    cluster_pool_idle_timeout: float = Field(600.0, description="cluster 预测预建连接的空闲超时(秒):预测预建比被动预建早建得多,默认 600s(远超被动预建的空闲超时),让预测连接活到真实 co-target 到达;用户取向命中不省 fd,故不随 conn_pool.idle_timeout 走")
 
     @model_validator(mode="after")
     def _gate_on_enabled(self):
