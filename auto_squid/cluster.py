@@ -97,7 +97,7 @@ class ClusterGraph:
     def __init__(self, store: ProxyStore, enabled: bool = False, window_sec: float = 2.0,
                  predict_topk: int = 3, min_support: int = 2, ttl_sec: int = 86400,
                  max_entries: int = 100_000, throttle_sec: float = 30.0,
-                 proxy_fanout: int = 3, probe_decay_sec: float = 3600.0,
+                 proxy_fanout: int = 2, probe_decay_sec: float = 3600.0,
                  prewarm_spawn: Optional[Callable] = None):
         self._store = store
         # 总闸与门:仅当 conn_pool.enabled + target_prewarm 时 Router 才开启并调用;
