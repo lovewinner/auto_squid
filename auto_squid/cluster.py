@@ -96,6 +96,9 @@ class ClusterGraph:
         # 发射通道:Router 绑定方法 _spawn_target_prewarm(proxy_host, proxy_port,
         # target)。本模块不 import Router(避免环);spawn 内部已含 conn_pool 门、
         # 本机直连跳过、task 注册与 fd 预算——预测只是"多一个 caller"。
+        # 注意:同一方法同时是"被动预建"的入口(域缓存/粘性/竞速胜出后直接调用)。
+        # ClusterGraph 经 _fire 时时携带 source='cluster' 调用,以便 pools 侧把
+        # 预测预建的连接打上 cluster 专属标签(_target_pool_refill 的 source 参数)。
         self._prewarm_spawn = prewarm_spawn
         # 瞬态窗口:client_ip → _Window。事件后即弃,stop() 清空;仅事件循环线程读写。
         self._active_windows: dict[str, _Window] = {}

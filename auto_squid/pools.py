@@ -132,6 +132,14 @@ class ConnectionPools:
         self.target_pool_hits = 0       # target 预连接取用成功次数
         self.target_pool_misses = 0     # 取 target 池未中需新建的次数
         self.target_pool_expired = 0    # target 预连接空闲超时关闭次数
+        # cluster 专属归因(见 _target_pool_refill 的 source 参数):池里同一把
+        # 键混装着"预测预建"(cluster 提前预建)与"被动预建"(域缓存/粘性/竞速
+        # 胜出后补)。给连接打上来源标签,分别记创建/命中/过期,便于算 cluster
+        # 专属命中率 = cluster_pool_hits / cluster_pool_creates,并把被动预建的
+        # 贡献剥离出 target_pool_hits。
+        self.cluster_pool_creates = 0   # 预测预建的 target 连接数(cluster 专属)
+        self.cluster_pool_hits = 0      # 取用命中中被预测预建命中的次数
+        self.cluster_pool_expired = 0   # 空闲超时关闭中被预测预建关闭的次数
         self.target_prewarm_dispatched = 0  # 后台预热协程发起次数
         self.target_prewarm_success = 0     # 预热建连成功次数
         self.target_prewarm_failed = 0      # 预热建连失败次数
@@ -188,6 +196,11 @@ class ConnectionPools:
         CONNECT,可安全复用于同 target。取用成功计 target_pool_hits,需新建计
         target_pool_misses。上层优先用此池,其次才回退第一阶段通用池。
         命中/miss 均记 INFO(低频诊断,判断热 target 是否真的复用了预热连接)。
+
+        归因:连接的来源 tag(_cluster_prewarmed,见 _target_pool_refill)随
+        writer 保存;命中时若取到的恰是 cluster 预测预建的连接,额外计
+        cluster_pool_hits —— 该计数 / cluster_pool_creates 即 cluster 专属
+        命中率(把被动预建的贡献从 target_pool_hits 里剥离)。
         """
         got = self._pool_peek(self._target_pool, f"{proxy_host}:{proxy_port}|{target}")
         if got is None:
@@ -196,6 +209,9 @@ class ConnectionPools:
                         target, proxy_host, proxy_port, self.target_pool_misses)
         else:
             self.target_pool_hits += 1
+            reader, writer = got
+            if getattr(writer, '_cluster_prewarmed', False):
+                self.cluster_pool_hits += 1
             logger.info("target pool HIT  %s via %s:%s (hits=%d)",
                         target, proxy_host, proxy_port, self.target_pool_hits)
         return got
@@ -361,7 +377,8 @@ class ConnectionPools:
                 if total_idle >= self.conn_pool_total:
                     break
 
-    async def _target_pool_refill(self, proxy_host: str, proxy_port: int, target: str, cap: int = 2):
+    async def _target_pool_refill(self, proxy_host: str, proxy_port: int, target: str,
+                                  cap: int = 2, source: str = 'passive'):
         """为某 (proxy, target) 键补充半预连接到目标水位(一次调用补到 cap)。
 
         只建立"到上游代理"的 TCP(不提前 CONNECT 到目标),可安全复用于同
@@ -370,6 +387,12 @@ class ConnectionPools:
         过多 fd)。建连失败静默(下次命中再试)。单事件循环线程调用,无需加锁。
         cap 从 1 提升到 2:生产实测 cap=1 时 target_pool_hits=1 / misses=71,
         单条预热被取走即空,下一条同 target 请求只能回退 miss。
+
+        `source` 是归因标签:'cluster' = ClusterGraph 预测预建(提前为窗口内
+        尚未到达的 co-target 建连);'passive' = 域缓存/粘性命中或竞速胜出后补。
+        在唯一的建连处为 writer 打上来源 tag,供 _target_pool_peek 命中与
+        _pool_prune 过期分别计 cluster 专属计数(见 cluster_pool_*)。连接在此池
+        中没有第二个区分标识,故 tag 必须在建连处打。
         """
         if not self.conn_pool_enabled:
             return 0
@@ -391,6 +414,9 @@ class ConnectionPools:
                             target, proxy_host, proxy_port, self.target_prewarm_failed)
                 break
             writer._conn_pool_created = time.monotonic()
+            if source == 'cluster':
+                writer._cluster_prewarmed = True
+                self.cluster_pool_creates += 1
             self._target_pool.setdefault(key, []).append((reader, writer))
             self.target_pool_creates += 1
             self.target_prewarm_success += 1
@@ -402,15 +428,17 @@ class ConnectionPools:
                         self.target_pool_creates, len(self._target_pool.get(key, [])))
         return made
 
-    async def _target_pool_prewarm(self, proxy_host: str, proxy_port: int, target: str, cap: int = 2):
+    async def _target_pool_prewarm(self, proxy_host: str, proxy_port: int, target: str,
+                                   cap: int = 2, source: str = 'passive'):
         """后台协程:为 (proxy, target) 键预热半连接,失败静默(被取消/超时/建连
         失败都只是少一条预热,不影响主请求)。由命中域名缓存/粘性或竞速胜出的
         CONNECT 触发,是"fire-and-forget",主请求不 await 本协程。cap=2 与
         _target_pool_refill 一致(见其 docstring)。task 的注册/排空由 Router 的
-        _spawn_target_prewarm 负责(Router._running_tasks)。
+        _spawn_target_prewarm 负责(Router._running_tasks)。`source` 沿
+        _target_pool_refill 传递(仅'cluster'打 cluster 专属归因标签)。
         """
         try:
-            await self._target_pool_refill(proxy_host, proxy_port, target, cap=cap)
+            await self._target_pool_refill(proxy_host, proxy_port, target, cap=cap, source=source)
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -441,6 +469,9 @@ class ConnectionPools:
                     if now - last > self.conn_pool_idle_timeout:
                         stale.append(writer)
                         setattr(self, expired_counter, getattr(self, expired_counter) + 1)
+                        if expired_counter == 'target_pool_expired' \
+                                and getattr(writer, '_cluster_prewarmed', False):
+                            self.cluster_pool_expired += 1
                         continue
                     alive.append(item)
                 if alive:

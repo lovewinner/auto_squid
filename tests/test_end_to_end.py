@@ -4348,6 +4348,87 @@ class TestClusterPredictor:
             up_srv.close()
             await up_srv.wait_closed()
 
+    @pytest.mark.asyncio
+    async def test_cluster_prewarm_conns_are_tagged(self):
+        """归因:cluster 预测预建连接打 _cluster_prewarmed 标签并计 cluster_pool_creates;
+        取用该连接计 cluster_pool_hits(同一命中同样计入 target_pool_hits)。学习窗内的
+        两次 CONNECT 若各自触发被动预建会先占住键位,故两轮之间清空池子,确保第二轮
+        只由预测预建填充。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router(cluster_predict=True, cluster_min_support=1)
+        await r.start()
+        key_b = f"{HOST}:31991|tagged-b.example.com:443"
+        try:
+            # 第一窗:tagged-a 与 tagged-b 同簇学习(同 client_ip,间隔 < 窗口宽)。
+            await send_connect(HOST, ROUTER_PORT, target=b"tagged-a.example.com:443", payload=b"a")
+            await send_connect(HOST, ROUTER_PORT, target=b"tagged-b.example.com:443", payload=b"b")
+            await asyncio.sleep(2.2)
+            r.cluster.prune()
+            assert r.cluster_windows_learned == 1
+            # 清空池子:去掉第一轮固有被动预建(它们会先占住 tagged-b 键位)。
+            await r._conn_pool_close_all()
+            assert len(r._target_pool.get(key_b, [])) == 0
+            # 第二窗:先连 tagged-a → 开口预测 tagged-b 并预建(仅 cluster 来源)。
+            await send_connect(HOST, ROUTER_PORT, target=b"tagged-a.example.com:443", payload=b"a2")
+            for _ in range(200):
+                if len(r._target_pool.get(key_b, [])) >= 1:
+                    break
+                await asyncio.sleep(0.01)
+            stack = r._target_pool[key_b]
+            assert stack, "预测预建应落入 (proxy, tagged-b) 目标池"
+            # 预测预建应已打上 cluster 标签并计入 cluster_pool_creates(被动归零)。
+            assert all(getattr(w, '_cluster_prewarmed', False) for _, w in stack)
+            tagged = r.cluster_pool_creates
+            assert tagged >= 1
+            assert r.cluster_pool_expired == 0
+            # 取用该 cluster 预建连接:cluster_pool_hits +1(目标池命中同样计入)。
+            got = r._target_pool_peek(HOST, 31991, 'tagged-b.example.com:443')
+            assert got is not None
+            assert r.cluster_pool_hits == 1
+            assert r.target_pool_hits == 1
+            assert r.cluster_pool_creates == tagged  # peek 不改变 creates
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_passive_prewarm_not_counted_as_cluster(self):
+        """归因:被动预建(竞速胜出/域缓存触发,source 默认 'passive')不打 cluster 标签,
+        命中复用也不计 cluster_pool_hits——cluster 计数只归预测预建。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        # cluster_predict=False:只剩被动预建,是归因的反例(不得计入 cluster_pool_*)。
+        r = self._router(cluster_predict=False, enable_local_racing=False)
+        await r.start()
+        try:
+            target = b"passive-pre.example.com:443"
+            # 首次竞速 → 胜者是真实上游(非 local)→ 后台被动预建到 (proxy, target)。
+            await send_connect(HOST, ROUTER_PORT, target=target, payload=b"one")
+            for _ in range(200):
+                if len(r._target_pool.get(f"{HOST}:31991|passive-pre.example.com:443", [])) >= 1:
+                    break
+                await asyncio.sleep(0.01)
+            assert r.target_pool_creates >= 1, "被动预建应建连"
+            assert r.cluster_pool_creates == 0, "被动预建不得计入 cluster_pool_creates"
+            # 复用该被动预建连接 → target_pool_hits +1,cluster_pool_hits 保持 0。
+            hits_before = r.target_pool_hits
+            await send_connect(HOST, ROUTER_PORT, target=target, payload=b"two")
+            assert r.target_pool_hits == hits_before + 1
+            assert r.cluster_pool_hits == 0
+            assert r.cluster_pool_expired == 0
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    def test_cluster_attribution_snapshot(self):
+        """快照暴露 cluster 专属归因计数(观察点,供 /metrics 与 opt.log)。"""
+        r = self._router(cluster_predict=True)
+        s = r.snapshot_counters()
+        assert s['cluster_pool_creates'] == 0
+        assert s['cluster_pool_hits'] == 0
+        assert s['cluster_pool_expired'] == 0
+
     @staticmethod
     def _router(**kw) -> Router:
         """e2e 用 Router:enable 全链(cluster 依赖 conn_pool.enabled + target_prewarm)。"""

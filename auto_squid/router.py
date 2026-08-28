@@ -484,8 +484,10 @@ class Router:
         # ── 请求簇预测预热(ClusterGraph,#新增:观察见 _cluster_observe)──────
         # 全局共现图 + 客户端瞬态窗口(不超过 window_sec)。总闸 = conn_pool 第二
         # 阶段开启且启用 cluster_predict(未启用时 observe 为近乎空操作,零状态)。
-        # prewarm_spawn 注入 Router._spawn_target_prewarm(绑定方法)——预测只走
-        # 既有预建通道,受 conn_pool 门/fd 预算/空闲暂停约束,错预建 30s 自动回收。
+        # prewarm_spawn 注入 Router._spawn_target_prewarm(绑定方法)的 cluster 变体：
+        # 预测只走既有预建通道,受 conn_pool 门/fd 预算/空闲暂停约束,错预建 30s
+        # 自动回收;并用 source='cluster' 给预测预建打上专属归因标签(被动预建
+        # 调用的裸 _spawn_target_prewarm 走默认 source='passive',见其签名)。
         self.cluster = ClusterGraph(
             proxy_store,
             enabled=(cluster_predict and conn_pool_enabled and conn_pool_target_prewarm),
@@ -495,7 +497,7 @@ class Router:
             ttl_sec=cluster_graph_ttl_sec,
             max_entries=cluster_graph_max_entries,
             throttle_sec=cluster_predict_throttle_sec,
-            prewarm_spawn=self._spawn_target_prewarm)
+            prewarm_spawn=lambda h, p, t: self._spawn_target_prewarm(h, p, t, source='cluster'))
 
         # ── 数据持久化 ──────────────────────────────────────────
         self._db_path = db_path
@@ -1008,6 +1010,9 @@ class Router:
             "target_pool_hits": self.target_pool_hits,
             "target_pool_misses": self.target_pool_misses,
             "target_pool_expired": self.target_pool_expired,
+            "cluster_pool_creates": self.cluster_pool_creates,
+            "cluster_pool_hits": self.cluster_pool_hits,
+            "cluster_pool_expired": self.cluster_pool_expired,
             "target_pool_size": sum(len(v) for v in self._target_pool.values()),
             "target_prewarm_dispatched": self.target_prewarm_dispatched,
             "target_prewarm_success": self.target_prewarm_success,
@@ -1338,7 +1343,8 @@ class Router:
     # 热路径原有 self._conn_pool / self.conn_pool_creates 等引用原样解析到 pools。
     # Router 侧只剩"触发预热"的一处编排 —— task 注册/排空进 _running_tasks。
 
-    def _spawn_target_prewarm(self, proxy_host: Optional[str], proxy_port: Optional[int], target: str):
+    def _spawn_target_prewarm(self, proxy_host: Optional[str], proxy_port: Optional[int],
+                              target: str, source: str = 'passive'):
         """命中域名缓存/粘性或竞速胜出的 CONNECT → 后台预热 (proxy, target) 半连接。
 
         仅在第二阶段开启且经上游代理(非本机直连)时触发;计数并登记到
@@ -1346,6 +1352,11 @@ class Router:
         _target_pool_prewarm(idle-pause/预算/超时都在 pools 侧决定)。
         预热条数由 _target_pool_prewarm 默认 cap=2 控制(取走 1 条仍留 1 条备用,
         降低"取走即空→周期 miss";生产实测 cap=1 时 target_pool_hits=1/misses=71)。
+
+        `source` 归因标签:域缓存/粘性/竞速胜后的被动预建走默认 'passive';
+        ClusterGraph 预测预建经注入的 prewarm_spawn lambda 以 source='cluster'
+        进入(见 __init__ 接线)。pools 据此给 cluster 连接打上 _cluster_prewarmed
+        标签,算 cluster 专属命中率(cluster_pool_hits / cluster_pool_creates)。
         """
         if not (self.conn_pool_enabled and self.conn_pool_target_prewarm):
             return
@@ -1354,7 +1365,9 @@ class Router:
         self.target_prewarm_dispatched += 1
         logger.info("target prewarm SPAWN %s via %s:%s (dispatched=%d)",
                     target, proxy_host, proxy_port, self.target_prewarm_dispatched)
-        task = asyncio.create_task(self.pools._target_pool_prewarm(proxy_host, proxy_port, target))
+        task = asyncio.create_task(
+            self.pools._target_pool_prewarm(proxy_host, proxy_port, target,
+                                            source=source))
         self._running_tasks.add(task)
         task.add_done_callback(self._running_tasks.discard)
 
@@ -2658,6 +2671,7 @@ class Router:
         'conn_pool_refill_pause_min_requests',
         'conn_pool_creates', 'conn_pool_hits', 'conn_pool_misses', 'conn_pool_expired',
         'target_pool_creates', 'target_pool_hits', 'target_pool_misses', 'target_pool_expired',
+        'cluster_pool_creates', 'cluster_pool_hits', 'cluster_pool_expired',
         'target_prewarm_dispatched', 'target_prewarm_success', 'target_prewarm_failed',
         'established_pool_hits', 'established_pool_misses', 'established_pool_expired',
         'established_pool_returned', 'connect_new_conns',
