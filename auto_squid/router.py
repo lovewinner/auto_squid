@@ -503,7 +503,10 @@ class Router:
             throttle_sec=cluster_predict_throttle_sec,
             proxy_fanout=cluster_proxy_fanout,
             probe_decay_sec=cluster_probe_decay_sec,
-            prewarm_spawn=lambda h, p, t: self._spawn_target_prewarm(h, p, t, source='cluster'))
+            prewarm_spawn=lambda h, p, t: self._spawn_target_prewarm(h, p, t, source='cluster'),
+            # 熔断感知:摊桶跳过熔断退避期内的代理(退避期内连不上,预建白建 → bucket_miss)。
+            # 与竞速路径同一判定(is_circuit_open),保持"预测桶=竞速可用桶"一致。
+            is_circuit_open=self.selector.is_circuit_open)
 
         # ── 数据持久化 ──────────────────────────────────────────
         self._db_path = db_path

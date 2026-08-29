@@ -4401,6 +4401,45 @@ class TestClusterPredictor:
         finally:
             g.reset()
 
+    def test_resolve_skips_circuit_open_proxy(self):
+        """熔断感知:is_circuit_open(pid) 的代理被 _resolve_top 跳过,不摊到熔断桶。
+        直方图 {p,q} 且 q 熔断 → 只发 p(不建白桶);桶数/发射条数相应减少。"""
+        spawn = self._stub_spawn()
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host=HOST, port=31991))
+        store.add(ProxyInfo(id='q', host=HOST, port=31992))
+        open_pids = {'q'}
+        g = ClusterGraph(store, enabled=True, min_support=1, proxy_fanout=2,
+                         probe_decay_sec=1e6, prewarm_spawn=spawn,
+                         is_circuit_open=lambda pid: pid in open_pids)
+        try:
+            self._learn(g, '7.7.7.7', ['a.com:443', 'b.com:443'], pid='p', t0=10.0)
+            self._learn(g, '7.7.7.7', ['a.com:443', 'b.com:443'], pid='q', t0=40.0)
+            # 窗口3:直方图 {p:1,q:1},q 熔断 → 只解析出 p 一个桶。
+            sp0, bs0 = g.cluster_prewarm_spawned, g.cluster_bucket_spawns
+            g.observe('7.7.7.7', 'a.com:443', 'p', now=70.0)
+            assert g.cluster_prewarm_spawned == sp0 + 1, "熔断桶不发射"
+            assert g.cluster_bucket_spawns == bs0 + 1, "熔断桶不计数"
+            assert spawn.calls[-1] == (HOST, 31991, 'b.com:443'), "只摊到非熔断桶 p"
+        finally:
+            g.reset()
+
+    def test_resolve_without_circuit_callback_falls_back(self):
+        """未注入 is_circuit_open(None)→ 等价全部代理可用,不跳过(向后兼容)。"""
+        spawn = self._stub_spawn()
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host=HOST, port=31991))
+        store.add(ProxyInfo(id='q', host=HOST, port=31992))
+        g = ClusterGraph(store, enabled=True, min_support=1, proxy_fanout=2,
+                         probe_decay_sec=1e6, prewarm_spawn=spawn)
+        try:
+            self._learn(g, '7.7.7.7', ['a.com:443', 'b.com:443'], pid='p', t0=10.0)
+            self._learn(g, '7.7.7.7', ['a.com:443', 'b.com:443'], pid='q', t0=40.0)
+            g.observe('7.7.7.7', 'a.com:443', 'p', now=70.0)
+            assert sorted(spawn.calls[-2:]) == [(HOST, 31991, 'b.com:443'), (HOST, 31992, 'b.com:443')]
+        finally:
+            g.reset()
+
     def test_bucket_spawns_equals_len_proxies(self):
         """cluster_bucket_spawns 语义:一次预测摊 N 个可解析代理桶 → 增量恰为 N,
         与实际发射条数(cluster_prewarm_spawned)一致但独立计数(不随 _fire 重复累加)。"""

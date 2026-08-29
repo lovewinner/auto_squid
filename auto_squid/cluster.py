@@ -98,7 +98,8 @@ class ClusterGraph:
                  predict_topk: int = 3, min_support: int = 2, ttl_sec: int = 86400,
                  max_entries: int = 100_000, throttle_sec: float = 30.0,
                  proxy_fanout: int = 2, probe_decay_sec: float = 3600.0,
-                 prewarm_spawn: Optional[Callable] = None):
+                 prewarm_spawn: Optional[Callable] = None,
+                 is_circuit_open: Optional[Callable] = None):
         self._store = store
         # 总闸与门:仅当 conn_pool.enabled + target_prewarm 时 Router 才开启并调用;
         # enabled=False 时 observe/prune 全部近乎空操作(状态零分配)。
@@ -122,6 +123,10 @@ class ClusterGraph:
         # ClusterGraph 经 _fire 时时携带 source='cluster' 调用,以便 pools 侧把
         # 预测预建的连接打上 cluster 专属标签(_target_pool_refill 的 source 参数)。
         self._prewarm_spawn = prewarm_spawn
+        # 熔断查询:Router 注入 selector.is_circuit_open 的绑定方法。_resolve_top 摊桶时
+        # 跳过熔断中的代理(退避期内的代理连不上,预建只会白建 → bucket_miss)。None=
+        # 无熔断感知(单元测试/未启用),等价于全部代理视为可用。
+        self._is_circuit_open = is_circuit_open
         # 瞬态窗口:client_ip → _Window。事件后即弃,stop() 清空;仅事件循环线程读写。
         self._active_windows: dict[str, _Window] = {}
         # 全局共现图:src_target → {co_target: _CoEntry}。
@@ -325,18 +330,24 @@ class ClusterGraph:
         """把胜出代理直方图解析为至多 `fanout` 个 (host, port),按计数降序。
 
         'local'/被删/停用的 pid 跳过(记录式测试中 pid 直方图直接经 get_cluster_cache
-        回读,而 _resolve_top 走 ProxyStore 解析)。不足 fanout 个可解析代理时,返回
-        全部可用的(不凑数——宁少建不建错桶)。
+        回读,而 _resolve_top 走 ProxyStore 解析);**熔断退避期内的代理跳过**(退避期内
+        连不上,预建只会白建 → bucket_miss,生产 opt.log 显示流量激增时大量代理熔断、
+        bucket_miss 同步暴增)。不足 fanout 个可解析代理时,返回全部可用的(不凑数——
+        宁少建不建错桶)。
         """
-        ordered = sorted(pid_hist.items(), key=lambda kv: kv[1], reverse=True)[:fanout]
+        ordered = sorted(pid_hist.items(), key=lambda kv: kv[1], reverse=True)
         out: list = []
         for pid, _count in ordered:
             if pid is None or pid == 'local':
                 continue
+            if self._is_circuit_open is not None and self._is_circuit_open(pid):
+                continue  # 熔断退避期:该桶即使预建也连不上,跳过
             proxy = self._store.get(pid)
             if proxy is None:
                 continue
             out.append((proxy.host, proxy.port))
+            if len(out) >= fanout:
+                break
         return out
 
     def _fire(self, co_target: str, proxy: tuple):
