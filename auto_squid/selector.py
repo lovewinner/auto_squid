@@ -96,6 +96,13 @@ class ProxySelector:
         #   EWMA 直接等于该次观测,可直接参与对比;仅存有观测的代理,无观测的代理
         #   在排序时视为"未知质量"(排在新手区)。
         self._quality: dict[str, dict[str, float]] = {}
+        # 每域名×代理质量: {domain: {pid: {"ewma_ttfb": float(秒), "obs": int, "ts": float}}}。
+        #   ts = time.monotonic() 最近观测时刻,供周期淘汰(prune_domain_quality)。
+        #   域名级数据存在时,降级判定优先用它(见 Router._single_send_degraded /
+        #   _worse_than_best),避免全局 EWMA 跨域名平均掩盖"某代理对该域名其实
+        #   很快"的事实(生产案例:247-246 全局 EWMA 快但被其他域名拖累,对
+        #   github.com 其实很快,却因全局 EWMA 恶化被降级剔除)。
+        self._domain_quality: dict[str, dict[str, dict[str, float]]] = {}
         # 每代理熔断/慢启动状态(与 _quality 分开维护,含未观测过的新代理):
         #   {pid: {"consec_fail": int, "open_until": float(monotonic 秒), "backoff": float}}
         self._circuit: dict[str, dict[str, float]] = {}
@@ -185,29 +192,124 @@ class ProxySelector:
         """返回当前每代理并发上限快照 {pid: limit}(供 /metrics / 仪表盘)。"""
         return {pid: int(s["limit"]) for pid, s in self._conc.items()}
 
-    def record_ttfb(self, pid: str, ttfb: float):
+    def record_ttfb(self, pid: str, ttfb: float, domain: Optional[str] = None):
         """记录一次成功请求的首字节耗时(秒),更新该代理的 EWMA。
 
         EWMA 公式:无历史时直接取当前值;有历史时 ewma = (1-alpha)*old + alpha*new。
         obs 计数随每次观测 +1(EWMA 样本数),供单发降级判定读取。
+        domain 非 None 时同步更新该域名的独立 EWMA 桶(见 _domain_quality)——降级
+        判定域名级优先(见 Router._single_send_degraded),probe 探活无目标域名不传。
         """
-        q = self._quality.get(pid)
-        if q is None:
-            self._quality[pid] = {"ewma_ttfb": ttfb, "obs": 1}
-            self._conc_observe_success(pid)
-            return
-        old = q["ewma_ttfb"]
-        q["ewma_ttfb"] = (1.0 - self.EWMA_ALPHA) * old + self.EWMA_ALPHA * ttfb
-        q["obs"] = int(q.get("obs", 0)) + 1
+        self._apply_ewma(self._quality, pid, ttfb)
         self._conc_observe_success(pid)
+        if domain:
+            per_pid = self._domain_quality.setdefault(domain, {})
+            entry = self._apply_ewma(per_pid, pid, ttfb)
+            if entry is not None:
+                entry["ts"] = time.monotonic()
+
+    @staticmethod
+    def _apply_ewma(table: dict, pid: str, ttfb: float) -> Optional[dict]:
+        """在 table[pid] 上应用 EWMA_ALPHA 公式,返回更新后的条目(首次建新)。
+
+        全局质量表与域名质量表共用同一公式(见 _quality/_domain_quality 注释)。
+        """
+        q = table.get(pid)
+        if q is None:
+            q = {"ewma_ttfb": ttfb, "obs": 1}
+            table[pid] = q
+            return q
+        q["ewma_ttfb"] = ((1.0 - ProxySelector.EWMA_ALPHA) * q["ewma_ttfb"]
+                          + ProxySelector.EWMA_ALPHA * ttfb)
+        q["obs"] = int(q.get("obs", 0)) + 1
+        return q
+
+    def _domain_quality_for(self, domain: str, pid: str) -> Optional[dict]:
+        """热路径定向读:某域名下某代理的质量条目(不存在返回 None)。
+
+        不要在判定热路径用 get_domain_quality()(全量拷贝),用它逐域名读取。
+        """
+        return self._domain_quality.get(domain, {}).get(pid)
+
+    def get_domain_quality(self) -> dict[str, dict[str, dict[str, float]]]:
+        """返回域名级质量表快照 {domain: {pid: dict}}(供 /metrics / 仪表盘)。
+
+        读内存无锁;返回深一层拷贝,调用方改返回值不影响内部表。
+        """
+        return {d: {pid: dict(q) for pid, q in per_pid.items()}
+                for d, per_pid in self._domain_quality.items()}
+
+    def best_domain_ewma(self, domain: str, exclude: Optional[str] = None) -> tuple:
+        """该域名下有观测且可用(未熔断/未被禁用/仍存在)的代理中 EWMA 最小者。
+
+        返回 (pid, ewma);无观测或全部不可用返回 (None, None)。exclude 给定则
+        跳过该代理(方向 A 回填门比较赢家与其余候选,自己不比自己)。
+        过滤与 ordered_proxies 同构:熔断/已删/禁用代理残留的域名观测不能成为
+        "域名 best",否则会把健康赢家误拦或放错基准。
+        """
+        per_pid = self._domain_quality.get(domain)
+        if not per_pid:
+            return None, None
+        best_pid, best_ewma = None, None
+        for pid, q in per_pid.items():
+            if pid == exclude:
+                continue
+            ewma = self._proxy_quality_ewma(q)
+            if ewma is None:
+                continue
+            if self.is_circuit_open(pid):
+                continue
+            p = self.proxy_store.get(pid)
+            if p is None or not p.enabled:
+                continue
+            if best_ewma is None or ewma < best_ewma:
+                best_pid, best_ewma = pid, ewma
+        return best_pid, best_ewma
+
+    @staticmethod
+    def _proxy_quality_ewma(q: Optional[dict]) -> Optional[float]:
+        """从质量表条目取出 EWMA(秒);无条目/缺字段返回 None。
+
+        与 Router._proxy_quality_ewma 同语义,域名桶条目结构一致。
+        """
+        if not q:
+            return None
+        ewma = q.get("ewma_ttfb")
+        return float(ewma) if isinstance(ewma, (int, float)) else None
+
+    def prune_domain_quality(self, max_entries: int = 10_000):
+        """域名级质量表容量保护:条目超上限时按最近观测 ts 淘汰最旧条目。
+
+        由 Router._flush_loop 周期调用(与 _prune_sticky/cluster.prune 同位置),
+        防止域名×代理数组合无界增长。max_entries=0 时清空整表。
+        """
+        if max_entries <= 0:
+            self._domain_quality.clear()
+            return
+        total = sum(len(per_pid) for per_pid in self._domain_quality.values())
+        if total <= max_entries:
+            return
+        flat: list[tuple[float, str, str]] = []
+        for d, per_pid in self._domain_quality.items():
+            for pid, q in per_pid.items():
+                flat.append((float(q.get("ts", 0.0)), d, pid))
+        flat.sort(key=lambda t: t[0])
+        for _, d, pid in flat[: total - max_entries]:
+            per_pid = self._domain_quality.get(d)
+            if per_pid is not None:
+                per_pid.pop(pid, None)
+                if not per_pid:
+                    self._domain_quality.pop(d, None)
 
     def reset_quality(self):
         """清空全部质量数据(RFC 8305 §4:历史 RTT 不可跨网络沿用)。
 
         网络切换/代理分组变化后调用,让排序回到无偏状态重新学习。熔断/慢启动
-        状态一并清空(旧网络的连续失败计数对当前网络无意义)。
+        状态一并清空(旧网络的连续失败计数对当前网络无意义)。域名级质量表
+        (跨域名分离的 EWMA)同样清空——旧网络的域名级历史对当前网络无意义。
         """
         self._quality.clear()
+        self._domain_quality.clear()
         self._circuit.clear()
         self._in_flight.clear()
         self._conc.clear()  # 并发上限随质量重学(P3)

@@ -2691,15 +2691,15 @@ class TestWinnerBackfillQualityGate:
         r.selector.record_ttfb('fast', 0.03)  # EWMA ≈ 0.023
         r.selector.record_ttfb('slow', 0.30)
         r.selector.record_ttfb('slow', 0.30)  # EWMA ≈ 0.30, > 2× best 且差 277ms
-        assert r._worse_than_best('slow') is True
-        assert r._worse_than_best('fast') is False
+        assert r._worse_than_best('example.com', 'slow') is True
+        assert r._worse_than_best('example.com', 'fast') is False
 
     def test_fast_winner_not_blocked(self):
         """最优代理自己是赢家 → 正常回填(不影响正常路径)。"""
         r = self._router()
         r.selector.record_ttfb('fast', 0.02)
         r.selector.record_ttfb('slow', 0.30)
-        assert r._worse_than_best('fast') is False
+        assert r._worse_than_best('example.com', 'fast') is False
         r._record_win_meta('example.com', 'fast')
         assert r._get_fresh_proxy('example.com') == 'fast'
 
@@ -2728,7 +2728,7 @@ class TestWinnerBackfillQualityGate:
         r.selector.record_ttfb('fast', 0.02)
         r.selector.record_ttfb('slow', 0.30)  # slow 仅 1 次观测,EWMA=0.30
         # 即使 obs=1,只要 EWMA 显著差于最优(0.30 > 0.02×2 且差 280ms)就拦。
-        assert r._worse_than_best('slow') is True
+        assert r._worse_than_best('example.com', 'slow') is True
         r._record_win_meta('example.com', 'slow')
         assert 'example.com' not in r._meta_cache
 
@@ -2739,12 +2739,12 @@ class TestWinnerBackfillQualityGate:
         r.selector.record_ttfb('fast', 0.02)  # fast 稳定观测,EWMA≈0.02
         r.selector.record_ttfb('slow', 0.30)
         # 慢时被拦。
-        assert r._worse_than_best('slow') is True
+        assert r._worse_than_best('example.com', 'slow') is True
         # 恢复:slow 多次观测到接近 fast 的延迟,EWMA 显著回落。
         # EWMA alpha=0.3,0.30 收敛到 ≤0.04(fast 0.02×2)需 0.7^n×0.30≤0.04 → n≥6。
         for _ in range(8):
             r.selector.record_ttfb('slow', 0.02)
-        assert r._worse_than_best('slow') is False
+        assert r._worse_than_best('example.com', 'slow') is False
         r._record_win_meta('example.com', 'slow')
         assert r._get_fresh_proxy('example.com') == 'slow'
 
@@ -2874,6 +2874,174 @@ class TestSingleSendDegrade:
         assert r.get_degraded_single_send() == []
         # meta 仍指向 'p'(ref_ewma 基线保留但质量表已清,降级判定无据可依)。
         assert r._get_fresh_proxy('example.com') == 'p'
+
+
+class TestDomainEWMA:
+    """域名级 EWMA(selector._domain_quality):记录与读取语义。"""
+
+    def _selector(self):
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host='h', port=3128))
+        store.add(ProxyInfo(id='q', host='h2', port=3128))
+        return ProxySelector(store)
+
+    def test_domain_formula_independent(self):
+        """域名级 EWMA 独立于全局演进;两域名互不污染。"""
+        s = self._selector()
+        s.record_ttfb('p', 0.10, 'd1')      # obs=1,EWMA=0.10
+        s.record_ttfb('p', 0.50, 'd1')      # obs=2:0.7*0.10+0.3*0.50=0.22
+        assert s._domain_quality['d1']['p']['ewma_ttfb'] == pytest.approx(0.22)
+        assert s._domain_quality['d1']['p']['obs'] == 2
+        # 全局独立演进(0.10 → 0.22),与域名桶不同源。
+        assert s._quality['p']['ewma_ttfb'] == pytest.approx(0.22)
+        # 另一域名不污染 d1。
+        s.record_ttfb('p', 0.99, 'd2')
+        assert s._domain_quality['d1']['p']['ewma_ttfb'] == pytest.approx(0.22)
+        assert s._domain_quality['d2']['p']['ewma_ttfb'] == pytest.approx(0.99)
+
+    def test_no_domain_only_global(self):
+        """record_ttfb 不带 domain(probe 语义)→ 不建域名桶。"""
+        s = self._selector()
+        s.record_ttfb('p', 0.10)
+        assert s._domain_quality == {}
+        assert s._quality['p']['ewma_ttfb'] == 0.10
+
+    def test_reset_quality_clears_domain(self):
+        """reset_quality 一并清空域名级质量表。"""
+        s = self._selector()
+        s.record_ttfb('p', 0.10, 'd1')
+        s.reset_quality()
+        assert s._domain_quality == {}
+        assert s._quality == {}
+
+    def test_best_domain_ewma_excludes_unusable(self):
+        """域名 best 跳过熔断/禁用/已删除代理;exclude 生效。"""
+        store = ProxyStore()
+        store.add(ProxyInfo(id='fast', host='h', port=1, enabled=True))
+        store.add(ProxyInfo(id='open', host='h', port=2, enabled=True))
+        store.add(ProxyInfo(id='disabled', host='h', port=3, enabled=False))
+        store.add(ProxyInfo(id='gone', host='h', port=4, enabled=True))
+        s = ProxySelector(store)
+        s.record_ttfb('fast', 0.01, 'd')
+        s.record_ttfb('open', 0.02, 'd')
+        s.record_ttfb('disabled', 0.015, 'd')
+        s.record_ttfb('gone', 0.02, 'd')
+        store.remove('gone')            # 已删除(残留域名观测)
+        s.record_failure('open'); s.record_failure('open'); s.record_failure('open')  # 熔断
+        pid, ewma = s.best_domain_ewma('d')
+        # 熔断/禁用/删除代理被跳过 → fast 是唯一可用观测者。
+        assert pid == 'fast'
+        assert ewma == pytest.approx(0.01)
+        # exclude=fast 后无可用观测者 → (None, None)。
+        assert s.best_domain_ewma('d', exclude='fast') == (None, None)
+        # 空域名 → (None, None)。
+        assert s.best_domain_ewma('nope') == (None, None)
+
+    def test_prune_domain_quality_caps(self):
+        """prune_domain_quality 超上限按 ts 淘汰最旧条目。"""
+        s = self._selector()
+        for i, d in enumerate(['d1', 'd2', 'd3']):
+            s.record_ttfb('p', 0.01, d)
+            s._domain_quality[d]['p']['ts'] = float(i)  # 覆写 ts 使顺序确定
+        s.prune_domain_quality(max_entries=2)
+        # 共 3 条超上限 2,淘汰 ts 最旧的 d1(ts=0.0),剩 d2(ts=1.0)/d3(ts=2.0)。
+        assert set(s._domain_quality) == {'d2', 'd3'}
+        assert 'd1' not in s._domain_quality
+
+
+class TestDomainLevelDegrade:
+    """域名级降级判定(核心价值 = 模拟生产 247-246 案例)。
+
+    247-246 全局 EWMA 快(11.5ms,第 2 快)却因被其他域名拖累的全局 EWMA
+    相对 ref_ewma 恶化被降级;但它对 github.com 实际很快。本类验证:该域名
+    有自己的 EWMA 桶后,降级判定与方向 A 回填门都按域名级走,全局污染不再
+    影响 github.com 决策。
+    """
+
+    def _router(self, **kw):
+        store = ProxyStore()
+        store.add(ProxyInfo(id='x', host='h', port=3128))
+        store.add(ProxyInfo(id='y', host='h2', port=3128))
+        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+                      db_path=tempfile.mktemp(suffix='.db'),
+                      stickiness_enabled=True, stickiness_ttl=1800,
+                      single_send_degrade_ratio=2.0, single_send_degrade_slack_ms=5.0,
+                      **kw)
+
+    def test_domain_fast_not_degraded_despite_slow_global(self):
+        """判别测试(旧逻辑必挂):全局 EWMA 被污染,域名级仍快 → 不降级。
+
+        旧逻辑:ref=全局 0.01(钉住时全局未污染),随后全局被 other.com 桶推高
+        → _single_send_degraded 全局 cur≈0.5 ≥ 0.01×2 且差>slack → 降级,断言
+        失败。域名级:github.com 桶 cur 仍 0.01,obs=2,相对 ref 不恶化 → 放行。
+        """
+        r = self._router()
+        # 代理 x 对 github.com 的域名级观测:obs=2,EWMA≈0.01。
+        r.selector.record_ttfb('x', 0.01, 'github.com')
+        r.selector.record_ttfb('x', 0.01, 'github.com')
+        r._record_win_meta('github.com', 'x')
+        # 污染全局 EWMA:other.com 桶(域名级)持续观测 0.50。
+        for _ in range(5):
+            r.selector.record_ttfb('x', 0.50, 'other.com')
+        # github.com 的域名级判定不受全局污染影响。
+        assert r._get_fresh_proxy('github.com') == 'x'
+        assert 'x' not in r.get_degraded_single_send()
+        r._record_sticky('1.2.3.4', 'github.com', 'x')
+        assert r._get_sticky_proxy('1.2.3.4', 'github.com') == 'x'
+
+    def test_domain_worse_than_best_blocks_winner(self):
+        """同一代理在慢域名被拦、在快域名放行(方向 A 域名化)。"""
+        r = self._router()
+        # github.com 桶:x=0.01×2,y=0.02×2 → x 是该域名最优。
+        r.selector.record_ttfb('x', 0.01, 'github.com')
+        r.selector.record_ttfb('x', 0.01, 'github.com')
+        r.selector.record_ttfb('y', 0.02, 'github.com')
+        r.selector.record_ttfb('y', 0.02, 'github.com')
+        # slow.example.com 桶:x=0.60×2,y=0.02×2 → x 在该域名显著慢。
+        r.selector.record_ttfb('x', 0.60, 'slow.example.com')
+        r.selector.record_ttfb('x', 0.60, 'slow.example.com')
+        r.selector.record_ttfb('y', 0.02, 'slow.example.com')
+        r.selector.record_ttfb('y', 0.02, 'slow.example.com')
+        assert r._worse_than_best('github.com', 'x') is False
+        assert r._worse_than_best('slow.example.com', 'x') is True
+        # 慢域名赢家不进 meta(继续竞速)。
+        r._record_win_meta('slow.example.com', 'x')
+        assert 'slow.example.com' not in r._meta_cache
+        # 快域名赢家正常钉住。
+        r._record_win_meta('github.com', 'x')
+        assert r._get_fresh_proxy('github.com') == 'x'
+
+    def test_domain_only_observer_not_blocked(self):
+        """该域名唯一有观测的是 pid 自己 → 不拦(无比较对象)。"""
+        r = self._router()
+        r.selector.record_ttfb('x', 0.60, 'github.com')
+        r.selector.record_ttfb('x', 0.60, 'github.com')
+        # 全局路径里 y 是最优(未观测 x 的域名时),但 x 有 github.com 域名观测
+        # 且是唯一观测者 → 域名分支返回 False,不被全局最优误拦。
+        r.selector.record_ttfb('y', 0.01)
+        assert r._worse_than_best('github.com', 'x') is False
+        r._record_win_meta('github.com', 'x')
+        assert r._get_fresh_proxy('github.com') == 'x'
+
+    def test_domain_ref_not_polluted_by_global(self):
+        """ref_ewma 捕获域名级优先,不被其他域名桶污染。"""
+        r = self._router()
+        r.selector.record_ttfb('x', 0.01, 'github.com')
+        r.selector.record_ttfb('x', 0.50, 'other.com')
+        r._record_win_meta('github.com', 'x')
+        # 域名桶 cur=0.01 有 obs=1 → ref 取域名级 0.01,而非全局≈0.24。
+        assert r._meta_cache['github.com']['ref_ewma'] == pytest.approx(0.01)
+
+    def test_http_connect_domain_split(self):
+        """HTTP key('github.com')与 CONNECT key('github.com:443')独立桶。"""
+        r = self._router()
+        r.selector.record_ttfb('x', 0.01, 'github.com')
+        r.selector.record_ttfb('x', 0.05, 'github.com:443')
+        r._record_win_meta('github.com:443', 'x')
+        # CONNECT 桶 ref=0.05,与其独立。
+        assert r._meta_cache['github.com:443']['ref_ewma'] == pytest.approx(0.05)
+        # HTTP 桶未被 CONNECT 桶污染。
+        assert r.selector._domain_quality['github.com']['x']['ewma_ttfb'] == pytest.approx(0.01)
 
 
 class TestPolicyRouting:

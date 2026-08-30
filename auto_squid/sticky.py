@@ -162,7 +162,7 @@ class StickyCache:
         pid = entry["proxy_id"]
         if pid == 'local':
             return False  # 本机直连不经 selector,跳过降级判定(A1)
-        if not self.router._single_send_degraded(pid, entry.get("ref_ewma")):
+        if not self.router._single_send_degraded(domain, pid, entry.get("ref_ewma")):
             return False
         self._degraded_single_send.add(pid)
         return True
@@ -178,7 +178,7 @@ class StickyCache:
             return
         # 方向 A:新赢家显著差于当前最优代理 → 不回填粘性表(继续竞速),避免
         # 慢代理被钉住进入"钉住→降级→回填→再钉住"循环。
-        if self.router._worse_than_best(pid):
+        if self.router._worse_than_best(domain, pid):
             return
         key = self._sticky_key(client_ip, domain)
         if key not in self._sticky_cache and len(self._sticky_cache) >= self.stickiness_max_entries:
@@ -191,7 +191,7 @@ class StickyCache:
             "hits": 0,
             # Goal #6:钉住时刻的 EWMA 基线,供 _sticky_degrade_due 判定"相对钉住
             # 时是否恶化"。粘性命中(_bump_sticky)只滑动 TTL,不刷新基线。
-            "ref_ewma": self.router._proxy_quality_ewma(self.router.selector.get_quality().get(pid)),
+            "ref_ewma": self.router._ref_ewma_for(domain, pid),
         }
 
     def _bump_sticky(self, client_ip: str, domain: str, pid: str):

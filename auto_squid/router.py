@@ -667,7 +667,7 @@ class Router:
         self.switch_damping_blocks += 1
         return False
 
-    def _worse_than_best(self, pid: str) -> bool:
+    def _worse_than_best(self, domain: str, pid: str) -> bool:
         """方向 A:赢家回填前的质量闸——代理 EWMA 是否显著差于当前可用最优代理。
 
         判定:pid 有 EWMA 观测(不要求 obs>=2——竞速赢家常是刚起步的新代理,
@@ -677,12 +677,31 @@ class Router:
         (single_send_degrade_slack_ms,防极低延迟误判)→ 视为"显著更慢"。
         最优代理可能正是 pid 自己(此时不触发);无最优/无观测 → False。
 
+        **域名级优先**:该域名有 pid 的观测时,与**同域名下的最优可用代理**
+        (best_domain_ewma,过滤熔断/禁用/删除)比较;pid 是唯一观测者 → 不拦
+        (与全局 `best == pid → False` 同构,防"全局慢/该域名唯一观测"的代理被
+        全局最优误拦)。域名级数据不足(该域名无 pid 观测)→ 回退全局逻辑,与
+        现状一致(重启后/冷启动平滑过渡)。
+
         与 Goal #6 degrade 的语义对比:degrade 是"相对**钉住时刻**的自身基线恶化",
         这里问"相对**当前最优代理**差多少"。前者兜底"钉住的代理自己变差",后者
         兜底"赢家本就显著劣于其他代理"(竞速偶发让慢代理赢,却把它回填钉住)。
         ratio 复用 single_send_degrade_ratio(生产 2.0),语义一致:EWMA 慢 2 倍
         就认为不该单发。
         """
+        if self.single_send_degrade_ratio <= 0:
+            return False
+        slack = self.single_send_degrade_slack_ms / 1000.0
+        dq = self.selector._domain_quality_for(domain, pid)
+        if dq is not None:
+            cur = self.selector._proxy_quality_ewma(dq)
+            if cur is None:
+                return False
+            best, best_ewma = self.selector.best_domain_ewma(domain, exclude=pid)
+            if best is None:
+                return False  # 自己是该域名唯一有观测的可用代理,无比较对象不拦
+            return cur > best_ewma * self.single_send_degrade_ratio \
+                and (cur - best_ewma) > slack
         q = self.selector.get_quality().get(pid)
         cur = self._proxy_quality_ewma(q)
         if cur is None:
@@ -694,9 +713,6 @@ class Router:
         best_ewma = self._proxy_quality_ewma(best_q)
         if best_ewma is None or best_ewma <= 0:
             return False
-        if self.single_send_degrade_ratio <= 0:
-            return False
-        slack = self.single_send_degrade_slack_ms / 1000.0
         return cur > best_ewma * self.single_send_degrade_ratio and (cur - best_ewma) > slack
 
     def _record_win_meta(self, domain: str, pid: str):
@@ -727,12 +743,12 @@ class Router:
             return  # 阻尼拦截:保持旧赢家,不替换
         # 方向 A:竞速赢家显著差于当前最优代理 → 不钉进域名缓存,继续竞速。
         # (慢代理偶发胜出时,回填会把劣质赢家钉住导致"钉住→降级→回填"循环。)
-        if self._worse_than_best(pid):
+        if self._worse_than_best(domain, pid):
             return
         self._meta_cache[domain] = {
             "default_proxy": pid,
             "updated_at": self._now_utc(),
-            "ref_ewma": self._proxy_quality_ewma(self.selector.get_quality().get(pid)),
+            "ref_ewma": self._ref_ewma_for(domain, pid),
         }
         if self.adaptive_ttl_enabled:
             prev = self._domain_last_pid.get(domain)
@@ -798,6 +814,7 @@ class Router:
                     self._flush_to_db()
                     self._prune_sticky()
                     self.cluster.prune()
+                    self.selector.prune_domain_quality()
                 except Exception:
                     logger.exception("background flush failed")
         except asyncio.CancelledError:
@@ -1171,7 +1188,19 @@ class Router:
         ewma = q.get("ewma_ttfb")
         return float(ewma) if isinstance(ewma, (int, float)) else None
 
-    def _single_send_degraded(self, pid: str, ref_ewma: Optional[float]) -> bool:
+    def _ref_ewma_for(self, domain: str, pid: str) -> Optional[float]:
+        """钉住时刻的 EWMA 基线捕获(供 _record_win_meta / _record_sticky)。
+
+        域名级优先:该域名有 pid 的观测(obs>0)时取域名级 EWMA——这样恶化判定
+        相对"该代理对该域名的真实延迟",而非被其他域名拖累的全局平均;域名级
+        数据缺失(重启后/冷启动)回退全局,与旧行为一致。
+        """
+        dq = self.selector._domain_quality_for(domain, pid)
+        if dq is not None and int(dq.get("obs", 0)) > 0:
+            return self.selector._proxy_quality_ewma(dq)
+        return self._proxy_quality_ewma(self.selector.get_quality().get(pid))
+
+    def _single_send_degraded(self, domain: str, pid: str, ref_ewma: Optional[float]) -> bool:
         """被钉住代理在"单发选择"时是否已恶化,应降级回竞速(Goal #6)。
 
         两条独立信号,任一命中即判定不稳定(与熔断解耦——熔断是"连续失败达阈值
@@ -1179,11 +1208,15 @@ class Router:
           1) 连续失败:selector 的连续失败计数 ≥ single_send_degrade_fail
              (熔断阈值 3 的早告警,默认 2)。被钉住代理最近在真实请求/探活中
              连续失败,说明它在变差——单发命中它只会放大失败路径,降级回竞速
-             让有序候选/兜底批自动绕开它。
+             让有序候选/兜底批自动绕开它。此信号保持全局(proxy 级健康信号,
+             跨域名共享)。
           2) EWMA 恶化:当前 EWMA ≥ ref_ewma × single_send_degrade_ratio。
              与熔断器解耦——该代理可能仍整体健康(EWMA 未到"差"的绝对档),但
              相比被钉住时显著变慢,应重竞速换新赢家。EWMA 相对基线恶化
              (envoy 风格连续失败剔除 + 基线比对,见分析 doc P2-6)。
+             **域名级优先**:该域名有 pid 的观测时用域名级 EWMA 与域名级 obs
+             (避免全局 EWMA 跨域名平均掩盖"该代理对这个域名其实很快",生产案例
+             247-246);域名级数据缺失则回退全局(重启后/冷启动平滑过渡)。
 
         防御:代理已熔断(open)→ 由调用方的 is_circuit_open 处理,此处不重复;
         无 EWMA 观测/无基线 → 不触发 EWMA 信号(失败信号仍可独立触发)。
@@ -1198,9 +1231,15 @@ class Router:
                 self.single_send_degrades += 1
                 return True
         if self.single_send_degrade_ratio > 0 and ref_ewma is not None and ref_ewma > 0:
-            q = self.selector.get_quality().get(pid)
-            cur = self._proxy_quality_ewma(q)
-            if cur is not None and int(q.get("obs", 0)) >= 2 \
+            dq = self.selector._domain_quality_for(domain, pid)
+            if dq is not None:
+                cur = self.selector._proxy_quality_ewma(dq)
+                obs = int(dq.get("obs", 0))
+            else:
+                q = self.selector.get_quality().get(pid)
+                cur = self._proxy_quality_ewma(q)
+                obs = int(q.get("obs", 0)) if q else 0
+            if cur is not None and obs >= 2 \
                     and cur >= ref_ewma * self.single_send_degrade_ratio:
                 slack = self.single_send_degrade_slack_ms / 1000.0
                 if (cur - ref_ewma) > slack:
@@ -1230,7 +1269,7 @@ class Router:
         # 已是浮点 EWMA 值(非质量 dict)。
         # 命中降级 → 记入降级集合(可观测)并视为未命中退回竞速;竞速新赢家会经
         # _record_win_meta 清除标记。
-        if self._single_send_degraded(pid, entry.get("ref_ewma")):
+        if self._single_send_degraded(domain, pid, entry.get("ref_ewma")):
             self._degraded_single_send.add(pid)
             # 自适应 TTL:被钉住代理开始恶化 → TTL 打回下限,让竞速新赢家接管。
             if self.adaptive_ttl_enabled:
@@ -1724,13 +1763,15 @@ class Router:
             self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
             self.upstream_attempts += 1  # 聚合竞速扇出总数(供 /metrics 算放大率)
             # 首字节计时:从发起到收到响应头。用于 EWMA 质量跟踪(竞速排序)。
+            # domain 与 _record_attempt / _record_win_meta 用同一解析表达式,
+            # 保证域名级 EWMA 的 key 与 meta/sticky 取用 key 完全一致。
+            domain = urllib.parse.urlparse(url).hostname or url
             t0 = time.perf_counter()
             resp = await client.send(
                 client.build_request(method, url, headers=headers, content=body),
                 stream=True)
-            self.selector.record_ttfb(pid, time.perf_counter() - t0)
+            self.selector.record_ttfb(pid, time.perf_counter() - t0, domain)
             self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
-            domain = urllib.parse.urlparse(url).hostname or url
             # 仅记尝试统计(竞速扇出);meta 由 _handle_http_request 在确认赢家后
             # 调 _record_win_meta 写一次,避免败者覆写域名缓存。
             self._record_attempt(domain, pid)
@@ -1849,7 +1890,9 @@ class Router:
                     if not h or h in (b"\r\n", b"\n"):
                         break
                 self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
-                self.selector.record_ttfb(pid, time.perf_counter() - t0)
+                # CONNECT 域名 key = 原始 target("host:port"),与 _record_attempt /
+                # _get_fresh_proxy(target) / sticky key(client_ip|target)一致。
+                self.selector.record_ttfb(pid, time.perf_counter() - t0, target)
             # 仅记尝试统计;meta 由 _handle_connect 在确认赢家后调 _record_win_meta。
             self._record_attempt(target, pid)
             # CONNECT 拿到 200 即视为一次成功观测(EWMA + 连续失败归零)。
