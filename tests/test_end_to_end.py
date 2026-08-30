@@ -3044,6 +3044,79 @@ class TestDomainLevelDegrade:
         assert r.selector._domain_quality['github.com']['x']['ewma_ttfb'] == pytest.approx(0.01)
 
 
+class TestStickySlowProbe:
+    """方案C:粘性慢探路——sticky 代理显著差于域名最优可用代理时主动驱逐。
+
+    与 Goal #6 的 _sticky_degrade_due(相对自身钉住基线)互补:后者只在代理
+    "自己变差"或"失败"时触发,对"钉住时就慢→基线高→永远不超 ratio"的
+    盲区无效。方案C 比较同域名下其他代理(由 best_domain_ewma 给出),复用
+    single_send_degrade_ratio/slack_ms,无需新增配置。
+    触发:sticky 代理域名级 EWMA > best_domain × ratio 且差值 > slack。
+    非触发:best_domain 无观测(无更好选择)、该代理无域名观测(冷启动)、
+    差距不够大、单发降级关闭。
+    """
+
+    def _router(self, proxies=('fast', 'slow'), **kw):
+        store = ProxyStore()
+        for i, pid in enumerate(proxies):
+            store.add(ProxyInfo(id=pid, host=f'h{i}', port=3128))
+        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+                      db_path=tempfile.mktemp(suffix='.db'),
+                      stickiness_enabled=True, stickiness_ttl=1800,
+                      single_send_degrade_ratio=3.0,
+                      single_send_degrade_slack_ms=10.0,
+                      **kw)
+
+    def test_slow_sticky_evicted_when_better_alt_exists(self):
+        """慢探路核心场景:slow 钉住时 fast 无观测(方向A放行),fast 被观测到
+        显著更快后 slow 被驱逐回竞速。"""
+        r = self._router()
+        r.selector.record_ttfb('slow', 0.50, 'example.com')
+        r._record_sticky('1.2.3.4', 'example.com', 'slow')
+        assert r._get_sticky_proxy('1.2.3.4', 'example.com') == 'slow'
+        # fast 域名级 0.01:比值 50>3 且差 0.49s>10ms slack → 驱逐。
+        r.selector.record_ttfb('fast', 0.01, 'example.com')
+        assert r._get_sticky_proxy('1.2.3.4', 'example.com') is None
+        assert r.sticky_slow_probes == 1
+
+    def test_sticky_kept_when_close_to_best(self):
+        """差距不够大(比值 1.5<3.0)→ 不驱逐,保持粘性单发。"""
+        r = self._router()
+        r.selector.record_ttfb('fast', 0.10, 'example.com')
+        r.selector.record_ttfb('slow', 0.15, 'example.com')
+        # 方向A放行:0.15 < 0.10*3=0.30,回填粘性表成功。
+        r._record_sticky('1.2.3.4', 'example.com', 'slow')
+        assert r._get_sticky_proxy('1.2.3.4', 'example.com') == 'slow'
+        assert r.sticky_slow_probes == 0
+
+    def test_no_evict_when_only_one_proxy(self):
+        """唯一代理:best_domain 无更好选择(exclude 后为空)→ 不驱逐。"""
+        r = self._router(proxies=('single',))
+        r.selector.record_ttfb('single', 0.50, 'example.com')
+        r._record_sticky('1.2.3.4', 'example.com', 'single')
+        assert r._get_sticky_proxy('1.2.3.4', 'example.com') == 'single'
+        assert r.sticky_slow_probes == 0
+
+    def test_no_evict_when_no_domain_data(self):
+        """该代理无域名级观测(冷启动钉住)→ 无比较数据不驱逐。"""
+        r = self._router()
+        r.selector.record_ttfb('fast', 0.01, 'example.com')
+        r._record_sticky('1.2.3.4', 'example.com', 'slow')  # slow 无观测,方向A放行
+        assert r._get_sticky_proxy('1.2.3.4', 'example.com') == 'slow'
+        assert r.sticky_slow_probes == 0
+
+    def test_slow_probe_counter_reported_in_metrics(self):
+        """驱逐计数进入 snapshot_counters() 供 /metrics 展示。"""
+        r = self._router()
+        r.selector.record_ttfb('slow', 0.50, 'example.com')
+        r._record_sticky('1.2.3.4', 'example.com', 'slow')
+        r._record_sticky('5.6.7.8', 'example.com', 'slow')  # fast 未观测,方向A放行
+        r.selector.record_ttfb('fast', 0.01, 'example.com')
+        assert r._get_sticky_proxy('1.2.3.4', 'example.com') is None
+        assert r._get_sticky_proxy('5.6.7.8', 'example.com') is None
+        assert r.snapshot_counters()['sticky_slow_probes'] == 2
+
+
 class TestPolicyRouting:
     """策略路由(P1):按目标域名(后缀/精确/正则)命中第一条策略,把候选代理集
     收窄到策略允许的 tags/ids 子集。作用于竞速候选、域名缓存、粘性取用三方

@@ -48,6 +48,11 @@ class StickyCache:
         self._sticky_cache: dict[str, dict[str, object]] = {}
         self.sticky_cache_hits = 0
         self.sticky_evictions = 0       # 粘性表驱逐次数(5xx/失败/超容量)
+        # 方案C:慢探路驱逐次数。sticky 代理的域名级 EWMA 显著差于同域名最优
+        # 可用代理时主动驱逐(见 _sticky_slow_probe_due),与 Goal #6 的
+        # _sticky_degrade_due(相对自身钉住基线)互补——后者只在代理"自己变差"
+        # 或"失败"时触发,对"钉住时就慢→基线高→永远不超 ratio"的盲区无效。
+        self.sticky_slow_probes = 0
         # "降级中"代理集合与 Router 共享同一 set 实例(Router._degraded_single_send):
         # 本类在 _sticky_degrade_due 判定命中时 add,Router 侧 remove/clear 同对象
         # 生效(由 _record_win_meta 新赢家接管 / reset_proxy_quality 清除)。
@@ -118,6 +123,14 @@ class StickyCache:
         # _sticky_recheck_due 决定跳过域名缓存直接竞速)。
         if self._sticky_recheck_due(client_ip, domain):
             return None
+        # 方案C:慢探路——sticky 代理显著差于该域名最优可用代理 → 驱逐并退回
+        # 竞速。与 _sticky_degrade_due 互补:后者比较"相对自身钉住基线恶化",
+        # 这里比较"相对同域名其他代理更慢",解决"钉住时就慢→基线高→无法
+        # 驱逐"的盲区。local 直连不经 selector,跳过该检查(A1)。
+        if pid != 'local' and self._sticky_slow_probe_due(client_ip, domain, pid):
+            self._degraded_single_send.add(pid)
+            self.sticky_slow_probes += 1
+            return None
         # Goal #6:质量感知粘性。被钉住代理最近失败率上升 / EWMA 恶化 → 驱逐
         # 并回落竞速(调用方 _evict_sticky + 跳过域名缓存直接竞速)。local 直连
         # 不经 selector,跳过降级判定(A1)。
@@ -166,6 +179,33 @@ class StickyCache:
             return False
         self._degraded_single_send.add(pid)
         return True
+
+    def _sticky_slow_probe_due(self, client_ip: str, domain: str, pid: str) -> bool:
+        """方案C:粘性代理是否显著慢于该域名最优可用代理。
+
+        与 _sticky_degrade_due(相对自身钉住基线)互补:这里比较的是**同域名下
+        其他代理**,解决"钉住时就慢→基线高→永远不超 ratio→无法驱逐"的盲区。
+        复用 single_send_degrade_ratio/slack_ms,无需新增配置。
+        要求:单发降级已启用(degrade_ratio>0)且该代理与 best_domain 有足够
+        差距(差值>slack)。best_domain 无观测/自己是唯一→不驱逐(无更好选择)。
+        """
+        if self.router.single_send_degrade_ratio <= 0:
+            return False
+        # 与 best_domain_ewma(exclude=pid)比较:找同域名下**其他**最优代理。
+        best_pid, best_ewma = self.router.selector.best_domain_ewma(domain, exclude=pid)
+        if best_pid is None:
+            return False  # 无更好选择(自己是唯一观测者或全部不可用)
+        dq = self.router.selector._domain_quality_for(domain, pid)
+        if dq is None:
+            return False
+        cur = self.router.selector._proxy_quality_ewma(dq)
+        if cur is None:
+            return False
+        slack = self.router.single_send_degrade_slack_ms / 1000.0
+        if cur > best_ewma * self.router.single_send_degrade_ratio \
+                and (cur - best_ewma) > slack:
+            return True
+        return False
 
     def _record_sticky(self, client_ip: str, domain: str, pid: str):
         """记录客户端+域名的粘性代理(刷新 updated_at,hits 归零)。

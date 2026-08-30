@@ -1007,6 +1007,7 @@ class Router:
             "domain_cache_hits": self.domain_cache_hits,
             "sticky_cache_hits": self.sticky_cache_hits,
             "sticky_evictions": self.sticky_evictions,
+            "sticky_slow_probes": self.sticky_slow_probes,
             "racing_invocations": self.racing_invocations,
             "upstream_attempts": self.upstream_attempts,
             "http_cache_entries": len(self._http_cache),
@@ -2748,7 +2749,7 @@ class Router:
 
     _STICKY_FORWARD = frozenset({'stickiness_enabled', 'stickiness_ttl', 'stickiness_recheck_hits',
         'stickiness_max_entries', '_sticky_cache', 'sticky_cache_hits',
-        'sticky_evictions',
+        'sticky_evictions', 'sticky_slow_probes',
         'get_sticky_cache', '_sticky_key', '_evict_sticky_key',
         '_get_sticky_proxy', '_sticky_recheck_due', '_sticky_degrade_due',
         '_record_sticky', '_bump_sticky', '_evict_sticky', '_evict_oldest_sticky',

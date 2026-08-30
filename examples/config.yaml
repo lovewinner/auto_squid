@@ -62,6 +62,9 @@ router:
     # 粘性表容量硬上限:写前先清过期条目,仍超限则驱逐更新时间最旧的一条,
     # 防止客户端 IP 集合过大时内存无界增长。
     max_entries: 100000
+    # 方案C:粘性慢探路。sticky 代理域名级 EWMA 显著差于同域名最优可用代理时
+    # 自动驱逐退回竞速(复用 single_send_degrade_ratio/slack_ms)。
+    # 解决"代理在钉住时就慢→_sticky_degrade_due 基线高→永远不触发"的盲区。
 
   # 熔断器 + 后台探活 + slow-start + in-flight 选批 + 单发降级
   circuit:

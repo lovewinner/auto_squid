@@ -344,7 +344,7 @@ class CircuitConfig(ConfigBase):
     slow_start_success: int = Field(3, description="slow-start 恢复期内成功多少次后恢复完整权重")
     lb_bias: float = Field(1.0, description="加权 least-request 在途惩罚指数,0=纯 EWMA 排序")
     single_send_degrade_fail: int = Field(0, description="单发降级:连续失败阈值,0=关闭")
-    single_send_degrade_ratio: float = Field(0.0, description="单发降级:EWMA 恶化比值阈值,0=关闭")
+    single_send_degrade_ratio: float = Field(0.0, description="单发降级:EWMA 恶化比值阈值,0=关闭(同时用于方案C:粘性慢探路)")
     single_send_degrade_slack_ms: float = Field(10.0, description="EWMA 降级绝对下限(毫秒)")
 
 
