@@ -4096,6 +4096,42 @@ class TestTargetPrewarm:
             up_srv.close()
             await up_srv.wait_closed()
 
+    @pytest.mark.asyncio
+    async def test_established_outlives_passive_prune(self):
+        """established 池独立空闲超时:已握手库存比通用池连接活得更久。
+
+        _pool_prune 按连接级 _established_pooled 标签选超时——established 连接
+        用 established_pool_idle_timeout(默认 None=跟随 conn_pool_idle_timeout,
+        显式配置则独立),通用池仍用 conn_pool_idle_timeout。同一过期间隔下,
+        established 标签连接存活、无标签连接被关。
+        """
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        # 通用池 1s 过期;established 池独立 1000s(模拟选项1:库存多活等复访)。
+        r = self._router(conn_pool_idle_timeout=1.0,
+                         conn_pool_established_idle_timeout=1000.0)
+        try:
+            # 手工建两条 established 池连接(模拟竞速败者归还,打 _established_pooled)。
+            for i in range(2):
+                reader, writer = await asyncio.open_connection(HOST, 31991)
+                writer._established_pooled = True
+                writer._conn_pool_created = time.monotonic() - 50  # 超通用超时,未超 established
+                key = f"{HOST}:31991|est-prune.example.com:443"
+                r._established_pool.setdefault(key, []).append((reader, writer))
+            # 手工建一条通用池连接(无 established 标签),同为 50s 前建连。
+            reader, writer = await asyncio.open_connection(HOST, 31991)
+            writer._conn_pool_created = time.monotonic() - 50
+            r._conn_pool.setdefault(f"{HOST}:31991", []).append((reader, writer))
+            await r._pool_prune()
+            # established 2 条存活(独立超时 1000s 生效),通用池 1 条被关。
+            assert len(r._established_pool[key]) == 2, \
+                f"established should survive, keys={list(r._established_pool.keys())}"
+            assert r.established_pool_expired == 0
+            assert r.conn_pool_expired >= 1, "generic conn should be pruned"
+        finally:
+            await r._conn_pool_close_all()
+            up_srv.close()
+            await up_srv.wait_closed()
+
     def test_snapshot_exposes_target_pool(self):
         """snapshot_counters 暴露 target 半预连接池计数与开关。"""
         r = self._router()

@@ -85,6 +85,7 @@ FIELD_ORDER = [
     "cluster_pool_timing_miss", # 探针:miss 且该桶有 cluster 预建(时序没赶上)
     "cluster_pool_bucket_miss", # 探针:miss 且该桶无 cluster 预建(代理桶不匹配)
     "cluster_pool_consumed_expired", # 被真实消费后再空转被关(极少)
+    "conn_pool_established_idle_timeout", # established 池独立空闲超时(秒,状态,None=跟随 idle_timeout)
     "target_prewarm_dispatched",# 预热协程发起次数
     "target_prewarm_success",   # 预热建连成功次数
     "target_prewarm_failed",    # 预热建连失败次数
@@ -141,6 +142,7 @@ FIELD_DOCS = {
     "cluster_pool_timing_miss": "探针:miss 且该桶有 cluster 预建(时序没赶上)",
     "cluster_pool_bucket_miss": "探针:miss 且该桶无 cluster 预建(代理桶不匹配)",
     "cluster_pool_consumed_expired": "被真实消费后再空转被关(极少)",
+    "conn_pool_established_idle_timeout": "established 池独立空闲超时(秒),None=跟随 idle_timeout",
     "target_prewarm_dispatched": "预热协程发起次数",
     "target_prewarm_success": "预热建连成功次数",
     "target_prewarm_failed": "预热建连失败次数",
@@ -170,6 +172,7 @@ NO_DELTA_FIELDS = {
     "cluster_predict",
     "cluster_pool_idle_timeout",
     "established_pool_size",
+    "conn_pool_established_idle_timeout",
 }
 
 # 优化分析重点关注字段(供 grep 快速定位)

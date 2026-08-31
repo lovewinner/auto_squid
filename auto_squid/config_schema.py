@@ -240,6 +240,7 @@ class ConnPoolConfig(ConfigBase):
     refill_pause_activity_window: Optional[float] = Field(None, description="活动判定窗口(秒)。窗口计数:窗口内出现 ≥ refill_pause_min_requests 个客户端请求才算『活动』并刷新活动时间戳。真实流量是簇(一次页面加载数秒内多 hostname 并发),窗口内计数高;后台心跳(如 alive.github.com / client.wns.windows.com,间隔 3-10 分钟)是孤例,计数低——据此区分,既不误伤真实孤立请求,又免疫心跳。默认 None=用旧 silence_sec(等价窗口 ≈ silence_sec/4,或 120s);0=不启用窗口计数(任意请求都刷新,旧行为)")
     refill_pause_min_requests: int = Field(3, description="活动判定窗口阈值(默认 3):窗口(见 refill_pause_activity_window)内请求数 ≥ 此值才刷新活动时间戳。真实页面加载一次 ≥3 个 hostname 的 CONNECT 簇即达标;心跳(孤例)不达标。阈值 ≤1 时退化为『任意请求都刷新』")
     established_reuse: bool = Field(False, description="已建握手隧道复用:隧道结束若连接干净则归还池,下次同 (proxy,target) 请求复用已 CONNECT 握手的连接,跳过握手,省掉重建。仅当 conn_pool.enabled 为 True 时生效")
+    established_idle_timeout: Optional[float] = Field(None, description="已建握手隧道池的独立空闲超时(秒)。established 库存(竞速败者/隧道结束归还的已握手连接)复访同 (proxy,target) 的频率常低于通用池取用,统一用 idle_timeout 会导致归还后 90% 在复访前被清(生产观测 returned=133/expired=120,命中 7)。独立超时让库存多活一阵等复访;默认 None=跟随 idle_timeout(零行为变化)。")
     cluster_predict: bool = Field(False, description="请求簇预测预热:按客户端窗口的 CONNECT 簇共现规律,在窗口开口预测同簇下一批 co-target 并提前预建到上游代理的 TCP(不 CONNECT 源站)。仅当 conn_pool.enabled 且 target_prewarm 为 True 时生效")
     cluster_window_sec: float = Field(2.0, description="簇窗口宽(秒):同一客户端窗口内观察到的目标算一簇;下一请求距上一请求超过窗口宽则关闭并学习上一窗口")
     cluster_predict_topk: int = Field(3, description="窗口开口时预测的 co-target 数上限(按共现支持度取前 K,跳过当前窗口已观察的目标)")

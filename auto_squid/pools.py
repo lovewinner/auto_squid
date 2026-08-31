@@ -73,7 +73,7 @@ class ConnectionPools:
                  refill_interval, refill_target, connect_timeout, target_prewarm,
                  established_reuse, pause_minutes, pause_silence_sec,
                  pause_activity_window, pause_min_requests,
-                 idle_timeout_cluster=600.0):
+                 idle_timeout_cluster=600.0, idle_timeout_established=None):
         self.proxy_store = proxy_store
         self.conn_pool_enabled = bool(enabled)
         self.conn_pool_per_proxy = max(1, int(per_proxy))
@@ -84,6 +84,14 @@ class ConnectionPools:
         # 被清 → timing_miss。预测连接打 _cluster_prewarmed 标签,_pool_prune 按
         # 连接级标签选超时;本值独立于被动预建的空闲超时。
         self.cluster_pool_idle_timeout = max(1.0, float(idle_timeout_cluster))
+        # 已建握手隧道池(established_reuse)的独立空闲超时(默认 None=跟随
+        # conn_pool_idle_timeout)。竞速败者/隧道结束归还的已握手连接,复访同一
+        # (proxy,target) 的频率常低于通用池取用频率,统一用通用池超时会导致
+        # 归还后 90% 在复访前被清(观测 returned=133/expired=120)。独立超时
+        # 让已握手库存多活一阵等复访;连接打 _established_pooled 标签,_pool_prune
+        # 按连接级标签选超时(cluster > established > conn)。
+        self.established_pool_idle_timeout = max(
+            1.0, float(idle_timeout_established)) if idle_timeout_established else None
         self.conn_pool_refill_interval = max(0.0, float(refill_interval))
         self.conn_pool_refill_target = max(0, min(self.conn_pool_per_proxy, int(refill_target)))
         self.conn_pool_connect_timeout = max(1.0, float(connect_timeout))
@@ -498,9 +506,14 @@ class ConnectionPools:
                     if writer.is_closing():
                         continue
                     last = getattr(writer, '_conn_pool_created', 0)
-                    timeout = (self.cluster_pool_idle_timeout
-                               if getattr(writer, '_cluster_prewarmed', False)
-                               else self.conn_pool_idle_timeout)
+                    # 连接级超时选择:cluster 预测预建 > established 已握手库存 >
+                    # 通用池。各自有独立 idle 超时,避免归还没被复访就过早清掉。
+                    timeout = self.conn_pool_idle_timeout
+                    if getattr(writer, '_cluster_prewarmed', False):
+                        timeout = self.cluster_pool_idle_timeout
+                    elif getattr(writer, '_established_pooled', False) \
+                            and self.established_pool_idle_timeout is not None:
+                        timeout = self.established_pool_idle_timeout
                     if now - last > timeout:
                         stale.append(writer)
                         setattr(self, expired_counter, getattr(self, expired_counter) + 1)
