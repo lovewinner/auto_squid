@@ -494,6 +494,73 @@ class ProxySelector:
                                     self._weighted_rank(p.id)))
         return [p.id for p in enabled]
 
+    def _domain_quality_rank(self, domain_obs: Optional[dict], pid: str) -> tuple:
+        """域名维度未知质量排序键:该域名无观测的代理统一垫底(标记 1)。
+
+        domain_obs 为 None(域名无任何观测桶)时委托全局 _quality_rank——
+        即整体回退全局排序。域名有观测桶时,只对"该域名下被测过"的代理按
+        域名 EWMA 排,该域名下从未观测的代理垫底(首字节判胜竞速里不该死磕
+        未知质量的代理,与全局 _quality_rank 的"未知垫底"语义一致)。
+        """
+        if domain_obs is None:
+            return self._quality_rank(pid)
+        q = domain_obs.get(pid)
+        if q is None:
+            return (1, 0.0)
+        return (0, self._proxy_quality_ewma(q) or 0.0)
+
+    def _domain_weighted_rank(self, domain_obs: Optional[dict], pid: str) -> float:
+        """域名维度加权 least-request 权重:域名 EWMA × (1 + active)^lb_bias。
+
+        与 _weighted_rank 同构,只是延迟基准从全局 EWMA 换成该域名 EWMA。
+        在途积压 active 仍取全局(并发压力是全局的,与域名无关),保留
+        least-active 语义。domain_obs 为 None 时委托全局 _weighted_rank(回退)。
+        该域名无观测的代理给权重 0(靠前尝试,与 _weighted_rank 一致)。
+        """
+        if domain_obs is None:
+            return self._weighted_rank(pid)
+        q = domain_obs.get(pid)
+        if q is None:
+            return 0.0
+        w = self._proxy_quality_ewma(q)
+        if w is None:
+            return 0.0
+        if self.lb_bias > 0:
+            active = self._in_flight.get(pid, 0)
+            if active:
+                w *= (1.0 + active) ** self.lb_bias
+        return w
+
+    def ordered_for_domain(self, domain: Optional[str] = None) -> List[str]:
+        """域名级竞速候选排序:该域名下有观测时,该域名快代理(域名 EWMA 小者)
+        靠前,该域名无观测的代理垫底;整个域名无任何观测时完全回退全局排序。
+
+        与 ordered_proxies 的差异只在排序基准:过滤(熔断/禁用/并发上限)、
+        slow-start 恢复期垫底、同权重随机打乱、least-active 在途惩罚全部保留,
+        只是把"全局 EWMA"换成"该域名 EWMA(缺失时用全局)"。这样竞速首批
+        (stagger_initial 个)发的是**该域名下最快的代理**,而非全局最快的——
+        修复全局 EWMA 跨域名平均掩盖"代理对该域名真实快慢"的污染。
+
+        domain=None 时与 ordered_proxies() 逐位等价(冷启动/无域名上下文零变化)。
+        """
+        domain_obs = None
+        if domain is not None:
+            per = self._domain_quality.get(domain)
+            if per:
+                domain_obs = per
+        proxies = self.proxy_store.list()
+        enabled = [p for p in proxies if p.enabled]
+        # 过滤熔断中的代理(is_circuit_open 同时处理退避到期解熔断)。
+        enabled = [p for p in enabled if not self.is_circuit_open(p.id)]
+        # 自适应并发限制(P3):在途已达上限的代理不参与候选(防慢代理被堆死)。
+        if self.concurrency_enabled:
+            enabled = [p for p in enabled if not self._at_concurrency_limit(p.id)]
+        random.shuffle(enabled)
+        enabled.sort(key=lambda p: (self._slow_start_rank(p.id),
+                                    self._domain_quality_rank(domain_obs, p.id)[0],
+                                    self._domain_weighted_rank(domain_obs, p.id)))
+        return [p.id for p in enabled]
+
     def best_proxy(self) -> Optional[str]:
         """返回按 EWMA 排序后的首个代理 id(无代理时返回 None)。"""
         lst = self.ordered_proxies()

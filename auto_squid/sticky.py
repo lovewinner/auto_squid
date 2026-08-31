@@ -16,6 +16,7 @@
 (粘性是瞬态,重启即清)。
 """
 
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -31,7 +32,8 @@ class StickyCache:
 
     def __init__(self, router, enable_local_racing: bool = False,
                  enabled: bool = False, ttl: int = 1800,
-                 recheck_hits: int = 100, max_entries: int = 100_000):
+                 recheck_hits: int = 100, max_entries: int = 100_000,
+                 probe_interval_sec: float = 0.0, probe_fanout: int = 2):
         # 背引用:Router→StickyCache→Router 的运行时对象引用,不构成 import 环。
         # 依赖的决策链成员(selector/策略/单发降级/质量判优)统一经 router 读取。
         self.router = router
@@ -41,6 +43,12 @@ class StickyCache:
         self.stickiness_max_entries = max_entries
         # 本机竞速开关('local' 直连是否参与粘性判定)。Router 同名单字段同步读本值。
         self.enable_local_racing = enable_local_racing
+        # 粘性命中后台探路(杠杆A):命中后 fire-and-forget 对竞争代理做 CONNECT-only
+        # 探路,探路显著快于粘性代理则驱逐。probe_interval_sec<=0 关闭(默认)。
+        self.stickiness_probe_interval_sec = probe_interval_sec
+        self.stickiness_probe_fanout = probe_fanout
+        # 节流状态:sticky_key -> monotonic 最后实际探路时刻(供 sticky_probe_due 判定)。
+        self._sticky_probe_last: dict[str, float] = {}
         # 键 = "{client_ip}|{domain}",值 = {"proxy_id": pid, "updated_at": ts}。
         # 纯内存、滑动 TTL:同一客户端+域名复用上次胜出的代理,保持 egress IP
         # 稳定;粘性代理失败则驱逐并回落竞速(redispatch)。仿 Router._meta_cache
@@ -53,6 +61,9 @@ class StickyCache:
         # _sticky_degrade_due(相对自身钉住基线)互补——后者只在代理"自己变差"
         # 或"失败"时触发,对"钉住时就慢→基线高→永远不超 ratio"的盲区无效。
         self.sticky_slow_probes = 0
+        # 杠杆A:粘性后台探路实际发射次数 / 探路驱逐次数(探路发现显著更快代理)。
+        self.sticky_probes_fired = 0
+        self.sticky_probe_evictions = 0
         # "降级中"代理集合与 Router 共享同一 set 实例(Router._degraded_single_send):
         # 本类在 _sticky_degrade_due 判定命中时 add,Router 侧 remove/clear 同对象
         # 生效(由 _record_win_meta 新赢家接管 / reset_proxy_quality 清除)。
@@ -157,6 +168,19 @@ class StickyCache:
             return (datetime.now(timezone.utc) - dt).total_seconds() < self.stickiness_ttl
         except Exception:
             return False
+
+    def sticky_probe_due(self, client_ip: str, domain: str) -> bool:
+        """该 sticky key 是否到了后台探路时机(杠杆A 节流)。
+
+        仅读判定、不刷新时间戳(时间戳由探路协程 _sticky_probe_race 启动时
+        刷新——被"无域名观测/无候选"前置门提前 return 的分支不消耗节流)。
+        probe_interval_sec<=0(关闭)恒返回 False;冷却 interval 内返回 False。
+        """
+        if self.stickiness_probe_interval_sec <= 0:
+            return False
+        key = self._sticky_key(client_ip, domain)
+        last = self._sticky_probe_last.get(key, 0.0)
+        return (time.monotonic() - last) >= self.stickiness_probe_interval_sec
 
     def _sticky_degrade_due(self, client_ip: str, domain: str) -> bool:
         """粘性单发是否该因"代理质量恶化"降级回竞速(Goal #6)。

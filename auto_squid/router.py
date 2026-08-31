@@ -33,6 +33,7 @@
 
 import asyncio
 import base64
+import functools
 import logging
 import re
 import socket
@@ -151,7 +152,7 @@ class Router:
     生命周期:start() 开始监听 → handle_client 处理每个连接 → stop() 优雅关闭。
     """
 
-    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False, conn_pool_refill_pause_minutes: float = 60.0, conn_pool_refill_pause_silence_sec: float = 120.0, conn_pool_refill_pause_activity_window: Optional[float] = None, conn_pool_refill_pause_min_requests: int = 3, conn_pool_established_reuse: bool = False, cluster_predict: bool = False, cluster_window_sec: float = 2.0, cluster_predict_topk: int = 3, cluster_min_support: int = 2, cluster_graph_ttl_sec: int = 86400, cluster_graph_max_entries: int = 100_000, cluster_predict_throttle_sec: float = 30.0, cluster_proxy_fanout: int = 2, cluster_probe_decay_sec: float = 3600.0, cluster_pool_idle_timeout: float = 600.0, router_cfg: Optional[RouterConfig] = None):
+    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, sticky_probe_interval_sec: float = 0.0, sticky_probe_fanout: int = 2, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False, conn_pool_refill_pause_minutes: float = 60.0, conn_pool_refill_pause_silence_sec: float = 120.0, conn_pool_refill_pause_activity_window: Optional[float] = None, conn_pool_refill_pause_min_requests: int = 3, conn_pool_established_reuse: bool = False, cluster_predict: bool = False, cluster_window_sec: float = 2.0, cluster_predict_topk: int = 3, cluster_min_support: int = 2, cluster_graph_ttl_sec: int = 86400, cluster_graph_max_entries: int = 100_000, cluster_predict_throttle_sec: float = 30.0, cluster_proxy_fanout: int = 2, cluster_probe_decay_sec: float = 3600.0, cluster_pool_idle_timeout: float = 600.0, router_cfg: Optional[RouterConfig] = None):
         """构造路由器。
 
         参数:
@@ -300,6 +301,7 @@ class Router:
                 hc.max_entries, hc.max_bytes, hc.stream_cache_limit)
             stickiness_enabled, stickiness_ttl = stick.enabled, stick.ttl
             stickiness_recheck_hits, stickiness_max_entries = stick.recheck_hits, stick.max_entries
+            sticky_probe_interval_sec, sticky_probe_fanout = stick.probe_interval_sec, stick.probe_fanout
             adaptive_ttl, adaptive_ttl_min, adaptive_ttl_max = at.enabled, at.min_sec, at.max_sec
             switch_damping, switch_damping_min_wins = sd.enabled, sd.min_wins
             switch_damping_ratio, switch_damping_abs_ms = sd.ratio, sd.abs_ms
@@ -433,7 +435,9 @@ class Router:
             enabled=stickiness_enabled,
             ttl=stickiness_ttl,
             recheck_hits=stickiness_recheck_hits,
-            max_entries=stickiness_max_entries)
+            max_entries=stickiness_max_entries,
+            probe_interval_sec=sticky_probe_interval_sec,
+            probe_fanout=sticky_probe_fanout)
         # ── 策略路由(P1)───────────────────────────────────────
         # 按目标域名收窄候选代理集。不配置(policies 为空)→ 对所有 enabled
         # 代理统一竞速,等价旧行为。预编译正则避免每请求重编译;条目为
@@ -1008,6 +1012,8 @@ class Router:
             "sticky_cache_hits": self.sticky_cache_hits,
             "sticky_evictions": self.sticky_evictions,
             "sticky_slow_probes": self.sticky_slow_probes,
+            "sticky_probes_fired": self.sticky_probes_fired,
+            "sticky_probe_evictions": self.sticky_probe_evictions,
             "racing_invocations": self.racing_invocations,
             "upstream_attempts": self.upstream_attempts,
             "http_cache_entries": len(self._http_cache),
@@ -1425,6 +1431,90 @@ class Router:
         self._running_tasks.add(task)
         task.add_done_callback(self._running_tasks.discard)
 
+    def _spawn_sticky_probe(self, client_ip: str, domain: str, sticky_pid: str):
+        """粘性命中后 fire-and-forget 后台探路(杠杆A):对竞争代理做轻量 CONNECT
+        竞速,探路结果显示有代理显著快于粘性代理时驱逐该粘性条目。
+
+        domain 是 sticky 记账桶:CONNECT 为原始 target("host:port"),HTTP 为裸
+        hostname(与 record_ttfb 的 domain 桶同键)。探路统一走 CONNECT-only:
+        HTTP 的 probe_target 拼成 "host:443"(HTTPS 短连接是压 TTFB 主场景)。
+        探路候选的 EWMA 记入 probe_target 桶(CONNECT 时与 domain 同桶;HTTP 时
+        与 sticky 的裸 hostname 桶不同——比较时 cur 读 domain 桶、best 读
+        probe_target 桶,两桶独立,见 _sticky_probe_race)。
+
+        仿 _spawn_target_prewarm 的任务登记/排空模式:asyncio.create_task 注册进
+        _running_tasks + add_done_callback(discard),stop() 统一收尾。探路本身
+        CONNECT-only、不拉业务数据,首个 CONNECT 200 即停;失败静默(不算失败
+        观测,不喂熔断)。节流由 sticky 侧 cooldown 状态保证(sticky_probe_due)。
+        """
+        if not self.stickiness_enabled or self.sticky.stickiness_probe_interval_sec <= 0:
+            return
+        if sticky_pid == 'local':
+            return  # 直连路径无上游可探
+        # 探路 target:CONNECT 的 domain 已是 "host:port";HTTP 裸 hostname → 拼 443。
+        probe_target = domain if ':' in domain else f"{domain}:443"
+        if not self.selector._domain_quality.get(domain):
+            return  # sticky 记账桶无观测,无从比较快慢(探路无基准)
+        if not self.sticky.sticky_probe_due(client_ip, domain):
+            return  # 冷却内:不重复探(时间戳由探路协程启动时刷新,不在此消耗)
+        task = asyncio.create_task(
+            self._sticky_probe_race(client_ip, domain, probe_target, sticky_pid))
+        self._running_tasks.add(task)
+        task.add_done_callback(self._running_tasks.discard)
+
+    async def _sticky_probe_race(self, client_ip: str, domain: str, probe_target: str,
+                                 sticky_pid: str):
+        """单次探路:对竞争代理发起 CONNECT-only 错峰竞速,收集最快者 EWMA,显著
+        快于粘性代理则驱逐粘性条目(复用 _sticky_slow_probe_due 的 ratio/slack)。
+
+        cur 读 domain 桶(sticky 代理的真实请求 EWMA);best 读 probe_target 桶
+        (探路赢家的 CONNECT 握手 EWMA)。CONNECT 时两桶合一(都是 target);
+        HTTP 时不同桶(裸 hostname vs host:443),比较是"真实请求延迟 vs 探路
+        握手延迟",只对"显著更快"才驱逐,粗比值下误差可容忍。
+
+        探路赢家的 EWMA 由 _try_tunnel 内部 record_ttfb 自动喂入 probe_target
+        桶——但**探路只握手不拉数据**,单次握手延迟混入域名 EWMA 有噪声。设计上
+        接受:探路频率低(节流 interval),且只影响该桶的 best 基准,不参与 sticky
+        驱逐的 cur(那吃真实请求 TTFB)。探路建出的隧道经 _cleanup_tunnel_result
+        归还 _established_pool(杠杆C,探路即备货)。
+        """
+        try:
+            # 探路时间戳在此刷新:只有真正进入探路才消耗节流。
+            self.sticky._sticky_probe_last[self.sticky._sticky_key(client_ip, domain)] = time.monotonic()
+            exclude = sticky_pid if sticky_pid != 'local' else None
+            candidates = self.selector.ordered_for_domain(probe_target)
+            candidates = [p for p in candidates if p != exclude and p != 'local']
+            candidates = candidates[:self.sticky.stickiness_probe_fanout]
+            places = [(pid, probe_target) for pid in candidates if self.proxy_store.get(pid)]
+            if not places:
+                return
+            race_cleanup = functools.partial(self._cleanup_tunnel_result, target=probe_target)
+            winner = await self._race_staggered(
+                places, cleanup=race_cleanup,
+                initial=1, interval=self.stagger_interval)
+            if winner is None:
+                return
+            win_pid = winner[0]
+            self.sticky.sticky_probes_fired += 1
+            # 判定:探路赢家是"候选里最快的",若它显著快于 sticky 代理 → 驱逐。
+            dq = self.selector._domain_quality_for(domain, sticky_pid)
+            if dq is None:
+                return
+            cur = self.selector._proxy_quality_ewma(dq)
+            if cur is None:
+                return
+            best_ewma = self.selector._proxy_quality_ewma(
+                self.selector._domain_quality_for(probe_target, win_pid)) or cur
+            slack = self.single_send_degrade_slack_ms / 1000.0
+            if cur > best_ewma * self.single_send_degrade_ratio \
+                    and (cur - best_ewma) > slack:
+                self.sticky.sticky_probe_evictions += 1
+                self.sticky._evict_sticky(client_ip, domain)
+                logger.info("sticky probe EVICT %s pid=%s cur=%.3fs best=%.3fs",
+                            domain, sticky_pid, cur, best_ewma)
+        except Exception:
+            logger.debug("sticky probe failed", exc_info=True)
+
     # ── 通用竞速 / pipe / 响应写入 ──────────────────────────────
 
     @staticmethod
@@ -1663,20 +1753,32 @@ class Router:
         except Exception:
             pass
 
-    @staticmethod
-    async def _cleanup_tunnel_result(result):
-        """关闭竞速中已完成但未获胜的 CONNECT task 持有的上游连接。
+    async def _cleanup_tunnel_result(self, result, target=None):
+        """竞速败者 CONNECT 隧道的统一清理:可归还时归还 _established_pool,
+        否则关闭上游连接。result = (pid, up_reader, up_writer)。
 
-        CONNECT 走裸 socket(无连接池),连接不可跨请求复用,故直接关闭。
+        target 由 CONNECT 竞速调用点经 functools.partial 部分绑定(缺省 None 时
+        退化为旧行为——只关闭连接,用于 HTTP 竞速等无 target 上下文路径)。
+        上游地址按 result[0] 的 pid 反查 proxy_store(避免 partial 在 mixed
+        local/上游批次里绑定错 host;local 直连 proxy 为 None → 不归还)。
+        竞速败者 CONNECT 200 后 _try_tunnel 已 record_ttfb;竞速 harness 只读
+        响应头不读数据字节,败者连接无脏 buffer,满足 _maybe_return_established
+        的干净判定。开启 established_reuse 后,竞速浪费的已握手隧道变库存。
         """
         if not result:
             return
-        up_writer = result[-1]
-        try:
-            up_writer.close()
-            await up_writer.wait_closed()
-        except Exception:
-            pass
+        pid = result[0]
+        proxy = None if pid == 'local' else self.proxy_store.get(pid)
+        if (self.conn_pool_established_reuse and proxy is not None and target):
+            await self._maybe_return_established(
+                result[2], result[1], proxy.host, proxy.port, target)
+        else:
+            up_writer = result[-1]
+            try:
+                up_writer.close()
+                await up_writer.wait_closed()
+            except Exception:
+                pass
 
     @staticmethod
     async def _pipe(reader, writer, close_writer: bool = True):
@@ -2049,6 +2151,10 @@ class Router:
         最优者,等价于旧 _race 的兜底能力;一旦学得任一 EWMA 即回落到 stagger_initial
         (历史排序可信,首批单发即可)。与 _race 的差异只在候选启动时机,不影响
         max_retries 的候选总数上限。
+
+        冷启动判定保持**全局**键:ordered_for_domain 在域名无观测时回退全局排序
+        (可信)、有观测时按域名排(更可信)——排序可信度只由全局质量决定,域名
+        维度不改变翻倍语义(域名无观测不是"排序不可信",恰是回退到全局排序)。
         """
         if not self.selector.get_quality():
             return min(self.max_retries, max(2, self.stagger_initial))
@@ -2233,6 +2339,8 @@ class Router:
                         self._evict_sticky(client_ip, domain)
                     else:
                         self._bump_sticky(client_ip, domain, sticky_pid)
+                        # 杠杆A:粘性命中后台探路——竞争代理显著更快则驱逐(不阻塞单发)。
+                        self._spawn_sticky_probe(client_ip, domain, sticky_pid)
                     return
                 except Exception:
                     logger.debug("sticky proxy %s failed for %s", sticky_pid, domain)
@@ -2261,7 +2369,9 @@ class Router:
         #    错峰启动(stagger_start)时首批只发 stagger_initial 个(默认 1 个),
         #    补发剩余占位交 _race_staggered 按 interval 定时补发;否则同时全发。
         #    策略路由(P1):按目标域名收窄候选集,命中策略的域只在该子集内竞速。
-        proxies = self.selector.ordered_proxies()
+        #    排序域名级(ordered_for_domain):该域名快代理进首批,而非全局 EWMA
+        #    污染下被排到补发位置。
+        proxies = self.selector.ordered_for_domain(domain)
         if self._policies:
             proxies = self._policy_candidate_pids(domain, proxies)
         if not proxies and not self.enable_local_racing:
@@ -2465,38 +2575,52 @@ class Router:
                 except (asyncio.CancelledError, Exception):
                     pass
         finally:
-            # 归还条件:启用复用 + 经上游代理(非本机直连) + 上游连接未关闭。
-            can_reuse = (self.conn_pool_enabled and self.conn_pool_established_reuse
-                         and proxy_host is not None and target is not None
-                         and not up_writer.is_closing())
-            # 严格验证:上游残留缓冲 → 连接已脏,不归还(宁可不复用也不污染)。
-            if can_reuse and up_reader._buffer and len(up_reader._buffer) > 0:
-                logger.info("established pool NOT-RETURN %s via %s:%s (dirty buffer)",
-                            target, proxy_host, proxy_port)
-                can_reuse = False
-            if can_reuse:
-                key = f"{proxy_host}:{proxy_port}|{target}"
-                # 预算/cap 检查:established 池计入全局 conn_pool_total(与另两池同口径),
-                # 单键再受 _ESTABLISHED_KEY_CAP 上限。超限则关闭不复用——宁可这次不省
-                # 建连也不让 fd 无界增长。三池快照统一用 pools._total_idle(见 #14)。
-                if self.pools._total_idle() >= self.conn_pool_total \
-                        or len(self._established_pool.get(key, [])) >= _ESTABLISHED_KEY_CAP:
-                    logger.info("established pool SKIP-RETURN %s via %s:%s (over budget/cap, returned=%d)",
-                                target, proxy_host, proxy_port, self.established_pool_returned)
-                    can_reuse = False
-            if can_reuse:
-                self._set_pool_keepalive(up_writer)
-                up_writer._conn_pool_created = time.monotonic()
-                self._established_pool.setdefault(key, []).append((up_reader, up_writer))
-                self.established_pool_returned += 1
-                logger.info("established pool RETURN %s via %s:%s (returned=%d)",
+            # 统一归还判定:抽到 _maybe_return_established,与竞速败者清理共用。
+            await self._maybe_return_established(up_writer, up_reader, proxy_host, proxy_port, target)
+
+    async def _maybe_return_established(self, up_writer, up_reader,
+                                        proxy_host, proxy_port, target) -> bool:
+        """隧道/竞速败者结束时的统一"是否归还 _established_pool"判定。
+
+        判定条件(抽取自 _relay_tunnel finally):conn_pool_enabled 且
+        established_reuse 且经上游代理(proxy_host 非 None)且上游连接未关闭
+        且无残留缓冲(_pipe 的 close_writer=False 透传路径和竞速败者都只读过
+        CONNECT 响应头,缓冲天然干净)且预算/单键 cap 未超。归还成功返回 True;
+        否则关闭连接并返回 False。_relay_tunnel 与 _cleanup_tunnel_result 共用,
+        保证"正常隧道结束"与"竞速败者"同一套归还语义。
+        """
+        can_reuse = (self.conn_pool_enabled and self.conn_pool_established_reuse
+                     and proxy_host is not None and target is not None
+                     and not up_writer.is_closing())
+        # 严格验证:上游残留缓冲 → 连接已脏,不归还(宁可不复用也不污染)。
+        if can_reuse and up_reader._buffer and len(up_reader._buffer) > 0:
+            logger.info("established pool NOT-RETURN %s via %s:%s (dirty buffer)",
+                        target, proxy_host, proxy_port)
+            can_reuse = False
+        if can_reuse:
+            key = f"{proxy_host}:{proxy_port}|{target}"
+            # 预算/cap 检查:established 池计入全局 conn_pool_total(与另两池同口径),
+            # 单键再受 _ESTABLISHED_KEY_CAP 上限。超限则关闭不复用——宁可这次不省
+            # 建连也不让 fd 无界增长。三池快照统一用 pools._total_idle(见 #14)。
+            if self.pools._total_idle() >= self.conn_pool_total \
+                    or len(self._established_pool.get(key, [])) >= _ESTABLISHED_KEY_CAP:
+                logger.info("established pool SKIP-RETURN %s via %s:%s (over budget/cap, returned=%d)",
                             target, proxy_host, proxy_port, self.established_pool_returned)
-            else:
-                try:
-                    up_writer.close()
-                    await asyncio.wait_for(up_writer.wait_closed(), timeout=0.5)
-                except Exception:
-                    pass
+                can_reuse = False
+        if can_reuse:
+            self._set_pool_keepalive(up_writer)
+            up_writer._conn_pool_created = time.monotonic()
+            self._established_pool.setdefault(key, []).append((up_reader, up_writer))
+            self.established_pool_returned += 1
+            logger.info("established pool RETURN %s via %s:%s (returned=%d)",
+                        target, proxy_host, proxy_port, self.established_pool_returned)
+        else:
+            try:
+                up_writer.close()
+                await asyncio.wait_for(up_writer.wait_closed(), timeout=0.5)
+            except Exception:
+                pass
+        return can_reuse
 
     async def _handle_connect(self, target: str, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter, client_ip: str = ""):
         """处理 CONNECT 请求:建立到 target 的隧道并双向透传数据。
@@ -2530,6 +2654,8 @@ class Router:
                     logger.debug("proxy %s sticky hit CONNECT %s", pid, target)
                     self.sticky_cache_hits += 1
                     self._bump_sticky(client_ip, target, sticky_pid)
+                    # 杠杆A:粘性命中后台探路——竞争代理显著更快则驱逐(不阻塞单发)。
+                    self._spawn_sticky_probe(client_ip, target, sticky_pid)
                     await self._connect_established(client_writer, up_writer)
                     await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer,
                                              proxy.host if proxy else None,
@@ -2572,7 +2698,8 @@ class Router:
 
         # 3) 竞速:首批并行 max_retries 个,全失败且还有剩余则对剩余再竞速。
         #    策略路由(P1):按 target 收窄候选集,命中策略的 target 只在该子集内竞速。
-        proxies = self.selector.ordered_proxies()
+        #    排序域名级(ordered_for_domain,target 作 domain key,与 EWMA 记账同桶)。
+        proxies = self.selector.ordered_for_domain(target)
         if self._policies:
             proxies = self._policy_candidate_pids(target, proxies)
         if not proxies and not self.enable_local_racing:
@@ -2585,23 +2712,26 @@ class Router:
 
         # 错峰启动(stagger_start)时首批只发 stagger_initial 个,补发占位交
         # _race_staggered 按 interval 定时补发;否则同时全发(全失败再兜底批)。
+        # 败者清理 cleanup 经 partial 绑定 target,使 _cleanup_tunnel_result 能
+        # 把竞速败者(已 CONNECT 200 但输掉)的隧道归还 _established_pool。
+        race_cleanup = functools.partial(self._cleanup_tunnel_result, target=target)
         if self.stagger_start:
             initial_places, remaining = self._prep_connect(proxies, target)
             winner = await self._race_staggered(
-                initial_places + remaining, cleanup=self._cleanup_tunnel_result,
+                initial_places + remaining, cleanup=race_cleanup,
                 initial=len(initial_places), interval=self.stagger_interval)
         else:
             # 非错峰(_race):需真 task,占位经 _make_race_task 急切创建。
             places = self._build_racing_tasks_connect(proxies, target)
             tasks = {self._make_race_task(p, '', '', None, None) for p in places}
-            winner = await self._race(tasks, cleanup=self._cleanup_tunnel_result)
+            winner = await self._race(tasks, cleanup=race_cleanup)
 
             # 首批全失败且代理数超过 max_retries:对剩余代理再竞速兜底。
             if not winner and len(proxies) > self.max_retries:
                 remaining = proxies[self.max_retries:]
                 places = self._build_racing_tasks_connect(remaining, target)
                 tasks = {self._make_race_task(p, '', '', None, None) for p in places}
-                winner = await self._race(tasks, cleanup=self._cleanup_tunnel_result)
+                winner = await self._race(tasks, cleanup=race_cleanup)
 
         if winner:
             pid, up_reader, up_writer = winner
@@ -2750,6 +2880,9 @@ class Router:
     _STICKY_FORWARD = frozenset({'stickiness_enabled', 'stickiness_ttl', 'stickiness_recheck_hits',
         'stickiness_max_entries', '_sticky_cache', 'sticky_cache_hits',
         'sticky_evictions', 'sticky_slow_probes',
+        'stickiness_probe_interval_sec', 'stickiness_probe_fanout',
+        'sticky_probe_due', '_sticky_probe_last',
+        'sticky_probes_fired', 'sticky_probe_evictions',
         'get_sticky_cache', '_sticky_key', '_evict_sticky_key',
         '_get_sticky_proxy', '_sticky_recheck_due', '_sticky_degrade_due',
         '_record_sticky', '_bump_sticky', '_evict_sticky', '_evict_oldest_sticky',

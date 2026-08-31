@@ -2146,6 +2146,73 @@ class TestProxySelectorEWMA:
         assert sel._quality == {}
 
 
+class TestOrderedForDomain:
+    """杠杆B:域名级竞速候选排序(ordered_for_domain)。
+
+    竞速候选按域名级 EWMA 排序:该域名快代理进首批,而非全局 EWMA 污染下被排到
+    补发位置。域名无观测时完全回退全局排序(与 ordered_proxies 等价)。
+    """
+
+    def _sel(self):
+        store = ProxyStore()
+        store.add(ProxyInfo(id='fast', host='h1', port=3128))
+        store.add(ProxyInfo(id='slow', host='h2', port=3128))
+        return ProxySelector(store)
+
+    def test_domain_fast_first(self):
+        """fast 全局慢但该域名快 → ordered_for_domain 首位是 fast,而
+        ordered_proxies 首位仍是 slow(全局 EWMA 污染场景)。"""
+        sel = self._sel()
+        # slow 全局快、该域名慢;fast 全局慢、该域名快。
+        sel.record_ttfb('slow', 0.02, 'other.com')
+        sel.record_ttfb('slow', 0.30, 'example.com')
+        sel.record_ttfb('fast', 0.10, 'example.com')
+        sel.record_ttfb('fast', 0.20, 'other.com')
+        # 全局:slow 靠前(0.02+0.30 EWMA 比 fast 的 0.10+0.20 小)。
+        assert sel.ordered_proxies()[0] == 'slow'
+        # 该域名:fast 靠前(0.10 vs slow 的 0.30)。
+        for _ in range(50):
+            assert sel.ordered_for_domain('example.com')[0] == 'fast'
+
+    def test_unknown_domain_fallback_to_global(self):
+        """域名无任何观测 → ordered_for_domain 与 ordered_proxies 等价。"""
+        sel = self._sel()
+        sel.record_ttfb('fast', 0.01, 'other.com')
+        sel.record_ttfb('slow', 0.05, 'other.com')
+        for _ in range(20):
+            assert sel.ordered_for_domain('new.com') == sel.ordered_proxies()
+
+    def test_domain_unknown_proxy_ranked_last(self):
+        """域名有观测但某代理该域名无观测 → 该代理垫底(未知质量)。"""
+        store = ProxyStore()
+        store.add(ProxyInfo(id='fast', host='h1', port=3128))
+        store.add(ProxyInfo(id='new', host='h2', port=3128))
+        sel = ProxySelector(store)
+        sel.record_ttfb('fast', 0.01, 'example.com')
+        sel.record_ttfb('new', 0.001, 'other.com')  # 全局极快但该域名无观测
+        lst = sel.ordered_for_domain('example.com')
+        assert lst[-1] == 'new'
+
+    def test_stagger_initial_domain_agnostic(self):
+        """冷启动判定保持全局:域名无观测时 ordered_for_domain 回退全局排序(可信),
+        不翻倍;只有全局质量全空才翻倍。"""
+        from auto_squid.router import Router
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='fast', host='h1', port=3128))
+        ps.add(ProxyInfo(id='slow', host='h2', port=3128))
+        r = Router(ps, listen_host='127.0.0.1', listen_port=10809,
+                   db_path=tempfile.mktemp(suffix='.db'),
+                   max_retries=3, stagger_initial=1, enable_http_cache=False)
+        # 全局有观测 → 不翻倍(即使某域名无观测,排序回退全局仍可信)。
+        r.selector.record_ttfb('fast', 0.01, 'example.com')
+        assert r._stagger_initial() == 1
+        # 全局无观测(冷启动)→ 翻倍。
+        r2 = Router(ps, listen_host='127.0.0.1', listen_port=10809,
+                    db_path=tempfile.mktemp(suffix='.db'),
+                    max_retries=3, stagger_initial=1, enable_http_cache=False)
+        assert r2._stagger_initial() == min(3, max(2, 1)) == 2
+
+
 class TestStagger:
     """错峰启动(staggered start,RFC 8305 §5)行为。
 
@@ -4469,6 +4536,250 @@ class TestEstablishedTunnelReuse:
             await r.stop()
             up_srv.close()
             await up_srv.wait_closed()
+
+
+class TestRaceLoserEstablishedReturn:
+    """杠杆C:竞速败者(CONNECT 200 但输掉)隧道归还 _established_pool。
+
+    竞速胜出后,已完成 CONNECT 200 但首字节更慢的败者隧道,过去被 _cleanup_tunnel_result
+    直接关闭(浪费);现在经 partial 绑定 target 的清理路径归还已握手池,下次同
+    (proxy,target) 请求复用跳过握手。established_reuse 关闭时败者仍关闭(回归保护)。
+    """
+
+    def _router(self, **kw):
+        store = ProxyStore()
+        store.add(ProxyInfo(id='fast', host=HOST, port=31991))
+        store.add(ProxyInfo(id='slow', host=HOST, port=31992))
+        kw.setdefault('conn_pool_enabled', True)
+        kw.setdefault('conn_pool_established_reuse', True)
+        kw.setdefault('conn_pool_target_prewarm', False)
+        kw.setdefault('conn_pool_per_proxy', 4)
+        kw.setdefault('conn_pool_total', 8)
+        kw.setdefault('conn_pool_refill_interval', 0.0)  # 只取不补(测试手动)
+        kw.setdefault('conn_pool_idle_timeout', 100.0)   # 长超时,防测试中途过期
+        kw.setdefault('max_retries', 2)
+        kw.setdefault('stickiness_enabled', False)
+        kw.setdefault('enable_local_racing', False)       # 排除 local 直连,确保胜者是上游
+        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+                      db_path=tempfile.mktemp(suffix='.db'), **kw)
+
+    @staticmethod
+    def _keys(r):
+        return {k for k, v in r._established_pool.items() if v}
+
+    @pytest.mark.asyncio
+    async def test_cleanup_returns_loser_to_pool(self):
+        """_cleanup_tunnel_result 直接把"已 CONNECT 200 的败者"隧道归还池。
+
+        单元级(无竞速时序):手动建一条已握手的隧道,调清理函数,断言落池且计数 +1。
+        竞速时序里"败者已完成 200"是同一批次与赢家并列完成的情形,此处直接驱动。
+        """
+        up_srv = await run_mock_proxy_delayed_connect(HOST, 31992, connect_delay=0.0)
+        r = self._router()
+        await r.start()
+        try:
+            target = "loser-cleanup.example.com:443"
+            # 手动模拟一个已 CONNECT 200 的败者隧道(经 slow 上游 31992 握手成功)。
+            reader, writer = await asyncio.open_connection(HOST, 31992)
+            writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
+            await writer.drain()
+            status = await reader.readline()
+            assert b'200' in status, f"mock should return 200, got {status!r}"
+            # 消费残余头部直到空行(与 _try_tunnel 的 200 读取一致),否则残留
+            # \r\n 会让 _maybe_return_established 判脏不复用。
+            while True:
+                h = await reader.readline()
+                if not h or h in (b"\r\n", b"\n"):
+                    break
+            # 调用败者清理:应归还池而非关闭。
+            await r._cleanup_tunnel_result(('slow', reader, writer), target=target)
+            key = f"{HOST}:31992|{target}"
+            assert r._established_pool.get(key), \
+                f"loser tunnel should be returned, keys={self._keys(r)}"
+            assert r.established_pool_returned == 1
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_e2e_race_pools_both_winner_and_loser(self):
+        """E2E 竞速:两个无延迟代理同时完成 CONNECT 200,赢家经 relay 归还、
+        败者经 cleanup 归还 → 两键都入池。"""
+        up_srv_fast = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        up_srv_slow = await run_mock_proxy_delayed_connect(HOST, 31992, connect_delay=0.0)
+        r = self._router(stagger_start=False)  # _race 全发,两候选同时完成 200
+        await r.start()
+        try:
+            target = b"loser-e2e.example.com:443"
+            echo = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"one")
+            assert echo == b"one"
+            # 两键最终都应入池:赢家(客户端断开后 relay 归还)+ 败者(cleanup 归还)。
+            for _ in range(int(3.0 / 0.02)):
+                if len(r._established_pool) >= 2:
+                    break
+                await asyncio.sleep(0.02)
+            assert len(r._established_pool) == 2, \
+                f"both winner+loser tunnels should be pooled, keys={self._keys(r)}"
+            assert r.established_pool_returned >= 2
+        finally:
+            await r.stop()
+            up_srv_fast.close()
+            await up_srv_fast.wait_closed()
+            up_srv_slow.close()
+            await up_srv_slow.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_closes_when_reuse_disabled(self):
+        """established_reuse=False → 败者清理仍关闭连接,池保持空(回归保护)。"""
+        up_srv = await run_mock_proxy_delayed_connect(HOST, 31992, connect_delay=0.0)
+        r = self._router(conn_pool_established_reuse=False)
+        await r.start()
+        try:
+            target = "loser-off.example.com:443"
+            reader, writer = await asyncio.open_connection(HOST, 31992)
+            writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
+            await writer.drain()
+            status = await reader.readline()
+            assert b'200' in status
+            await r._cleanup_tunnel_result(('slow', reader, writer), target=target)
+            assert sum(len(v) for v in r._established_pool.values()) == 0, \
+                "reuse disabled: loser tunnels must be closed, not pooled"
+            assert r.established_pool_returned == 0
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+
+class TestStickyProbeEviction:
+    """杠杆A:粘性命中后台探路——命中后 fire-and-forget 对竞争代理做 CONNECT-only
+    探路,探路赢家显著快于粘性代理则驱逐粘性条目(慢窗口从 TTL 压到请求级)。
+
+    设计要点(与方案C _sticky_slow_probe_due 互补但不同):方案C 在"取用"时
+    被动比较域名 EWMA;杠杆A 在"命中"后主动探路,用探路赢家的 CONNECT 握手
+    EWMA 作 best 基准。探路不写 _domain_quality(只握手不拉数据,单次握手延迟
+    喂域名 EWMA 会混入噪声);建出的隧道经 C 的 _cleanup_tunnel_result 归还池。
+    节流:probe_interval_sec 冷却,时间戳在 _sticky_probe_race 启动时刷新
+    (前置门提前 return 的分支不消耗节流)。默认 interval=0.0 关闭。
+    """
+
+    @staticmethod
+    def _proxy(pid, **kw):
+        return ProxyInfo(id=pid, host='h', port=3128, **kw)
+
+    def _router(self, proxies=('fast', 'slow'), **kw):
+        store = ProxyStore()
+        for i, pid in enumerate(proxies):
+            store.add(self._proxy(pid))
+        kw.setdefault('stickiness_enabled', True)
+        kw.setdefault('stickiness_ttl', 1800)
+        kw.setdefault('single_send_degrade_ratio', 3.0)
+        kw.setdefault('single_send_degrade_slack_ms', 10.0)
+        kw.setdefault('sticky_probe_interval_sec', 1.0)
+        kw.setdefault('sticky_probe_fanout', 2)
+        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+                      db_path=tempfile.mktemp(suffix='.db'), **kw)
+
+    def test_probe_due_respects_cooldown(self):
+        """节流:interval<=0 关闭恒 False;冷却内 False;超冷却 True(只读不刷新)。"""
+        r = self._router(sticky_probe_interval_sec=0.0)
+        assert not r.sticky_probe_due('1.2.3.4', 'example.com')
+        r = self._router(sticky_probe_interval_sec=60.0)
+        # 从未探过:due。
+        assert r.sticky_probe_due('1.2.3.4', 'example.com')
+        # 模拟刚探过(手动塞时间戳):冷却内 → 不 due。
+        r._sticky_probe_last[r._sticky_key('1.2.3.4', 'example.com')] = time.monotonic()
+        assert not r.sticky_probe_due('1.2.3.4', 'example.com')
+        # 冷却内调用不刷新时间戳(只读判定)。
+        assert r._sticky_probe_last[r._sticky_key('1.2.3.4', 'example.com')] > 0
+        # 时间戳推到冷却前 → due。
+        r._sticky_probe_last[r._sticky_key('1.2.3.4', 'example.com')] = time.monotonic() - 61.0
+        assert r.sticky_probe_due('1.2.3.4', 'example.com')
+
+    def test_spawn_skips_when_interval_off(self):
+        """interval<=0(默认关闭):_spawn_sticky_probe 直接 return,零任务、零计数。"""
+        r = self._router(sticky_probe_interval_sec=0.0)
+        r.selector.record_ttfb('slow', 0.5, 'example.com')
+        r._record_sticky('1.2.3.4', 'example.com', 'slow')
+        r._spawn_sticky_probe('1.2.3.4', 'example.com', 'slow')
+        assert r.sticky_probes_fired == 0
+        # 无探路任务排队(probe_last 未写入,证明没进 race)。
+        assert not r._sticky_probe_last
+
+    def test_spawn_skips_when_no_domain_obs(self):
+        """sticky 记账桶无域名观测:无从比较快慢,探路不发射。"""
+        r = self._router()
+        r._record_sticky('1.2.3.4', 'example.com', 'slow')
+        r._spawn_sticky_probe('1.2.3.4', 'example.com', 'slow')
+        assert r.sticky_probes_fired == 0
+        assert not r._sticky_probe_last
+
+    def test_spawn_skips_when_sticky_local(self):
+        """sticky 是 local 直连:无上游可探,探路不发射。"""
+        r = self._router()
+        r.selector.record_ttfb('slow', 0.5, 'example.com')
+        r._spawn_sticky_probe('1.2.3.4', 'example.com', 'local')
+        assert r.sticky_probes_fired == 0
+
+    @pytest.mark.asyncio
+    async def test_probe_race_evicts_sticky(self, monkeypatch):
+        """探路赢家显著快于粘性代理 → 驱逐粘性条目 + 计数。
+
+        monkeypatch _race_staggered 直接返回 (fast, r, w) 作为探路赢家;sticky
+        代理 slow 的 domain EWMA=0.50,fast 在 probe_target 桶 EWMA=0.01 →
+        0.50 > 0.01*3.0 且差>10ms → 驱逐。探路计数 +1,驱逐计数 +1。
+        """
+        async def fake_race(places, cleanup=None, **kw):
+            # 探路候选应剔除 sticky_pid/slow 与 local,只剩 fast。
+            assert [p[0] for p in places] == ['fast'], f"places={places}"
+            return ('fast', object(), object())
+
+        r = self._router()
+        r.selector.record_ttfb('slow', 0.50, 'example.com')
+        # fast 在 CONNECT 桶("example.com:443")的 EWMA:探路基准(best)。
+        r.selector.record_ttfb('fast', 0.01, 'example.com:443')
+        r._record_sticky('1.2.3.4', 'example.com', 'slow')
+        assert r._get_sticky_proxy('1.2.3.4', 'example.com') == 'slow'
+        monkeypatch.setattr(r, '_race_staggered', fake_race)
+        await r._sticky_probe_race('1.2.3.4', 'example.com', 'example.com:443', 'slow')
+        # 驱逐后:下次取用 miss,回落竞速。
+        assert r._get_sticky_proxy('1.2.3.4', 'example.com') is None
+        assert r.sticky_probes_fired == 1
+        assert r.sticky_probe_evictions == 1
+
+    @pytest.mark.asyncio
+    async def test_probe_race_keeps_sticky_when_not_faster(self, monkeypatch):
+        """探路赢家不比粘性代理显著快(慢于阈值)→ 不驱逐,保持粘性单发。"""
+        async def fake_race(places, cleanup=None, **kw):
+            return ('fast', object(), object())
+
+        r = self._router()
+        r.selector.record_ttfb('slow', 0.10, 'example.com')
+        r.selector.record_ttfb('fast', 0.15, 'example.com:443')
+        r._record_sticky('1.2.3.4', 'example.com', 'slow')
+        assert r._get_sticky_proxy('1.2.3.4', 'example.com') == 'slow'
+        monkeypatch.setattr(r, '_race_staggered', fake_race)
+        await r._sticky_probe_race('1.2.3.4', 'example.com', 'example.com:443', 'slow')
+        # 0.10 < 0.15*3=0.45 → 不驱逐,粘性保留;计数只加发射不加驱逐。
+        assert r._get_sticky_proxy('1.2.3.4', 'example.com') == 'slow'
+        assert r.sticky_probes_fired == 1
+        assert r.sticky_probe_evictions == 0
+
+    def test_counters_reported_in_metrics(self):
+        """探路发射/驱逐计数进入 snapshot_counters() 供 /metrics 展示。"""
+        r = self._router()
+        r.selector.record_ttfb('slow', 0.50, 'example.com')
+        r.selector.record_ttfb('fast', 0.01, 'example.com:443')
+        r._record_sticky('1.2.3.4', 'example.com', 'slow')
+        r.sticky.sticky_probes_fired = 5
+        r.sticky.sticky_probe_evictions = 2
+        c = r.snapshot_counters()
+        assert c['sticky_probes_fired'] == 5
+        assert c['sticky_probe_evictions'] == 2
+        # 白名单:直接经 Router 访问也能解析(sticky 转发表)。
+        assert r.sticky_probes_fired == 5
+        assert r.sticky_probe_evictions == 2
 
 
 class TestClusterPredictor:

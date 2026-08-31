@@ -136,11 +136,19 @@ class StickinessConfig(ConfigBase):
                周期重评估)。驱逐后跳过域名缓存直接竞速,赢家 hits 归零。
     max_entries: 粘性表容量硬上限。写前先清过期条目,仍超限则驱逐 updated_at
                最旧的一条,防止客户端 IP 集合过大时内存无界增长(默认 100k)。
+    probe_interval_sec: 杠杆A 粘性命中后台探路冷却(秒)。粘性单发命中后,
+               fire-and-forget 对竞争代理做 CONNECT-only 探路,探路显著更快则
+               驱逐粘性条目(慢窗口从 TTL 压到请求级)。冷却内不重复探。
+               0=关闭(默认,生产灰度时再开)。
+    probe_fanout: 探路并发竞争的代理数上限(取 ordered_for_domain 域名排序
+               前 N 个,剔除粘性代理/直连)。默认 2。
     """
     enabled: bool = Field(False, description="启用会话粘性(同客户端+域名复用同一代理)")
     ttl: int = Field(1800, description="会话粘性有效期(秒)，滑动刷新")
     recheck_hits: int = Field(100, description="粘性命中 N 次后触发探路重竞速(0=关闭)")
     max_entries: int = Field(100_000, description="粘性表最大条目数,超出驱逐最旧(内存保护)")
+    probe_interval_sec: float = Field(0.0, description="粘性命中后台探路冷却(秒),0=关闭")
+    probe_fanout: int = Field(2, description="后台探路并发竞争的代理数上限")
 
 
 class HttpCacheConfig(ConfigBase):
