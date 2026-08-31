@@ -56,6 +56,7 @@ FIELD_ORDER = [
     "racing_invocations",       # 竞速发起次数(0 = 全走粘性/域名缓存单发)
     "domain_cache_hits",        # 域名缓存命中次数(单发复用)
     "sticky_cache_hits",        # 会话粘性命中次数(单发复用)
+    "sticky_slow_probes",       # 方案C:粘性慢探路驱逐次数(sticky 代理显著差于域名最优)
     "sticky_cache_size",        # 当前粘性表条目数
     "connect_new_conns",        # CONNECT 新建"本机→上游"连接数(池未中才建)
     # 第一阶段通用池
@@ -106,6 +107,7 @@ FIELD_DOCS = {
     "racing_invocations": "竞速发起次数(0=全走粘性/域名缓存单发)",
     "domain_cache_hits": "域名缓存命中(单发复用)",
     "sticky_cache_hits": "会话粘性命中(单发复用)",
+    "sticky_slow_probes": "方案C:粘性慢探路驱逐次数(被域名最优比下去)",
     "sticky_cache_size": "粘性表当前条目数",
     "connect_new_conns": "CONNECT 新建到上游连接数(池未中才建)",
     "conn_pool_size": "通用池空闲连接数",
