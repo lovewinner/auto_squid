@@ -73,6 +73,12 @@ FIELD_ORDER = [
     "target_pool_misses",       # 目标池取用 miss(退回通用池/新建)
     "target_pool_creates",      # 目标池预建连累计(含 background prewarm)
     "target_pool_expired",      # 目标池连接空闲超时被清
+    # 第三阶段已建握手隧道池(established_reuse,杠杆C 竞速败者进池)
+    "established_pool_size",    # 当前已建握手隧道池空闲连接数
+    "established_pool_hits",    # 复用已 CONNECT 握手的隧道(跳过握手,杠杆C 收益)
+    "established_pool_misses",  # 取用 miss(池无该 (proxy,target) 干净隧道)
+    "established_pool_returned",# 隧道结束归还池次数(含竞速败者,杠杆C 库存化)
+    "established_pool_expired", # 空闲超时被清(归还后未被复用的浪费)
     "cluster_pool_creates",     # 目标池中 cluster 预测预建条数(cluster 专属)
     "cluster_pool_hits",        # 命中中被预测预建命中的次数 → /creates = cluster 命中率
     "cluster_pool_expired",     # 空闲超时关闭中预测预建关闭的条数
@@ -124,6 +130,11 @@ FIELD_DOCS = {
     "target_pool_misses": "目标池取用 miss",
     "target_pool_creates": "目标池预建连累计",
     "target_pool_expired": "目标池连接空闲超时被清",
+    "established_pool_size": "已建握手隧道池空闲连接数(established_reuse)",
+    "established_pool_hits": "复用已 CONNECT 握手的隧道(跳过握手,杠杆C 收益)",
+    "established_pool_misses": "已建握手隧道池取用 miss(无干净隧道)",
+    "established_pool_returned": "隧道结束归还池次数(含竞速败者,杠杆C 库存化)",
+    "established_pool_expired": "已建握手隧道空闲超时被清(归还未复用的浪费)",
     "cluster_pool_creates": "目标池中 cluster 预测预建条数",
     "cluster_pool_hits": "命中中被预测预建命中的次数(/creates=cluster 命中率)",
     "cluster_pool_expired": "空闲超时关闭中预测预建关闭的条数",
@@ -158,6 +169,7 @@ NO_DELTA_FIELDS = {
     "conn_pool_refill_pause_min_requests",
     "cluster_predict",
     "cluster_pool_idle_timeout",
+    "established_pool_size",
 }
 
 # 优化分析重点关注字段(供 grep 快速定位)
@@ -177,6 +189,9 @@ FOCUS = [
     "cluster_bucket_spawns",
     "cluster_predictions",
     "sticky_probe_evictions",
+    "established_pool_hits",
+    "established_pool_returned",
+    "established_pool_expired",
 ]
 
 
