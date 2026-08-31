@@ -4696,6 +4696,10 @@ class TestStickyProbeEviction:
         # 时间戳推到冷却前 → due。
         r._sticky_probe_last[r._sticky_key('1.2.3.4', 'example.com')] = time.monotonic() - 61.0
         assert r.sticky_probe_due('1.2.3.4', 'example.com')
+        # 从未探过(None sentinel):恒放行,不依赖单调钟与 interval 的绝对关系。
+        # (fresh 容器单调钟从启动计,uptime<interval 时旧 0.0 默认会误判冷却内。)
+        r._sticky_probe_last[r._sticky_key('1.2.3.4', 'example.com')] = None
+        assert r.sticky_probe_due('1.2.3.4', 'example.com')
 
     def test_spawn_skips_when_interval_off(self):
         """interval<=0(默认关闭):_spawn_sticky_probe 直接 return,零任务、零计数。"""

@@ -174,12 +174,16 @@ class StickyCache:
 
         仅读判定、不刷新时间戳(时间戳由探路协程 _sticky_probe_race 启动时
         刷新——被"无域名观测/无候选"前置门提前 return 的分支不消耗节流)。
-        probe_interval_sec<=0(关闭)恒返回 False;冷却 interval 内返回 False。
+        probe_interval_sec<=0(关闭)恒返回 False;从未探过恒放行(不依赖单调钟
+        与 interval 的绝对关系——fresh 环境单调钟从容器启动计,uptime<interval
+        时旧实现会把首次探路误判为冷却内);冷却 interval 内返回 False。
         """
         if self.stickiness_probe_interval_sec <= 0:
             return False
         key = self._sticky_key(client_ip, domain)
-        last = self._sticky_probe_last.get(key, 0.0)
+        last = self._sticky_probe_last.get(key)
+        if last is None:
+            return True
         return (time.monotonic() - last) >= self.stickiness_probe_interval_sec
 
     def _sticky_degrade_due(self, client_ip: str, domain: str) -> bool:
