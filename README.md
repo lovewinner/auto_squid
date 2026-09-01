@@ -22,6 +22,7 @@ Lightweight forward proxy with parallel racing, domain-based caching, an HTTP re
 - Session stickiness (per-client+domain, in-memory, sliding TTL) with redispatch on sticky-proxy failure, 5xx eviction, periodic re-race, and a capacity cap
 - CONNECT upstream TCP warm pool (Phase 1, `router.conn_pool`): keeps a few idle TCP connections per upstream so CONNECTs skip the "this host → upstream proxy" connect; target half-preconnection (Phase 2, `conn_pool.target_prewarm`) pre-opens "to upstream" TCP for hot CONNECT targets on domain-cache/sticky hits **or racing wins** (warmed in pairs so a peek leaves a spare), shared fd budget + idle timeout
 - Request-cluster predictive pre-warm (Phase 3, `conn_pool.cluster_predict`): learns which CONNECT targets co-occur within a client's page-load window and, at the next window's opening request, pre-builds bare "to-upstream" TCP for the predicted co-targets (never CONNECTing the origin) — cutting the subresource burst's connect TTFB
+- Slow single-send sampling log (`router.circuit.single_send_slow_log_ms`): when a sticky/domain-cache single-send (the paths that skip racing) takes longer than the threshold from request to first byte, logs a line carrying the client IP — the only IP-attribution anchor for "won't open / needs refresh", since the success path emits no IP log
 - In-memory HTTP `GET` response cache with `Cache-Control` awareness
 - In-flight GET coalescing: concurrent requests to the same URL await the in-flight upstream request instead of racing a duplicate (bounded wait, falls back to racing on timeout)
 - Write-method cache invalidation: `POST`/`PUT`/`DELETE`/`PATCH` evict all cached `GET` responses for that domain before forwarding, so subsequent `GET`s don't serve stale content
@@ -214,7 +215,7 @@ The domain-cache cluster (`_meta_cache`, adaptive TTL, switch damping, quality-d
 | `GET /stickiness` | Session stickiness table (client_ip\|domain → sticky proxy + updated time) |
 | `GET /quality` | Per-proxy EWMA first-byte latency (s), the racing-order basis |
 | `POST /quality/reset` | Clear all proxy EWMA quality (call after network changes) |
-| `GET /circuit` | Circuit-breaker + probe state per proxy (`open`, backoff, `probes_sent/ok/skipped`, `single_send_degrades`) |
+| `GET /circuit` | Circuit-breaker + probe state per proxy (`open`, backoff, `probes_sent/ok/skipped`, `single_send_degrades`, `single_send_slow_log_ms`/`logged`) |
 | `GET /policies` | Policy-routing config snapshot (match + allowed proxy subset) |
 | `POST /circuit/reset` | Un-break all circuits, keep EWMA quality |
 
@@ -241,6 +242,7 @@ router:
     single_send_degrade_fail: 2     # single-send demote: consec-fail threshold (early warn, 0=off)
     single_send_degrade_ratio: 3.0  # single-send demote: EWMA vs pin-time baseline ratio (0=off)
     single_send_degrade_slack_ms: 10  # absolute floor (ms) against false positives at tiny latencies
+    single_send_slow_log_ms: 1500     # slow single-send sampling log (ms, 0=off): when a sticky/domain-cache single-send "request → first byte" exceeds this, log one line carrying the client IP (the only IP-attribution anchor for "won't open / needs refresh" — success path logs no IP)
   # optional speed features (all off by default):
   # policies:                        # narrow the racing candidate set per domain/tag
   #   - match: {domain_suffix: [".cn", "baidu.com"]}
@@ -308,6 +310,7 @@ Tuning notes:
 
 - **`probe_canary` must be reachable both locally and through every upstream.** After deploying, watch `GET /circuit` — if `probes_skipped` keeps growing, the canary is wrong for your network and probes are silently being skipped (no mis-trips, but no quality signal either).
 - **`single_send_degrade_fail` is an early warning for the circuit breaker**: set it to `circuit_threshold - 1` (2 with the default 3) so a pinned proxy that starts failing demotes to racing *before* it breaks the circuit.
+- **`single_send_slow_log_ms`** (default 0=off): samples the "request → first byte" latency of sticky/domain-cache single-sends (the paths that skip racing) and, when it exceeds the threshold, logs one line per dirty request carrying the client IP (`slow single send client=<ip> … ttfb=<ms>`), plus counts it under `single_send_slow_logged`. The success path logs no IP at all, so this is the only anchor to attribute "won't open / needs multiple refreshes" to a specific client IP on this host. Keep the threshold loose (e.g. 1500 = 1.5 s) to catch genuine stalls without flooding the log; monitor `single_send_slow_logged` in `/metrics` (or `opt.log`) to see how often the threshold trips.
 - **`lb_bias`** controls how much in-flight backlog penalizes a proxy's race order (`ewma × (1 + active)^bias`). Raise it if slow proxies get hammered; lower it if the fastest proxy is being deprioritized.
 - **Policy routing** (`router.policies`) narrows the racing candidate set per domain/tag, cutting TTFB and `racing.amplification` — see `examples/config.yaml` for the shape.
 - **`conn_pool.target_prewarm`** (Phase 2) needs `conn_pool.enabled`; it pre-opens "to-upstream" TCP for hot CONNECT targets on domain-cache/sticky hits **or when a racing proxy wins** (the dominant path for most CONNECT traffic — without it prewarm only served the few cache-hit requests). Each target is warmed to 2 connections so a peek leaves a spare. `conn_pool_total` bounds the combined fd budget of both pools. Watch `/metrics` `target_pool_hits` vs `target_pool_misses` to confirm hot targets actually reuse prewarmed connections.
@@ -337,7 +340,7 @@ curl -x http://127.0.0.1:10808 http://www.baidu.com
 .venv/bin/python -m pytest -q
 ```
 
-The suite (200 tests) covers HTTP/CONNECT forwarding, the HTTP response cache (incl. LRU/eviction and in-flight coalescing), the domain cache, racing/aggregation timeouts, client auth, circuit breaker / probing / EWMA selection / in-flight weighting, session stickiness (incl. quality-driven single-send degrade), per-domain stats + SQLite persistence, UTF-8 header safety, binary-safe request body handling, connection warm pools + established-handshake reuse + idle pause (with the "pause never blocks the request path" guarantee), robustness (request-header limits, truncated-response detection), the config layer (`extra="forbid"` rejects typos, cross-field validation, exit code 2), and the module-split regressions (router_cfg= vs kwarg equivalence and pool/cache/sticky forwarding identity).
+The suite (260 tests) covers HTTP/CONNECT forwarding, the HTTP response cache (incl. LRU/eviction and in-flight coalescing), the domain cache, racing/aggregation timeouts, client auth, circuit breaker / probing / EWMA selection / in-flight weighting, session stickiness (incl. quality-driven single-send degrade **and slow single-send sampling logs**), per-domain stats + SQLite persistence, UTF-8 header safety, binary-safe request body handling, connection warm pools + established-handshake reuse + idle pause (with the "pause never blocks the request path" guarantee), robustness (request-header limits, truncated-response detection), the config layer (`extra="forbid"` rejects typos, cross-field validation, exit code 2), and the module-split regressions (router_cfg= vs kwarg equivalence and pool/cache/sticky forwarding identity).
 
 CI runs the suite on **Python 3.10, 3.11 and 3.12** via GitHub Actions (`.github/workflows/test.yml`), with a per-test timeout (`pytest --timeout=60`) so a hanging test fails fast instead of blocking the job.
 

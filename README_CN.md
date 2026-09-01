@@ -20,6 +20,7 @@
 - HTTP 与 HTTPS（`CONNECT`）转发，**并行竞速多个上游代理**（按 EWMA 排序 + 错峰启动）
 - 域名级缓存（`cache_ttl`），按域名复用胜出代理
 - 会话粘性（per-client+domain，内存-only，滑动 TTL），粘性代理失败自动回落竞速并回填；5xx 驱逐、周期重竞速、容量上限
+- 慢单发采样日志（`router.circuit.single_send_slow_log_ms`）：粘性/域名缓存命中的单发（跳过竞速的路径）"发起到首字节"耗时超阈值即记一条**带客户端 IP** 的日志——成功路径不打 IP 日志,这是按 IP 归因"打不开/要反复刷新"的唯一锚点
 - CONNECT 上游 TCP 预热池（第一阶段，`router.conn_pool`）：为每上游维护少量空闲 TCP，CONNECT 跳过"本机→上游代理"建连；目标半预连接（第二阶段，`conn_pool.target_prewarm`）：命中域名缓存/粘性**或竞速胜出**的高频 CONNECT target 后台预建"到上游"的 TCP（每条 target 补 2 条、取走仍留 1 条备用），与第一阶段共享 fd 预算与空闲超时
 - 请求簇预测预热（第三阶段，`conn_pool.cluster_predict`）：学习客户端页面加载窗口内 CONNECT target 的共现规律,下次窗口开口即预测同簇 co-target 并预建"到上游代理"的裸 TCP(不 CONNECT 源站),把子资源突发期的建连 TTFB 省掉
 - 内存级 HTTP `GET` 响应缓存，遵循 `Cache-Control`
@@ -214,7 +215,7 @@ domain_cache 簇（`_meta_cache`、自适应 TTL、切换阻尼、质量感知�
 | `GET /stickiness` | 会话粘性表（客户端IP\|域名 → 粘性代理 + 更新时间） |
 | `GET /quality` | 各代理 EWMA 首字节延迟（秒），竞速排序依据 |
 | `POST /quality/reset` | 清空全部代理 EWMA 质量（网络切换后调用） |
-| `GET /circuit` | 各代理熔断 + 探活状态（`open`、退避、`probes_sent/ok/skipped`、`single_send_degrades`） |
+| `GET /circuit` | 各代理熔断 + 探活状态（`open`、退避、`probes_sent/ok/skipped`、`single_send_degrades`、`single_send_slow_log_ms`/`logged`） |
 | `GET /policies` | 策略路由配置快照（匹配条件 + 允许的代理子集） |
 | `POST /circuit/reset` | 手动解除全部熔断（保留 EWMA 质量） |
 
@@ -241,6 +242,7 @@ router:
     single_send_degrade_fail: 2     # 单发降级:连续失败阈值(熔断早告警,0=关闭)
     single_send_degrade_ratio: 3.0  # 单发降级:EWMA 相对钉住基线恶化倍数(0=关闭)
     single_send_degrade_slack_ms: 10  # 降级绝对下限(ms),防极低延迟误判
+    single_send_slow_log_ms: 1500     # 慢单发采样日志(ms,0=关闭):粘性/域缓存命中的单发"发起到首字节"耗时超阈值即记一条含客户端 IP 的日志(成功路径不打 IP,这是按 IP 归因"打不开/要刷新"的唯一锚点)
 logging:
   file: "auto_squid.log"
 ```
@@ -300,6 +302,7 @@ router:
 
 - **`probe_canary` 必须"本机直连可达 + 经所有上游都可达"。** 部署后看 `GET /circuit`——若 `probes_skipped` 持续增长,说明 canary 不适合当前网络,探活被静默跳过(不会误熔断,但也失去了质量信号)。
 - **`single_send_degrade_fail` 是熔断的早告警**:建议设为 `circuit_threshold - 1`(默认 3 时取 2),让被钉住代理开始失败时**先**降级回竞速,而不是等熔断。
+- **`single_send_slow_log_ms`**(默认 0=关闭):采样粘性/域名缓存命中单发(跳过竞速的路径)的"发起到首字节"耗时,超阈值即按请求记一条**带客户端 IP** 的日志(`slow single send client=<ip> … ttfb=<ms>`),并计入 `single_send_slow_logged`。成功请求路径完全不打 IP 日志,这是本机上按 IP 归因"打不开/需要反复刷新"的**唯一锚点**。阈值设宽松些(如 1500=1.5s)只捕真慢、避免刷屏;看 `/metrics`(或 opt.log)的 `single_send_slow_logged` 观察触发频率。
 - **`lb_bias`** 控制在途积压对竞速排序的惩罚(`ewma × (1 + active)^bias`)。慢代理易被打爆就调高;最快代理被过度避让就调低。
 - **策略路由**(`router.policies`)按域名/标签收窄竞速候选集,直接降低 TTFB 与 `racing.amplification`——形状见 `examples/config.yaml`。
 - **`conn_pool.target_prewarm`**(第二阶段)需 `conn_pool.enabled` 为 true;命中域名缓存/粘性**或竞速胜出**(竞速是多数 CONNECT 流量的主体路径,不加则预热只服务极少数缓存命中请求)的高频 CONNECT target 后台预建"到上游"的 TCP,每条 target 补 2 条、取走仍留 1 条备用。`conn_pool.total` 是两阶段合并的全局 fd 预算。看 `/metrics` 的 `target_pool_hits` vs `target_pool_misses` 确认热 target 真的复用了预建连接。
@@ -330,7 +333,7 @@ curl -x http://127.0.0.1:10808 http://www.baidu.com
 .venv/bin/python -m pytest -q
 ```
 
-测试套件（**200** 个用例）覆盖 HTTP/CONNECT 转发、HTTP 响应缓存（含 LRU/淘汰与在途去重聚合）、域名缓存、竞速/聚合超时、客户端认证、熔断/探活/EWMA 选路/在途加权、会话粘性（含质量感知单发降级）、域名统计 + SQLite 持久化、UTF-8 头安全、二进制安全的请求体处理、连接预热（通用池 + target 半预连接 + 已建握手隧道复用）+ 空闲暂停（含"暂停不卡请求路径"回归）、健壮性（请求头行数/字节上限、截断响应检测）、配置层（`extra="forbid"` 拒绝拼错键、跨字段校验、退出码 2），以及模块拆分回归（`router_cfg=` vs kwarg 等价、池/缓存/粘性转发同一性）。
+测试套件（**260** 个用例）覆盖 HTTP/CONNECT 转发、HTTP 响应缓存（含 LRU/淘汰与在途去重聚合）、域名缓存、竞速/聚合超时、客户端认证、熔断/探活/EWMA 选路/在途加权、会话粘性（含质量感知单发降级**与慢单发采样日志**）、域名统计 + SQLite 持久化、UTF-8 头安全、二进制安全的请求体处理、连接预热（通用池 + target 半预连接 + 已建握手隧道复用）+ 空闲暂停（含"暂停不卡请求路径"回归）、健壮性（请求头行数/字节上限、截断响应检测）、配置层（`extra="forbid"` 拒绝拼错键、跨字段校验、退出码 2），以及模块拆分回归（`router_cfg=` vs kwarg 等价、池/缓存/粘性转发同一性）。
 
 CI 通过 GitHub Actions（`.github/workflows/test.yml`）在 **Python 3.10 与 3.11 与 3.12** 三版本跑测试套件，并带单测试超时（`pytest --timeout=60`），挂起的测试会快速失败并报出测试名，而非无限阻塞任务。
 
