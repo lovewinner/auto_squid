@@ -4847,6 +4847,48 @@ class TestPrehandshake:
             up_srv.close()
             await up_srv.wait_closed()
 
+    @pytest.mark.asyncio
+    async def test_prehandshake_throttle_limits_burst(self):
+        """预握手节流:滑动窗口内最多 max_per_window 条,超限静默跳过。
+
+        直接驱动 pools._prehandshake_one 连续调 6 次(不同 target 避开单键 cap),
+        window=60s/max=3 → 只发射 3 条,其余 3 条被节流跳过(throttled_skips+3),
+        跳过不算失败。窗口内计数对并发预握手任务共享(风暴削峰)。
+        """
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router(conn_pool_prehandshake_throttle_window_sec=60.0,
+                         conn_pool_prehandshake_throttle_max_per_window=3)
+        await r.start()
+        try:
+            proxy = r.proxy_store.get('p')
+            results = []
+            for i in range(6):
+                target = f"ph-throttle-{i}.example.com:443"
+                results.append(await r.pools._prehandshake_one(
+                    proxy.host, proxy.port, target, proxy.auth))
+            assert results.count(True) == 3, \
+                f"节流下应只发射 3 条,实际 {results.count(True)}"
+            assert r.pools.prehandshake_throttled_skips == 3, \
+                f"应跳过 3 条,实际 {r.pools.prehandshake_throttled_skips}"
+            assert r.established_pool_prewarm_failed == 0, \
+                "节流跳过不算失败"
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_prehandshake_throttle_off_by_default(self):
+        """默认(0,0)不限速:连续发射不被跳过,throttled_skips 恒 0(零行为变化)。"""
+        r = self._router()
+        await r.start()
+        try:
+            for _ in range(10):
+                assert r.pools._prehandshake_throttle_allow()
+            assert r.pools.prehandshake_throttled_skips == 0
+        finally:
+            await r.stop()
+
 
 class TestStickyProbeEviction:
     """杠杆A:粘性命中后台探路——命中后 fire-and-forget 对竞争代理做 CONNECT-only

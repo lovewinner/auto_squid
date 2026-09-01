@@ -82,6 +82,9 @@ FIELD_ORDER = [
     "established_pool_prehandshook", # 预握手库存被复用命中次数(prehandshake 专属收益)
     "established_pool_prewarm_failed", # 预握手 CONNECT 失败次数(回退只建 TCP)
     "conn_pool_prehandshake",   # 预握手是否启用(状态)
+    "prehandshake_throttled_skips", # 预握手节流跳过次数(窗口已满静默跳过)
+    "prehandshake_throttle_window_sec", # 预握手节流窗口(秒,状态)
+    "prehandshake_throttle_max_per_window", # 预握手节流窗口内上限(状态)
     "cluster_pool_creates",     # 目标池中 cluster 预测预建条数(cluster 专属)
     "cluster_pool_hits",        # 命中中被预测预建命中的次数 → /creates = cluster 命中率
     "cluster_pool_expired",     # 空闲超时关闭中预测预建关闭的条数
@@ -142,6 +145,9 @@ FIELD_DOCS = {
     "established_pool_prehandshook": "预握手库存被复用命中次数(prehandshake 专属收益)",
     "established_pool_prewarm_failed": "预握手 CONNECT 失败次数(回退只建 TCP)",
     "conn_pool_prehandshake": "预握手是否启用(状态)",
+    "prehandshake_throttled_skips": "预握手节流跳过次数(窗口已满静默跳过)",
+    "prehandshake_throttle_window_sec": "预握手节流窗口(秒,状态)",
+    "prehandshake_throttle_max_per_window": "预握手节流窗口内上限(状态)",
     "cluster_pool_creates": "目标池中 cluster 预测预建条数",
     "cluster_pool_hits": "命中中被预测预建命中的次数(/creates=cluster 命中率)",
     "cluster_pool_expired": "空闲超时关闭中预测预建关闭的条数",
@@ -180,6 +186,8 @@ NO_DELTA_FIELDS = {
     "established_pool_size",
     "conn_pool_established_idle_timeout",
     "conn_pool_prehandshake",
+    "prehandshake_throttle_window_sec",
+    "prehandshake_throttle_max_per_window",
 }
 
 # 优化分析重点关注字段(供 grep 快速定位)
@@ -203,6 +211,7 @@ FOCUS = [
     "established_pool_returned",
     "established_pool_expired",
     "established_pool_prehandshook",
+    "prehandshake_throttled_skips",
 ]
 
 

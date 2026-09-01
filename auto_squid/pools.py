@@ -84,7 +84,8 @@ class ConnectionPools:
                  established_reuse, prehandshake=False, pause_minutes=60.0,
                  pause_silence_sec=120.0, pause_activity_window=None,
                  pause_min_requests=3, idle_timeout_cluster=600.0,
-                 idle_timeout_established=None):
+                 idle_timeout_established=None, prehandshake_throttle_window_sec=0.0,
+                 prehandshake_throttle_max_per_window=0):
         self.proxy_store = proxy_store
         self.conn_pool_enabled = bool(enabled)
         self.conn_pool_per_proxy = max(1, int(per_proxy))
@@ -195,6 +196,15 @@ class ConnectionPools:
         self.prehandshake_enabled = bool(prehandshake)  # snapshot 只读别名
         self.established_pool_prehandshook = 0      # 预握手隧道被复用命中次数
         self.established_pool_prewarm_failed = 0    # 预握手 CONNECT 失败(回退只建 TCP)
+        # 预握手节流(生产事故 09-01:页面首载瞬间对几十个 target × 多代理疯狂预握手,
+        # 3 秒内 PREHANDSHAKE 落池 20+,把上游代理压到过载→全量熔断风暴)。滑动窗口
+        # 限速:window_sec 内最多 max_per_window 条,超出静默跳过(库存下次再补,不
+        # 打扰主请求)。两值都 >0 才生效,默认 0=不限速(零行为变化)。
+        self.prehandshake_throttle_window_sec = max(0.0, float(prehandshake_throttle_window_sec))
+        self.prehandshake_throttle_max_per_window = max(0, int(prehandshake_throttle_max_per_window))
+        self.prehandshake_throttled_skips = 0       # 节流跳过次数(观测节流是否过紧)
+        # 滑动窗口内预握手发射时间戳(monotonic 秒),用于限速判定。
+        self._prehandshake_emits: collections.deque = collections.deque()
         # 观测(P1 先观测后实现):CONNECT 到上游的新建 TCP 连接计数(不含预热池
         # 命中)。供压测算 HTTPS 建链成本、验证预热池收益。
         self.connect_new_conns = 0
@@ -526,6 +536,27 @@ class ConnectionPools:
         except Exception:
             logger.info("target prewarm FAILED %s via %s:%s", target, proxy_host, proxy_port)
 
+    def _prehandshake_throttle_allow(self) -> bool:
+        """预握手滑动窗口限速:window 内发射数 < 上限才放行并记账。
+
+        不限速(两值任一 ≤0)恒 True,零行为变化。窗口内已满则计
+        prehandshake_throttled_skips 并返回 False(静默跳过,不打扰主请求)。
+        """
+        win = self.prehandshake_throttle_window_sec
+        cap = self.prehandshake_throttle_max_per_window
+        if win <= 0 or cap <= 0:
+            return True
+        now = time.monotonic()
+        q = self._prehandshake_emits
+        # 丢弃窗口外旧时间戳,滑动窗口内计数。
+        while q and now - q[0] > win:
+            q.popleft()
+        if len(q) >= cap:
+            self.prehandshake_throttled_skips += 1
+            return False
+        q.append(now)
+        return True
+
     async def _prehandshake_one(self, proxy_host: str, proxy_port: int, target: str,
                                 proxy_auth: dict):
         """预握手一条 (proxy, target):自建 TCP → 发 CONNECT → 拿到 200 进 established 池。
@@ -543,6 +574,8 @@ class ConnectionPools:
         if self._total_idle() >= self.conn_pool_total \
                 or len(self._established_pool.get(key, [])) >= _ESTABLISHED_KEY_CAP:
             return False  # 超预算/cap:宁可这次不预握手
+        if not self._prehandshake_throttle_allow():
+            return False  # 节流窗口已满:静默跳过,库存下次再补
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(proxy_host, proxy_port),
