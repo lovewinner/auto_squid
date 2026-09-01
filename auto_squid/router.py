@@ -152,7 +152,7 @@ class Router:
     生命周期:start() 开始监听 → handle_client 处理每个连接 → stop() 优雅关闭。
     """
 
-    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, sticky_probe_interval_sec: float = 0.0, sticky_probe_fanout: int = 2, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False, conn_pool_refill_pause_minutes: float = 60.0, conn_pool_refill_pause_silence_sec: float = 120.0, conn_pool_refill_pause_activity_window: Optional[float] = None, conn_pool_refill_pause_min_requests: int = 3, conn_pool_established_reuse: bool = False, conn_pool_established_idle_timeout: Optional[float] = None, cluster_predict: bool = False, cluster_window_sec: float = 2.0, cluster_predict_topk: int = 3, cluster_min_support: int = 2, cluster_graph_ttl_sec: int = 86400, cluster_graph_max_entries: int = 100_000, cluster_predict_throttle_sec: float = 30.0, cluster_proxy_fanout: int = 2, cluster_probe_decay_sec: float = 3600.0, cluster_pool_idle_timeout: float = 600.0, router_cfg: Optional[RouterConfig] = None):
+    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, sticky_probe_interval_sec: float = 0.0, sticky_probe_fanout: int = 2, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False, conn_pool_refill_pause_minutes: float = 60.0, conn_pool_refill_pause_silence_sec: float = 120.0, conn_pool_refill_pause_activity_window: Optional[float] = None, conn_pool_refill_pause_min_requests: int = 3, conn_pool_established_reuse: bool = False, conn_pool_established_idle_timeout: Optional[float] = None, conn_pool_prehandshake: bool = False, cluster_predict: bool = False, cluster_window_sec: float = 2.0, cluster_predict_topk: int = 3, cluster_min_support: int = 2, cluster_graph_ttl_sec: int = 86400, cluster_graph_max_entries: int = 100_000, cluster_predict_throttle_sec: float = 30.0, cluster_proxy_fanout: int = 2, cluster_probe_decay_sec: float = 3600.0, cluster_pool_idle_timeout: float = 600.0, router_cfg: Optional[RouterConfig] = None):
         """构造路由器。
 
         参数:
@@ -319,6 +319,7 @@ class Router:
             conn_pool_refill_pause_min_requests = pc.refill_pause_min_requests
             conn_pool_established_reuse = pc.established_reuse
             conn_pool_established_idle_timeout = pc.established_idle_timeout
+            conn_pool_prehandshake = pc.prehandshake
             cluster_predict = pc.cluster_predict
             cluster_window_sec = pc.cluster_window_sec
             cluster_predict_topk = pc.cluster_predict_topk
@@ -485,6 +486,7 @@ class Router:
             idle_timeout=conn_pool_idle_timeout, refill_interval=conn_pool_refill_interval,
             refill_target=conn_pool_refill_target, connect_timeout=conn_pool_connect_timeout,
             target_prewarm=conn_pool_target_prewarm, established_reuse=conn_pool_established_reuse,
+            prehandshake=conn_pool_prehandshake,
             pause_minutes=conn_pool_refill_pause_minutes, pause_silence_sec=conn_pool_refill_pause_silence_sec,
             pause_activity_window=conn_pool_refill_pause_activity_window,
             pause_min_requests=conn_pool_refill_pause_min_requests,
@@ -1064,6 +1066,9 @@ class Router:
             "cluster_graph_size": self.cluster.graph_size(),
             "conn_pool_established_reuse": self.conn_pool_established_reuse,
             "conn_pool_established_idle_timeout": self.pools.established_pool_idle_timeout,
+            "conn_pool_prehandshake": self.pools.prehandshake_enabled,
+            "established_pool_prehandshook": self.pools.established_pool_prehandshook,
+            "established_pool_prewarm_failed": self.pools.established_pool_prewarm_failed,
             "established_pool_hits": self.established_pool_hits,
             "established_pool_misses": self.established_pool_misses,
             "established_pool_expired": self.established_pool_expired,
@@ -1407,8 +1412,9 @@ class Router:
     # Router 侧只剩"触发预热"的一处编排 —— task 注册/排空进 _running_tasks。
 
     def _spawn_target_prewarm(self, proxy_host: Optional[str], proxy_port: Optional[int],
-                              target: str, source: str = 'passive'):
-        """命中域名缓存/粘性或竞速胜出的 CONNECT → 后台预热 (proxy, target) 半连接。
+                              target: str, source: str = 'passive', *,
+                              proxy_auth: Optional[dict] = None):
+        """命中域名缓存/粘性或竞速胜出的 CONNECT → 后台预热 (proxy, target) 连接。
 
         仅在第二阶段开启且经上游代理(非本机直连)时触发;计数并登记到
         self._running_tasks(供 stop() 排空)。实际预热协程在 pools 的
@@ -1420,6 +1426,17 @@ class Router:
         ClusterGraph 预测预建经注入的 prewarm_spawn lambda 以 source='cluster'
         进入(见 __init__ 接线)。pools 据此给 cluster 连接打上 _cluster_prewarmed
         标签,算 cluster 专属命中率(cluster_pool_hits / cluster_pool_creates)。
+
+        **预握手升级(prehandshake)**:`proxy_auth` 提供访问该上游代理的凭据
+        (调用点已拿到 proxy.auth,带进 pools 免二次反查)。pools 在预握手开启且
+        established_reuse 开启时,对**被动**预建(self 发起的(proxy, target))
+        额外建一条**自建 TCP + CONNECT 预握手**隧道(CONNECT 拿 200 即进
+        established 池,skip 下次握手)——注意是**新建** TCP,不复用本次请求的
+        赢家隧道(那隧道正被 _relay_tunnel 透传,复用会与业务数据交织竞态)。
+        预握手库存打 _prehandshook 标签走 established 超时(600s),并计
+        established_pool_prehandshook 专属命中率。cluster 预测保持只建 TCP
+        (预测命中率 ~3%,预握手浪费面大,v1 不做)。未开启 established_reuse 或
+        预握手失败时回退只建 TCP 进 target 池(现状,零行为变化)。
         """
         if not (self.conn_pool_enabled and self.conn_pool_target_prewarm):
             return
@@ -1430,7 +1447,7 @@ class Router:
                     target, proxy_host, proxy_port, self.target_prewarm_dispatched)
         task = asyncio.create_task(
             self.pools._target_pool_prewarm(proxy_host, proxy_port, target,
-                                            source=source))
+                                            source=source, proxy_auth=proxy_auth))
         self._running_tasks.add(task)
         task.add_done_callback(self._running_tasks.discard)
 
@@ -2652,8 +2669,12 @@ class Router:
                     else:
                         pid, up_reader, up_writer = await self._try_tunnel(sticky_pid, target, proxy.host, proxy.port, proxy.auth)
                         # CONNECT 目标半预连接(P2):粘性命中说明该 target 高频,
-                        # 后台预热下一条到上游代理的 TCP(不阻塞本请求)。
-                        self._spawn_target_prewarm(proxy.host, proxy.port, target)
+                        # 后台预热下一条到上游代理的 TCP(不阻塞本请求)。预握手升级:
+                        # 把 proxy.auth 交给 pools,开启 prehandshake 时额外自建
+                        # TCP + CONNECT 预握手一条(库存进 established 池),否则
+                        # 只建 TCP 进 target 池(现状)。
+                        self._spawn_target_prewarm(proxy.host, proxy.port, target,
+                                                   proxy_auth=proxy.auth)
                     # 请求簇预测预热:把该 target 连同胜出代理记入客户端窗口(windows
                     # 关闭时学习全局共现图;开启新窗口时预测同簇 co-target 预建)。
                     self.cluster.observe(client_ip, target, sticky_pid)
@@ -2687,8 +2708,10 @@ class Router:
                 else:
                     pid, up_reader, up_writer = await self._try_tunnel(cached_pid, target, proxy.host, proxy.port, proxy.auth)
                     # CONNECT 目标半预连接(P2):域名缓存命中说明该 target 高频,
-                    # 后台预热下一条到上游代理的 TCP(不阻塞本请求)。
-                    self._spawn_target_prewarm(proxy.host, proxy.port, target)
+                    # 后台预热下一条到上游代理的 TCP(不阻塞本请求)。预握手升级
+                    # 同 sticky 分支(带 proxy.auth)。
+                    self._spawn_target_prewarm(proxy.host, proxy.port, target,
+                                               proxy_auth=proxy.auth)
                 # 请求簇预测预热:域缓存命中即 target 高频,同 sticky 分支记入客户端窗口。
                 self.cluster.observe(client_ip, target, cached_pid)
                 logger.debug("proxy %s cache hit CONNECT %s", pid, target)
@@ -2754,7 +2777,10 @@ class Router:
             if pid != 'local':
                 win_proxy = self.proxy_store.get(pid)
                 if win_proxy is not None:
-                    self._spawn_target_prewarm(win_proxy.host, win_proxy.port, target)
+                    # 预握手升级:竞速胜出同粘性/域缓存分支,把 win_proxy.auth 交给
+                    # pools 预握手(竞速天然高频 target,库存直接进 established 池)。
+                    self._spawn_target_prewarm(win_proxy.host, win_proxy.port, target,
+                                               proxy_auth=win_proxy.auth)
             # 请求簇预测预热:竞速胜出同样记入客户端窗口(页面的每一跳都是一簇一员)。
             self.cluster.observe(client_ip, target, pid)
             await self._connect_established(client_writer, up_writer)
@@ -2860,9 +2886,10 @@ class Router:
     _POOL_FORWARD = frozenset({'_conn_pool', '_target_pool', '_established_pool',
         'conn_pool_enabled', 'conn_pool_per_proxy', 'conn_pool_total', 'conn_pool_idle_timeout',
         'conn_pool_refill_interval', 'conn_pool_refill_target', 'conn_pool_connect_timeout',
-        'conn_pool_target_prewarm', 'conn_pool_established_reuse',
+        'conn_pool_target_prewarm', 'conn_pool_established_reuse', 'conn_pool_prehandshake',
         'conn_pool_refill_pause_minutes', 'conn_pool_refill_pause_activity_window',
         'conn_pool_refill_pause_min_requests', 'cluster_pool_idle_timeout',
+        'prehandshake_enabled', 'established_pool_prehandshook', 'established_pool_prewarm_failed',
         'conn_pool_creates', 'conn_pool_hits', 'conn_pool_misses', 'conn_pool_expired',
         'target_pool_creates', 'target_pool_hits', 'target_pool_misses', 'target_pool_expired',
         'cluster_pool_creates', 'cluster_pool_hits', 'cluster_pool_expired',

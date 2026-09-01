@@ -4688,6 +4688,164 @@ class TestRaceLoserEstablishedReturn:
             await up_srv.wait_closed()
 
 
+class TestPrehandshake:
+    """预握手(被动预建升级):命中粘性/域缓存/竞速胜出的 CONNECT,在既有"只建 TCP"
+    预建之外额外自建一条 TCP 并发 CONNECT 预握手,拿到 200 直接进 _established_pool
+    ——提升库存产生率,等同 target 请求到来时复用跳过握手。
+
+    触发路径:粘性命中 CONNECT 分支 _spawn_target_prewarm 带 proxy_auth;预握手
+    库存打 _prehandshook 标签,复用经 _established_pool_peek 命中(prehandshook
+    归因计数),prune 按 established 独立超时(而非通用池超时)。
+    """
+
+    def _router(self, **kw):
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host=HOST, port=31991,
+                            auth=dict(username="u", password="p")))
+        kw.setdefault('conn_pool_enabled', True)
+        kw.setdefault('conn_pool_target_prewarm', True)
+        kw.setdefault('conn_pool_established_reuse', True)
+        kw.setdefault('conn_pool_prehandshake', True)
+        kw.setdefault('conn_pool_per_proxy', 4)
+        kw.setdefault('conn_pool_total', 8)
+        kw.setdefault('conn_pool_refill_interval', 0.0)  # 只取不补(测试手动)
+        kw.setdefault('conn_pool_idle_timeout', 100.0)   # 长超时,防测试中途过期
+        kw.setdefault('stickiness_enabled', True)
+        kw.setdefault('stickiness_ttl', 1800.0)
+        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+                      db_path=tempfile.mktemp(suffix='.db'), **kw)
+
+    async def _wait_prehandshake(self, r, target, timeout=2.0):
+        """轮询等待预握手库存落池(预握手是 fire-and-forget 后台任务)。"""
+        key = f"{HOST}:31991|{target.decode()}"
+        for _ in range(int(timeout / 0.02)):
+            if r._established_pool.get(key):
+                return True
+            await asyncio.sleep(0.02)
+        return False
+
+    @pytest.mark.asyncio
+    async def test_prehandshake_stocks_established_pool(self):
+        """粘性命中 CONNECT → 后台预握手一条进 established 池(_prehandshook 标签)。
+
+        走 sticky 命中路径(sticky_pid 触发 _spawn_target_prewarm 带 proxy_auth)。
+        第一次请求建立粘性,第二次粘性命中触发预握手;轮询等待库存落池。
+        """
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router()
+        await r.start()
+        try:
+            target = b"prehandshake.example.com:443"
+            # 第一次:建隧道 + 粘性记录。
+            echo1 = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"one")
+            assert echo1 == b"one"
+            assert r.sticky_cache_hits == 0  # 第一次是 miss(建立粘性)
+            # 第二次:粘性命中 → 触发后台预握手。
+            echo2 = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"two")
+            assert echo2 == b"two"
+            assert r.sticky_cache_hits >= 1
+            assert await self._wait_prehandshake(r, target), \
+                "预握手库存应落 established 池"
+            key = f"{HOST}:31991|{target.decode()}"
+            writer = r._established_pool[key][0][1]
+            assert getattr(writer, '_prehandshook', False), \
+                "预握手连接应打 _prehandshook 标签"
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_prehandshake_reuse_skips_connect(self):
+        """预握手库存被复用:established_pool_peek 命中预握手隧道,prehandshook 归因 +1。
+
+        单元级(时序确定):先 _prehandshake_one 落一条预握手库存,再 _established_pool_peek
+        取用——命中即计 established_pool_hits 与 established_pool_prehandshook 归因。
+        (E2E 复用跳过 CONNECT 由既有 TestEstablishedTunnelReuse.test_reuse_skips_connect
+        覆盖,此处只验 prehandshook 专属归因路径。)
+        """
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router()
+        await r.start()
+        try:
+            target = "prehandshake-reuse.example.com:443"
+            proxy = r.proxy_store.get('p')
+            ok = await r.pools._prehandshake_one(proxy.host, proxy.port, target,
+                                                 proxy.auth)
+            assert ok, "预握手应成功落池"
+            key = f"{HOST}:31991|{target}"
+            assert r._established_pool.get(key), "预握手库存应在池中"
+            writer = r._established_pool[key][0][1]
+            assert getattr(writer, '_prehandshook', False), "应打 _prehandshook 标签"
+            # 取用:命中预握手隧道,prehandshook 归因 +1。
+            got = r._established_pool_peek(HOST, 31991, target)
+            assert got is not None, "取用应命中预握手库存"
+            assert r.established_pool_hits == 1
+            assert r.established_pool_prehandshook == 1, \
+                "预握手库存命中应计 prehandshook 归因"
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_prehandshake_off_falls_back_to_tcp(self):
+        """prehandshake=False → 预建仍是裸 TCP 进 target 池,无 _prehandshook 库存。
+
+        预握手关闭时,_target_pool_prewarm 只建"到上游"的裸 TCP 进 _target_pool;
+        established 池里即使有连接(粘性请求自己的隧道经 relay 归还)也不带
+        _prehandshook 标签。
+        """
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router(conn_pool_prehandshake=False)
+        await r.start()
+        try:
+            target = b"prehandshake-off.example.com:443"
+            echo1 = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"one")
+            assert echo1 == b"one"
+            echo2 = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"two")
+            assert echo2 == b"two"
+            # 给后台预建一点时间(预建仍是裸 TCP 进 target 池)。
+            await asyncio.sleep(0.2)
+            key = f"{HOST}:31991|{target.decode()}"
+            # established 池里可能有一条粘性请求自己的隧道(relay 归还),但不带
+            # _prehandshook 标签(预握手被关闭)。
+            for reader, writer in r._established_pool.get(key, []):
+                assert not getattr(writer, '_prehandshook', False), \
+                    "prehandshake=False:established 池不应有预握手库存"
+            assert r.established_pool_prehandshook == 0
+            # 预建仍应进 target 池(既有行为)。
+            assert r.target_pool_creates >= 1, "裸 TCP 预建应照常发生"
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_prehandshake_respects_budget(self):
+        """预算/cap 检查:established 池满(预算或单键 cap)时预握手跳过。
+
+        直接驱动 pools._prehandshake_one,验证超预算返回 False 且不落池。
+        """
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router(conn_pool_total=1)  # 预算极小:established 池接近满
+        await r.start()
+        try:
+            target = "prehandshake-budget.example.com:443"
+            # 手工占满 established 池预算:直接插入一条(算作已有库存)。
+            r._established_pool[f"{HOST}:31991|{target}"] = [(None, None)]
+            proxy = r.proxy_store.get('p')
+            ok = await r.pools._prehandshake_one(proxy.host, proxy.port, target,
+                                                 proxy.auth)
+            assert not ok, "预算已满时预握手应跳过(不落池不计数)"
+            assert r.established_pool_prewarm_failed == 0, \
+                "预算跳过不算失败(失败只计建连/CONNECT 非 200)"
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+
 class TestStickyProbeEviction:
     """杠杆A:粘性命中后台探路——命中后 fire-and-forget 对竞争代理做 CONNECT-only
     探路,探路赢家显著快于粘性代理则驱逐粘性条目(慢窗口从 TTL 压到请求级)。

@@ -241,6 +241,7 @@ class ConnPoolConfig(ConfigBase):
     refill_pause_min_requests: int = Field(3, description="活动判定窗口阈值(默认 3):窗口(见 refill_pause_activity_window)内请求数 ≥ 此值才刷新活动时间戳。真实页面加载一次 ≥3 个 hostname 的 CONNECT 簇即达标;心跳(孤例)不达标。阈值 ≤1 时退化为『任意请求都刷新』")
     established_reuse: bool = Field(False, description="已建握手隧道复用:隧道结束若连接干净则归还池,下次同 (proxy,target) 请求复用已 CONNECT 握手的连接,跳过握手,省掉重建。仅当 conn_pool.enabled 为 True 时生效")
     established_idle_timeout: Optional[float] = Field(None, description="已建握手隧道池的独立空闲超时(秒)。established 库存(竞速败者/隧道结束归还的已握手连接)复访同 (proxy,target) 的频率常低于通用池取用,统一用 idle_timeout 会导致归还后 90% 在复访前被清(生产观测 returned=133/expired=120,命中 7)。独立超时让库存多活一阵等复访;默认 None=跟随 idle_timeout(零行为变化)。")
+    prehandshake: bool = Field(False, description="预握手(被动预建升级):命中粘性/域缓存/竞速胜出的 CONNECT 在既有'只建 TCP'预建之外,额外自建一条 TCP 并发 CONNECT 预握手,拿到 200 直接进已建握手池——提升库存产生率,等同 target 请求到来时复用跳过握手。需 conn_pool.enabled + target_prewarm + established_reuse 同时开启才生效;关闭时零行为变化(只建裸 TCP 进 target 池)")
     cluster_predict: bool = Field(False, description="请求簇预测预热:按客户端窗口的 CONNECT 簇共现规律,在窗口开口预测同簇下一批 co-target 并提前预建到上游代理的 TCP(不 CONNECT 源站)。仅当 conn_pool.enabled 且 target_prewarm 为 True 时生效")
     cluster_window_sec: float = Field(2.0, description="簇窗口宽(秒):同一客户端窗口内观察到的目标算一簇;下一请求距上一请求超过窗口宽则关闭并学习上一窗口")
     cluster_predict_topk: int = Field(3, description="窗口开口时预测的 co-target 数上限(按共现支持度取前 K,跳过当前窗口已观察的目标)")
