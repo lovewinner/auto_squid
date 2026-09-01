@@ -3479,6 +3479,36 @@ class TestAdaptiveTTL:
         m2 = r2.get_domain_meta_enriched()
         assert set(m2['d.example.com'].keys()) == {'default_proxy', 'updated_at', 'ref_ewma'}
 
+    def test_slow_single_send_observation_logs_with_ip(self, caplog):
+        """慢单发采样:首字节耗时超阈值 → 记带 client_ip 的日志并计数。"""
+        import logging
+        r = self._router(single_send_slow_log_ms=1500.0)
+        with caplog.at_level(logging.INFO, logger='auto_squid.router'):
+            # 用回溯 2s 的起始戳伪造一次慢观测,避免 sleep。
+            r._observe_single_send('59.67.225.91', 'github.com', 'github.com', 'p',
+                                   time.perf_counter() - 2.0)
+        assert r.single_send_slow_logged == 1
+        hit = [rec for rec in caplog.records
+               if rec.getMessage().startswith("slow single send")]
+        assert hit and "59.67.225.91" in hit[0].getMessage()
+
+    def test_slow_single_send_below_threshold_and_disabled_noop(self, caplog):
+        """低于阈值不记;阈值 0(默认关闭)不记,计数恒 0。"""
+        import logging
+        r = self._router(single_send_slow_log_ms=1500.0)
+        with caplog.at_level(logging.INFO, logger='auto_squid.router'):
+            # 实时戳(接近 0ms)→ 远低于阈值。
+            r._observe_single_send('59.67.225.91', 'github.com', 'github.com', 'p',
+                                   time.perf_counter())
+        assert r.single_send_slow_logged == 0
+        assert not any(rec.getMessage().startswith("slow single send")
+                       for rec in caplog.records)
+        # 默认关闭:即使传慢戳也不记。
+        r0 = self._router()
+        r0._observe_single_send('59.67.225.91', 'github.com', 'github.com', 'p',
+                                time.perf_counter() - 5.0)
+        assert r0.single_send_slow_logged == 0
+
 
 class TestSwitchDamping:
     """域名赢家切换阻尼(P3):新赢家不能因单次竞速抖动就替换稳定域名赢家。"""
@@ -5609,6 +5639,7 @@ class TestRouterConfigPassThrough:
             single_send_degrade_fail=cc.single_send_degrade_fail,
             single_send_degrade_ratio=cc.single_send_degrade_ratio,
             single_send_degrade_slack_ms=cc.single_send_degrade_slack_ms,
+            single_send_slow_log_ms=cc.single_send_slow_log_ms,
             auth_enabled=auth.enabled, auth_username=auth.username, auth_password=auth.password,
             enable_http_cache=hc.enabled, http_cache_ttl=hc.ttl,
             http_cache_max_entries=hc.max_entries, http_cache_max_bytes=hc.max_bytes,
@@ -5653,7 +5684,8 @@ class TestRouterConfigPassThrough:
                 circuit_threshold=4, circuit_max_backoff=120.0,
                 slow_start_window=30.0, slow_start_success=2, lb_bias=0.5,
                 single_send_degrade_fail=2, single_send_degrade_ratio=2.5,
-                single_send_degrade_slack_ms=20.0),
+                single_send_degrade_slack_ms=20.0,
+                single_send_slow_log_ms=1500.0),
             auth=dict(enabled=True, username="u", password="p"),
             http_cache=dict(enabled=False),
             stickiness=dict(enabled=True, ttl=900.0, recheck_hits=50, max_entries=5000),
@@ -5696,7 +5728,7 @@ class TestRouterConfigPassThrough:
             for attr in ('max_retries', 'cache_ttl', 'stagger_interval', 'probe_interval_sec',
                          'conn_pool_enabled', 'conn_pool_total', 'conn_pool_established_reuse',
                          'conn_pool_idle_timeout', 'cluster_proxy_fanout', 'cluster_probe_decay_sec',
-                         'cluster_pool_idle_timeout'):
+                         'cluster_pool_idle_timeout', 'single_send_slow_log_ms'):
                 assert getattr(r_cfg, attr) == getattr(r_kw, attr), f"{attr} 两条构造路径不一致"
             for attr in ('circuit_threshold', 'circuit_max_backoff', 'slow_start_window',
                          'slow_start_success', 'lb_bias'):

@@ -346,6 +346,11 @@ class CircuitConfig(ConfigBase):
     single_send_degrade_slack_ms: EWMA 降级的绝对下限(毫秒,默认 10)。基线与当前值
                        都极小时(如 0.2ms→0.9ms,比值 4.5 但绝对差距 <1ms)用纯比值
                        会误判剧烈恶化——绝对差值低于该 slack 时不降级。
+    single_send_slow_log_ms: 慢单发采样日志阈值(毫秒,默认 0=关闭)。会话粘性/域名
+                       缓存命中的单发请求在"发起到首字节"耗时超过该阈值时,记一条
+                       `slow single send` 日志(含客户端 IP + 域名/目标 + 所用代理 +
+                       耗时)。用于按客户端 IP 归因慢/打不开:成功请求不打 IP 日志,
+                       单发命中才是感知瓶颈的主要路径,这里补一条带 IP 的观测。
     """
     probe_interval_sec: float = Field(30.0, description="后台探活周期(秒),0=关闭主动探活")
     probe_canary: str = Field("1.1.1.1:443", description="探活目标 host:port(单 canary;被 probe_canaries 覆盖)")
@@ -358,6 +363,7 @@ class CircuitConfig(ConfigBase):
     single_send_degrade_fail: int = Field(0, description="单发降级:连续失败阈值,0=关闭")
     single_send_degrade_ratio: float = Field(0.0, description="单发降级:EWMA 恶化比值阈值,0=关闭(同时用于方案C:粘性慢探路)")
     single_send_degrade_slack_ms: float = Field(10.0, description="EWMA 降级绝对下限(毫秒)")
+    single_send_slow_log_ms: float = Field(0.0, description="慢单发采样日志阈值(毫秒),0=关闭")
 
 
 class RouterConfig(ConfigBase):

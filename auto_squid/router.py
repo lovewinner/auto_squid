@@ -152,7 +152,7 @@ class Router:
     生命周期:start() 开始监听 → handle_client 处理每个连接 → stop() 优雅关闭。
     """
 
-    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, sticky_probe_interval_sec: float = 0.0, sticky_probe_fanout: int = 2, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False, conn_pool_refill_pause_minutes: float = 60.0, conn_pool_refill_pause_silence_sec: float = 120.0, conn_pool_refill_pause_activity_window: Optional[float] = None, conn_pool_refill_pause_min_requests: int = 3, conn_pool_established_reuse: bool = False, conn_pool_established_idle_timeout: Optional[float] = None, conn_pool_prehandshake: bool = False, conn_pool_prehandshake_throttle_window_sec: float = 0.0, conn_pool_prehandshake_throttle_max_per_window: int = 0, cluster_predict: bool = False, cluster_window_sec: float = 2.0, cluster_predict_topk: int = 3, cluster_min_support: int = 2, cluster_graph_ttl_sec: int = 86400, cluster_graph_max_entries: int = 100_000, cluster_predict_throttle_sec: float = 30.0, cluster_proxy_fanout: int = 2, cluster_probe_decay_sec: float = 3600.0, cluster_pool_idle_timeout: float = 600.0, router_cfg: Optional[RouterConfig] = None):
+    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, sticky_probe_interval_sec: float = 0.0, sticky_probe_fanout: int = 2, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, single_send_slow_log_ms: float = 0.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False, conn_pool_refill_pause_minutes: float = 60.0, conn_pool_refill_pause_silence_sec: float = 120.0, conn_pool_refill_pause_activity_window: Optional[float] = None, conn_pool_refill_pause_min_requests: int = 3, conn_pool_established_reuse: bool = False, conn_pool_established_idle_timeout: Optional[float] = None, conn_pool_prehandshake: bool = False, conn_pool_prehandshake_throttle_window_sec: float = 0.0, conn_pool_prehandshake_throttle_max_per_window: int = 0, cluster_predict: bool = False, cluster_window_sec: float = 2.0, cluster_predict_topk: int = 3, cluster_min_support: int = 2, cluster_graph_ttl_sec: int = 86400, cluster_graph_max_entries: int = 100_000, cluster_predict_throttle_sec: float = 30.0, cluster_proxy_fanout: int = 2, cluster_probe_decay_sec: float = 3600.0, cluster_pool_idle_timeout: float = 600.0, router_cfg: Optional[RouterConfig] = None):
         """构造路由器。
 
         参数:
@@ -295,6 +295,7 @@ class Router:
             lb_bias = cc.lb_bias
             single_send_degrade_fail, single_send_degrade_ratio, single_send_degrade_slack_ms = (
                 cc.single_send_degrade_fail, cc.single_send_degrade_ratio, cc.single_send_degrade_slack_ms)
+            single_send_slow_log_ms = cc.single_send_slow_log_ms
             auth_enabled, auth_username, auth_password = auth.enabled, auth.username, auth.password
             enable_http_cache, http_cache_ttl = hc.enabled, hc.ttl
             http_cache_max_entries, http_cache_max_bytes, http_cache_stream_limit = (
@@ -422,6 +423,11 @@ class Router:
         self.single_send_degrade_fail = max(0, int(single_send_degrade_fail))
         self.single_send_degrade_ratio = max(0.0, float(single_send_degrade_ratio))
         self.single_send_degrade_slack_ms = max(0.0, float(single_send_degrade_slack_ms))
+        # 慢单发采样日志(毫秒):粘性/域名缓存命中的单发"发起到首字节"耗时超阈值
+        # 即记一条带 client_ip 的日志(见 HTTP _forward_single / CONNECT 单发)。默认
+        # 0=关闭。同时记录采样日志条数供 opt.log 观测阈值触发频率。
+        self.single_send_slow_log_ms = max(0.0, float(single_send_slow_log_ms))
+        self.single_send_slow_logged = 0
         # "降级中"代理集合(可观测,非门控):被单发降级判定命中的代理记录于此。
         # 注意真正的门控是每次选择时实时重估 _single_send_degraded(代理恢复后立即
         # 重新可单发,无需冷却),此集合只供 /metrics /circuit 展示"当前被判定降级的
@@ -1089,6 +1095,8 @@ class Router:
             "circuit_open_count": self.selector.circuit_open_count,
             "circuit_state": self.selector.get_circuit_state(),
             "single_send_degrades": self.single_send_degrades,
+            "single_send_slow_logged": self.single_send_slow_logged,
+            "single_send_slow_log_ms": self.single_send_slow_log_ms,
             "domain_ttl_grows": self.domain_ttl_grows,
             "domain_ttl_resets": self.domain_ttl_resets,
             "adaptive_ttl_enabled": self.adaptive_ttl_enabled,
@@ -2301,8 +2309,26 @@ class Router:
                     else:
                         agg_fut.set_result(None)
 
+    def _observe_single_send(self, client_ip: str, domain: str, target: str, pid: str,
+                             perf_t0: float) -> None:
+        """慢单发采样:单发命中"发起到首字节"耗时超阈值即记一条带 IP 的日志。
+
+        用 client_ip 归因慢/打不开的唯一锚点(成功请求路径不打 IP 日志)。仅对
+        粘性/域名缓存命中的真实单发观测(竞速赢家不在此);失败已在调用方抛出让
+        调用方回退,此处只观测成功的慢单发。默认阈值 0=关闭,零行为变化。
+        """
+        if self.single_send_slow_log_ms <= 0:
+            return
+        elapsed_ms = (time.perf_counter() - perf_t0) * 1000.0
+        if elapsed_ms >= self.single_send_slow_log_ms:
+            self.single_send_slow_logged += 1
+            logger.info("slow single send client=%s domain=%s target=%s pid=%s ttfb=%.1fms "
+                        "(threshold=%sms)", client_ip or "-", domain, target, pid,
+                        elapsed_ms, self.single_send_slow_log_ms)
+
     async def _forward_single(self, writer, method: str, url: str, hdrs: dict, body, domain: str,
-                             pid: str | None = None, instantiated=None, sticky: bool = False):
+                             pid: str | None = None, instantiated=None, sticky: bool = False,
+                             client_ip: str = ""):
         """流式转发一个已取得胜利的响应并视情写入响应缓存,作为统一收尾。
 
         供域名缓存命中单发、会话粘性命中单发 与 竞速赢家三条路径共用:流式
@@ -2316,8 +2342,11 @@ class Router:
         if pid is not None:
             try:
                 proxy = self.proxy_store.get(pid)
+                # 慢单发采样:测"发起到首字节"耗时。失败抛出让调用方回退(不观测)。
+                _perf_t0 = time.perf_counter()
                 _pid, method, url, resp, client = await self._try_http(
                     pid, self._build_proxy_url(proxy), method, url, hdrs, body)
+                self._observe_single_send(client_ip, domain, url, pid, _perf_t0)
             except Exception:
                 raise  # 单发失败:让调用方回退到竞速
         else:
@@ -2361,7 +2390,8 @@ class Router:
             if sticky_pid:
                 try:
                     status = await self._forward_single(
-                        writer, method, url, hdrs, body, domain, sticky_pid, sticky=True)
+                        writer, method, url, hdrs, body, domain, sticky_pid, sticky=True,
+                        client_ip=client_ip)
                     if status is not None and status >= 500:
                         self._evict_sticky(client_ip, domain)
                     else:
@@ -2386,7 +2416,8 @@ class Router:
             if cached_pid:
                 try:
                     result = await self._forward_single(
-                        writer, method, url, hdrs, body, domain, cached_pid)
+                        writer, method, url, hdrs, body, domain, cached_pid,
+                        client_ip=client_ip)
                     self._record_sticky(client_ip, domain, cached_pid)
                     return result
                 except Exception:
@@ -2671,6 +2702,9 @@ class Router:
             if sticky_pid:
                 proxy = None if sticky_pid == 'local' else self.proxy_store.get(sticky_pid)
                 try:
+                    # 慢单发采样:测"发起到拿到 CONNECT 200"耗时(失败抛出让调用方
+                    # 驱逐回退,不观测)。
+                    _perf_t0 = time.perf_counter()
                     if proxy is None:
                         pid, up_reader, up_writer = await self._try_tunnel(sticky_pid, target, None, None, None)
                     else:
@@ -2682,6 +2716,7 @@ class Router:
                         # 只建 TCP 进 target 池(现状)。
                         self._spawn_target_prewarm(proxy.host, proxy.port, target,
                                                    proxy_auth=proxy.auth)
+                    self._observe_single_send(client_ip, target, target, sticky_pid, _perf_t0)
                     # 请求簇预测预热:把该 target 连同胜出代理记入客户端窗口(windows
                     # 关闭时学习全局共现图;开启新窗口时预测同簇 co-target 预建)。
                     self.cluster.observe(client_ip, target, sticky_pid)
@@ -2710,6 +2745,9 @@ class Router:
         if cached_pid:
             proxy = None if cached_pid == 'local' else self.proxy_store.get(cached_pid)
             try:
+                # 慢单发采样:测"发起到拿到 CONNECT 200"耗时(失败抛出让调用方
+                # 回退竞速,不观测)。
+                _perf_t0 = time.perf_counter()
                 if proxy is None:
                     pid, up_reader, up_writer = await self._try_tunnel(cached_pid, target, None, None, None)
                 else:
@@ -2719,6 +2757,7 @@ class Router:
                     # 同 sticky 分支(带 proxy.auth)。
                     self._spawn_target_prewarm(proxy.host, proxy.port, target,
                                                proxy_auth=proxy.auth)
+                self._observe_single_send(client_ip, target, target, cached_pid, _perf_t0)
                 # 请求簇预测预热:域缓存命中即 target 高频,同 sticky 分支记入客户端窗口。
                 self.cluster.observe(client_ip, target, cached_pid)
                 logger.debug("proxy %s cache hit CONNECT %s", pid, target)

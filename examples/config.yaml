@@ -104,6 +104,11 @@ router:
     single_send_degrade_fail: 2
     single_send_degrade_ratio: 3.0
     single_send_degrade_slack_ms: 10
+    # 慢单发采样日志(毫秒,默认 0=关闭):粘性/域名缓存命中的单发"发起到首字节"
+    # 耗时超阈值即记一条含客户端 IP 的日志(slow single send),用于按 IP 归因
+    # "打不开/要刷新"——成功请求路径不打 IP 日志,这里是单发感知慢的唯一锚点。
+    # 预祝事故诊断设足够宽松(如 1500=1.5s)只捕真慢,避免刷屏。
+    # single_send_slow_log_ms: 1500
 
   # 策略路由(P1):按目标域名/标签收窄竞速候选集。不配置则对所有 enabled
   # 代理统一竞速。match 命中按列表顺序取第一条,proxies 可按 tags 或 ids 收窄。
