@@ -351,6 +351,14 @@ class CircuitConfig(ConfigBase):
                        `slow single send` 日志(含客户端 IP + 域名/目标 + 所用代理 +
                        耗时)。用于按客户端 IP 归因慢/打不开:成功请求不打 IP 日志,
                        单发命中才是感知瓶颈的主要路径,这里补一条带 IP 的观测。
+                       单发失败(建连超时/握手失败)同样按此阈值记 `slow single send
+                       FAILED`(计入 single_send_fail_logged),补上失败型卡顿的 IP 归因。
+    connect_tunnel_timeout_sec: CONNECT 隧道建连/读响应超时(秒,默认 3.0)。_try_tunnel
+                       向源站 CONNECT 的 open_connection 与等 200 的统一上限,防某代理
+                       egress→源站建连/握手偶发卡死把请求拖成 10s+(原硬编码 15s)。
+    http_read_timeout_sec: HTTP 单发读首字节超时(秒,默认 3.0)。_upstream_timeout.read,
+                       防被钉代理转发 HTTP 首字节偶发卡死(原 10s;收敛 header 等待过去
+                       曾非净赢,见 router 注释,生产灰度盯 p99/fd)。
     """
     probe_interval_sec: float = Field(30.0, description="后台探活周期(秒),0=关闭主动探活")
     probe_canary: str = Field("1.1.1.1:443", description="探活目标 host:port(单 canary;被 probe_canaries 覆盖)")
@@ -364,6 +372,8 @@ class CircuitConfig(ConfigBase):
     single_send_degrade_ratio: float = Field(0.0, description="单发降级:EWMA 恶化比值阈值,0=关闭(同时用于方案C:粘性慢探路)")
     single_send_degrade_slack_ms: float = Field(10.0, description="EWMA 降级绝对下限(毫秒)")
     single_send_slow_log_ms: float = Field(0.0, description="慢单发采样日志阈值(毫秒),0=关闭")
+    connect_tunnel_timeout_sec: float = Field(3.0, description="CONNECT 隧道建连/读响应超时(秒):_try_tunnel 向源站 CONNECT 的 open_connection 与等 200 的统一上限,防某代理 egress→源站建连/握手偶发卡死把请求拖成 10s+。原硬编码 15s。测得的 CDN 首字节实际 0.6s,3s 给 5 倍余量。")
+    http_read_timeout_sec: float = Field(3.0, description="HTTP 单发读首字节超时(秒):_upstream_timeout.read,防某被钉代理转发 HTTP 首字节偶发卡死。原 10s。注意 router.py:480-483 记载收紧 header 等待曾非净赢(引爆 soak p99+fd 堆积)已回退,故本值生产灰度须盯 p99/fd。")
 
 
 class RouterConfig(ConfigBase):

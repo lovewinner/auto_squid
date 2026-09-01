@@ -111,6 +111,7 @@ FIELD_ORDER = [
     "probes_skipped",           # 探活跳过(本机不可达 canary)
     "single_send_degrades",     # 单发降级次数(粘性/缓存命中被降级回竞速)
     "single_send_slow_logged",  # 慢单发采样日志条数(粘性/缓存命中首字节超阈值)
+    "single_send_fail_logged",  # 慢单发失败采样日志条数(建连/握手失败超阈值,带 IP)
     "single_send_slow_log_ms",  # 慢单发采样阈值(毫秒,状态,0=关闭)
     # 空闲暂停活动判定(非计数型:状态/配置,增量恒 0,见 NO_DELTA_FIELDS)
     "conn_pool_idle_paused",    # 当前是否处于空闲暂停态(True=refill/预热已挂起)
@@ -174,6 +175,7 @@ FIELD_DOCS = {
     "probes_skipped": "探活跳过",
     "single_send_degrades": "单发降级次数",
     "single_send_slow_logged": "慢单发采样日志条数(粘性/缓存命中首字节超阈值)",
+    "single_send_fail_logged": "慢单发失败采样日志条数(建连/握手失败超阈值,带 IP)",
     "single_send_slow_log_ms": "慢单发采样阈值(毫秒,状态,0=关闭)",
     "conn_pool_idle_paused": "空闲暂停态(True=refill/预热已挂起)",
     "conn_pool_refill_pause_activity_window": "活动判定窗口(秒)",
@@ -218,6 +220,7 @@ FOCUS = [
     "established_pool_prehandshook",
     "prehandshake_throttled_skips",
     "single_send_slow_logged",
+    "single_send_fail_logged",
 ]
 
 

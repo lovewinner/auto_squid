@@ -242,7 +242,9 @@ router:
     single_send_degrade_fail: 2     # 单发降级:连续失败阈值(熔断早告警,0=关闭)
     single_send_degrade_ratio: 3.0  # 单发降级:EWMA 相对钉住基线恶化倍数(0=关闭)
     single_send_degrade_slack_ms: 10  # 降级绝对下限(ms),防极低延迟误判
-    single_send_slow_log_ms: 1500     # 慢单发采样日志(ms,0=关闭):粘性/域缓存命中的单发"发起到首字节"耗时超阈值即记一条含客户端 IP 的日志(成功路径不打 IP,这是按 IP 归因"打不开/要刷新"的唯一锚点)
+    single_send_slow_log_ms: 1500     # 慢单发采样日志(ms,0=关闭):粘性/域缓存命中的单发"发起到首字节"耗时超阈值即记一条含客户端 IP 的日志(成功路径不打 IP,这是按 IP 归因"打不开/要刷新"的唯一锚点);单发失败(建连/握手超阈值)记 slow single send FAILED(计入 single_send_fail_logged),补上建连失败型卡顿的 IP 归因
+    connect_tunnel_timeout_sec: 3.0   # CONNECT 隧道建连/读响应超时(秒,默认 3,原硬编码 15):_try_tunnel 向源站 CONNECT 的统一上限,防某代理 egress→源站建连/握手偶发卡死把请求拖成 10s+。测得 CDN 首字节实际 0.6s,3s 给 5 倍余量
+    http_read_timeout_sec: 3.0        # HTTP 单发读首字节超时(秒,默认 3,原 10):_upstream_timeout.read。曾有收紧 header 等待非净赢(引爆 soak p99+fd 已回退),生产灰度须盯 p99/fd
 logging:
   file: "auto_squid.log"
 ```
@@ -302,7 +304,9 @@ router:
 
 - **`probe_canary` 必须"本机直连可达 + 经所有上游都可达"。** 部署后看 `GET /circuit`——若 `probes_skipped` 持续增长,说明 canary 不适合当前网络,探活被静默跳过(不会误熔断,但也失去了质量信号)。
 - **`single_send_degrade_fail` 是熔断的早告警**:建议设为 `circuit_threshold - 1`(默认 3 时取 2),让被钉住代理开始失败时**先**降级回竞速,而不是等熔断。
-- **`single_send_slow_log_ms`**(默认 0=关闭):采样粘性/域名缓存命中单发(跳过竞速的路径)的"发起到首字节"耗时,超阈值即按请求记一条**带客户端 IP** 的日志(`slow single send client=<ip> … ttfb=<ms>`),并计入 `single_send_slow_logged`。成功请求路径完全不打 IP 日志,这是本机上按 IP 归因"打不开/需要反复刷新"的**唯一锚点**。阈值设宽松些(如 1500=1.5s)只捕真慢、避免刷屏;看 `/metrics`(或 opt.log)的 `single_send_slow_logged` 观察触发频率。
+- **`single_send_slow_log_ms`**(默认 0=关闭):采样粘性/域名缓存命中单发(跳过竞速的路径)的"发起到首字节"耗时,超阈值即按请求记一条**带客户端 IP** 的日志(`slow single send client=<ip> … ttfb=<ms>`),并计入 `single_send_slow_logged`。单发**失败**(建连超时/握手失败)超阈值也记 `slow single send FAILED`(独立计数 `single_send_fail_logged`)——生产卡顿多为**建连失败型**(被钉代理 egress→源站建连 10s+),只采样成功看不到。成功请求路径完全不打 IP 日志,这是本机上按 IP 归因"打不开/需要反复刷新"的**唯一锚点**。阈值设宽松些(如 1500=1.5s)只捕真慢、避免刷屏;看 `/metrics`(或 opt.log)的 `single_send_slow_logged`/`single_send_fail_logged` 观察两类触发频率。
+- **`connect_tunnel_timeout_sec`**(默认 3.0,可配置;原硬编码 15):单次 CONNECT 的统一上限——既含到上游的 `open_connection`,也含向源站 CONNECT 的 `readline` 等 200。被钉上游 egress→源站(Fastly CDN)偶发建连/握手卡死时,这个上限把"卡满 10-15s"变成"卡 3s 后回退竞速"。测得 CDN 首字节 0.6s,3s 是 5 倍余量。除非真实 CDN 首字节持续高于新界,否则只应调低;失败单发自动回退竞速。
+- **`http_read_timeout_sec`**(默认 3.0,可配置;原 10):`_upstream_timeout.read`,普通 HTTP 单发读首字节上限。⚠️ 历史曾收紧 HTTP header 等待(`_RACE_HEADER_TIMEOUT`+`asyncio.wait_for`)被回退(非净赢:5s 配置引爆 soak p99+fd 堆积),本值灰度须先验 p99/fd 无回归再放开。
 - **`lb_bias`** 控制在途积压对竞速排序的惩罚(`ewma × (1 + active)^bias`)。慢代理易被打爆就调高;最快代理被过度避让就调低。
 - **策略路由**(`router.policies`)按域名/标签收窄竞速候选集,直接降低 TTFB 与 `racing.amplification`——形状见 `examples/config.yaml`。
 - **`conn_pool.target_prewarm`**(第二阶段)需 `conn_pool.enabled` 为 true;命中域名缓存/粘性**或竞速胜出**(竞速是多数 CONNECT 流量的主体路径,不加则预热只服务极少数缓存命中请求)的高频 CONNECT target 后台预建"到上游"的 TCP,每条 target 补 2 条、取走仍留 1 条备用。`conn_pool.total` 是两阶段合并的全局 fd 预算。看 `/metrics` 的 `target_pool_hits` vs `target_pool_misses` 确认热 target 真的复用了预建连接。

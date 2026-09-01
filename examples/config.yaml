@@ -107,8 +107,18 @@ router:
     # 慢单发采样日志(毫秒,默认 0=关闭):粘性/域名缓存命中的单发"发起到首字节"
     # 耗时超阈值即记一条含客户端 IP 的日志(slow single send),用于按 IP 归因
     # "打不开/要刷新"——成功请求路径不打 IP 日志,这里是单发感知慢的唯一锚点。
+    # 单发失败(建连超时/握手失败)同样按此阈值记 slow single send FAILED
+    # (计入 single_send_fail_logged),补上建连失败型卡顿的 IP 归因。
     # 预祝事故诊断设足够宽松(如 1500=1.5s)只捕真慢,避免刷屏。
     # single_send_slow_log_ms: 1500
+    # CONNECT 隧道建连/读响应超时(秒,默认 3.0):_try_tunnel 向源站 CONNECT 的
+    # 统一上限,防某代理 egress→源站建连/握手偶发卡死把请求拖成 10s+。测得的
+    # CDN 首字节实际 0.6s,3s 给 5 倍余量。
+    # connect_tunnel_timeout_sec: 3.0
+    # HTTP 单发读首字节超时(秒,默认 3.0):_upstream_timeout.read,防被钉代理
+    # 转发 HTTP 首字节偶发卡死。注意历史曾收紧 header 等待非净赢(引爆 soak
+    # p99+fd 堆积已回退),本值生产灰度须盯 p99/fd。
+    # http_read_timeout_sec: 3.0
 
   # 策略路由(P1):按目标域名/标签收窄竞速候选集。不配置则对所有 enabled
   # 代理统一竞速。match 命中按列表顺序取第一条,proxies 可按 tags 或 ids 收窄。

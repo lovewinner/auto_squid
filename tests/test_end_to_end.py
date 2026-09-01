@@ -3509,6 +3509,41 @@ class TestAdaptiveTTL:
                                 time.perf_counter() - 5.0)
         assert r0.single_send_slow_logged == 0
 
+    def test_slow_single_send_failure_observation_logs_with_ip(self, caplog):
+        """慢单发失败采样:失败(建连超时)超阈值 → 记带 client_ip 的 FAILED 日志并计数。
+
+        建连失败型卡顿(某代理 egress→源站建连 10s+)是成功路径观测的盲区,这里验证
+        失败也按同一阈值捕获,计入独立的 single_send_fail_logged。
+        """
+        import logging
+        r = self._router(single_send_slow_log_ms=1500.0)
+        with caplog.at_level(logging.INFO, logger='auto_squid.router'):
+            # 回溯 3s 伪造一次慢失败(超阈值);超时异常。
+            r._observe_single_send_failure('59.67.225.91', 'github.com', 'github.com', 'p',
+                                           time.perf_counter() - 3.0, TimeoutError("connect timed out"))
+        assert r.single_send_fail_logged == 1
+        assert r.single_send_slow_logged == 0  # 失败计数与成功慢分开
+        hit = [rec for rec in caplog.records
+               if rec.getMessage().startswith("slow single send FAILED")]
+        assert hit and "59.67.225.91" in hit[0].getMessage()
+        assert "TimeoutError" in hit[0].getMessage()
+
+    def test_slow_single_send_failure_below_threshold_and_disabled_noop(self, caplog):
+        """失败低于阈值不记;阈值 0(默认关闭)不记,计数恒 0。"""
+        import logging
+        r = self._router(single_send_slow_log_ms=1500.0)
+        with caplog.at_level(logging.INFO, logger='auto_squid.router'):
+            r._observe_single_send_failure('59.67.225.91', 'github.com', 'github.com', 'p',
+                                           time.perf_counter(), TimeoutError("x"))
+        assert r.single_send_fail_logged == 0
+        assert not any(rec.getMessage().startswith("slow single send FAILED")
+                       for rec in caplog.records)
+        # 默认关闭:即使传慢失败戳也不记。
+        r0 = self._router()
+        r0._observe_single_send_failure('59.67.225.91', 'github.com', 'github.com', 'p',
+                                        time.perf_counter() - 10.0, TimeoutError("x"))
+        assert r0.single_send_fail_logged == 0
+
 
 class TestSwitchDamping:
     """域名赢家切换阻尼(P3):新赢家不能因单次竞速抖动就替换稳定域名赢家。"""
@@ -5640,6 +5675,8 @@ class TestRouterConfigPassThrough:
             single_send_degrade_ratio=cc.single_send_degrade_ratio,
             single_send_degrade_slack_ms=cc.single_send_degrade_slack_ms,
             single_send_slow_log_ms=cc.single_send_slow_log_ms,
+            connect_tunnel_timeout_sec=cc.connect_tunnel_timeout_sec,
+            http_read_timeout_sec=cc.http_read_timeout_sec,
             auth_enabled=auth.enabled, auth_username=auth.username, auth_password=auth.password,
             enable_http_cache=hc.enabled, http_cache_ttl=hc.ttl,
             http_cache_max_entries=hc.max_entries, http_cache_max_bytes=hc.max_bytes,
@@ -5685,7 +5722,8 @@ class TestRouterConfigPassThrough:
                 slow_start_window=30.0, slow_start_success=2, lb_bias=0.5,
                 single_send_degrade_fail=2, single_send_degrade_ratio=2.5,
                 single_send_degrade_slack_ms=20.0,
-                single_send_slow_log_ms=1500.0),
+                single_send_slow_log_ms=1500.0,
+                connect_tunnel_timeout_sec=4.0, http_read_timeout_sec=5.0),
             auth=dict(enabled=True, username="u", password="p"),
             http_cache=dict(enabled=False),
             stickiness=dict(enabled=True, ttl=900.0, recheck_hits=50, max_entries=5000),
@@ -5728,7 +5766,8 @@ class TestRouterConfigPassThrough:
             for attr in ('max_retries', 'cache_ttl', 'stagger_interval', 'probe_interval_sec',
                          'conn_pool_enabled', 'conn_pool_total', 'conn_pool_established_reuse',
                          'conn_pool_idle_timeout', 'cluster_proxy_fanout', 'cluster_probe_decay_sec',
-                         'cluster_pool_idle_timeout', 'single_send_slow_log_ms'):
+                         'cluster_pool_idle_timeout', 'single_send_slow_log_ms',
+                         'connect_tunnel_timeout_sec', 'http_read_timeout_sec'):
                 assert getattr(r_cfg, attr) == getattr(r_kw, attr), f"{attr} 两条构造路径不一致"
             for attr in ('circuit_threshold', 'circuit_max_backoff', 'slow_start_window',
                          'slow_start_success', 'lb_bias'):
