@@ -4747,9 +4747,11 @@ class TestPrehandshake:
             assert await self._wait_prehandshake(r, target), \
                 "预握手库存应落 established 池"
             key = f"{HOST}:31991|{target.decode()}"
-            writer = r._established_pool[key][0][1]
-            assert getattr(writer, '_prehandshook', False), \
-                "预握手连接应打 _prehandshook 标签"
+            # 预握手隧道与第二次请求自己的归还隧道(established_reuse)可能同键共存、
+            # 落池时序不定——断言"池中存在带标签的预握手库存"而非 index 0。
+            assert any(getattr(w, '_prehandshook', False)
+                       for _, w in r._established_pool.get(key, [])), \
+                "established 池中应存在预握手库存(_prehandshook 标签)"
         finally:
             await r.stop()
             up_srv.close()
