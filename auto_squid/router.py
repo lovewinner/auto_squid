@@ -2307,7 +2307,7 @@ class Router:
     def _prep_http(self, proxies: List[str], host: str = "") -> tuple:
         """HTTP 竞速的启动参数:首批/补发按 stagger 配置取占位,返回 (initial_places, remaining)。
 
-        供 _forward_upstream 统一拼接 _race_staggered 的调用。`initial_places` 是
+        供 _dispatch_single 拼接 _race_staggered 的调用。`initial_places` 是
         首批要同时发出的**有序**占位列表(最优先发出,保持 proxies 的 EWMA 排序);
         `remaining` 是待定时补发的**有序**占位列表。本机竞速开启时 local 优先
         (直连,常最快)。占位为 pid 字符串,_make_race_task 据此建 _try_http task。
@@ -2375,7 +2375,7 @@ class Router:
         #      不经任何远端代理——本机/内网服务不被全局 3s 转发超时掐断。失败回
         #      502 不绕远端(用户决策)。位置在缓存检查之后、在途聚合注册之前:
         #      (a) 白名单请求仍可命中直连写入的缓存; (b) 白名单请求不注册在途
-        #      聚合,waiter 也不会落入 _forward_upstream 的远端竞速(跨路径坑)。
+        #      聚合,waiter 也不会落入 _dispatch_single 的远端竞速(跨路径坑)。
         if self._host_in_local_direct(domain):
             self.local_direct_hits += 1
             logger.debug("local-direct HTTP %s %s", method, url)
@@ -2412,7 +2412,8 @@ class Router:
                 agg_fut = asyncio.get_running_loop().create_future()
                 self.httpcache._inflight_futures[agg_key] = agg_fut
         try:
-            await self._forward_upstream(writer, method, url, hdrs, body, domain, client_ip)
+            await self._dispatch_single(writer, method, url, hdrs, body, domain,
+                                        proto='http', client_ip=client_ip)
         finally:
             # 仅 GET 且本请求持有在途 Future 时 resolve(成功→结果,失败→None 让
             # waiter 自行竞速),并从在途表移除。若上方缓存/聚合命中则本请求不
@@ -2516,6 +2517,48 @@ class Router:
             except Exception:
                 pass
 
+    async def _connect_single_send(self, *, pid: str, target: str, domain: str,
+                                  client_ip: str = "") -> tuple:
+        """CONNECT 单发隧道的一次尝试:建连 → 观测 → 收尾,失败抛出。
+
+        折叠 _handle_connect 中 粘性单发 / 域名缓存单发 两处逐字重复内联体的
+        公共部分。外包一层 try/except——慢单发失败采样(建连失败型卡顿归因)在
+        helper 内部调用 _observe_single_send_failure 后再抛出,保证 _perf_t0
+        覆盖整个单发尝试(与旧内联体同一语义)。
+
+        除失败抛异常外,成功仅返回 (up_reader, up_writer, proxy_host, proxy_port,
+        is_tunnel) 元组——**不在此处写 200/透传**:CONNECT 成功即长连接,若在
+        helper 内 await 到 _relay_tunnel 返回才记账(TTL/命中/探路),长隧道下
+        会迟迟不记;故成功账簿与 200-透传留在统一 _dispatch_single 决策链完成
+        (relay 的 proxy_host/proxy_port 用返回值,不反查 proxy_store 双路径)。
+        """
+        proxy = None if pid == 'local' else self.proxy_store.get(pid)
+        try:
+            # 慢单发采样:测"发起到拿到 CONNECT 200"耗时(失败抛出让调用方驱逐/回退,不观测)。
+            _perf_t0 = time.perf_counter()
+            if proxy is None:
+                _pid, up_reader, up_writer = await self._try_tunnel(pid, target, None, None, None)
+            else:
+                _pid, up_reader, up_writer = await self._try_tunnel(pid, target, proxy.host, proxy.port, proxy.auth)
+                # CONNECT 目标半预连接(P2):单发命中说明该 target 高频,后台预热以下
+                # 一条到上游代理的 TCP(不阻塞本请求)。预握手升级:把 proxy.auth 交给
+                # pools,开启 prehandshake 时额外自建 TCP + CONNECT 预握手一条(库存进
+                # established 池),否则只建 TCP 进 target 池(现状)。
+                self._spawn_target_prewarm(proxy.host, proxy.port, target,
+                                           proxy_auth=proxy.auth)
+            self._observe_single_send(client_ip, target, target, pid, _perf_t0)
+            # 请求簇预测预热:单发命中即 target 高频,记入客户端窗口(windows 关闭时
+            # 学习全局共现图;开启新窗口时预测同簇 co-target 预建)。
+            self.cluster.observe(client_ip, target, pid)
+            return (up_reader, up_writer,
+                    proxy.host if proxy else None,
+                    proxy.port if proxy else None)
+        except Exception as e:
+            # 慢单发失败采样:建连/握手失败超阈值记带 IP 日志(建连失败型卡顿是成功观测
+            # 盲区),再抛出让调用方驱逐回退竞速。
+            self._observe_single_send_failure(client_ip, target, target, pid, _perf_t0, e)
+            raise
+
     async def _forward_local_direct_http(self, writer, method: str, url: str, hdrs: dict, body,
                                          domain: str, client_ip: str = ""):
         """本地白名单目标强制本机直连(HTTP):内联 _try_http(relaxed=True)+流式转发+写缓存。
@@ -2555,104 +2598,207 @@ class Router:
                 except Exception:
                     pass
 
-    async def _forward_upstream(self, writer, method: str, url: str, hdrs: dict, body, domain: str, client_ip: str = ""):
-        """把请求转发上游(会话粘性单发 → 域名缓存单发 → 竞速 → 兜底竞速 → 502)。
+    async def _dispatch_single(self, writer, method: str, url: str, hdrs: dict, body,
+                               domain_key: str, *, proto: str = 'http', target: str = '',
+                               client_reader=None, client_writer=None, client_ip: str = ""):
+        """统一 HTTP/CONNECT 决策链 + 单发/竞速 + proto-specific 收尾。
 
-        从 _handle_http_request 提取,供在途 GET 去重聚合统一在 finally 中
-        resolve Future。优先级:同一客户端+域名的会话粘性 > 全局域名缓存 >
-        竞速。粘性/域名缓存命中即单发(失败回退下一级),竞速失败有剩余则
-        对剩余再竞速。赢家同时回填粘性表与域名缓存 meta。
+        P3#8:把 HTTP 的旧决策链与 CONNECT 的 _handle_connect 决策部分合并为
+        一份"选代理 → 执行 → 收尾"编排,消除两段几乎同构的复制。
+
+        决策优先级(两者一致):会话粘性单发 → 域名缓存单发 → 竞速 → 兜底竞速 → 502。
+        粘性/缓存命中失败逐级回退;竞速赢家回填域名缓存 meta(_record_win_meta 收进
+        race 分支,统一点)+ 粘性表。
+
+        proto 分派差异:
+        - HTTP: 收尾 _forward_single(流式转发+写缓存);命中计数 sticky_cache_hits/
+          domain_cache_hits 在 _forward_single 内自增。返回 status。
+        - CONNECT: 收尾 _connect_established + _relay_tunnel(双向透传);慢单发观测
+          在 _connect_single_send 内完成,_perf_t0 覆盖整个单发尝试。成功账簿
+          (sticky_cache_hits/_bump_sticky/_spawn_sticky_probe/_record_sticky)与 200-
+          透传在此完成。返回 None(隧道结束即返回)。
         """
-        # 1) 会话粘性:同一客户端+域名复用上次胜出的代理单发(滑动 TTL)。
-        #    失败则驱逐该条目,回落到域名缓存/竞速(redispatch)。单发成功但
-        #    返回 5xx 同样驱逐(A2:响应已流式发出无法重试,下一请求竞速换新)。
-        #    非 5xx 成功则滑动 TTL 并累加命中次数(B2)。
+        # 1) 会话粘性:同一客户端+domain 复用上次胜出的代理单发(滑动 TTL)。
+        #    失败则驱逐该条目,回落到域名缓存/竞速。HTTP 单发 5xx 也驱逐(A2);
+        #    CONNECT 隧道无状态码,跳过该专有分支。
         skip_domain_cache = False
-        if domain and self.sticky.stickiness_enabled:
-            sticky_pid = self.sticky._get_sticky_proxy(client_ip, domain)
+        if self.sticky.stickiness_enabled:
+            sticky_pid = self.sticky._get_sticky_proxy(client_ip, domain_key)
             if sticky_pid:
                 try:
-                    status = await self._forward_single(
-                        writer, method, url, hdrs, body, domain, sticky_pid, sticky=True,
-                        client_ip=client_ip)
-                    if status is not None and status >= 500:
-                        self.sticky._evict_sticky(client_ip, domain)
-                    else:
-                        self.sticky._bump_sticky(client_ip, domain, sticky_pid)
-                        # 杠杆A:粘性命中后台探路——竞争代理显著更快则驱逐(不阻塞单发)。
-                        self._spawn_sticky_probe(client_ip, domain, sticky_pid)
-                    return
+                    if proto == 'http':
+                        status = await self._forward_single(
+                            writer, method, url, hdrs, body, domain_key, sticky_pid, sticky=True,
+                            client_ip=client_ip)
+                        if status is not None and status >= 500:
+                            self.sticky._evict_sticky(client_ip, domain_key)
+                        else:
+                            self.sticky._bump_sticky(client_ip, domain_key, sticky_pid)
+                            # 杠杆A:粘性命中后台探路——竞争代理显著更快则驱逐(不阻塞单发)。
+                            self._spawn_sticky_probe(client_ip, domain_key, sticky_pid)
+                        return status
+                    # CONNECT:成功账簿 + 200 + 透传。隧道为长连接,须在 _relay_tunnel
+                    # 之前记账;helper 成功已观测、失败已观测并抛出。
+                    up_reader, up_writer, ph, pp = await self._connect_single_send(
+                        pid=sticky_pid, target=target, domain=domain_key, client_ip=client_ip)
+                    logger.debug("proxy %s sticky hit CONNECT %s", sticky_pid, target)
+                    self.sticky.sticky_cache_hits += 1
+                    self.sticky._bump_sticky(client_ip, domain_key, sticky_pid)
+                    # 杠杆A:粘性命中后台探路——竞争代理显著更快则驱逐(不阻塞单发)。
+                    self._spawn_sticky_probe(client_ip, domain_key, sticky_pid)
+                    await self._connect_established(client_writer, up_writer)
+                    await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer,
+                                             ph, pp, target)
+                    return None
                 except Exception:
-                    logger.debug("sticky proxy %s failed for %s", sticky_pid, domain)
-                    self.sticky._evict_sticky(client_ip, domain)
-            elif self.sticky._sticky_recheck_due(client_ip, domain):
+                    # 慢单发失败采样已在 _forward_single(HTTP)/_connect_single_send
+                    # (CONNECT)内部观测并抛出,此处只驱逐回退下一级。
+                    logger.debug("sticky proxy %s failed for %s", sticky_pid, domain_key)
+                    self.sticky._evict_sticky(client_ip, domain_key)
+            elif self.sticky._sticky_recheck_due(client_ip, domain_key):
                 # B2:探路重评估到期——驱逐并跳过域名缓存,直接竞速换新赢家。
-                self.sticky._evict_sticky(client_ip, domain)
+                self.sticky._evict_sticky(client_ip, domain_key)
                 skip_domain_cache = True
 
-        # 2) 域名缓存:用上次胜出的代理单发请求(不重复更新 meta——_try_http
-        #    内部只记尝试统计),失败则回退到竞速。单发路径同样流式转发。
-        #    成功时也回填粘性表:粘性可能因上一轮 redispatch 被驱逐,而域名
-        #    缓存仍有效;若不回填,该客户端+域名会一直丢粘性直到域名缓存过期。
-        if domain and not skip_domain_cache:
-            cached_pid = self._get_fresh_proxy(domain)
+        # 2) 域名缓存:用上次胜出的代理单发,失败则回退到竞速。成功时也回填
+        #    粘性表:粘性可能因上一轮 redispatch 被驱逐,而域名缓存仍有效。
+        #    若不回填,该客户端+domain 会一直丢粘性直到域名缓存过期。
+        if not skip_domain_cache:
+            cached_pid = self._get_fresh_proxy(domain_key)
             if cached_pid:
                 try:
-                    result = await self._forward_single(
-                        writer, method, url, hdrs, body, domain, cached_pid,
-                        client_ip=client_ip)
-                    self.sticky._record_sticky(client_ip, domain, cached_pid)
-                    return result
+                    if proto == 'http':
+                        result = await self._forward_single(
+                            writer, method, url, hdrs, body, domain_key, cached_pid,
+                            client_ip=client_ip)
+                        self.sticky._record_sticky(client_ip, domain_key, cached_pid)
+                        return result
+                    up_reader, up_writer, ph, pp = await self._connect_single_send(
+                        pid=cached_pid, target=target, domain=domain_key, client_ip=client_ip)
+                    logger.debug("proxy %s cache hit CONNECT %s", cached_pid, target)
+                    self.sticky._record_sticky(client_ip, domain_key, cached_pid)
+                    await self._connect_established(client_writer, up_writer)
+                    await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer,
+                                             ph, pp, target)
+                    return None
                 except Exception:
-                    logger.debug("cached proxy %s failed for %s", cached_pid, domain)
+                    logger.debug("cached proxy %s failed for %s", cached_pid, domain_key)
 
         # 3) 竞速:首批并行 max_retries 个代理,全失败且还有剩余则对剩余再竞速。
-        #    错峰启动(stagger_start)时首批只发 stagger_initial 个(默认 1 个),
-        #    补发剩余占位交 _race_staggered 按 interval 定时补发;否则同时全发。
-        #    策略路由(P1):按目标域名收窄候选集,命中策略的域只在该子集内竞速。
-        #    排序域名级(ordered_for_domain):该域名快代理进首批,而非全局 EWMA
-        #    污染下被排到补发位置。
-        proxies = self.selector.ordered_for_domain(domain)
+        #    排序域名级(ordered_for_domain):该 domain 快代理进首批,而非全局
+        #    EWMA 污染下被排到补发位置。策略路由(P1):按目标 domain 收窄候选集。
+        #
+        #    HTTP/CONNECT 竞速的差异集中在 4 点:占位形状(pid vs (pid,target))、
+        #    cleanup(HTTP 流式 vs CONNECT 隧道归还)、错峰 kwargs(HTTP 带方法参数
+        #    建 _try_http task;CONNECT 无需但 _race_staggered 默认 "" 亦可)、
+        #    胜者收尾。统一后用 proto 分派选择,消除 duplicates。
+        proxies = self.selector.ordered_for_domain(domain_key)
         if self._policies:
-            proxies = self._policy_candidate_pids(domain, proxies)
+            proxies = self._policy_candidate_pids(domain_key, proxies)
         if not proxies and not self.enable_local_racing:
             await self._write_cached_response(writer, 502, 'Bad Gateway', {'Content-Type': 'text/plain'}, b'Bad Gateway')
-            return
+            return None
 
         # 计数:进入竞速(首批)。兜底批单独再 +1,故 invocations 可能 > 请求数。
-        self.racing_invocations += 1
-        if self.stagger_start:
-            initial_places, remaining = self._prep_http(proxies, domain)
-            winner_resp = await self._race_staggered(
-                initial_places + remaining, cleanup=self._cleanup_http_result,
-                initial=len(initial_places), interval=self.stagger_interval,
-                method=method, url=url, headers=hdrs, body=body, domain=domain)
+        # CONNECT 不记 racing_invocations(与旧 _handle_connect 一致,经 /metrics
+        # 仅统计 HTTP 竞速),HTTP 记。
+        if proto == 'http':
+            self.racing_invocations += 1
+
+        if proto == 'http':
+            if self.stagger_start:
+                initial_places, remaining = self._prep_http(proxies, domain_key)
+                winner = await self._race_staggered(
+                    initial_places + remaining, cleanup=self._cleanup_http_result,
+                    initial=len(initial_places), interval=self.stagger_interval,
+                    method=method, url=url, headers=hdrs, body=body, domain=domain_key)
+            else:
+                places = self._build_racing_tasks_http(proxies, domain_key)
+                tasks = {self._make_race_task(p, method, url, hdrs, body, domain_key)
+                         for p in places}
+                winner = await self._race(tasks, cleanup=self._cleanup_http_result)
+                # 首批全失败且代理数超过 max_retries:对剩余代理再竞速兜底。
+                if not winner and len(proxies) > self.max_retries:
+                    self.racing_invocations += 1
+                    remaining = proxies[self.max_retries:]
+                    places = self._build_racing_tasks_http(remaining)
+                    tasks = {self._make_race_task(p, method, url, hdrs, body, domain_key)
+                             for p in places}
+                    winner = await self._race(tasks, cleanup=self._cleanup_http_result)
+        else:  # CONNECT
+            race_cleanup = functools.partial(self._cleanup_tunnel_result, target=target)
+            if self.stagger_start:
+                initial_places, remaining = self._prep_connect(proxies, target)
+                winner = await self._race_staggered(
+                    initial_places + remaining, cleanup=race_cleanup,
+                    initial=len(initial_places), interval=self.stagger_interval)
+            else:
+                places = self._build_racing_tasks_connect(proxies, target)
+                tasks = {self._make_race_task(p, '', '', None, None) for p in places}
+                winner = await self._race(tasks, cleanup=race_cleanup)
+                # 首批全失败且代理数超过 max_retries:对剩余代理再竞速兜底。
+                if not winner and len(proxies) > self.max_retries:
+                    remaining = proxies[self.max_retries:]
+                    places = self._build_racing_tasks_connect(remaining, target)
+                    tasks = {self._make_race_task(p, '', '', None, None) for p in places}
+                    winner = await self._race(tasks, cleanup=race_cleanup)
+
+        if winner:
+            if proto == 'http':
+                pid, method, url, resp, client = winner
+                logger.debug("proxy %s racing win %s %s", pid, method, url)
+                # 仅赢家更新域名缓存 meta 与会话粘性表(败者只记了尝试统计,不会被覆写)。
+                self._record_win_meta(domain_key, pid)
+                self.sticky._record_sticky(client_ip, domain_key, pid)
+                return await self._forward_single(
+                    writer, method, url, hdrs, body, domain_key, instantiated=(pid, resp))
+            pid, up_reader, up_writer = winner
+            logger.debug("proxy %s racing CONNECT to %s for client %s",
+                         pid, target,
+                         client_writer.get_extra_info('peername') if client_writer else '')
+            self._record_win_meta(domain_key, pid)
+            self.sticky._record_sticky(client_ip, domain_key, pid)
+            # CONNECT 目标半预连接(P2):竞速胜出说明该 target 高频且最优代理已
+            # 确定,后台为 (proxy, target) 预热下一条到上游代理的 TCP(不阻塞本
+            # 请求)。注意 pid 可能是 'local'(enable_local_racing 直连),此时无
+            # 上游代理可预热,交由 _spawn_target_prewarm 内部跳过。
+            win_proxy = None
+            if pid != 'local':
+                win_proxy = self.proxy_store.get(pid)
+                if win_proxy is not None:
+                    # 预握手升级:竞速胜出同单发分支,把 win_proxy.auth 交给 pools
+                    # 预握手(竞速天然高频 target,库存直接进 established 池)。
+                    self._spawn_target_prewarm(win_proxy.host, win_proxy.port, target,
+                                               proxy_auth=win_proxy.auth)
+            # 请求簇预测预热:竞速胜出同样记入客户端窗口(页面的每一跳都是一簇一员)。
+            self.cluster.observe(client_ip, target, pid)
+            await self._connect_established(client_writer, up_writer)
+            await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer,
+                                     win_proxy.host if win_proxy is not None else None,
+                                     win_proxy.port if win_proxy is not None else None,
+                                     target)
+            return None
+
+        # 4) 全失败:HTTP 写 502;CONNECT 写 502 并关闭客户端连接(与旧内联体一致)。
+        #    CONNECT 仍记入客户端窗口(浏览器可能再次连接;pid=None 使该目标不进
+        #    预测,但簇成员关系仍被学习——旧 _handle_connect 语义,HTTP 不记)。
+        if proto == 'tunnel':
+            self.cluster.observe(client_ip, target, None)
+        logger.error("all proxies failed for %s request %s", proto, target or url)
+        if proto == 'http':
+            await self._write_cached_response(writer, 502, 'Bad Gateway', {'Content-Type': 'text/plain'}, b'Bad Gateway')
         else:
-            # 非错峰(_race):需真 task,占位经 _make_race_task 急切创建。
-            places = self._build_racing_tasks_http(proxies, domain)
-            tasks = {self._make_race_task(p, method, url, hdrs, body, domain) for p in places}
-            winner_resp = await self._race(tasks, cleanup=self._cleanup_http_result)
-
-            # 首批全失败且代理数超过 max_retries:对剩余代理再竞速兜底。
-            if not winner_resp and len(proxies) > self.max_retries:
-                self.racing_invocations += 1
-                remaining = proxies[self.max_retries:]
-                places = self._build_racing_tasks_http(remaining)
-                tasks = {self._make_race_task(p, method, url, hdrs, body, domain) for p in places}
-                winner_resp = await self._race(tasks, cleanup=self._cleanup_http_result)
-
-        if winner_resp:
-            pid, method, url, resp, client = winner_resp
-            logger.debug("proxy %s racing win %s %s", pid, method, url)
-            # 仅赢家更新域名缓存 meta:竞速中败者只记了 _record_attempt,不会反被
-            # 覆写 _meta_cache;domain 在上方已算好(同一 urlparse)。
-            self._record_win_meta(domain, pid)
-            if domain:
-                self.sticky._record_sticky(client_ip, domain, pid)
-            return await self._forward_single(writer, method, url, hdrs, body, domain, instantiated=(pid, resp))
-
-        logger.error("all proxies failed for HTTP request")
-        await self._write_cached_response(writer, 502, 'Bad Gateway', {'Content-Type': 'text/plain'}, b'Bad Gateway')
+            try:
+                client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n\r\nBad Gateway")
+                await client_writer.drain()
+            except Exception:
+                pass
+            try:
+                client_writer.close()
+                await client_writer.wait_closed()
+            except Exception:
+                pass
+        return None
 
     async def _stream_upstream_response(self, client_writer, resp, method: str, url: str) -> Optional[bytes]:
         """把上游流式响应转发给客户端,同时边收边缓冲(供响应缓存)。
@@ -2903,187 +3049,23 @@ class Router:
     async def _handle_connect(self, target: str, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter, client_ip: str = ""):
         """处理 CONNECT 请求:建立到 target 的隧道并双向透传数据。
 
-        决策顺序与 HTTP 类似:会话粘性命中 → 单发隧道;域名缓存命中 → 单发
-        隧道;否则竞速(首批 max_retries,失败对剩余兜底)。胜出后回 200,用
-        两个反向 _pipe 双向透传,任一方向结束即关闭。全失败回写 502。认证
-        已在 handle_client 完成,此处不再校验。
+        决策已统一进 _dispatch_single(proto='tunnel'):会话粘性命中 → 单发隧道;
+        域名缓存命中 → 单发隧道;否则竞速(首批 max_retries,失败对剩余兜底)。
+        胜出后回 200,用两个反向 _pipe 双向透传,任一方向结束即关闭。全失败
+        回写 502 并关闭客户端连接。本函数只保留 CONNECT 专有的白名单强制直连
+        拦截(命中 local_direct_domains 的目标直接 local 直连,不经任何远端代理,
+        失败回 502 不绕远端——用户决策)。认证已在 handle_client 完成。
         """
-        # 0) 本地白名单强制直连:命中(local_direct_domains)的目标直接 local 直连,
-        #    不经任何远端代理——本机/内网服务不被全局 3s 转发超时掐断。失败回 502
-        #    不绕远端(用户决策)。CONNECT 无在途聚合,位置无跨路径约束。
+        # 0) 本地白名单强制直连(CONNECT 无在途聚合,位置无跨路径约束)。
         host = self._try_tunnel_host(target)
         if self._host_in_local_direct(host):
             self.local_direct_hits += 1
             logger.debug("local-direct CONNECT %s", target)
             await self._local_direct_connect(target, client_reader, client_writer, client_ip)
             return
-        # 1) 会话粘性:同一客户端+target 复用上次胜出的代理单发隧道,失败则
-        #    驱逐该条目并回落到域名缓存/竞速(redispatch)。本机胜者('local')
-        #    走直连(None 代理),无需 proxy_store 校验(A1)。策略路由(P1):
-        #    粘性取用也须满足策略——命中策略但 pid 不在子集内 → 视为 miss
-        #    驱逐并回落(防旧粘性绕过新策略)。
-        skip_domain_cache = False
-        if self.sticky.stickiness_enabled:
-            sticky_pid = self.sticky._get_sticky_proxy(client_ip, target)
-            if sticky_pid:
-                proxy = None if sticky_pid == 'local' else self.proxy_store.get(sticky_pid)
-                try:
-                    # 慢单发采样:测"发起到拿到 CONNECT 200"耗时(失败抛出让调用方
-                    # 驱逐回退,不观测)。
-                    _perf_t0 = time.perf_counter()
-                    if proxy is None:
-                        pid, up_reader, up_writer = await self._try_tunnel(sticky_pid, target, None, None, None)
-                    else:
-                        pid, up_reader, up_writer = await self._try_tunnel(sticky_pid, target, proxy.host, proxy.port, proxy.auth)
-                        # CONNECT 目标半预连接(P2):粘性命中说明该 target 高频,
-                        # 后台预热下一条到上游代理的 TCP(不阻塞本请求)。预握手升级:
-                        # 把 proxy.auth 交给 pools,开启 prehandshake 时额外自建
-                        # TCP + CONNECT 预握手一条(库存进 established 池),否则
-                        # 只建 TCP 进 target 池(现状)。
-                        self._spawn_target_prewarm(proxy.host, proxy.port, target,
-                                                   proxy_auth=proxy.auth)
-                    self._observe_single_send(client_ip, target, target, sticky_pid, _perf_t0)
-                    # 请求簇预测预热:把该 target 连同胜出代理记入客户端窗口(windows
-                    # 关闭时学习全局共现图;开启新窗口时预测同簇 co-target 预建)。
-                    self.cluster.observe(client_ip, target, sticky_pid)
-                    logger.debug("proxy %s sticky hit CONNECT %s", pid, target)
-                    self.sticky.sticky_cache_hits += 1
-                    self.sticky._bump_sticky(client_ip, target, sticky_pid)
-                    # 杠杆A:粘性命中后台探路——竞争代理显著更快则驱逐(不阻塞单发)。
-                    self._spawn_sticky_probe(client_ip, target, sticky_pid)
-                    await self._connect_established(client_writer, up_writer)
-                    await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer,
-                                             proxy.host if proxy else None,
-                                             proxy.port if proxy else None,
-                                             target)
-                    return
-                except Exception as e:
-                    # 慢单发失败采样:粘性单发建连/握手失败超阈值记带 IP 日志(建连
-                    # 失败型卡顿是成功观测盲区),再驱逐回退竞速。
-                    self._observe_single_send_failure(client_ip, target, target, sticky_pid,
-                                                      _perf_t0, e)
-                    logger.debug("sticky proxy %s failed CONNECT %s", sticky_pid, target)
-                    self.sticky._evict_sticky(client_ip, target)
-            elif self.sticky._sticky_recheck_due(client_ip, target):
-                # B2:探路重评估到期——驱逐并跳过域名缓存,直接竞速换新赢家。
-                self.sticky._evict_sticky(client_ip, target)
-                skip_domain_cache = True
-
-        # 2) 域名缓存命中:用上次胜出的代理单发隧道(只记尝试统计),失败回退竞速。
-        #    成功时也回填粘性表(见 _forward_upstream 同名说明)。
-        cached_pid = None if skip_domain_cache else self._get_fresh_proxy(target)
-        if cached_pid:
-            proxy = None if cached_pid == 'local' else self.proxy_store.get(cached_pid)
-            try:
-                # 慢单发采样:测"发起到拿到 CONNECT 200"耗时(失败抛出让调用方
-                # 回退竞速,不观测)。
-                _perf_t0 = time.perf_counter()
-                if proxy is None:
-                    pid, up_reader, up_writer = await self._try_tunnel(cached_pid, target, None, None, None)
-                else:
-                    pid, up_reader, up_writer = await self._try_tunnel(cached_pid, target, proxy.host, proxy.port, proxy.auth)
-                    # CONNECT 目标半预连接(P2):域名缓存命中说明该 target 高频,
-                    # 后台预热下一条到上游代理的 TCP(不阻塞本请求)。预握手升级
-                    # 同 sticky 分支(带 proxy.auth)。
-                    self._spawn_target_prewarm(proxy.host, proxy.port, target,
-                                               proxy_auth=proxy.auth)
-                self._observe_single_send(client_ip, target, target, cached_pid, _perf_t0)
-                # 请求簇预测预热:域缓存命中即 target 高频,同 sticky 分支记入客户端窗口。
-                self.cluster.observe(client_ip, target, cached_pid)
-                logger.debug("proxy %s cache hit CONNECT %s", pid, target)
-                self.sticky._record_sticky(client_ip, target, cached_pid)
-                await self._connect_established(client_writer, up_writer)
-                await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer,
-                                         proxy.host if proxy else None,
-                                         proxy.port if proxy else None,
-                                         target)
-                return
-            except Exception as e:
-                # 慢单发失败采样:域名缓存单发建连/握手失败超阈值记带 IP 日志(建连
-                # 失败型卡顿是成功观测盲区),再回退竞速。
-                self._observe_single_send_failure(client_ip, target, target, cached_pid,
-                                                  _perf_t0, e)
-                logger.debug("cached proxy %s failed CONNECT %s", cached_pid, target)
-
-        # 3) 竞速:首批并行 max_retries 个,全失败且还有剩余则对剩余再竞速。
-        #    策略路由(P1):按 target 收窄候选集,命中策略的 target 只在该子集内竞速。
-        #    排序域名级(ordered_for_domain,target 作 domain key,与 EWMA 记账同桶)。
-        proxies = self.selector.ordered_for_domain(target)
-        if self._policies:
-            proxies = self._policy_candidate_pids(target, proxies)
-        if not proxies and not self.enable_local_racing:
-            try:
-                client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n\r\nBad Gateway")
-                await client_writer.drain()
-            except Exception:
-                pass
-            return
-
-        # 错峰启动(stagger_start)时首批只发 stagger_initial 个,补发占位交
-        # _race_staggered 按 interval 定时补发;否则同时全发(全失败再兜底批)。
-        # 败者清理 cleanup 经 partial 绑定 target,使 _cleanup_tunnel_result 能
-        # 把竞速败者(已 CONNECT 200 但输掉)的隧道归还 _established_pool。
-        race_cleanup = functools.partial(self._cleanup_tunnel_result, target=target)
-        if self.stagger_start:
-            initial_places, remaining = self._prep_connect(proxies, target)
-            winner = await self._race_staggered(
-                initial_places + remaining, cleanup=race_cleanup,
-                initial=len(initial_places), interval=self.stagger_interval)
-        else:
-            # 非错峰(_race):需真 task,占位经 _make_race_task 急切创建。
-            places = self._build_racing_tasks_connect(proxies, target)
-            tasks = {self._make_race_task(p, '', '', None, None) for p in places}
-            winner = await self._race(tasks, cleanup=race_cleanup)
-
-            # 首批全失败且代理数超过 max_retries:对剩余代理再竞速兜底。
-            if not winner and len(proxies) > self.max_retries:
-                remaining = proxies[self.max_retries:]
-                places = self._build_racing_tasks_connect(remaining, target)
-                tasks = {self._make_race_task(p, '', '', None, None) for p in places}
-                winner = await self._race(tasks, cleanup=race_cleanup)
-
-        if winner:
-            pid, up_reader, up_writer = winner
-            client_peer = client_writer.get_extra_info('peername')
-            logger.debug("proxy %s racing CONNECT to %s for client %s", pid, target, client_peer)
-            # 仅赢家更新域名缓存 meta 与会话粘性表(用 target 作 domain key);
-            # 败者只记了尝试统计。
-            self._record_win_meta(target, pid)
-            self.sticky._record_sticky(client_ip, target, pid)
-            # CONNECT 目标半预连接(P2):竞速胜出说明该 target 高频且最优代理已
-            # 确定,后台为 (proxy, target) 预热下一条到上游代理的 TCP(不阻塞本
-            # 请求)。注意 pid 可能是 'local'(enable_local_racing 直连),此时无
-            # 上游代理可预热,交由 _spawn_target_prewarm 内部跳过。
-            if pid != 'local':
-                win_proxy = self.proxy_store.get(pid)
-                if win_proxy is not None:
-                    # 预握手升级:竞速胜出同粘性/域缓存分支,把 win_proxy.auth 交给
-                    # pools 预握手(竞速天然高频 target,库存直接进 established 池)。
-                    self._spawn_target_prewarm(win_proxy.host, win_proxy.port, target,
-                                               proxy_auth=win_proxy.auth)
-            # 请求簇预测预热:竞速胜出同样记入客户端窗口(页面的每一跳都是一簇一员)。
-            self.cluster.observe(client_ip, target, pid)
-            await self._connect_established(client_writer, up_writer)
-            await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer,
-                                     win_proxy.host if pid != 'local' and win_proxy is not None else None,
-                                     win_proxy.port if pid != 'local' and win_proxy is not None else None,
-                                     target)
-            return
-
-        # 4) 全失败:回写 502 并关闭客户端连接。仍记入客户端窗口(浏览器可能再次
-        #    连接;pid=None 使该目标不进预测,但簇成员关系仍被学习)。
-        self.cluster.observe(client_ip, target, None)
-        logger.error("all proxies failed for CONNECT to %s", target)
-        try:
-            client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n\r\nBad Gateway")
-            await client_writer.drain()
-        except Exception:
-            pass
-        try:
-            client_writer.close()
-            await client_writer.wait_closed()
-        except Exception:
-            pass
+        await self._dispatch_single(
+            None, '', '', None, None, target, proto='tunnel', target=target,
+            client_reader=client_reader, client_writer=client_writer, client_ip=client_ip)
 
     async def start(self):
         """开始监听代理端口,接受客户端连接(非阻塞,返回后服务在后台运行)。

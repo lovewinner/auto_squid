@@ -6495,3 +6495,59 @@ async def test_local_direct_timeout_relaxed():
         await router.stop()
         slow_srv.close()
         await slow_srv.wait_closed()
+
+
+class TestDispatchSingleUnified:
+    """P3#8 统一 _dispatch_single:HTTP 与 CONNECT 竞速胜者都写域名缓存 meta 与会话粘性。
+
+    锁定统一体 race winner 分支对两条 proto 都调 _record_win_meta + _record_sticky
+    (败者只记尝试统计)。用 spy 记录调用,不依赖竞速时序确定性。
+    """
+
+    @pytest.mark.asyncio
+    async def test_http_race_winner_writes_win_meta(self):
+        """HTTP 竞速胜者:统一 _dispatch_single 的 race 分支写 win_meta + sticky。"""
+        fast_srv = await run_mock_proxy_tagged(HOST, 31391, 'FAST')
+        store = ProxyStore()
+        store.add(ProxyInfo(id='fast', host=HOST, port=31391))
+        r = Router(store, listen_host=HOST, listen_port=10809,
+                   max_retries=2, enable_http_cache=False,
+                   db_path=tempfile.mktemp(suffix='.db'))
+        win_meta_calls, sticky_calls = [], []
+        orig_meta, orig_sticky = r._record_win_meta, r.sticky._record_sticky
+        r._record_win_meta = lambda d, p: (win_meta_calls.append((d, p)), orig_meta(d, p))[-1]
+        r.sticky._record_sticky = lambda ip, d, p: (sticky_calls.append((d, p)), orig_sticky(ip, d, p))[-1]
+        await r.start()
+        try:
+            body = await send_http_get(HOST, 10809, url=b"http://dispatch-unify.test/")
+            assert body == b"FAST"
+            assert win_meta_calls and win_meta_calls[-1][1] == 'fast'
+            assert sticky_calls and sticky_calls[-1][1] == 'fast'
+        finally:
+            await r.stop()
+            fast_srv.close()
+            await fast_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_connect_race_winner_writes_win_meta(self):
+        """CONNECT 竞速胜者:统一 _dispatch_single 的 race 分支写 win_meta + sticky。"""
+        fast_srv = await run_mock_proxy(HOST, 31392)
+        store = ProxyStore()
+        store.add(ProxyInfo(id='fast', host=HOST, port=31392))
+        r = Router(store, listen_host=HOST, listen_port=10810,
+                   max_retries=2, enable_http_cache=False,
+                   db_path=tempfile.mktemp(suffix='.db'))
+        win_meta_calls, sticky_calls = [], []
+        orig_meta, orig_sticky = r._record_win_meta, r.sticky._record_sticky
+        r._record_win_meta = lambda d, p: (win_meta_calls.append((d, p)), orig_meta(d, p))[-1]
+        r.sticky._record_sticky = lambda ip, d, p: (sticky_calls.append((d, p)), orig_sticky(ip, d, p))[-1]
+        await r.start()
+        try:
+            echo = await send_connect(HOST, 10810, target=b"dispatch-unify.connect:443", payload=b"ping")
+            assert echo == b"ping"
+            assert win_meta_calls and win_meta_calls[-1][0] == "dispatch-unify.connect:443"
+            assert sticky_calls and sticky_calls[-1][0] == "dispatch-unify.connect:443"
+        finally:
+            await r.stop()
+            fast_srv.close()
+            await fast_srv.wait_closed()
