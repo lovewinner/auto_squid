@@ -1994,7 +1994,7 @@ class Router:
 
     # ── HTTP 请求 ──────────────────────────────────────────────
 
-    async def _try_http(self, pid: str, proxy_url: Optional[str], method: str, url: str, headers: dict, body: Optional[bytes], domain: Optional[str] = None, relaxed: bool = False):
+    async def _try_http(self, pid: str, proxy_url: Optional[str], method: str, url: str, headers: dict, body: Optional[bytes], domain: Optional[str] = None, relaxed: bool = False, client_ip: str = ""):
         """经某上游代理尝试一次 HTTP 请求,作为竞速的一个候选(流式)。
 
         从连接池取长驻 client,以 stream=True 发送——收到响应头即返回(resp
@@ -2011,6 +2011,9 @@ class Router:
         relaxed: 本地白名单强制直连路径传 True → _get_client 用
         local_direct_timeout_sec 放宽超时;其余调用保持 False 用全局 3s。
 
+        client_ip: 发起请求的客户端 IP(决策链单发路径透传;竞速候选无则空串,
+        仅用于上游尝试失败时记 per-attempt 日志,不参与选择逻辑)。
+
         成功返回 (pid, method, url, resp, client);失败(BaseException,含
         CancelledError)关闭 resp 并向上抛出,让 _race 的清理逻辑处理。
         """
@@ -2020,6 +2023,7 @@ class Router:
         # 计入该代理在途数:从"发起尝试"到"收到响应头/失败/被取消"的整个窗口,
         # 供加权 least-request 选批避开积压代理。finally 中无论何种出口都释放。
         self.selector._inflight_start(pid)
+        _perf_t0 = time.perf_counter()  # 失败观测用:记录本次尝试的发起时刻
         try:
             self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
             self.upstream_attempts += 1  # 聚合竞速扇出总数(供 /metrics 算放大率)
@@ -2053,6 +2057,10 @@ class Router:
             # 才累计连续失败并可能触发熔断。
             if not isinstance(ex, asyncio.CancelledError) and pid != 'local':
                 self.selector.record_failure(pid)
+            # per-attempt 失败观测:每次上游尝试失败都记(含被取消的竞速败者,区分
+            # 取消/真失败;单发失败此前只能从决策链汇总推,无 client_ip/耗时)。
+            # 值 P0:让"哪个代理对哪个目标为何失败"可直接 grep 到。
+            self._log_attempt_failure(client_ip, domain, url, pid, ex, _perf_t0)
             raise
         finally:
             self.selector._inflight_finish(pid)
@@ -2073,7 +2081,7 @@ class Router:
             return target
         return target.rsplit(':', 1)[0]
 
-    async def _try_tunnel(self, pid: str, target: str, proxy_host: Optional[str], proxy_port: Optional[int], proxy_auth: Optional[dict], relaxed: bool = False):
+    async def _try_tunnel(self, pid: str, target: str, proxy_host: Optional[str], proxy_port: Optional[int], proxy_auth: Optional[dict], relaxed: bool = False, client_ip: str = ""):
         """尝试建立一条 CONNECT 隧道,作为竞速的一个候选。
 
         - proxy_host 给定:经该上游代理发起 CONNECT(带上游 Proxy-Authorization)。
@@ -2083,10 +2091,13 @@ class Router:
         防止挂死上游长期占用竞速槽。
         relaxed: 本地白名单强制直连路径传 True → connect_timeout 用
         local_direct_timeout_sec(默认 10s);其余调用保持 False 用全局 3s。
+        client_ip: 发起请求的客户端 IP(决策链单发路径透传;竞速候选无则空串,
+        仅用于上游尝试失败时记 per-attempt 日志,不参与选择逻辑)。
         成功返回 (pid, up_reader, up_writer);失败/被取消则关闭上游连接并抛出。
         """
         # 建立 CONNECT 与读取响应均设超时，避免挂死的上游无限占用竞速 task 与连接。
         connect_timeout = self._local_direct_timeout if relaxed else self._tunnel_timeout_sec
+        _perf_t0 = time.perf_counter()  # 失败观测用:记录本次 CONNECT 尝试的发起时刻
         try:
             if proxy_host is not None:
                 # CONNECT 预热池(P1)+ 目标半预连接(P2):取用顺序为——
@@ -2134,7 +2145,18 @@ class Router:
                 up_reader, up_writer = await asyncio.wait_for(
                     asyncio.open_connection(host, port), timeout=connect_timeout)
         except (asyncio.TimeoutError, OSError, ConnectionError) as e:
+            # per-attempt 失败观测:建连阶段失败(本机→上游 open_connection 超时/拒绝),
+            # 先记日志再转 RuntimeError,否则该失败从 _try_tunnel 直接逃逸,不会被下方
+            # 2198 except 捕获(两条 except 覆盖不同失败窗口:建连 vs CONNECT 握手)。
+            self._log_attempt_failure(client_ip, target, target, pid,
+                                      RuntimeError(f'connect to {proxy_host or target} timed out or failed: {e}'),
+                                      _perf_t0)
             raise RuntimeError(f'connect to {proxy_host or target} timed out or failed: {e}') from e
+        except ValueError as e:
+            # 非法 CONNECT target(空 host / 坏端口):同样记 per-attempt 日志,原样重抛。
+            # 调用方按 ValueError 处理(直连分支/测试),不转 RuntimeError。
+            self._log_attempt_failure(client_ip, target, target, pid, e, _perf_t0)
+            raise
         # 首字节计时:从 CONNECT 发出到收到 200。用于 EWMA 质量跟踪(竞速排序)。
         # 复用已握手隧道时无 CONNECT 往返,计时为 0(不做 EWMA 观测)。
         reused_established = (self.pools.conn_pool_established_reuse
@@ -2187,6 +2209,9 @@ class Router:
             # 同 _try_http:被竞速取消(CancelledError)不算失败;真失败才累计熔断。
             if not isinstance(ex, asyncio.CancelledError) and pid != 'local':
                 self.selector.record_failure(pid)
+            # per-attempt 失败观测(同 _try_http):每次 CONNECT 尝试失败都记(含取消
+            # 的竞速败者),带 client_ip/异常类型/耗时,可直接 grep 定位事故源。
+            self._log_attempt_failure(client_ip, target, target, pid, ex, _perf_t0)
             raise
         finally:
             self.selector._inflight_finish(pid)
@@ -2501,6 +2526,26 @@ class Router:
                         client_ip or "-", domain, target, pid, elapsed_ms, err_name,
                         str(err)[:120], self.single_send_slow_log_ms)
 
+    def _log_attempt_failure(self, client_ip: str, domain: str, target: str, pid: str,
+                             err: BaseException, perf_t0: float) -> None:
+        """记一次上游尝试失败的观测日志(per-attempt,INFO 常驻)。
+
+        覆盖单发(粘性/域名缓存)+ 竞速(候选)的所有失败,统一字段便于 grep:
+        - client_ip:决策链单发才有(竞速候选空串,记 '-')
+        - pid:实际尝试的代理(单发/竞速候选)
+        - domain / target:目标(HTTP 的 domain、CONNECT 的 target)
+        - err 类型/消息:区分超时/连接失败/上游错误/CancelledError(被取消的竞速败者)
+        - 耗时:perf_t0 到失败时刻,识别"卡了多久才失败"
+
+        在 _try_http/_try_tunnel 的 except 内调用(失败产生地):此处有确切 err 与
+        失败时刻。单发失败此前只能从决策链 "sticky/cached proxy failed" 汇总推
+        (无类型/耗时/client_ip);竞速败者失败更是完全无日志——P0 补上这一盲区。
+        """
+        elapsed_ms = (time.perf_counter() - perf_t0) * 1000.0
+        logger.info("upstream attempt FAILED client=%s domain=%s target=%s pid=%s err=%s: %s "
+                    "elapsed=%.1fms", client_ip or "-", domain, target, pid,
+                    type(err).__name__, str(err)[:200] or "-", elapsed_ms)
+
     async def _forward_single(self, writer, method: str, url: str, hdrs: dict, body, domain: str,
                              pid: str | None = None, instantiated=None, sticky: bool = False,
                              client_ip: str = ""):
@@ -2520,7 +2565,8 @@ class Router:
                 # 慢单发采样:测"发起到首字节"耗时。失败抛出让调用方回退(不观测)。
                 _perf_t0 = time.perf_counter()
                 _pid, method, url, resp, client = await self._try_http(
-                    pid, self.proxy_store.proxy_url(pid), method, url, hdrs, body, domain)
+                    pid, self.proxy_store.proxy_url(pid), method, url, hdrs, body, domain,
+                    client_ip=client_ip)
                 self._observe_single_send(client_ip, domain, url, pid, _perf_t0)
             except Exception as e:
                 # 慢单发失败采样:建连/首字节失败超阈值也记带 IP 的日志(建连失败型
@@ -2570,9 +2616,11 @@ class Router:
             # 慢单发采样:测"发起到拿到 CONNECT 200"耗时(失败抛出让调用方驱逐/回退,不观测)。
             _perf_t0 = time.perf_counter()
             if proxy is None:
-                _pid, up_reader, up_writer = await self._try_tunnel(pid, target, None, None, None)
+                _pid, up_reader, up_writer = await self._try_tunnel(pid, target, None, None, None,
+                                                                     client_ip=client_ip)
             else:
-                _pid, up_reader, up_writer = await self._try_tunnel(pid, target, proxy.host, proxy.port, proxy.auth)
+                _pid, up_reader, up_writer = await self._try_tunnel(pid, target, proxy.host, proxy.port, proxy.auth,
+                                                                    client_ip=client_ip)
                 # CONNECT 目标半预连接(P2):单发命中说明该 target 高频,后台预热以下
                 # 一条到上游代理的 TCP(不阻塞本请求)。预握手升级:把 proxy.auth 交给
                 # pools,开启 prehandshake 时额外自建 TCP + CONNECT 预握手一条(库存进
@@ -2606,7 +2654,7 @@ class Router:
         try:
             _perf_t0 = time.perf_counter()
             _pid, _m, url, resp, _c = await self._try_http(
-                'local', None, method, url, hdrs, body, domain, relaxed=True)
+                'local', None, method, url, hdrs, body, domain, relaxed=True, client_ip=client_ip)
             self._observe_single_send(client_ip, domain, url, 'local', _perf_t0)
             buffered = await self._stream_upstream_response(writer, resp, method, url)
             if buffered is not None and resp.status_code in CACHEABLE_STATUS:
@@ -3062,7 +3110,7 @@ class Router:
         try:
             _perf_t0 = time.perf_counter()
             _pid, up_reader, up_writer = await self._try_tunnel(
-                'local', target, None, None, None, relaxed=True)
+                'local', target, None, None, None, relaxed=True, client_ip=client_ip)
             self._observe_single_send(client_ip, self._try_tunnel_host(target), target, 'local', _perf_t0)
             await self._connect_established(client_writer, up_writer)
             await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer,

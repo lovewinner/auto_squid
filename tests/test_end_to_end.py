@@ -6651,3 +6651,48 @@ class TestDispatchSingleUnified:
             assert r._get_fresh_proxy(domain) is None
         finally:
             await r.stop()
+
+    def test_attempt_failure_logs_on_single_send_timeout(self, caplog):
+        """per-attempt 失败日志:CONNECT 单发超时 → 记 upstream attempt FAILED,带 pid/err 类型。"""
+        import logging
+        store = ProxyStore()
+        store.add(ProxyInfo(id='slow', host=HOST, port=31398))
+        r = Router(store, listen_host=HOST, listen_port=10814,
+                   max_retries=2, enable_http_cache=False,
+                   db_path=tempfile.mktemp(suffix='.db'))
+        with caplog.at_level(logging.INFO, logger='auto_squid.router'):
+            r._log_attempt_failure('59.67.225.91', 'github.com:443', 'github.com:443', 'slow',
+                                   RuntimeError("connect to xxx timed out"), time.perf_counter() - 0.3)
+        hit = [rec for rec in caplog.records
+               if rec.getMessage().startswith("upstream attempt FAILED")]
+        assert hit
+        assert "github.com:443" in hit[0].getMessage()
+        assert "slow" in hit[0].getMessage()
+        assert "RuntimeError" in hit[0].getMessage()
+        assert "59.67.225.91" in hit[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_attempt_failure_logs_from_try_tunnel_except(self, caplog):
+        """per-attempt 失败日志来自 _try_tunnel 的 except:真失败(如非法 target)记日志带类型。
+
+        用"本机直连非法/invalid target"真实走 _try_tunnel 的 except——
+        直接确认 except 内 _log_attempt_failure 被调用,而非 mock 掉 except。
+        """
+        import logging
+        store = ProxyStore()
+        store.add(ProxyInfo(id='slow', host=HOST, port=31399))
+        r = Router(store, listen_host=HOST, listen_port=10815,
+                   max_retries=2, enable_http_cache=False,
+                   db_path=tempfile.mktemp(suffix='.db'))
+        # 本机直连路径(proxy_host=None)对空 target 抛 ValueError,真实走 except。
+        # 空 target → _try_tunnel_host 返回 '' → `if not host: raise ValueError`。
+        with caplog.at_level(logging.INFO, logger='auto_squid.router'):
+            try:
+                await r._try_tunnel('local', '', None, None, None)
+            except ValueError:
+                pass
+        hit = [rec for rec in caplog.records
+               if rec.getMessage().startswith("upstream attempt FAILED")]
+        assert hit
+        assert "ValueError" in hit[-1].getMessage()
+        assert "local" in hit[-1].getMessage()
