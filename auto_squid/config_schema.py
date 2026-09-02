@@ -374,6 +374,7 @@ class CircuitConfig(ConfigBase):
     single_send_slow_log_ms: float = Field(0.0, description="慢单发采样日志阈值(毫秒),0=关闭")
     connect_tunnel_timeout_sec: float = Field(3.0, description="CONNECT 隧道建连/读响应超时(秒):_try_tunnel 向源站 CONNECT 的 open_connection 与等 200 的统一上限,防某代理 egress→源站建连/握手偶发卡死把请求拖成 10s+。原硬编码 15s。测得的 CDN 首字节实际 0.6s,3s 给 5 倍余量。")
     http_read_timeout_sec: float = Field(3.0, description="HTTP 单发读首字节超时(秒):_upstream_timeout.read,防某被钉代理转发 HTTP 首字节偶发卡死。原 10s。注意 router.py:480-483 记载收紧 header 等待曾非净赢(引爆 soak p99+fd 堆积)已回退,故本值生产灰度须盯 p99/fd。")
+    local_direct_timeout_sec: float = Field(10.0, description="本地域名白名单(local_direct_domains)强制直连的超时(秒):白名单目标的 HTTP read 与 CONNECT 建连/读响应用该值,而非全局 http_read_timeout_sec/connect_tunnel_timeout_sec(默认 3s)。本地回环/内网链路不需要 3s 那么紧——生产本机管理面板(10.14.25.86:20128)过载时被全局 3s 掐断、页面半截。默认 10s 给 4 倍余量(过载实测 ttfb 1.7-2.4s)。仅影响白名单强制路径;竞速/粘性 local 仍走全局 3s。")
 
 
 class RouterConfig(ConfigBase):
@@ -398,6 +399,7 @@ class RouterConfig(ConfigBase):
     """
     cache_ttl: int = Field(600, description="域名缓存有效期(秒)，过期后重新竞速")
     enable_local_racing: bool = Field(False, description="将本机作为代理节点参与竞速")
+    local_direct_domains: List[str] = Field(default_factory=list, description="本地域名白名单:命中(裸 host/IP,不带端口)的目标强制本机直连(local),不经任何远端代理;直连失败直接回 502,不绕远端。用于本机/内网管理服务(如 10.14.25.86:20128)不被全局 3s 转发超时掐断。匹配大小写/尾点/IPv6 括号归一")
     max_retries: int = Field(3, description="竞速首批并行的代理数量")
     stagger_start: bool = Field(True, description="启用错峰启动(RFC 8305 §5)")
     stagger_initial: int = Field(1, description="错峰首批并发数(冷启动自动翻倍到2)")

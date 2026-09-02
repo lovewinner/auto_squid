@@ -152,7 +152,7 @@ class Router:
     生命周期:start() 开始监听 → handle_client 处理每个连接 → stop() 优雅关闭。
     """
 
-    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, sticky_probe_interval_sec: float = 0.0, sticky_probe_fanout: int = 2, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, single_send_slow_log_ms: float = 0.0, connect_tunnel_timeout_sec: float = 3.0, http_read_timeout_sec: float = 3.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False, conn_pool_refill_pause_minutes: float = 60.0, conn_pool_refill_pause_silence_sec: float = 120.0, conn_pool_refill_pause_activity_window: Optional[float] = None, conn_pool_refill_pause_min_requests: int = 3, conn_pool_established_reuse: bool = False, conn_pool_established_idle_timeout: Optional[float] = None, conn_pool_prehandshake: bool = False, conn_pool_prehandshake_throttle_window_sec: float = 0.0, conn_pool_prehandshake_throttle_max_per_window: int = 0, cluster_predict: bool = False, cluster_window_sec: float = 2.0, cluster_predict_topk: int = 3, cluster_min_support: int = 2, cluster_graph_ttl_sec: int = 86400, cluster_graph_max_entries: int = 100_000, cluster_predict_throttle_sec: float = 30.0, cluster_proxy_fanout: int = 2, cluster_probe_decay_sec: float = 3600.0, cluster_pool_idle_timeout: float = 600.0, router_cfg: Optional[RouterConfig] = None):
+    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, sticky_probe_interval_sec: float = 0.0, sticky_probe_fanout: int = 2, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, single_send_slow_log_ms: float = 0.0, connect_tunnel_timeout_sec: float = 3.0, http_read_timeout_sec: float = 3.0, local_direct_domains: Optional[List[str]] = None, local_direct_timeout_sec: float = 10.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False, conn_pool_refill_pause_minutes: float = 60.0, conn_pool_refill_pause_silence_sec: float = 120.0, conn_pool_refill_pause_activity_window: Optional[float] = None, conn_pool_refill_pause_min_requests: int = 3, conn_pool_established_reuse: bool = False, conn_pool_established_idle_timeout: Optional[float] = None, conn_pool_prehandshake: bool = False, conn_pool_prehandshake_throttle_window_sec: float = 0.0, conn_pool_prehandshake_throttle_max_per_window: int = 0, cluster_predict: bool = False, cluster_window_sec: float = 2.0, cluster_predict_topk: int = 3, cluster_min_support: int = 2, cluster_graph_ttl_sec: int = 86400, cluster_graph_max_entries: int = 100_000, cluster_predict_throttle_sec: float = 30.0, cluster_proxy_fanout: int = 2, cluster_probe_decay_sec: float = 3600.0, cluster_pool_idle_timeout: float = 600.0, router_cfg: Optional[RouterConfig] = None):
         """构造路由器。
 
         参数:
@@ -286,6 +286,8 @@ class Router:
             max_retries = c.max_retries
             cache_ttl = c.cache_ttl
             enable_local_racing = c.enable_local_racing
+            local_direct_domains = list(c.local_direct_domains)
+            local_direct_timeout_sec = cc.local_direct_timeout_sec
             stagger_start, stagger_initial, stagger_interval_ms = c.stagger_start, c.stagger_initial, c.stagger_interval_ms
             probe_interval_sec = cc.probe_interval_sec
             probe_canary = cc.probe_canary
@@ -441,6 +443,18 @@ class Router:
         self.http_read_timeout_sec = max(1.0, float(http_read_timeout_sec))
         self._tunnel_timeout_sec = self.connect_tunnel_timeout_sec
         self._http_read_timeout_sec = self.http_read_timeout_sec
+        # 本地域名白名单强制直连(local_direct_domains):命中的目标(裸 host/IP)强制
+        # 走本机直连(local),不经任何远端代理——本机/内网管理服务(如 10.14.25.86:20128)
+        # 不被全局 http_read_timeout_sec/connect_tunnel_timeout_sec(3s)掐断。直连失败
+        # 直接回 502 不绕远端(用户决策)。白名单条目不依赖 enable_local_racing 开关。
+        # local_direct_timeout_sec:白名单直连的放宽超时(默认 10s),仅白名单路径用
+        # (relaxed=True),竞速/粘性的 local 单发仍走全局 3s 零行为变化。
+        self._local_direct_domains = frozenset(
+            self._norm_host(d) for d in (local_direct_domains or []) if d)
+        self.local_direct_timeout_sec = max(1.0, float(local_direct_timeout_sec))
+        self._local_direct_timeout = self.local_direct_timeout_sec
+        self.local_direct_hits = 0        # 白名单命中(强制本机直连)次数
+        self.local_direct_failures = 0    # 白名单直连失败(回 502)次数
         # "降级中"代理集合(可观测,非门控):被单发降级判定命中的代理记录于此。
         # 注意真正的门控是每次选择时实时重估 _single_send_degraded(代理恢复后立即
         # 重新可单发,无需冷却),此集合只供 /metrics /circuit 展示"当前被判定降级的
@@ -655,6 +669,26 @@ class Router:
                 "_updated_mono": mono,
                 "ref_ewma": (float(ewma) if ewma is not None else None),
             }
+
+    @staticmethod
+    def _norm_host(host: str) -> str:
+        """归一化 hostname/IP 用于白名单匹配:去尾点、小写、IPv6 去括号。
+
+        不拆端口(白名单条目是裸 host;HTTP 的 domain 已由 urlparse.hostname 剥掉
+        端口,CONNECT 的 host 由调用方按 _try_tunnel 同逻辑解析)。空串原样返回。
+        """
+        h = (host or "").strip()
+        if h.startswith('[') and h.endswith(']'):
+            h = h[1:-1]
+        if h.endswith('.'):
+            h = h[:-1]
+        return h.lower()
+
+    def _host_in_local_direct(self, host: str) -> bool:
+        """目标 host 是否命中本地白名单(强制本机直连)。空白名单恒 False。"""
+        if not self._local_direct_domains or not host:
+            return False
+        return self._norm_host(host) in self._local_direct_domains
 
     def _record_attempt(self, domain: str, pid: str):
         """记录一次"代理 pid 对域名 domain 的尝试"(竞速扇出统计)。
@@ -1136,6 +1170,8 @@ class Router:
             "single_send_slow_logged": self.single_send_slow_logged,
             "single_send_fail_logged": self.single_send_fail_logged,
             "single_send_slow_log_ms": self.single_send_slow_log_ms,
+            "local_direct_hits": self.local_direct_hits,
+            "local_direct_failures": self.local_direct_failures,
             "connect_tunnel_timeout_sec": self.connect_tunnel_timeout_sec,
             "http_read_timeout_sec": self.http_read_timeout_sec,
             "domain_ttl_grows": self.domain_ttl_grows,
@@ -1429,18 +1465,27 @@ class Router:
             return 'local'
         return proxy_url
 
-    async def _get_client(self, key: str, proxy_url: Optional[str]) -> httpx.AsyncClient:
+    async def _get_client(self, key: str, proxy_url: Optional[str],
+                          relaxed: bool = False) -> httpx.AsyncClient:
         """从池中取(或按需创建)某上游的长驻 httpx.AsyncClient。
 
         池化跨请求复用 keep-alive 连接,避免每请求重建到上游代理的 TCP
         (HTTPS 经 CONNECT 还多一次握手)。client 不随单请求关闭,仅在
         stop() 时统一 aclose。
+
+        relaxed=True:用 local_direct_timeout_sec 替代全局 _upstream_timeout
+        (仅本地白名单强制直连路径传)。其余(竞速/粘性/域名缓存的 local 单发)
+        保持默认 relaxed=False 用全局 3s,零行为变化。
         """
         client = self._client_pool.get(key)
         if client is not None and not client.is_closed:
             return client
         kw: dict[str, Any] = {
-            "timeout": self._upstream_timeout,
+            "timeout": (httpx.Timeout(self._local_direct_timeout,
+                                      connect=self._local_direct_timeout,
+                                      pool=5.0, read=self._local_direct_timeout,
+                                      write=self._local_direct_timeout)
+                        if relaxed else self._upstream_timeout),
             # 连接池上限按"单代理"计。压测 staircase 在 concurrency=200 时,
             # 冷请求(30%)向 4 个代理竞速 + 热请求单发,瞬时并发上游 socket
             # ~380(fd_peak 实测 358≈池打满)。原 max_connections=100/代理虽
@@ -1916,7 +1961,7 @@ class Router:
 
     # ── HTTP 请求 ──────────────────────────────────────────────
 
-    async def _try_http(self, pid: str, proxy_url: Optional[str], method: str, url: str, headers: dict, body: Optional[bytes], domain: Optional[str] = None):
+    async def _try_http(self, pid: str, proxy_url: Optional[str], method: str, url: str, headers: dict, body: Optional[bytes], domain: Optional[str] = None, relaxed: bool = False):
         """经某上游代理尝试一次 HTTP 请求,作为竞速的一个候选(流式)。
 
         从连接池取长驻 client,以 stream=True 发送——收到响应头即返回(resp
@@ -1930,11 +1975,14 @@ class Router:
         此处回退解析(单发等路径),保证与 _record_attempt / _record_win_meta
         用同一解析表达式,域名级 EWMA 的 key 与 meta/sticky 取用 key 完全一致。
 
+        relaxed: 本地白名单强制直连路径传 True → _get_client 用
+        local_direct_timeout_sec 放宽超时;其余调用保持 False 用全局 3s。
+
         成功返回 (pid, method, url, resp, client);失败(BaseException,含
         CancelledError)关闭 resp 并向上抛出,让 _race 的清理逻辑处理。
         """
         key = self._client_key(pid, proxy_url)
-        client = await self._get_client(key, proxy_url)
+        client = await self._get_client(key, proxy_url, relaxed=relaxed)
         resp = None
         # 计入该代理在途数:从"发起尝试"到"收到响应头/失败/被取消"的整个窗口,
         # 供加权 least-request 选批避开积压代理。finally 中无论何种出口都释放。
@@ -1976,7 +2024,23 @@ class Router:
         finally:
             self.selector._inflight_finish(pid)
 
-    async def _try_tunnel(self, pid: str, target: str, proxy_host: Optional[str], proxy_port: Optional[int], proxy_auth: Optional[dict]):
+    @staticmethod
+    def _try_tunnel_host(target: str) -> str:
+        """从 CONNECT target("host:port" 或 "[ipv6]:port")解析出裸 host。
+
+        供 _try_tunnel 直连分支与 _handle_connect 白名单判定共用,保证两处解析
+        一致。非法 target 原样返回(由 _try_tunnel 报错处理)。
+        """
+        if not target or ':' not in target:
+            return target or ''
+        if target.startswith('['):
+            host_end = target.find(']')
+            if host_end > 0:
+                return target[1:host_end]
+            return target
+        return target.rsplit(':', 1)[0]
+
+    async def _try_tunnel(self, pid: str, target: str, proxy_host: Optional[str], proxy_port: Optional[int], proxy_auth: Optional[dict], relaxed: bool = False):
         """尝试建立一条 CONNECT 隧道,作为竞速的一个候选。
 
         - proxy_host 给定:经该上游代理发起 CONNECT(带上游 Proxy-Authorization)。
@@ -1984,10 +2048,12 @@ class Router:
           "host:port" 或 "[ipv6]:port"。
         建连与读响应均设 connect_timeout(self._tunnel_timeout_sec,默认 3s),
         防止挂死上游长期占用竞速槽。
+        relaxed: 本地白名单强制直连路径传 True → connect_timeout 用
+        local_direct_timeout_sec(默认 10s);其余调用保持 False 用全局 3s。
         成功返回 (pid, up_reader, up_writer);失败/被取消则关闭上游连接并抛出。
         """
         # 建立 CONNECT 与读取响应均设超时，避免挂死的上游无限占用竞速 task 与连接。
-        connect_timeout = self._tunnel_timeout_sec
+        connect_timeout = self._local_direct_timeout if relaxed else self._tunnel_timeout_sec
         try:
             if proxy_host is not None:
                 # CONNECT 预热池(P1)+ 目标半预连接(P2):取用顺序为——
@@ -2023,15 +2089,15 @@ class Router:
                     up_reader, up_writer = await asyncio.wait_for(
                         asyncio.open_connection(proxy_host, proxy_port), timeout=connect_timeout)
             else:
-                if ':' not in target:
+                host = self._try_tunnel_host(target)
+                if not host:
                     raise ValueError(f'Invalid CONNECT target: {target}')
+                # 端口从 target 解析(host:port);_try_tunnel_host 只回裸 host。
                 if target.startswith('['):
                     host_end = target.find(']')
-                    host = target[1:host_end]
                     port = int(target[host_end + 2:])
                 else:
-                    host, port_str = target.rsplit(':', 1)
-                    port = int(port_str)
+                    port = int(target.rsplit(':', 1)[1])
                 up_reader, up_writer = await asyncio.wait_for(
                     asyncio.open_connection(host, port), timeout=connect_timeout)
         except (asyncio.TimeoutError, OSError, ConnectionError) as e:
@@ -2305,6 +2371,17 @@ class Router:
                                        cached_entry['headers'], cached_entry['content'])
             return
 
+        # 1.2) 本地白名单强制直连:命中(local_direct_domains)的目标强制本机直连,
+        #      不经任何远端代理——本机/内网服务不被全局 3s 转发超时掐断。失败回
+        #      502 不绕远端(用户决策)。位置在缓存检查之后、在途聚合注册之前:
+        #      (a) 白名单请求仍可命中直连写入的缓存; (b) 白名单请求不注册在途
+        #      聚合,waiter 也不会落入 _forward_upstream 的远端竞速(跨路径坑)。
+        if self._host_in_local_direct(domain):
+            self.local_direct_hits += 1
+            logger.debug("local-direct HTTP %s %s", method, url)
+            await self._forward_local_direct_http(writer, method, url, hdrs, body, domain, client_ip)
+            return
+
         # 1.5) 在途 GET 去重聚合:同 URL 并发 GET 命中未命中缓存时,若已有在途
         #      请求(首个请求正在转发上游),则 await 其结果,不再重复打上游。
         #      首个请求完成后把结果 set 进 Future,waiter 据此回写客户端。仅
@@ -2438,6 +2515,45 @@ class Router:
                 await resp.aclose()
             except Exception:
                 pass
+
+    async def _forward_local_direct_http(self, writer, method: str, url: str, hdrs: dict, body,
+                                         domain: str, client_ip: str = ""):
+        """本地白名单目标强制本机直连(HTTP):内联 _try_http(relaxed=True)+流式转发+写缓存。
+
+        由 _handle_http_request 在命中白名单时调用(拦截点在缓存检查之后、在途
+        聚合注册之前)。直连成功流式转发并按 CACHEABLE_STATUS 写响应缓存(本地
+        静态资源/RSC 可缓存);失败直接回 502 不绕远端(用户决策:白名单目标若
+        绕远端又会被全局 3s 掐断)。不进入 sticky/域名缓存/竞速三层——白名单即
+        显式授权直连,不走远端代理,也不计 domain_cache_hits/sticky 命中。
+        """
+        resp = None
+        try:
+            _perf_t0 = time.perf_counter()
+            _pid, _m, url, resp, _c = await self._try_http(
+                'local', None, method, url, hdrs, body, domain, relaxed=True)
+            self._observe_single_send(client_ip, domain, url, 'local', _perf_t0)
+            buffered = await self._stream_upstream_response(writer, resp, method, url)
+            if buffered is not None and resp.status_code in CACHEABLE_STATUS:
+                self._http_cache_set(method, url, resp.status_code, resp.reason_phrase,
+                                     list(resp.headers.multi_items()), buffered)
+            return resp.status_code
+        except Exception as e:
+            # local 直连失败:不 record_failure(pid=='local' 既有约定,见 _try_http),
+            # 直接 502 且不绕远端(用户决策)。
+            self.local_direct_failures += 1
+            logger.error("local-direct FAILED client=%s domain=%s target=%s err=%s",
+                         client_ip or '-', domain, url, type(e).__name__)
+            try:
+                await self._write_cached_response(writer, 502, 'Bad Gateway',
+                                                  {'Content-Type': 'text/plain'}, b'Bad Gateway')
+            except Exception:
+                pass
+        finally:
+            if resp is not None:
+                try:
+                    await resp.aclose()
+                except Exception:
+                    pass
 
     async def _forward_upstream(self, writer, method: str, url: str, hdrs: dict, body, domain: str, client_ip: str = ""):
         """把请求转发上游(会话粘性单发 → 域名缓存单发 → 竞速 → 兜底竞速 → 502)。
@@ -2750,6 +2866,40 @@ class Router:
                 pass
         return can_reuse
 
+    async def _local_direct_connect(self, target: str, client_reader: asyncio.StreamReader,
+                                    client_writer: asyncio.StreamWriter, client_ip: str = ""):
+        """本地白名单目标强制本机直连(CONNECT):relaxed 直连 + 双向透传。
+
+        由 _handle_connect 在命中白名单时调用。_try_tunnel('local', ..., relaxed=True)
+        用 local_direct_timeout_sec(默认 10s)放宽建连/读响应,本机回环不被全局 3s
+        掐断。透传复用 _relay_tunnel(proxy_host=None → 不归还 established 池不预热,
+        正确)。失败回 502 不绕远端(用户决策:白名单目标若绕远端又会被全局 3s 掐)。
+        """
+        up_reader = up_writer = None
+        try:
+            _perf_t0 = time.perf_counter()
+            _pid, up_reader, up_writer = await self._try_tunnel(
+                'local', target, None, None, None, relaxed=True)
+            self._observe_single_send(client_ip, self._try_tunnel_host(target), target, 'local', _perf_t0)
+            await self._connect_established(client_writer, up_writer)
+            await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer,
+                                     None, None, target)
+        except Exception as e:
+            self.local_direct_failures += 1
+            logger.error("local-direct CONNECT FAILED client=%s target=%s err=%s",
+                         client_ip or '-', target, type(e).__name__)
+            try:
+                client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n\r\nBad Gateway")
+                await client_writer.drain()
+            except Exception:
+                pass
+            if up_writer is not None:
+                try:
+                    up_writer.close()
+                    await asyncio.wait_for(up_writer.wait_closed(), timeout=0.5)
+                except Exception:
+                    pass
+
     async def _handle_connect(self, target: str, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter, client_ip: str = ""):
         """处理 CONNECT 请求:建立到 target 的隧道并双向透传数据。
 
@@ -2758,6 +2908,15 @@ class Router:
         两个反向 _pipe 双向透传,任一方向结束即关闭。全失败回写 502。认证
         已在 handle_client 完成,此处不再校验。
         """
+        # 0) 本地白名单强制直连:命中(local_direct_domains)的目标直接 local 直连,
+        #    不经任何远端代理——本机/内网服务不被全局 3s 转发超时掐断。失败回 502
+        #    不绕远端(用户决策)。CONNECT 无在途聚合,位置无跨路径约束。
+        host = self._try_tunnel_host(target)
+        if self._host_in_local_direct(host):
+            self.local_direct_hits += 1
+            logger.debug("local-direct CONNECT %s", target)
+            await self._local_direct_connect(target, client_reader, client_writer, client_ip)
+            return
         # 1) 会话粘性:同一客户端+target 复用上次胜出的代理单发隧道,失败则
         #    驱逐该条目并回落到域名缓存/竞速(redispatch)。本机胜者('local')
         #    走直连(None 代理),无需 proxy_store 校验(A1)。策略路由(P1):

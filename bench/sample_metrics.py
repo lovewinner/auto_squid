@@ -113,6 +113,8 @@ FIELD_ORDER = [
     "single_send_slow_logged",  # 慢单发采样日志条数(粘性/缓存命中首字节超阈值)
     "single_send_fail_logged",  # 慢单发失败采样日志条数(建连/握手失败超阈值,带 IP)
     "single_send_slow_log_ms",  # 慢单发采样阈值(毫秒,状态,0=关闭)
+    "local_direct_hits",        # 本地白名单命中(强制本机直连)次数
+    "local_direct_failures",    # 本地白名单直连失败(回 502)次数
     # 空闲暂停活动判定(非计数型:状态/配置,增量恒 0,见 NO_DELTA_FIELDS)
     "conn_pool_idle_paused",    # 当前是否处于空闲暂停态(True=refill/预热已挂起)
     "conn_pool_refill_pause_activity_window",   # 活动判定窗口(秒)配置值
@@ -177,6 +179,8 @@ FIELD_DOCS = {
     "single_send_slow_logged": "慢单发采样日志条数(粘性/缓存命中首字节超阈值)",
     "single_send_fail_logged": "慢单发失败采样日志条数(建连/握手失败超阈值,带 IP)",
     "single_send_slow_log_ms": "慢单发采样阈值(毫秒,状态,0=关闭)",
+    "local_direct_hits": "本地白名单命中(强制本机直连)次数",
+    "local_direct_failures": "本地白名单直连失败(回 502)次数",
     "conn_pool_idle_paused": "空闲暂停态(True=refill/预热已挂起)",
     "conn_pool_refill_pause_activity_window": "活动判定窗口(秒)",
     "conn_pool_refill_pause_min_requests": "活动判定窗口阈值(K)",
@@ -221,6 +225,8 @@ FOCUS = [
     "prehandshake_throttled_skips",
     "single_send_slow_logged",
     "single_send_fail_logged",
+    "local_direct_hits",
+    "local_direct_failures",
 ]
 
 

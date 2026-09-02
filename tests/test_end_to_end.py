@@ -27,6 +27,7 @@ from auto_squid.api import app as api_app, mount
 PROXY_PORT = 31291
 ROUTER_PORT = 10809
 LOCAL_HTTP_PORT = 18081
+LOCAL_TCP_ECHO_PORT = 18082
 HOST = '127.0.0.1'
 
 
@@ -6244,3 +6245,253 @@ class TestSetupLoggingLevel:
         assert "debug marker that must NOT appear qqq" not in body
         assert "info marker should appear" in body
         self._reset_logging()
+
+
+# ── local_direct_domains 白名单强制直连 ──────────────────────────
+
+def _local_direct_router(**kw):
+    """Router with an empty proxy store + local_direct_domains=[HOST].
+
+    Note: with a mock CONNECT proxy present at PROXY_PORT, a non-whitelisted
+    target can race through it, so the non-whitelist HTTP test passes its own
+    url with a non-whitelisted *host* while whitelisting HOST.
+    """
+    ps = ProxyStore()
+    kw.setdefault('local_direct_domains', [HOST])
+    kw.setdefault('db_path', tempfile.mktemp(suffix='.db'))
+    kw.setdefault('enable_http_cache', False)
+    return Router(ps, listen_host=HOST, listen_port=ROUTER_PORT, **kw)
+
+
+@pytest.mark.asyncio
+async def test_local_direct_http_hit_uses_local():
+    """白名单目标 → 强制本机直连:body 来自本地服务,远端 mock 代理 0 命中。"""
+    local_srv = await run_local_http_server(HOST, LOCAL_HTTP_PORT)
+    proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=[])
+    router = _local_direct_router()
+    await router.start()
+    try:
+        url = f"http://{HOST}:{LOCAL_HTTP_PORT}/".encode()
+        body = await send_http_get(HOST, ROUTER_PORT, url=url)
+        assert b'local-response' in body, f"expected local body, got {body!r}"
+        assert router.request_counts.get('local', 0) > 0
+        counters = router.snapshot_counters()
+        assert counters['local_direct_hits'] >= 1
+        assert counters['local_direct_failures'] == 0
+    finally:
+        await router.stop()
+        local_srv.close()
+        await local_srv.wait_closed()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_local_direct_http_non_whitelist_uses_upstream():
+    """非白名单目标 → 不强制直连:请求走上游 mock 代理(需 store 有代理,否则 502)。"""
+    local_srv = await run_local_http_server(HOST, LOCAL_HTTP_PORT)
+    hit = []
+    proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=hit)
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                    local_direct_domains=[HOST], enable_http_cache=False,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        # 白名单是 HOST(127.0.0.1);目标用非白名单域名 example.com → 走上游。
+        body = await send_http_get(HOST, ROUTER_PORT, url=b"http://example.com/x")
+        assert b'proxied' in body, f"expected upstream body, got {body!r}"
+        assert len(hit) >= 1, "upstream should have been hit"
+        assert router.request_counts.get('local', 0) == 0
+        counters = router.snapshot_counters()
+        assert counters['local_direct_hits'] == 0
+    finally:
+        await router.stop()
+        local_srv.close()
+        await local_srv.wait_closed()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_local_direct_http_failure_502_no_upstream():
+    """白名单目标直连失败 → 直接 502,不绕远端 mock 代理(用户决策)。"""
+    hit = []
+    proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=hit)
+    # LOCAL_HTTP_PORT 无服务 → 直连失败。
+    router = _local_direct_router()
+    await router.start()
+    try:
+        url = f"http://{HOST}:{LOCAL_HTTP_PORT}/".encode()
+        status = await send_http_get_status(HOST, ROUTER_PORT, url=url)
+        assert b'502' in status, f"expected 502, got {status}"
+        assert len(hit) == 0, "white-listed failure must NOT fall back to upstream"
+        counters = router.snapshot_counters()
+        assert counters['local_direct_hits'] >= 1
+        assert counters['local_direct_failures'] >= 1
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_local_direct_http_cache_still_works():
+    """白名单请求仍走 HTTP 响应缓存:第二次命中缓存,local 只打一次。"""
+    local_srv = await run_local_http_server(HOST, LOCAL_HTTP_PORT)
+    router = _local_direct_router(enable_http_cache=True)
+    await router.start()
+    try:
+        url = f"http://{HOST}:{LOCAL_HTTP_PORT}/".encode()
+        body1 = await send_http_get(HOST, ROUTER_PORT, url=url)
+        body2 = await send_http_get(HOST, ROUTER_PORT, url=url)
+        assert b'local-response' in body1 and b'local-response' in body2
+        counters = router.snapshot_counters()
+        assert counters['http_cache_hits'] >= 1, "second request should hit cache"
+        assert router.request_counts.get('local', 0) == 1, "local origin hit once only"
+        # 缓存命中分支在白名单拦截之前 return → 只算一次 local_direct_hits(直连那次)。
+        assert counters['local_direct_hits'] == 1
+    finally:
+        await router.stop()
+        local_srv.close()
+        await local_srv.wait_closed()
+
+
+async def send_connect_raw(host, port, target, payload=b"hello", expect=b"200"):
+    """Send CONNECT, drain headers, write payload, read echo. Returns (status, echo)."""
+    reader, writer = await asyncio.open_connection(host, port)
+    writer.write(b"CONNECT " + target + b" HTTP/1.1\r\nHost: " + target + b"\r\n\r\n")
+    await writer.drain()
+    status = await reader.readline()
+    if expect is not None and expect not in status:
+        writer.close()
+        await writer.wait_closed()
+        return status, b""
+    while True:
+        h = await reader.readline()
+        if not h or h in (b"\r\n", b"\n"):
+            break
+    writer.write(payload)
+    await writer.drain()
+    echo = await asyncio.wait_for(reader.read(len(payload)), timeout=5)
+    writer.close()
+    await writer.wait_closed()
+    return status, echo
+
+
+@pytest.mark.asyncio
+async def test_local_direct_connect_echo():
+    """白名单目标 CONNECT → 强制本机直连,payload 经 mock proxy 原样往返。
+
+    _try_tunnel 直连分支会向目标发 CONNECT 请求并期待 200,因此本地目标用
+    run_mock_proxy(它响应 CONNECT→200 后 echo 数据),而非裸 TCP echo。
+    """
+    echo_srv = await run_mock_proxy(HOST, LOCAL_TCP_ECHO_PORT)
+    router = _local_direct_router()
+    await router.start()
+    try:
+        target = f"{HOST}:{LOCAL_TCP_ECHO_PORT}".encode()
+        status, echo = await send_connect_raw(HOST, ROUTER_PORT, target, payload=b"ping-123")
+        assert b'200' in status, f"expected 200, got {status}"
+        assert echo == b"ping-123", f"expected echo, got {echo!r}"
+        counters = router.snapshot_counters()
+        assert counters['local_direct_hits'] >= 1
+        assert counters['local_direct_failures'] == 0
+    finally:
+        await router.stop()
+        echo_srv.close()
+        await echo_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_local_direct_connect_failure_502():
+    """白名单目标 CONNECT 直连失败 → 502,不绕远端 mock 代理。"""
+    hit = []
+    proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=hit)
+    router = _local_direct_router()
+    await router.start()
+    try:
+        # LOCAL_TCP_ECHO_PORT 无服务 → 直连失败。
+        target = f"{HOST}:{LOCAL_TCP_ECHO_PORT}".encode()
+        status, _ = await send_connect_raw(HOST, ROUTER_PORT, target, expect=None)
+        assert b'502' in status, f"expected 502, got {status}"
+        assert len(hit) == 0, "white-listed CONNECT failure must NOT fall back to upstream"
+        counters = router.snapshot_counters()
+        assert counters['local_direct_hits'] >= 1
+        assert counters['local_direct_failures'] >= 1
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
+
+def test_local_direct_norm_sensitivity():
+    """host 归一:尾点/大小写/IPv6 括号不影响命中。"""
+    r = _local_direct_router(local_direct_domains=['LOCAL.', '[::1]'])
+    assert r._host_in_local_direct('local') is True
+    assert r._host_in_local_direct('LOCAL') is True
+    assert r._host_in_local_direct('local.') is True
+    assert r._host_in_local_direct('::1') is True
+    assert r._host_in_local_direct('[::1]') is True
+    assert r._host_in_local_direct('other.example') is False
+    assert r._host_in_local_direct('') is False
+    assert r._host_in_local_direct(None) is False
+
+
+@pytest.mark.asyncio
+async def test_local_direct_independent_of_enable_local_racing():
+    """白名单强制直连不依赖 enable_local_racing(关闭时仍命中)。"""
+    local_srv = await run_local_http_server(HOST, LOCAL_HTTP_PORT)
+    router = _local_direct_router(enable_local_racing=False)
+    await router.start()
+    try:
+        url = f"http://{HOST}:{LOCAL_HTTP_PORT}/".encode()
+        body = await send_http_get(HOST, ROUTER_PORT, url=url)
+        assert b'local-response' in body, f"expected local body, got {body!r}"
+        counters = router.snapshot_counters()
+        assert counters['local_direct_hits'] >= 1
+    finally:
+        await router.stop()
+        local_srv.close()
+        await local_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_local_direct_timeout_relaxed():
+    """白名单直连用 local_direct_timeout_sec(10s)而非全局 3s:本地服务延迟
+    4s 仍成功,证明不被全局 http_read_timeout_sec 掐断。"""
+    delay = 4.0
+
+    async def slow_handle(reader, writer):
+        try:
+            while True:
+                h = await reader.readline()
+                if not h or h in (b"\r\n", b"\n"):
+                    break
+            await asyncio.sleep(delay)
+            body = b"slow-local-response"
+            writer.write(b"HTTP/1.1 200 OK\r\n")
+            writer.write(f"Content-Length: {len(body)}\r\n".encode())
+            writer.write(b"Content-Type: text/plain\r\n\r\n")
+            writer.write(body)
+            await writer.drain()
+            writer.close()
+        except Exception:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    slow_srv = await asyncio.start_server(slow_handle, host=HOST, port=LOCAL_TCP_ECHO_PORT)
+    router = _local_direct_router()  # local_direct_timeout_sec 默认 10s
+    await router.start()
+    try:
+        url = f"http://{HOST}:{LOCAL_TCP_ECHO_PORT}/".encode()
+        body = await send_http_get(HOST, ROUTER_PORT, url=url)
+        assert b'slow-local-response' in body, f"expected slow local body, got {body!r}"
+        assert router.request_counts.get('local', 0) > 0
+    finally:
+        await router.stop()
+        slow_srv.close()
+        await slow_srv.wait_closed()
