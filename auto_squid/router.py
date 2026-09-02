@@ -899,7 +899,7 @@ class Router:
                 await asyncio.sleep(FLUSH_INTERVAL)
                 try:
                     self._flush_to_db()
-                    self._prune_sticky()
+                    self.sticky._prune_sticky()
                     self.cluster.prune()
                     self.selector.prune_domain_quality()
                 except Exception:
@@ -1095,18 +1095,18 @@ class Router:
             "http_cache_hits": self.http_cache_hits,
             "http_cache_misses": self.http_cache_misses,
             "domain_cache_hits": self.domain_cache_hits,
-            "sticky_cache_hits": self.sticky_cache_hits,
-            "sticky_evictions": self.sticky_evictions,
-            "sticky_slow_probes": self.sticky_slow_probes,
-            "sticky_probes_fired": self.sticky_probes_fired,
-            "sticky_probe_evictions": self.sticky_probe_evictions,
+            "sticky_cache_hits": self.sticky.sticky_cache_hits,
+            "sticky_evictions": self.sticky.sticky_evictions,
+            "sticky_slow_probes": self.sticky.sticky_slow_probes,
+            "sticky_probes_fired": self.sticky.sticky_probes_fired,
+            "sticky_probe_evictions": self.sticky.sticky_probe_evictions,
             "racing_invocations": self.racing_invocations,
             "upstream_attempts": self.upstream_attempts,
-            "http_cache_entries": len(self._http_cache),
-            "http_cache_bytes": self._http_cache_bytes,
-            "http_cache_evictions": self.http_cache_evictions,
+            "http_cache_entries": len(self.httpcache._http_cache),
+            "http_cache_bytes": self.httpcache._http_cache_bytes,
+            "http_cache_evictions": self.httpcache.http_cache_evictions,
             "client_pool_size": len(self._client_pool),
-            "sticky_cache_size": len(self._sticky_cache),
+            "sticky_cache_size": len(self.sticky._sticky_cache),
             "request_counts": dict(self.request_counts),
             "attempted_counts": dict(self.attempted_counts),
             "proxy_quality": self.selector.get_quality(),
@@ -1114,39 +1114,39 @@ class Router:
             "max_in_flight": self.selector.max_in_flight,
             "proxy_concurrency_limits": self.selector.get_concurrency_limits(),
             "concurrency_limit_enabled": self.selector.concurrency_enabled,
-            "conn_pool_enabled": self.conn_pool_enabled,
-            "conn_pool_creates": self.conn_pool_creates,
-            "conn_pool_hits": self.conn_pool_hits,
-            "conn_pool_misses": self.conn_pool_misses,
-            "conn_pool_expired": self.conn_pool_expired,
-            "conn_pool_size": sum(len(v) for v in self._conn_pool.values()),
-            "conn_pool_target_prewarm": self.conn_pool_target_prewarm,
-            "conn_pool_refill_pause_minutes": self.conn_pool_refill_pause_minutes,
-            "conn_pool_refill_pause_activity_window": self.conn_pool_refill_pause_activity_window,
-            "conn_pool_refill_pause_min_requests": self.conn_pool_refill_pause_min_requests,
-            "conn_pool_idle_paused": self._conn_pool_idle(),
-            "target_pool_creates": self.target_pool_creates,
-            "target_pool_hits": self.target_pool_hits,
-            "target_pool_misses": self.target_pool_misses,
-            "target_pool_expired": self.target_pool_expired,
-            "cluster_pool_creates": self.cluster_pool_creates,
-            "cluster_pool_hits": self.cluster_pool_hits,
-            "cluster_pool_expired": self.cluster_pool_expired,
-            "cluster_pool_timing_miss": self.cluster_pool_timing_miss,
-            "cluster_pool_bucket_miss": self.cluster_pool_bucket_miss,
-            "cluster_pool_consumed_expired": self.cluster_pool_consumed_expired,
-            "cluster_pool_idle_timeout": self.cluster_pool_idle_timeout,
-            "target_pool_size": sum(len(v) for v in self._target_pool.values()),
-            "target_prewarm_dispatched": self.target_prewarm_dispatched,
-            "target_prewarm_success": self.target_prewarm_success,
-            "target_prewarm_failed": self.target_prewarm_failed,
+            "conn_pool_enabled": self.pools.conn_pool_enabled,
+            "conn_pool_creates": self.pools.conn_pool_creates,
+            "conn_pool_hits": self.pools.conn_pool_hits,
+            "conn_pool_misses": self.pools.conn_pool_misses,
+            "conn_pool_expired": self.pools.conn_pool_expired,
+            "conn_pool_size": sum(len(v) for v in self.pools._conn_pool.values()),
+            "conn_pool_target_prewarm": self.pools.conn_pool_target_prewarm,
+            "conn_pool_refill_pause_minutes": self.pools.conn_pool_refill_pause_minutes,
+            "conn_pool_refill_pause_activity_window": self.pools.conn_pool_refill_pause_activity_window,
+            "conn_pool_refill_pause_min_requests": self.pools.conn_pool_refill_pause_min_requests,
+            "conn_pool_idle_paused": self.pools._conn_pool_idle(),
+            "target_pool_creates": self.pools.target_pool_creates,
+            "target_pool_hits": self.pools.target_pool_hits,
+            "target_pool_misses": self.pools.target_pool_misses,
+            "target_pool_expired": self.pools.target_pool_expired,
+            "cluster_pool_creates": self.pools.cluster_pool_creates,
+            "cluster_pool_hits": self.pools.cluster_pool_hits,
+            "cluster_pool_expired": self.pools.cluster_pool_expired,
+            "cluster_pool_timing_miss": self.pools.cluster_pool_timing_miss,
+            "cluster_pool_bucket_miss": self.pools.cluster_pool_bucket_miss,
+            "cluster_pool_consumed_expired": self.pools.cluster_pool_consumed_expired,
+            "cluster_pool_idle_timeout": self.pools.cluster_pool_idle_timeout,
+            "target_pool_size": sum(len(v) for v in self.pools._target_pool.values()),
+            "target_prewarm_dispatched": self.pools.target_prewarm_dispatched,
+            "target_prewarm_success": self.pools.target_prewarm_success,
+            "target_prewarm_failed": self.pools.target_prewarm_failed,
             "cluster_predict": self.cluster.enabled,
             "cluster_windows_learned": self.cluster.cluster_windows_learned,
             "cluster_predictions": self.cluster.cluster_predictions,
             "cluster_prewarm_spawned": self.cluster.cluster_prewarm_spawned,
             "cluster_bucket_spawns": self.cluster.cluster_bucket_spawns,
             "cluster_graph_size": self.cluster.graph_size(),
-            "conn_pool_established_reuse": self.conn_pool_established_reuse,
+            "conn_pool_established_reuse": self.pools.conn_pool_established_reuse,
             "conn_pool_established_idle_timeout": self.pools.established_pool_idle_timeout,
             "conn_pool_prehandshake": self.pools.prehandshake_enabled,
             "established_pool_prehandshook": self.pools.established_pool_prehandshook,
@@ -1154,12 +1154,12 @@ class Router:
             "prehandshake_throttled_skips": self.pools.prehandshake_throttled_skips,
             "prehandshake_throttle_window_sec": self.pools.prehandshake_throttle_window_sec,
             "prehandshake_throttle_max_per_window": self.pools.prehandshake_throttle_max_per_window,
-            "established_pool_hits": self.established_pool_hits,
-            "established_pool_misses": self.established_pool_misses,
-            "established_pool_expired": self.established_pool_expired,
-            "established_pool_returned": self.established_pool_returned,
-            "established_pool_size": sum(len(v) for v in self._established_pool.values()),
-            "connect_new_conns": self.connect_new_conns,
+            "established_pool_hits": self.pools.established_pool_hits,
+            "established_pool_misses": self.pools.established_pool_misses,
+            "established_pool_expired": self.pools.established_pool_expired,
+            "established_pool_returned": self.pools.established_pool_returned,
+            "established_pool_size": sum(len(v) for v in self.pools._established_pool.values()),
+            "connect_new_conns": self.pools.connect_new_conns,
             "probes_sent": self.probes_sent,
             "probes_ok": self.probes_ok,
             "probes_skipped": self.probes_skipped,
@@ -1546,13 +1546,13 @@ class Router:
         (预测命中率 ~3%,预握手浪费面大,v1 不做)。未开启 established_reuse 或
         预握手失败时回退只建 TCP 进 target 池(现状,零行为变化)。
         """
-        if not (self.conn_pool_enabled and self.conn_pool_target_prewarm):
+        if not (self.pools.conn_pool_enabled and self.pools.conn_pool_target_prewarm):
             return
         if proxy_host is None:
             return  # 本机直连路径无"上游代理"可预热
-        self.target_prewarm_dispatched += 1
+        self.pools.target_prewarm_dispatched += 1
         logger.info("target prewarm SPAWN %s via %s:%s (dispatched=%d)",
-                    target, proxy_host, proxy_port, self.target_prewarm_dispatched)
+                    target, proxy_host, proxy_port, self.pools.target_prewarm_dispatched)
         task = asyncio.create_task(
             self.pools._target_pool_prewarm(proxy_host, proxy_port, target,
                                             source=source, proxy_auth=proxy_auth))
@@ -1575,7 +1575,7 @@ class Router:
         CONNECT-only、不拉业务数据,首个 CONNECT 200 即停;失败静默(不算失败
         观测,不喂熔断)。节流由 sticky 侧 cooldown 状态保证(sticky_probe_due)。
         """
-        if not self.stickiness_enabled or self.sticky.stickiness_probe_interval_sec <= 0:
+        if not self.sticky.stickiness_enabled or self.sticky.stickiness_probe_interval_sec <= 0:
             return
         if sticky_pid == 'local':
             return  # 直连路径无上游可探
@@ -1901,7 +1901,7 @@ class Router:
             return
         pid = result[0]
         proxy = None if pid == 'local' else self.proxy_store.get(pid)
-        if (self.conn_pool_established_reuse and proxy is not None and target):
+        if (self.pools.conn_pool_established_reuse and proxy is not None and target):
             await self._maybe_return_established(
                 result[2], result[1], proxy.host, proxy.port, target)
         else:
@@ -2060,32 +2060,32 @@ class Router:
                 # 1) target 半预连接池(按 proxy|target 键,只预连"到上游代理"的
                 #    TCP,未发 CONNECT,可安全复用);2) 第一阶段通用池;3) 新建。
                 # 取用成功即省掉"本机→上游"建连 TTFB。
-                if self.conn_pool_enabled:
+                if self.pools.conn_pool_enabled:
                     up_reader, up_writer = None, None
                     # 已握手隧道复用:优先取"已发 CONNECT 且收到 200"的连接,命中则
                     # 跳过下方 CONNECT 握手,直接返回(连接已处于可透传状态)。
-                    if self.conn_pool_established_reuse:
-                        up_reader, up_writer = self._established_pool_peek(proxy_host, proxy_port, target) or (None, None)
-                        if up_reader is not None and not await self._established_alive(up_reader, up_writer):
+                    if self.pools.conn_pool_established_reuse:
+                        up_reader, up_writer = self.pools._established_pool_peek(proxy_host, proxy_port, target) or (None, None)
+                        if up_reader is not None and not await self.pools._established_alive(up_reader, up_writer):
                             # 死/脏连接:丢弃(peek 已计 hits),不跳过多余 I/O、不影响下
                             # 一候选判定——回落后续池/新建。避免一个 tick 赢竞速。
-                            self.established_pool_expired += 1
+                            self.pools.established_pool_expired += 1
                             logger.info("established pool DEAD-ON-PROBE %s via %s:%s",
                                         target, proxy_host, proxy_port)
                             _discard_conn(up_writer)
                             up_reader = up_writer = None
-                    if up_reader is None and self.conn_pool_target_prewarm:
-                        up_reader, up_writer = self._target_pool_peek(proxy_host, proxy_port, target) or (None, None)
+                    if up_reader is None and self.pools.conn_pool_target_prewarm:
+                        up_reader, up_writer = self.pools._target_pool_peek(proxy_host, proxy_port, target) or (None, None)
                     if up_reader is None:
-                        pooled = self._conn_pool_peek(proxy_host, proxy_port)
+                        pooled = self.pools._conn_pool_peek(proxy_host, proxy_port)
                         if pooled is not None:
                             up_reader, up_writer = pooled
                     if up_reader is None:
-                        self.connect_new_conns += 1  # 观测:池未中需新建
+                        self.pools.connect_new_conns += 1  # 观测:池未中需新建
                         up_reader, up_writer = await asyncio.wait_for(
                             asyncio.open_connection(proxy_host, proxy_port), timeout=connect_timeout)
                 else:
-                    self.connect_new_conns += 1  # 观测:无池路径每次新建
+                    self.pools.connect_new_conns += 1  # 观测:无池路径每次新建
                     up_reader, up_writer = await asyncio.wait_for(
                         asyncio.open_connection(proxy_host, proxy_port), timeout=connect_timeout)
             else:
@@ -2104,7 +2104,7 @@ class Router:
             raise RuntimeError(f'connect to {proxy_host or target} timed out or failed: {e}') from e
         # 首字节计时:从 CONNECT 发出到收到 200。用于 EWMA 质量跟踪(竞速排序)。
         # 复用已握手隧道时无 CONNECT 往返,计时为 0(不做 EWMA 观测)。
-        reused_established = (self.conn_pool_established_reuse
+        reused_established = (self.pools.conn_pool_established_reuse
                               and proxy_host is not None
                               and up_reader is not None
                               and getattr(up_writer, '_established_reused', False))
@@ -2220,7 +2220,7 @@ class Router:
                                                _hb(reason or 'Authentication required'))
                     return
             # 有效客户端请求(认证通过):刷新 refill 空闲感知的活动时间戳,解除深夜暂停。
-            self._record_request_activity()
+            self.pools._record_request_activity()
             if first.upper().startswith('CONNECT'):
                 target = first.split(' ')[1]
                 await self._handle_connect(target, reader, writer, client_ip)
@@ -2358,10 +2358,10 @@ class Router:
         #    缓存读取前、转发前,覆盖所有后续 return 路径;写请求即便最终失败,
         #    后果也只是下次 GET 多回源一次。
         if method.upper() in _INVALIDATING_METHODS:
-            self._http_cache_invalidate(domain)
+            self.httpcache._http_cache_invalidate(domain)
 
         # 1) HTTP 响应缓存:GET 幂等响应直接命中,完全不经上游。
-        cached_entry = self._http_cache_get(method, url)
+        cached_entry = self.httpcache._http_cache_get(method, url)
         if cached_entry:
             # 翻转:命中响应缓存,把入口记的 miss 撤回、改记 hit。
             self.http_cache_misses -= 1
@@ -2391,10 +2391,10 @@ class Router:
         #      自行竞速,避免慢上游下 waiter 挂住连接导致 fd 堆积(压测观测
         #      rate 场景 fd_peak 冲到 300+)。放弃后该 Future 仍由首个请求在
         #      finally 中 resolve,waiter 不再 await,无副作用。
-        agg_key = self._http_cache_key(method, url)
+        agg_key = self.httpcache._http_cache_key(method, url)
         agg_fut = None
         if method == 'GET':
-            existing = self._inflight_futures.get(agg_key)
+            existing = self.httpcache._inflight_futures.get(agg_key)
             if existing is not None:
                 try:
                     logger.debug("coalescing %s %s (in-flight)", method, url)
@@ -2410,7 +2410,7 @@ class Router:
                     existing = None
             if existing is None:
                 agg_fut = asyncio.get_running_loop().create_future()
-                self._inflight_futures[agg_key] = agg_fut
+                self.httpcache._inflight_futures[agg_key] = agg_fut
         try:
             await self._forward_upstream(writer, method, url, hdrs, body, domain, client_ip)
         finally:
@@ -2418,11 +2418,11 @@ class Router:
             # waiter 自行竞速),并从在途表移除。若上方缓存/聚合命中则本请求不
             # 持有 Future,此为空操作。非 GET 永远不进聚合表,同样为空操作。
             if agg_fut is not None:
-                self._inflight_futures.pop(agg_key, None)
+                self.httpcache._inflight_futures.pop(agg_key, None)
                 if not agg_fut.done():
                     # 从响应缓存取刚写入的条目作为聚合结果(内容可能超
                     # STREAM_CACHE_LIMIT 未入缓存 → 无条目 → 回 None,waiter 自行竞速)。
-                    entry = self._http_cache_get(method, url)
+                    entry = self.httpcache._http_cache_get(method, url)
                     if entry is not None:
                         agg_fut.set_result((entry['status_code'], entry['reason_phrase'],
                                             entry['headers'], entry['content']))
@@ -2499,14 +2499,14 @@ class Router:
         # 不计——竞速命中率只统计"未竞速即命中"的单发。
         if instantiated is None:
             if sticky:
-                self.sticky_cache_hits += 1
+                self.sticky.sticky_cache_hits += 1
             else:
                 self.domain_cache_hits += 1
         try:
             buffered = await self._stream_upstream_response(writer, resp, method, url)
             if buffered is not None and resp.status_code in CACHEABLE_STATUS:
-                self._http_cache_set(method, url, resp.status_code, resp.reason_phrase,
-                                     list(resp.headers.multi_items()), buffered)
+                self.httpcache._http_cache_set(method, url, resp.status_code, resp.reason_phrase,
+                                                list(resp.headers.multi_items()), buffered)
             return resp.status_code
         finally:
             # 无论 _stream_upstream_response 是否抛 BaseException,都释放流式 resp 及其
@@ -2534,8 +2534,8 @@ class Router:
             self._observe_single_send(client_ip, domain, url, 'local', _perf_t0)
             buffered = await self._stream_upstream_response(writer, resp, method, url)
             if buffered is not None and resp.status_code in CACHEABLE_STATUS:
-                self._http_cache_set(method, url, resp.status_code, resp.reason_phrase,
-                                     list(resp.headers.multi_items()), buffered)
+                self.httpcache._http_cache_set(method, url, resp.status_code, resp.reason_phrase,
+                                                list(resp.headers.multi_items()), buffered)
             return resp.status_code
         except Exception as e:
             # local 直连失败:不 record_failure(pid=='local' 既有约定,见 _try_http),
@@ -2568,26 +2568,26 @@ class Router:
         #    返回 5xx 同样驱逐(A2:响应已流式发出无法重试,下一请求竞速换新)。
         #    非 5xx 成功则滑动 TTL 并累加命中次数(B2)。
         skip_domain_cache = False
-        if domain and self.stickiness_enabled:
-            sticky_pid = self._get_sticky_proxy(client_ip, domain)
+        if domain and self.sticky.stickiness_enabled:
+            sticky_pid = self.sticky._get_sticky_proxy(client_ip, domain)
             if sticky_pid:
                 try:
                     status = await self._forward_single(
                         writer, method, url, hdrs, body, domain, sticky_pid, sticky=True,
                         client_ip=client_ip)
                     if status is not None and status >= 500:
-                        self._evict_sticky(client_ip, domain)
+                        self.sticky._evict_sticky(client_ip, domain)
                     else:
-                        self._bump_sticky(client_ip, domain, sticky_pid)
+                        self.sticky._bump_sticky(client_ip, domain, sticky_pid)
                         # 杠杆A:粘性命中后台探路——竞争代理显著更快则驱逐(不阻塞单发)。
                         self._spawn_sticky_probe(client_ip, domain, sticky_pid)
                     return
                 except Exception:
                     logger.debug("sticky proxy %s failed for %s", sticky_pid, domain)
-                    self._evict_sticky(client_ip, domain)
-            elif self._sticky_recheck_due(client_ip, domain):
+                    self.sticky._evict_sticky(client_ip, domain)
+            elif self.sticky._sticky_recheck_due(client_ip, domain):
                 # B2:探路重评估到期——驱逐并跳过域名缓存,直接竞速换新赢家。
-                self._evict_sticky(client_ip, domain)
+                self.sticky._evict_sticky(client_ip, domain)
                 skip_domain_cache = True
 
         # 2) 域名缓存:用上次胜出的代理单发请求(不重复更新 meta——_try_http
@@ -2601,7 +2601,7 @@ class Router:
                     result = await self._forward_single(
                         writer, method, url, hdrs, body, domain, cached_pid,
                         client_ip=client_ip)
-                    self._record_sticky(client_ip, domain, cached_pid)
+                    self.sticky._record_sticky(client_ip, domain, cached_pid)
                     return result
                 except Exception:
                     logger.debug("cached proxy %s failed for %s", cached_pid, domain)
@@ -2648,7 +2648,7 @@ class Router:
             # 覆写 _meta_cache;domain 在上方已算好(同一 urlparse)。
             self._record_win_meta(domain, pid)
             if domain:
-                self._record_sticky(client_ip, domain, pid)
+                self.sticky._record_sticky(client_ip, domain, pid)
             return await self._forward_single(writer, method, url, hdrs, body, domain, instantiated=(pid, resp))
 
         logger.error("all proxies failed for HTTP request")
@@ -2700,7 +2700,7 @@ class Router:
         try:
             async for chunk in resp.aiter_raw():
                 if buffering:
-                    if len(buffered) + len(chunk) <= self._stream_cache_limit:
+                    if len(buffered) + len(chunk) <= self.httpcache._stream_cache_limit:
                         buffered.extend(chunk)
                     else:
                         # 超过缓存上限:放弃缓存,丢弃已缓冲的部分省内存。
@@ -2830,7 +2830,7 @@ class Router:
         否则关闭连接并返回 False。_relay_tunnel 与 _cleanup_tunnel_result 共用,
         保证"正常隧道结束"与"竞速败者"同一套归还语义。
         """
-        can_reuse = (self.conn_pool_enabled and self.conn_pool_established_reuse
+        can_reuse = (self.pools.conn_pool_enabled and self.pools.conn_pool_established_reuse
                      and proxy_host is not None and target is not None
                      and not up_writer.is_closing())
         # 严格验证:上游残留缓冲 → 连接已脏,不归还(宁可不复用也不污染)。
@@ -2843,10 +2843,10 @@ class Router:
             # 预算/cap 检查:established 池计入全局 conn_pool_total(与另两池同口径),
             # 单键再受 _ESTABLISHED_KEY_CAP 上限。超限则关闭不复用——宁可这次不省
             # 建连也不让 fd 无界增长。三池快照统一用 pools._total_idle(见 #14)。
-            if self.pools._total_idle() >= self.conn_pool_total \
-                    or len(self._established_pool.get(key, [])) >= _ESTABLISHED_KEY_CAP:
+            if self.pools._total_idle() >= self.pools.conn_pool_total \
+                    or len(self.pools._established_pool.get(key, [])) >= _ESTABLISHED_KEY_CAP:
                 logger.info("established pool SKIP-RETURN %s via %s:%s (over budget/cap, returned=%d)",
-                            target, proxy_host, proxy_port, self.established_pool_returned)
+                            target, proxy_host, proxy_port, self.pools.established_pool_returned)
                 can_reuse = False
         if can_reuse:
             self._set_pool_keepalive(up_writer)
@@ -2854,10 +2854,10 @@ class Router:
             # 打 established 标签:过期清理按此选独立 idle 超时(established 库存
             # 复访频率低,统一用通用池超时会在复访前被清——见 pools._pool_prune)。
             up_writer._established_pooled = True
-            self._established_pool.setdefault(key, []).append((up_reader, up_writer))
-            self.established_pool_returned += 1
+            self.pools._established_pool.setdefault(key, []).append((up_reader, up_writer))
+            self.pools.established_pool_returned += 1
             logger.info("established pool RETURN %s via %s:%s (returned=%d)",
-                        target, proxy_host, proxy_port, self.established_pool_returned)
+                        target, proxy_host, proxy_port, self.pools.established_pool_returned)
         else:
             try:
                 up_writer.close()
@@ -2923,8 +2923,8 @@ class Router:
         #    粘性取用也须满足策略——命中策略但 pid 不在子集内 → 视为 miss
         #    驱逐并回落(防旧粘性绕过新策略)。
         skip_domain_cache = False
-        if self.stickiness_enabled:
-            sticky_pid = self._get_sticky_proxy(client_ip, target)
+        if self.sticky.stickiness_enabled:
+            sticky_pid = self.sticky._get_sticky_proxy(client_ip, target)
             if sticky_pid:
                 proxy = None if sticky_pid == 'local' else self.proxy_store.get(sticky_pid)
                 try:
@@ -2947,8 +2947,8 @@ class Router:
                     # 关闭时学习全局共现图;开启新窗口时预测同簇 co-target 预建)。
                     self.cluster.observe(client_ip, target, sticky_pid)
                     logger.debug("proxy %s sticky hit CONNECT %s", pid, target)
-                    self.sticky_cache_hits += 1
-                    self._bump_sticky(client_ip, target, sticky_pid)
+                    self.sticky.sticky_cache_hits += 1
+                    self.sticky._bump_sticky(client_ip, target, sticky_pid)
                     # 杠杆A:粘性命中后台探路——竞争代理显著更快则驱逐(不阻塞单发)。
                     self._spawn_sticky_probe(client_ip, target, sticky_pid)
                     await self._connect_established(client_writer, up_writer)
@@ -2963,10 +2963,10 @@ class Router:
                     self._observe_single_send_failure(client_ip, target, target, sticky_pid,
                                                       _perf_t0, e)
                     logger.debug("sticky proxy %s failed CONNECT %s", sticky_pid, target)
-                    self._evict_sticky(client_ip, target)
-            elif self._sticky_recheck_due(client_ip, target):
+                    self.sticky._evict_sticky(client_ip, target)
+            elif self.sticky._sticky_recheck_due(client_ip, target):
                 # B2:探路重评估到期——驱逐并跳过域名缓存,直接竞速换新赢家。
-                self._evict_sticky(client_ip, target)
+                self.sticky._evict_sticky(client_ip, target)
                 skip_domain_cache = True
 
         # 2) 域名缓存命中:用上次胜出的代理单发隧道(只记尝试统计),失败回退竞速。
@@ -2991,7 +2991,7 @@ class Router:
                 # 请求簇预测预热:域缓存命中即 target 高频,同 sticky 分支记入客户端窗口。
                 self.cluster.observe(client_ip, target, cached_pid)
                 logger.debug("proxy %s cache hit CONNECT %s", pid, target)
-                self._record_sticky(client_ip, target, cached_pid)
+                self.sticky._record_sticky(client_ip, target, cached_pid)
                 await self._connect_established(client_writer, up_writer)
                 await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer,
                                          proxy.host if proxy else None,
@@ -3049,7 +3049,7 @@ class Router:
             # 仅赢家更新域名缓存 meta 与会话粘性表(用 target 作 domain key);
             # 败者只记了尝试统计。
             self._record_win_meta(target, pid)
-            self._record_sticky(client_ip, target, pid)
+            self.sticky._record_sticky(client_ip, target, pid)
             # CONNECT 目标半预连接(P2):竞速胜出说明该 target 高频且最优代理已
             # 确定,后台为 (proxy, target) 预热下一条到上游代理的 TCP(不阻塞本
             # 请求)。注意 pid 可能是 'local'(enable_local_racing 直连),此时无
