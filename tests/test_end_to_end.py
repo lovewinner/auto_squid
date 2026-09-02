@@ -2235,7 +2235,7 @@ class TestStagger:
         async def fast(pid, proxy_url, method, url, headers, body):
             launched.append(pid)
             return pid, method, url, object(), object()
-        r._make_race_task = lambda place, method, url, headers, body: \
+        r._make_race_task = lambda place, method, url, headers, body, domain=None: \
             asyncio.create_task(fast(place, None, method, url, headers, body))
         win = await r._race_staggered(['p1', 'p2', 'p3'], initial=1, interval=0.01)
         assert win[0] == 'p1'
@@ -5836,7 +5836,7 @@ class TestRaceStaggeredCleanupOnAllFail:
             # 被 _is_acceptable_win 拒绝 → 留在 completed、占用连接(candidate 的形状)。
             return place, method, url, FakeResp5xx(), object()
 
-        r._make_race_task = lambda place, method, url, headers, body: \
+        r._make_race_task = lambda place, method, url, headers, body, domain=None: \
             asyncio.create_task(fivexx(place, method, url, headers, body))
 
         async def cleanup_cb(result):
@@ -5878,7 +5878,7 @@ class TestRaceStaggeredCleanupOnAllFail:
                 return 'ok', method, url, object(), object()
             raise RuntimeError("dead")
 
-        r._make_race_task = lambda place, method, url, headers, body: \
+        r._make_race_task = lambda place, method, url, headers, body, domain=None: \
             asyncio.create_task(ok_and_dead(place, method, url, headers, body))
 
         def spy_cleanup(losers, cleanup):

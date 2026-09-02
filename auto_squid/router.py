@@ -636,11 +636,25 @@ class Router:
         self._stats_cache = {}
         for domain, pid, wins in stats_rows:
             self._stats_cache.setdefault(domain, {})[pid] = wins
-        self._meta_cache = {
-            domain: {"default_proxy": dp, "updated_at": ua,
-                     "ref_ewma": (float(ewma) if ewma is not None else None)}
-            for domain, dp, ua, ewma in meta_rows
-        }
+        # DB 冷启动载入:updated_at 为 ISO 字符串,解析一次换算成单调时钟浮点
+        # (等价于 _record_win_meta 写入的 _updated_mono),此后热路径免解析。
+        for domain, dp, ua, ewma in meta_rows:
+            mono = None
+            try:
+                dt = datetime.fromisoformat(ua)
+                # ISO(UTC) → 与 time.monotonic 对齐的单调基线:用墙上时钟差倒推。
+                # 单调时钟重启清零,此处取"距现在秒数"等价于 _get_fresh_proxy 的
+                # (now - dt) 判定;用 time.time() 与单调时钟的相对关系换算即可。
+                age = (datetime.now(timezone.utc) - dt).total_seconds()
+                mono = time.monotonic() - age
+            except Exception:
+                pass
+            self._meta_cache[domain] = {
+                "default_proxy": dp,
+                "updated_at": ua,
+                "_updated_mono": mono,
+                "ref_ewma": (float(ewma) if ewma is not None else None),
+            }
 
     def _record_attempt(self, domain: str, pid: str):
         """记录一次"代理 pid 对域名 domain 的尝试"(竞速扇出统计)。
@@ -783,6 +797,10 @@ class Router:
         self._meta_cache[domain] = {
             "default_proxy": pid,
             "updated_at": self._now_utc(),
+            # 单调时钟 TTL 判定用的浮点时间戳:_get_fresh_proxy 用它判断
+            # cache_ttl 是否过期,避免每次检查都 fromisoformat + tz 计算。
+            # updated_at(ISO)保留给 API 展示与 DB 持久化,两者不冲突。
+            "_updated_mono": time.monotonic(),
             "ref_ewma": self._ref_ewma_for(domain, pid),
         }
         if self.adaptive_ttl_enabled:
@@ -1006,15 +1024,18 @@ class Router:
         """读取全量域名元数据 {domain: {default_proxy, updated_at}}。
 
         读内存镜像(权威源),供管理 API / 仪表盘使用。无需触 DB/锁。
+        剔除内部字段(_updated_mono 单调时钟 TTL 判定专用,不外露)。
         """
-        return {d: dict(m) for d, m in self._meta_cache.items()}
+        return {d: {k: v for k, v in m.items() if k != '_updated_mono'}
+                for d, m in self._meta_cache.items()}
 
     def get_domain_meta_enriched(self) -> dict[str, dict]:
         """读取域名元数据 + 自适应 TTL 状态(P2 验收:/domains/meta 展示
         ttl/expires_at/switch_count)。仅自适应 TTL 开启时附加字段,否则与
         get_domain_meta_from_db 同构(兼容旧消费方)。
         """
-        out = {d: dict(m) for d, m in self._meta_cache.items()}
+        out = {d: {k: v for k, v in m.items() if k != '_updated_mono'}
+               for d, m in self._meta_cache.items()}
         if self.adaptive_ttl_enabled:
             now = datetime.now(timezone.utc)
             for d, m in out.items():
@@ -1326,8 +1347,15 @@ class Router:
                 self._domain_ttl_cache[domain] = self.adaptive_ttl_min
                 self.domain_ttl_resets += 1
             return None
-        updated_at_str = entry["updated_at"]
         ttl = self._domain_ttl(domain)
+        # 优先用单调时钟浮点时间戳判定 TTL(热路径:无字符串解析/时区计算)。
+        # 仅 DB 冷启动载入的条目缺 _updated_mono,回退 ISO 解析(启动期一次)。
+        mono = entry.get("_updated_mono")
+        if mono is not None:
+            if time.monotonic() - mono < ttl:
+                return pid
+            return None
+        updated_at_str = entry["updated_at"]
         try:
             dt = datetime.fromisoformat(updated_at_str)
             if (datetime.now(timezone.utc) - dt).total_seconds() < ttl:
@@ -1654,7 +1682,8 @@ class Router:
     async def _race_staggered(self, places, cleanup=None,
                               initial: int = 1, interval: float = 0.25,
                               method: str = "", url: str = "",
-                              headers: Optional[dict] = None, body: Optional[bytes] = None) -> Optional[Any]:
+                              headers: Optional[dict] = None, body: Optional[bytes] = None,
+                              domain: Optional[str] = None) -> Optional[Any]:
         """错峰启动竞速(RFC 8305 §5):先发最优 initial 个,间隔 interval 补发,首字节成功即取消其余。
 
         与 _race 的差异只在**候选的启动时机**:
@@ -1684,7 +1713,7 @@ class Router:
         initial = max(1, min(initial, len(places)))
         running: set = set()
         for p in places[:initial]:
-            running.add(self._make_race_task(p, method, url, headers, body))
+            running.add(self._make_race_task(p, method, url, headers, body, domain))
         # 未发候选:后补发的先 pop 先发,故反转成"从最优端 pop"。
         unlaunched = places[initial:]
         unlaunched.reverse()
@@ -1723,7 +1752,7 @@ class Router:
                 return winner
             # 无胜者(完成候选均失败/被取消):定时补发下一个候选(若有)。
             if unlaunched:
-                running.add(self._make_race_task(unlaunched.pop(), method, url, headers, body))
+                running.add(self._make_race_task(unlaunched.pop(), method, url, headers, body, domain))
         # 全部候选耗尽仍无胜者:completed 里那些"拿到 5xx 响应头但被判非胜"的任务
         # 持有流式 resp(占 httpx 连接池连接),必须下放清理,否则反复全失败累积到
         # 连接池耗尽。winner 分支已在上面处理了 completed(经 losers),_race 的
@@ -1769,13 +1798,16 @@ class Router:
             pass
 
     def _make_race_task(self, place, method: str, url: str, headers: dict,
-                        body: Optional[bytes]) -> asyncio.Task:
+                        body: Optional[bytes], domain: Optional[str] = None) -> asyncio.Task:
         """把一个候选占位(pid 或 (pid, target))惰性创建为竞速 task。
 
         统一工厂供 _race_staggered 补发候选:place 为字符串 pid 时建 HTTP task
         (_try_http,经上游代理转发;pid='local' 直连);place 为 (pid, target) 时建
         CONNECT 隧道 task(_try_tunnel,经上游 CONNECT)。延迟到调用时才 create_task,
         保证"未发候选不启动"——这是错峰与 _race 同时全发的本质区别。
+
+        domain: HTTP 路径已由调用方算好的域名 key,透传 _try_http 避免重复
+        urlparse;CONNECT 路径用 target 作 key,忽略此参。
         """
         if isinstance(place, tuple):
             pid, target = place
@@ -1788,9 +1820,9 @@ class Router:
         pid = place
         proxy = self.proxy_store.get(pid)
         if proxy is None:
-            return asyncio.create_task(self._try_http('local', None, method, url, headers, body))
+            return asyncio.create_task(self._try_http('local', None, method, url, headers, body, domain))
         return asyncio.create_task(
-            self._try_http(pid, self._build_proxy_url(proxy), method, url, headers, body))
+            self._try_http(pid, self.proxy_store.proxy_url(pid), method, url, headers, body, domain))
 
     @staticmethod
     async def _cleanup_http_result(result):
@@ -1884,22 +1916,7 @@ class Router:
 
     # ── HTTP 请求 ──────────────────────────────────────────────
 
-    @staticmethod
-    def _build_proxy_url(proxy) -> Optional[str]:
-        """构造 httpx 代理 URL:`http://[user:pw@]host:port`。
-
-        有上游认证时把凭据 URL 编码后嵌入(凭据含特殊字符也安全)。
-        proxy 为 None 返回 None(表示不走上游,如本机竞速)。
-        """
-        if not proxy:
-            return None
-        if proxy.auth:
-            user = urllib.parse.quote(proxy.auth['username'], safe='')
-            pw = urllib.parse.quote(proxy.auth['password'], safe='')
-            return f"http://{user}:{pw}@{proxy.host}:{proxy.port}"
-        return f"http://{proxy.host}:{proxy.port}"
-
-    async def _try_http(self, pid: str, proxy_url: Optional[str], method: str, url: str, headers: dict, body: Optional[bytes]):
+    async def _try_http(self, pid: str, proxy_url: Optional[str], method: str, url: str, headers: dict, body: Optional[bytes], domain: Optional[str] = None):
         """经某上游代理尝试一次 HTTP 请求,作为竞速的一个候选(流式)。
 
         从连接池取长驻 client,以 stream=True 发送——收到响应头即返回(resp
@@ -1907,6 +1924,11 @@ class Router:
         即判其获胜,其余候选随即取消、其流式 resp 被 aclose(见 _cleanup),
         不再下载整包。获胜者的 body 由调用方在 _stream_upstream_response 中
         边收边转发,client 用完归还连接池(不关闭)。
+
+        domain: 已由调用方(handle_client→_handle_http_request)算好的域名 key,
+        竞速多候选共用同一 URL → 传入避免每个候选重复 urlparse;为 None 时
+        此处回退解析(单发等路径),保证与 _record_attempt / _record_win_meta
+        用同一解析表达式,域名级 EWMA 的 key 与 meta/sticky 取用 key 完全一致。
 
         成功返回 (pid, method, url, resp, client);失败(BaseException,含
         CancelledError)关闭 resp 并向上抛出,让 _race 的清理逻辑处理。
@@ -1921,9 +1943,9 @@ class Router:
             self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
             self.upstream_attempts += 1  # 聚合竞速扇出总数(供 /metrics 算放大率)
             # 首字节计时:从发起到收到响应头。用于 EWMA 质量跟踪(竞速排序)。
-            # domain 与 _record_attempt / _record_win_meta 用同一解析表达式,
-            # 保证域名级 EWMA 的 key 与 meta/sticky 取用 key 完全一致。
-            domain = urllib.parse.urlparse(url).hostname or url
+            # 调用方通常已算出 domain(见 docstring),仅兜底时才 urlparse。
+            if domain is None:
+                domain = urllib.parse.urlparse(url).hostname or url
             t0 = time.perf_counter()
             resp = await client.send(
                 client.build_request(method, url, headers=headers, content=body),
@@ -2212,7 +2234,7 @@ class Router:
         (可信)、有观测时按域名排(更可信)——排序可信度只由全局质量决定,域名
         维度不改变翻倍语义(域名无观测不是"排序不可信",恰是回退到全局排序)。
         """
-        if not self.selector.get_quality():
+        if not self.selector.has_quality():
             return min(self.max_retries, max(2, self.stagger_initial))
         return self.stagger_initial
 
@@ -2387,7 +2409,7 @@ class Router:
                 # 慢单发采样:测"发起到首字节"耗时。失败抛出让调用方回退(不观测)。
                 _perf_t0 = time.perf_counter()
                 _pid, method, url, resp, client = await self._try_http(
-                    pid, self._build_proxy_url(proxy), method, url, hdrs, body)
+                    pid, self.proxy_store.proxy_url(pid), method, url, hdrs, body, domain)
                 self._observe_single_send(client_ip, domain, url, pid, _perf_t0)
             except Exception as e:
                 # 慢单发失败采样:建连/首字节失败超阈值也记带 IP 的日志(建连失败型
@@ -2488,11 +2510,11 @@ class Router:
             winner_resp = await self._race_staggered(
                 initial_places + remaining, cleanup=self._cleanup_http_result,
                 initial=len(initial_places), interval=self.stagger_interval,
-                method=method, url=url, headers=hdrs, body=body)
+                method=method, url=url, headers=hdrs, body=body, domain=domain)
         else:
             # 非错峰(_race):需真 task,占位经 _make_race_task 急切创建。
             places = self._build_racing_tasks_http(proxies, domain)
-            tasks = {self._make_race_task(p, method, url, hdrs, body) for p in places}
+            tasks = {self._make_race_task(p, method, url, hdrs, body, domain) for p in places}
             winner_resp = await self._race(tasks, cleanup=self._cleanup_http_result)
 
             # 首批全失败且代理数超过 max_retries:对剩余代理再竞速兜底。
@@ -2500,7 +2522,7 @@ class Router:
                 self.racing_invocations += 1
                 remaining = proxies[self.max_retries:]
                 places = self._build_racing_tasks_http(remaining)
-                tasks = {self._make_race_task(p, method, url, hdrs, body) for p in places}
+                tasks = {self._make_race_task(p, method, url, hdrs, body, domain) for p in places}
                 winner_resp = await self._race(tasks, cleanup=self._cleanup_http_result)
 
         if winner_resp:

@@ -119,6 +119,14 @@ class ProxySelector:
         """返回质量表快照(供 /metrics / 仪表盘展示,读内存无锁)。"""
         return {pid: dict(q) for pid, q in self._quality.items()}
 
+    def has_quality(self) -> bool:
+        """是否已有任何代理质量观测(冷启动判定用,无需整表快照拷贝)。
+
+        _stagger_initial 的冷启动翻倍只需知道"空/非空",get_quality 返回整表
+        dict 拷贝,竞速热路径没必要为一次布尔判断付出 O(n) 拷贝。
+        """
+        return bool(self._quality)
+
     # ── in-flight 计数(P2C / least-active 选批依据)──────────────
 
     def _inflight_start(self, pid: str):
