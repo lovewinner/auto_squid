@@ -6551,3 +6551,103 @@ class TestDispatchSingleUnified:
             await r.stop()
             fast_srv.close()
             await fast_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_connect_sticky_failure_marks_immediate_degrade(self):
+        """CONNECT 粘性单发失败 → 即时降级门控(不再被域名缓存单发重复钉死)。
+
+        锁定 _dispatch_single 粘性 catch 调 _degrade_send_proxy:被钉代理失败后立即可
+        域名缓存再次单发(事故根因),而是被标记,下一请求回落到竞速。
+        """
+        store = ProxyStore()
+        store.add(ProxyInfo(id='slow', host=HOST, port=31395))
+        r = Router(store, listen_host=HOST, listen_port=10811,
+                   max_retries=2, enable_http_cache=False, stickiness_enabled=True,
+                   db_path=tempfile.mktemp(suffix='.db'))
+        target = "immediate-degrade.connect:443"
+        # 预置粘性 + 域名缓存都钉 slow,使单发命中。
+        r.sticky._sticky_cache["_test_ip|" + target] = {"proxy_id": 'slow', "updated_at": r._now_utc()}
+        r._meta_cache[target] = {"default_proxy": 'slow', "updated_at": "2026-01-01T00:00:00+00:00", "_updated_mono": time.monotonic(), "ref_ewma": None}
+        r.selector.record_failure('slow')  # consec_fail=1,不足以触发统计降级(阈值2)
+        # mock 单发抛超时(RuntimeError,与 _try_tunnel 兔子转译一致)。
+        r._connect_single_send = None  # type: ignore[method-assign]
+
+        async def fail_send(*, pid, target, domain, client_ip=""):
+            raise RuntimeError(f'connect to slow timed out: {pid}')
+
+        r._connect_single_send = fail_send
+
+        async def fake_race(*args, **kwargs):
+            return None
+
+        srv = await run_mock_proxy(HOST, 31395)
+        r._race = fake_race
+        await r.start()
+        try:
+            # 首次触发:粘性单发失败 → 驱逐 + 即时降级标记。
+            try:
+                await r._dispatch_single(None, '', '', None, None, target, proto='tunnel',
+                                         target=target, client_reader=object(),
+                                         client_writer=object(), client_ip="_test_ip")
+            except Exception:
+                pass
+            assert 'slow' in r._immediate_degraded
+            assert 'slow' in r._degraded_single_send
+            assert r.single_send_degrades >= 1
+            # 下一请求:域名缓存也应跳过 slow(门控),不再次单发。
+            assert r._get_fresh_proxy(target) is None
+            # 竞速赢家接管后清除标记(既有机制,纯即时集与展示集都清)。
+            r._record_win_meta(target, 'slow')
+            assert 'slow' not in r._immediate_degraded
+            assert 'slow' not in r._degraded_single_send
+        finally:
+            await r.stop()
+            srv.close()
+            await srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_domain_cache_skips_immediately_degraded(self):
+        """_get_fresh_proxy 对「即时降级」标记的代理直接 miss,回落到竞速。"""
+        store = ProxyStore()
+        store.add(ProxyInfo(id='slow', host=HOST, port=31396))
+        r = Router(store, listen_host=HOST, listen_port=10812,
+                   max_retries=2, enable_http_cache=False,
+                   db_path=tempfile.mktemp(suffix='.db'))
+        r._immediate_degraded.add('slow')
+        r._meta_cache["x.test"] = {"default_proxy": 'slow', "updated_at": "2026-01-01T00:00:00+00:00", "_updated_mono": time.monotonic(), "ref_ewma": None}
+        assert r._get_fresh_proxy("x.test") is None
+
+    @pytest.mark.asyncio
+    async def test_http_sticky_failure_marks_immediate_degrade(self):
+        """HTTP 粘性单发失败同样即时降级(与 CONNECT 对称,覆盖 _forward_single 异常)。"""
+        store = ProxyStore()
+        store.add(ProxyInfo(id='slow', host=HOST, port=31397))
+        r = Router(store, listen_host=HOST, listen_port=10813,
+                   max_retries=2, enable_http_cache=False, stickiness_enabled=True,
+                   db_path=tempfile.mktemp(suffix='.db'))
+        domain = "x.test"
+        r.sticky._sticky_cache["_test_ip|" + domain] = {"proxy_id": 'slow', "updated_at": r._now_utc()}
+        r._meta_cache[domain] = {"default_proxy": 'slow', "updated_at": "2026-01-01T00:00:00+00:00", "_updated_mono": time.monotonic(), "ref_ewma": None}
+        r.selector.record_failure('slow')
+
+        async def fail_single(*args, **kwargs):
+            raise RuntimeError('read timed out')
+
+        async def fake_race(*args, **kwargs):
+            return None
+
+        r._forward_single = fail_single
+        r._race = fake_race
+        await r.start()
+        try:
+            try:
+                await r._dispatch_single(None, 'GET', f'http://{domain}/', {}, None, domain,
+                                         proto='http', client_ip="_test_ip")
+            except Exception:
+                pass
+            assert 'slow' in r._immediate_degraded
+            assert 'slow' in r._degraded_single_send
+            assert r.single_send_degrades >= 1
+            assert r._get_fresh_proxy(domain) is None
+        finally:
+            await r.stop()
