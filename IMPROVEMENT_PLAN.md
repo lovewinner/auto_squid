@@ -156,7 +156,7 @@ def _single_send_degraded(self, domain, pid, ref_ewma):
 | `/domains/meta` | 域名级完整统计（上述所有） | [x] 每域名增 `proxy_metrics`（含 TTFB/TTLB 分位、成功率、错误分类、吞吐） |
 | `/metrics` | 暴露分位数、成功率、吞吐、错误分类计数器 | [x] `/metrics` 增 `proxy_metrics`；新增 `/metrics/per-destination` 提供 (域名,代理) 粒度 |
 
-> 计划中的 `/quality` 原位扩字段改为**新增 `/quality/meta` 端点**,避免破坏既有
+> 计划中的 `/quality` 原位扩字段改为**新增 `/quality/meta` 端点',避免破坏既有
 > `/quality` 消费方（其返回 `{pid: {ewma_ttfb, obs}}` 结构未变）。`test_routing.py`
 > 每代理排序行同步展示 TTFB/TTLB 分位、成功率、错误分类、吞吐。
 
@@ -183,3 +183,84 @@ def _single_send_degraded(self, domain, pid, ref_ewma):
 > 下一步（可选）: 线上重启加载新代码后,用 `/quality/meta` 与
 > `/metrics/per-destination` 对 `github.com:443` 实测,确认 TTFB/TTLB/成功率/错误
 > 分类采集到位;随后据此推进 Phase 2 加权排序与 Phase 1.4 协议/复用标记采集。
+
+---
+
+## 六、补充完善建议（审阅汇总）
+
+为帮助后续 Phase 2/3 设计与上线，这里把审阅建议按主题给出，可直接作为 PR checklist：
+
+1) 指标与统计方法（测量质量与鲁棒性）
+- 建议接入 t-digest 或 HDRHistogram 来计算 p50/p95/p99，比分片环形缓冲更稳健且内存友好，尤其对 p99 有明显好处。
+- 为每个分位数输出观测样本数与置信度标识（如 obs < N 标注低置信度），避免低样本噪声驱动路由决策。
+- 对 success_rate 使用贝叶斯平滑（Laplace：(s+α)/(n+α+β)，α=1/2/2）以避免 0/1 极端值影响。
+- 在计算 EWMA/percentile 前做简单的去极值或剪裁策略（例如忽略异常超长请求或把其归入特殊 bucket）。
+- 计时请使用 monotonic 时钟（time.perf_counter）以防系统时间跳变污染指标。
+
+2) 指标设计细节（现有指标补充）
+- 明确所有指标单位与命名：TTFB/TTLB 用毫秒(ms)，吞吐用 MB/s（或明确 MiB/s）；EWMA 的 alpha/半衰期需文档化。
+- 明确定义重试/重传如何计数（一次请求发生多次重试时如何统计 success/total/ retry_rate）。
+- 记录响应体大小分布与 request size bucket（短/中/长），便于区分“下载慢”与“首字节慢”。
+- 把连接复用率、HTTP/2/3 支持、TLS session reuse 作为可选采集字段，并考虑将它们纳入健康分数。
+
+3) 排序/权重函数改进建议（Phase 2）
+- 对指标先做归一化或对数变换（如 log(latency)），避免不同量级直接相加导致权重难以调。
+- 将不确定性（obs）纳入 Cost（样本少时增加探索权重或降低confidence），例如 normalized_metric / sqrt(1 + k/obs)。
+- 建议结合 success_rate（平滑后）与短期失败惩罚：既用长期 success_rate 做稳定权重，又用最近 N 次失败触发快速惩罚。
+- 考虑轻量的探索策略（epsilon-greedy 或 Thompson Sampling）做低频探索，防止长期不尝试恢复良好的代理。
+- 在 Cost 计算中保留分解输出（latency_cost、success_cost、throughput_cost）以便可解释性与调参。
+
+4) 域名/路径粒度与缓存策略
+- 对关键路径做 path-level 观测（可选白名单），并为缓存敏感路径（静态资源 vs API）单独设阈值。
+- 提供域名缓存 TTL 与显式失效策略（当域名级指标恶化超过阈值时触发缓存失效并快速切换）。
+- 对潜在 CDN 场景加以识别（通过 response headers / ip/geolocation）避免把不同边缘节点的行为混为代理质量问题。
+
+5) 探测/预热与采样风险（Phase 4）
+- probe-with-get 必须限制速率、白名单域名，并与业务请求隔离（独立的连接/线程池）。
+- 探测任务不能占用主请求池资源，建议设置最小/最大并发并带后退策略。
+
+6) 可观测性、报警与数据保留（Phase 5 补充）
+- Prometheus 指标标签规范：包含 `proxy_id`, `domain`, `region`（如有）, `protocol`（h1/h2/h3）等，但避免高基数标签（path 不宜作为 label，改用 histogram buckets 或外部聚合）。
+- 建议预置告警：整体 success_rate 下降、p99 超阈、throughput 降幅过大、探测失败率升高等。
+- 指标保留策略：高精度原始样本短期保存（如 1-7 天），长期只保留 rollup（p95/p99 per-hour/day）以节约存储。
+
+7) 安全、隐私与接口稳定性
+- /quality/meta 与 /metrics/per-destination 应限制输出敏感信息（避免上游真实 IP 等），并对外接口做鉴权或内部网限定。
+- 配置（权重、阈值）应支持运行时动态更新并具备回滚开关。
+
+8) 上线兜底与回滚策略
+- 首次上线 Phase 2 时做 canary（小流量）验证，并保留旧策略做 A/B 对比。
+- 对新策略引入慢启动与保护：对新加入或重启的代理施加 slow-start 探索限制。
+- 一键回滚：配置开关或环境变量能迅速禁用新权重并回退到 EWMA 策略。
+
+9) 测试与验证计划
+- 单元测试：覆盖 metric 采集、error 分类、percentile 计算与权重函数逻辑。
+- 性能测试：在压力环境下评估采集开销（CPU/内存/锁争用）并确定采样率上限。
+- 灰度实验：A/B 指标对比（旧排序 vs 新排序），收集至少 1-2 周数据并做统计显著性分析。
+
+10) 小的实现细节与陷阱
+- 保证竞速取消(CancelledError)不产生重复计数或日志噪音；败者取消不计入 error counters（已处理）。
+- OBS_WINDOW 的大小需与代理数量/内存预算校准（256 是起点，可调）。
+- 明确 throughput 的计算方式为 body_bytes / transfer_time（排除头部和连接空闲时间），并对 chunked/streaming 场景标注为不可比样本。
+
+---
+
+## 七、可落地的短期任务（建议作为 PR checklist）
+
+- [ ] 引入 t-digest/HDRHistogram 库并实现 p50/p95/p99 接口（Phase 1 补充）
+- [ ] 为分位数暴露样本数/置信度并在 `/quality/meta` 上加标识
+- [ ] 对 success_rate 使用贝叶斯平滑与 retry_rate 分离统计
+- [ ] 实现 metrics 标签规范并在 /metrics 中限制高基数标签
+- [ ] 设计 Phase 2 的 Cost 函数草案（含归一化/对数变换 & 默认权重）并在小流量 canary 上 A/B 验证
+- [ ] 编写单元与集成测试覆盖新采集与排序逻辑
+
+---
+
+我已经把审阅建议直接合并到文档末尾（新增“六、补充完善建议” 与“七、可落地的短期任务”），以便团队在现有计划上按优先级拆分 PR。
+
+下一步我可以：
+- （A）给出 `t-digest` 的接入示例和代码片段并帮你实现一个小 PR；或
+- （B）草拟 Phase 2 的 Cost 函数实现（含归一化/对数变换、观测不确定性处理和默认权重）；或
+- （C）把上面的短期任务拆成 Issue 模板并创建到仓库（如果你希望我直接创建 issue 我可以继续）。
+
+你希望我接着做哪项？
