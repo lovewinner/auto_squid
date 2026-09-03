@@ -644,9 +644,115 @@ def format_output(analysis: Dict[str, Any], json_output: bool = False) -> str:
     return "\n".join(lines)
 
 
+# ── 增强指标视图(--metrics / --domains-list)渲染 ──────────────
+# 复用 show_metrics.py 的表格渲染逻辑,纳入 test_routing.py;数据来自
+# /quality/meta(每代理全局)与 /metrics/per-destination(域名×代理)。
+
+_ERROR_LABELS = {
+    "timeout": "超时", "connect": "连接", "http_5xx": "5xx", "tls": "TLS",
+    "protocol": "协议", "cancelled": "取消", "other": "其他",
+}
+
+
+def _render_metrics_header(api_url: str) -> List[str]:
+    return [f"=== auto_squid 采集指标 @ {api_url}  {datetime.now(timezone.utc).isoformat()} ==="]
+
+
+def _render_per_destination_metrics(dom_metrics: Dict[str, Any], keys: List[str],
+                                    quality: Dict[str, Any], qm: Dict[str, Any]) -> List[str]:
+    """把 /metrics/per-destination 中匹配 keys 的 (域名,代理) 指标渲染成表格。
+
+    keys: 目标域名键候选(如 ['github.com:443','github.com'])。qm 未用,保留签名
+    以兼容全局概览扩展;排序用 quality 的 EWMA 反映竞速倾向。
+    """
+    lines = [f"目标实测指标: {keys[0] if keys else ''}", "-" * 40]
+    matched = {k: per for k, per in dom_metrics.items() if k in set(keys)} if keys else dom_metrics
+    if not matched:
+        lines.append(f"  (该目标尚无域名级观测;候选键: {', '.join(keys)})")
+        lines.append("")
+        return lines
+    for dkey, per in matched.items():
+        lines.append(f"  ▶ 域名键: {dkey}")
+        header = (f"      {'代理':<10}{'TTFB p50/p95/p99':<26}{'TTLB p99':<12}"
+                  f"{'成功率':<10}{'吞吐':<12}{'错误分类'}")
+        lines.append(header)
+        lines.append("      " + "-" * (len(header) - 6))
+        order = sorted(per.items(), key=lambda kv: (quality.get(kv[0], {}).get("ewma_ttfb") or 1e9))
+        for pid, m in order:
+            per_t = m.get("percentiles") or {}
+            tfb, tlb = per_t.get("ttfb") or {}, per_t.get("ttlb") or {}
+            tf = "—"
+            if tfb.get("samples"):
+                tf = (f"{tfb.get('p50',0)*1000:.0f}/{(tfb.get('p95') or 0)*1000:.0f}/"
+                      f"{(tfb.get('p99') or 0)*1000:.0f}(n={tfb['samples']})")
+            tl = "—"
+            if tlb.get("samples"):
+                tl = f"{tlb.get('p99', 0)*1000:.0f}(n={tlb['samples']})"
+            errs = {k: v for k, v in (m.get("errors") or {}).items() if v}
+            err_str = ",".join(f"{_ERROR_LABELS.get(k, k)}:{v}" for k, v in errs.items()) or "—"
+            total = m.get("total", 0)
+            rate = (m.get("success", 0) / total) if total else None
+            rate_s = "—" if rate is None else f"{rate*100:.1f}%"
+            thr = m.get("throughput_ewma")
+            thr_s = "—" if thr is None else f"{thr:.2f}MB/s"
+            lines.append(f"      {pid:<10}{tf:<26}{tl:<12}{rate_s:<10}{thr_s:<12}{err_str}"
+                         f"  <<n={total}")
+        lines.append("")
+    return lines
+
+
+def _render_domain_list(dom_metrics: Dict[str, Any]) -> List[str]:
+    """列出所有有观测的域名及每代理观测次数。"""
+    lines = [f"所有有观测的域名(共 {len(dom_metrics)} 个)  [域名键 @ 代理: 观测次数]",
+             "-" * 60]
+    for dkey in sorted(dom_metrics.keys()):
+        per = dom_metrics[dkey]
+        parts = [f"{pid}:{m.get('total', 0)}"
+                 for pid, m in sorted(per.items(), key=lambda kv: -kv[1].get("total", 0))]
+        lines.append(f"  {dkey:<38} {'  '.join(parts)}")
+    lines.append("")
+    return lines
+
+
+def _render_proxy_overview(qm: Dict[str, Any]) -> List[str]:
+    """把 /quality/meta 的 {pid: metric} 渲染成每代理全局概览表。"""
+    lines = ["全局每代理概览(跨域名聚合)", "-" * 40]
+    if not qm:
+        lines.append("  (尚无观测)")
+        lines.append("")
+        return lines
+    header = (f"  {'代理':<10}{'TTFB p50/p95/p99':<26}{'TTLB p99':<12}"
+              f"{'成功率':<10}{'吞吐':<12}{'错误分类'}")
+    lines.append(header)
+    lines.append("  " + "-" * (len(header) - 2))
+    for pid, m in sorted(qm.items(), key=lambda kv: (kv[1].get("success_rate") or 0)):
+        tfb, tlb = m.get("ttfb") or {}, m.get("ttlb") or {}
+        tf = "—"
+        if tfb.get("samples"):
+            tf = (f"{tfb.get('p50',0)*1000:.0f}/{(tfb.get('p95') or 0)*1000:.0f}/"
+                  f"{(tfb.get('p99') or 0)*1000:.0f}(n={tfb['samples']})")
+        tl = "—"
+        if tlb.get("samples"):
+            tl = f"{tlb.get('p99', 0)*1000:.0f}(n={tlb['samples']})"
+        errs = {k: v for k, v in (m.get("errors") or {}).items() if v}
+        err_str = ",".join(f"{_ERROR_LABELS.get(k, k)}:{v}" for k, v in errs.items()) or "—"
+        rate = m.get("success_rate")
+        rate_s = "—" if rate is None else f"{rate*100:.1f}%"
+        thr = m.get("throughput_ewma_mbps")
+        thr_s = "—" if thr is None else f"{thr:.2f}MB/s"
+        lines.append(f"  {pid:<10}{tf:<26}{tl:<12}{rate_s:<10}{thr_s:<12}{err_str}")
+    lines.append("")
+    return lines
+
+
 async def main():
     parser = argparse.ArgumentParser(description="Analyze auto_squid routing for a URL")
-    parser.add_argument("url", help="URL to analyze (e.g., https://github.com/user/repo)")
+    parser.add_argument("url", nargs="?", default="", help="URL to analyze (e.g., https://github.com/user/repo)")
+    parser.add_argument("--domain", default="", help="Domain or host:port for the metrics view (overrides url)")
+    parser.add_argument("--metrics", action="store_true",
+                        help="Show collected Phase 1 metrics (TTFB/TTLB percentiles, success rate, errors, throughput)")
+    parser.add_argument("--domains-list", action="store_true",
+                        help="List all observed domains with per-proxy attempt counts")
     parser.add_argument("--client-ip", help="Client IP for sticky cache analysis")
     parser.add_argument("--config", default="", help="Path to config.yaml")
     parser.add_argument("--proxies", default="proxies.yaml", help="Path to proxies.yaml")
@@ -663,7 +769,13 @@ async def main():
 
     args = parser.parse_args()
 
-    domain = extract_domain(args.url)
+    # --metrics / --domains-list 只读指标视图:允许无 url。
+    if not args.url and not args.metrics and not args.domains_list:
+        parser.error("需要提供 URL 位置参数(或使用 --metrics / --domains-list)")
+
+    # 指标视图的目标:优先 --domain,回退 url 推导;明文 https→host:443 等。
+    metrics_target = args.domain or args.url
+    domain = extract_domain(metrics_target) if metrics_target else ""
 
     if args.api_url:
         # Connect to running instance via API
@@ -680,6 +792,28 @@ async def main():
             headers["Authorization"] = f"Basic {token}"
 
         async with httpx.AsyncClient(base_url=args.api_url, timeout=10.0) as client:
+            # 增强指标视图(--metrics / --domains-list)只需质量明细端点。
+            if args.metrics or args.domains_list:
+                qm = (await client.get("/quality/meta", headers=headers)).json()
+                pd = (await client.get("/metrics/per-destination", headers=headers)).json()
+                qual = (await client.get("/quality", headers=headers)).json()
+                if args.domains_list:
+                    out = _render_domain_list(pd)
+                    print("\n".join(out))
+                    return
+                if args.json:
+                    print(json.dumps({"quality_meta": qm, "per_destination": pd},
+                                     indent=2, ensure_ascii=False))
+                    return
+                out = _render_metrics_header(args.api_url)
+                if metrics_target:
+                    out += _render_per_destination_metrics(pd, domain_keys(metrics_target),
+                                                           qual, qm)
+                else:
+                    out += _render_proxy_overview(qm)
+                print("\n".join(out))
+                return
+
             # Fetch domain meta, quality, circuit, etc.
             meta_resp = await client.get("/domains/meta", headers=headers)
             quality_resp = await client.get("/quality", headers=headers)
@@ -775,12 +909,31 @@ async def main():
         # Load caches from DB
         router._load_caches_from_db()
 
+        # 本地模式(--metrics / --domains-list)直接从运行实例的 selector 内存读。
+        if args.metrics or args.domains_list:
+            pd = router.selector.get_domain_metrics()
+            if args.domains_list:
+                print("\n".join(_render_domain_list(pd)))
+                return
+            if args.json:
+                print(json.dumps({"quality_meta": router.selector.get_pid_quality_v2(),
+                                  "per_destination": pd}, indent=2, ensure_ascii=False))
+                return
+            out = _render_metrics_header("(local)")
+            if metrics_target:
+                out += _render_per_destination_metrics(pd, domain_keys(metrics_target),
+                                                       router.selector.get_quality(), {})
+            else:
+                out += _render_proxy_overview(router.selector.get_pid_quality_v2())
+            print("\n".join(out))
+            return
+
         # Determine proxy auth creds for test request
         proxy_user, proxy_pass = args.proxy_user, args.proxy_pass
         if not proxy_user:
             proxy_user, proxy_pass = _extract_proxy_auth(cfg)
 
-        analyzer = RoutingAnalyzer(router, domain, args.client_ip, keys=domain_keys(args.url))
+        analyzer = RoutingAnalyzer(router, domain, args.client_ip, routing_keys=domain_keys(args.url))
         analysis = analyzer.full_analysis()
 
         # Test request if requested
