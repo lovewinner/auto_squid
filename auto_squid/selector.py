@@ -40,6 +40,11 @@ _SLOW_START_SUCCESS = 3
 # 公式的对偶,此处以乘法形式作用于延迟权重)。bias=0 时退化为纯 EWMA 排序。
 _LB_BIAS_DEFAULT = 1.0
 
+# 近期连续失败对排序权重的惩罚倍数(见 _failure_penalty_mult)。默认 4.0 →
+# 连失 1 次权重 ×5、连失 2 次 ×9,把恒失败代理从"首批竞速"挤走(比 3 次熔断
+# 早一步反应);成功清零 consec_fail 后自动回归。0=关闭(熔断兜底)。
+_FAIL_PENALTY_DEFAULT = 4.0
+
 
 class ProxySelector:
     """从 ProxyStore 产出代理 id 的有序列表,供竞速使用。
@@ -64,6 +69,7 @@ class ProxySelector:
                  slow_start_window: float = _SLOW_START_WINDOW,
                  slow_start_success: int = _SLOW_START_SUCCESS,
                  lb_bias: float = _LB_BIAS_DEFAULT,
+                 fail_penalty_weight: float = _FAIL_PENALTY_DEFAULT,
                  concurrency_limit_enabled: bool = False,
                  concurrency_limit_initial: int = 16,
                  concurrency_limit_min: int = 2,
@@ -79,6 +85,9 @@ class ProxySelector:
         # 加权 least-request 的在途惩罚指数(见 _LB_BIAS_DEFAULT)。
         # 排序权重 = ewma × (1 + active)^bias;bias=0 退化为纯 EWMA 排序。
         self.lb_bias = max(0.0, lb_bias)
+        # 近期连续失败惩罚权重(见 _FAIL_PENALTY_DEFAULT):把 consec_fail 折算成
+        # 排序权重抬升,让恒失败代理提前移出前排竞速,不必等熔断阈值。
+        self.fail_penalty_weight = max(0.0, fail_penalty_weight)
         # ── 自适应并发限制(P3)────────────────────────────────
         # 每代理并发上限,成功加性增/失败乘性降,防慢代理被请求堆死。
         self.concurrency_enabled = concurrency_limit_enabled
@@ -448,6 +457,24 @@ class ProxySelector:
             return (1, 0.0)
         return (0, q["ewma_ttfb"])
 
+    def _failure_penalty_mult(self, pid: str) -> float:
+        """近期连续失败对排序权重的惩罚倍数。
+
+        竞速/单发排序只按 EWMA(成功耗时)排,失败代理的 EWMA 不会因失败而降——
+        一个"恒 0ms 失败"的代理能靠老 EWMA 赖在前排持续陪跑(2026-09 事故的金
+        属型:247-246 单日 400+ 次竞速失败)。这里把当前连续失败次数(record_failure
+        累加的 consec_fail)折算成权重惩罚:连续失败越多,权重被抬得越高(排序越靠后)。
+
+        只在 **退避期外** 生效(熔断退避期由 is_circuit_open 过滤,退避结束后进入
+        slow-start 已由 _slow_start_rank 垫底);成功 record_success 会清零
+        consec_fail,惩罚随之消失——"间歇可用"代理恢复一次成功即中断惩罚,不误伤。
+        """
+        s = self._circuit.get(pid)
+        if not s:
+            return 1.0
+        k = int(s.get("consec_fail", 0))
+        return 1.0 + k * self.fail_penalty_weight
+
     def _weighted_rank(self, pid: str) -> float:
         """加权 least-request 排序权重:ewma × (1 + active)^lb_bias。
 
@@ -462,7 +489,10 @@ class ProxySelector:
         q = self._quality.get(pid)
         if q is None:
             return 0.0
-        w = q["ewma_ttfb"]
+        # 近期连续失败惩罚:一个代理连失 N 次,权重 ×(1 + N*fail_penalty) 抬升,
+        # 从"首批竞速"位置被挤下去(比熔断早一步反应——0ms 失败一次就该降温,
+        # 不必等 3 次熔断)。成功清零 consec_fail 后自动回归。
+        w = q["ewma_ttfb"] * self._failure_penalty_mult(pid)
         if self.lb_bias > 0:
             active = self._in_flight.get(pid, 0)
             if active:
@@ -533,6 +563,8 @@ class ProxySelector:
         w = self._proxy_quality_ewma(q)
         if w is None:
             return 0.0
+        # 近期连续失败惩罚注入(与全局 _weighted_rank 同构),见 _failure_penalty_mult。
+        w *= self._failure_penalty_mult(pid)
         if self.lb_bias > 0:
             active = self._in_flight.get(pid, 0)
             if active:

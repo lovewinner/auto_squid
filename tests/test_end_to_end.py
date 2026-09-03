@@ -2706,6 +2706,52 @@ class TestInFlightSelection:
             assert lst[-1] == 'untested'
             assert lst.index('slow') < lst.index('fast')
 
+    def test_failure_penalty_depresses_ranking(self):
+        """fail_penalty_weight 把近期连续失败折算成排序权重抬升,恒失败代理被挤出前排。
+
+        关键语义:排序只看 EWMA(成功耗时),失败不降权——一个恒 0ms 失败代理靠老
+        EWMA 赖在前排持续陪跑(2026-09 事故:247-246 单日 400+ 竞速失败)。连失后
+        权重 = ewma × (1 + k*fail_penalty),不必等 3 次熔断就提前降温;连成功一次
+        清零 consec_fail 后自动回归。
+        """
+        store = ProxyStore()
+        store.add(ProxyInfo(id='dead', host='h1', port=3128))
+        store.add(ProxyInfo(id='healthy', host='h2', port=3128))
+        sel = ProxySelector(store, lb_bias=0.0, fail_penalty_weight=4.0)
+        # 两者 EWMA 相同(dead 曾快,现在老 EWMA 还挂着)
+        sel.record_ttfb('dead', 0.02)
+        sel.record_ttfb('healthy', 0.02)
+        assert sel._weighted_rank('dead') == sel._weighted_rank('healthy')  # 未失败时并列
+        # dead 连失 2 次 → 权重被抬 x(1+2*4)=9,healthy 保持 → 排序后 healthy 在前
+        sel.record_failure('dead')
+        sel.record_failure('dead')
+        for _ in range(30):
+            lst = sel.ordered_proxies()
+            assert lst[0] == 'healthy', f"连失代理应被挤出前排, got {lst}"
+        assert sel._weighted_rank('dead') > sel._weighted_rank('healthy')
+        # 恢复:dead 成功一次 → consec_fail 清零 → 权重回归,不再被惩罚
+        sel.record_success('dead')
+        assert sel._weighted_rank('dead') == sel._weighted_rank('healthy')
+        # 域名维度同样受惩罚(domain_obs 是 per-pid dict,不是嵌套域名的 dict)
+        sel2 = ProxySelector(store, lb_bias=0.0, fail_penalty_weight=4.0)
+        sel2.record_ttfb('dead', 0.02, 'a.com')
+        sel2.record_ttfb('healthy', 0.02, 'a.com')
+        sel2.record_failure('dead')
+        per = {'dead': {'ewma_ttfb': 0.02, 'obs': 1}, 'healthy': {'ewma_ttfb': 0.02, 'obs': 1}}
+        assert sel2._domain_weighted_rank(per, 'dead') > sel2._domain_weighted_rank(per, 'healthy')
+
+    def test_failure_penalty_zero_keeps_old_behavior(self):
+        """fail_penalty_weight=0 时纯 EWMA 排序,失败不惩罚(旧行为)。"""
+        store = ProxyStore()
+        store.add(ProxyInfo(id='dead', host='h1', port=3128))
+        store.add(ProxyInfo(id='healthy', host='h2', port=3128))
+        sel = ProxySelector(store, lb_bias=0.0, fail_penalty_weight=0.0)
+        sel.record_ttfb('dead', 0.02)
+        sel.record_ttfb('healthy', 0.02)
+        sel.record_failure('dead')
+        sel.record_failure('dead')
+        assert sel._weighted_rank('dead') == sel._weighted_rank('healthy')
+
     def test_reset_quality_clears_in_flight(self):
         """reset_quality 一并清空在途计数(RFC 8305 §4:旧数据不跨网络沿用)。"""
         store = ProxyStore()
@@ -5672,6 +5718,7 @@ class TestRouterConfigPassThrough:
             circuit_threshold=cc.circuit_threshold, circuit_max_backoff=cc.circuit_max_backoff,
             slow_start_window=cc.slow_start_window, slow_start_success=cc.slow_start_success,
             lb_bias=cc.lb_bias,
+            fail_penalty_weight=cc.fail_penalty_weight,
             single_send_degrade_fail=cc.single_send_degrade_fail,
             single_send_degrade_ratio=cc.single_send_degrade_ratio,
             single_send_degrade_slack_ms=cc.single_send_degrade_slack_ms,
@@ -5771,7 +5818,7 @@ class TestRouterConfigPassThrough:
                          'connect_tunnel_timeout_sec', 'http_read_timeout_sec'):
                 assert getattr(r_cfg, attr) == getattr(r_kw, attr), f"{attr} 两条构造路径不一致"
             for attr in ('circuit_threshold', 'circuit_max_backoff', 'slow_start_window',
-                         'slow_start_success', 'lb_bias'):
+                         'slow_start_success', 'lb_bias', 'fail_penalty_weight'):
                 assert getattr(r_cfg.selector, attr) == getattr(r_kw.selector, attr), \
                     f"selector.{attr} 两条构造路径不一致"
             assert r_cfg.conn_pool_total == 20 and r_cfg.max_retries == 5

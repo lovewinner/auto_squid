@@ -336,6 +336,12 @@ class CircuitConfig(ConfigBase):
                        权重 = ewma × (1 + active)^bias,在途积压多的代理被压低,
                        保护慢代理不被打爆(Envoy LeastRequest / Dubbo LeastActive)。
                        0 退化为纯 EWMA 排序。
+    fail_penalty_weight: 近期连续失败对排序权重的惩罚倍数(默认 4.0)。竞速排序只按
+                       成功 EWMA(不降权),一个"恒失败"代理能靠老 EWMA 赖在前排持续
+                       陪跑(0ms EOF 死代理单日数百次竞速失败的事故)。把当前连失次数
+                       k 折算成 1 + k*fail_penalty 的权重抬升:连失 1 次 ×5、2 次 ×9,
+                       比 3 次熔断更早一步降温。成功清零 consec_fail 后自动回归,不
+                       误伤"间歇可用"代理。0=关闭(用熔断兜底)。
     single_send_degrade_fail: 单发降级:连续失败阈值(默认 0=关闭)。域名缓存/粘性
                        命中的代理连续失败达该值,即使未到熔断阈值,单发路径也主动
                        降级回竞速(质量感知的确定性探路,Goal #6)。建议设为
@@ -368,6 +374,7 @@ class CircuitConfig(ConfigBase):
     slow_start_window: float = Field(60.0, description="slow-start 爬升窗口(秒)")
     slow_start_success: int = Field(3, description="slow-start 恢复期内成功多少次后恢复完整权重")
     lb_bias: float = Field(1.0, description="加权 least-request 在途惩罚指数,0=纯 EWMA 排序")
+    fail_penalty_weight: float = Field(4.0, description="近期连续失败对排序权重的惩罚倍数,0=关闭(熔断兜底)")
     single_send_degrade_fail: int = Field(0, description="单发降级:连续失败阈值,0=关闭")
     single_send_degrade_ratio: float = Field(0.0, description="单发降级:EWMA 恶化比值阈值,0=关闭(同时用于方案C:粘性慢探路)")
     single_send_degrade_slack_ms: float = Field(10.0, description="EWMA 降级绝对下限(毫秒)")
