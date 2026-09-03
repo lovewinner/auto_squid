@@ -2055,7 +2055,10 @@ class Router:
             # 竞速落败被取消(CancelledError)不算失败——健康慢代理每次竞速都会
             # 被快代理抢先取消,若计入会误熔断。真失败(连接/超时/上游错误)
             # 才累计连续失败并可能触发熔断。
-            if not isinstance(ex, asyncio.CancelledError) and pid != 'local':
+            # local(本机直连)真失败同样喂熔断:colo 防火墙挡住的 127.0.0.1 端点
+            # 接连真失败即 is_circuit_open('local') 移出竞速/单发(local-add 与
+            # _get_fresh_proxy/sticky 已加门控),消除每请求白烧 3s。
+            if not isinstance(ex, asyncio.CancelledError):
                 self.selector.record_failure(pid)
             # per-attempt 失败观测:每次上游尝试失败都记(含被取消的竞速败者,区分
             # 取消/真失败;单发失败此前只能从决策链汇总推,无 client_ip/耗时)。
@@ -2148,14 +2151,18 @@ class Router:
             # per-attempt 失败观测:建连阶段失败(本机→上游 open_connection 超时/拒绝),
             # 先记日志再转 RuntimeError,否则该失败从 _try_tunnel 直接逃逸,不会被下方
             # 2198 except 捕获(两条 except 覆盖不同失败窗口:建连 vs CONNECT 握手)。
+            # record_failure 也在此喂——建连失败返回前不进入 2198 except(handshake
+            # 用),此前的代理建连失败从未计入熔断,同样白白反复竞速同批坏端点。
             self._log_attempt_failure(client_ip, target, target, pid,
                                       RuntimeError(f'connect to {proxy_host or target} timed out or failed: {e}'),
                                       _perf_t0)
+            self.selector.record_failure(pid)
             raise RuntimeError(f'connect to {proxy_host or target} timed out or failed: {e}') from e
         except ValueError as e:
-            # 非法 CONNECT target(空 host / 坏端口):同样记 per-attempt 日志,原样重抛。
-            # 调用方按 ValueError 处理(直连分支/测试),不转 RuntimeError。
+            # 非法 CONNECT target(空 host / 坏端口):同样记 per-attempt 日志与熔断
+            # (真失败),原样重抛(调用方按 ValueError 处理,不转 RuntimeError)。
             self._log_attempt_failure(client_ip, target, target, pid, e, _perf_t0)
+            self.selector.record_failure(pid)
             raise
         # 首字节计时:从 CONNECT 发出到收到 200。用于 EWMA 质量跟踪(竞速排序)。
         # 复用已握手隧道时无 CONNECT 往返,计时为 0(不做 EWMA 观测)。
@@ -2207,7 +2214,10 @@ class Router:
             except Exception:
                 pass
             # 同 _try_http:被竞速取消(CancelledError)不算失败;真失败才累计熔断。
-            if not isinstance(ex, asyncio.CancelledError) and pid != 'local':
+            # local(本机直连)真失败同样喂熔断——把"死本机端点"(如 colo 防火墙挡住
+            # 的 127.0.0.1:26128/6128)经 is_circuit_open('local') 移出竞速/单发
+            # (4 处 local-add 与 _get_fresh_proxy/sticky 已加门控),消除每请求白烧 3s。
+            if not isinstance(ex, asyncio.CancelledError):
                 self.selector.record_failure(pid)
             # per-attempt 失败观测(同 _try_http):每次 CONNECT 尝试失败都记(含取消
             # 的竞速败者),带 client_ip/异常类型/耗时,可直接 grep 定位事故源。
@@ -2341,7 +2351,10 @@ class Router:
         proxies 已由调用方按策略收窄;local 仅当策略放行时加入。
         """
         places = {pid for pid in proxies[:self.max_retries] if self.proxy_store.get(pid)}
-        if self.enable_local_racing and self._policy_allows_sticky(host, 'local'):
+        # local 仅当 enable_local_racing + 策略放行 + 未熔断(死本机端点/连续真失败被
+        # is_circuit_open 标记)时参与竞速——熔断后 local 不再白烧 3s。
+        if self.enable_local_racing and self._policy_allows_sticky(host, 'local') \
+                and not self.selector.is_circuit_open('local'):
             places.add('local')
         return places
 
@@ -2374,7 +2387,8 @@ class Router:
         n_initial = self._stagger_initial()
         initial_pids = proxies[:n_initial]
         if self.enable_local_racing and 'local' not in initial_pids \
-                and self._policy_allows_sticky(host, 'local'):
+                and self._policy_allows_sticky(host, 'local') \
+                and not self.selector.is_circuit_open('local'):
             initial_pids = ['local'] + initial_pids
         initial_places = [pid for pid in initial_pids
                           if pid == 'local' or self.proxy_store.get(pid)]
@@ -2990,7 +3004,8 @@ class Router:
         for pid in proxies[:self.max_retries]:
             if self.proxy_store.get(pid):
                 places.add((pid, target))
-        if self.enable_local_racing and self._policy_allows_sticky(target, 'local'):
+        if self.enable_local_racing and self._policy_allows_sticky(target, 'local') \
+                and not self.selector.is_circuit_open('local'):
             places.add(('local', target))
         return places
 
@@ -3005,7 +3020,8 @@ class Router:
         n_initial = self._stagger_initial()
         initial_pids = proxies[:n_initial]
         if self.enable_local_racing and 'local' not in initial_pids \
-                and self._policy_allows_sticky(target, 'local'):
+                and self._policy_allows_sticky(target, 'local') \
+                and not self.selector.is_circuit_open('local'):
             initial_pids = ['local'] + initial_pids
         initial_places = [(pid, target) for pid in initial_pids
                           if pid == 'local' or self.proxy_store.get(pid)]

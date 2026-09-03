@@ -6696,3 +6696,82 @@ class TestDispatchSingleUnified:
         assert hit
         assert "ValueError" in hit[-1].getMessage()
         assert "local" in hit[-1].getMessage()
+
+    def test_local_real_failure_feeds_circuit(self):
+        """竞速 local 失败喂熔断:真失败(非取消)累计 consec_fail,达阈值熔断 'local'。
+
+        修复前 record_failure 对 pid=='local' 跳过,死本机端点(colo 防火墙挡住
+        的 127.0.0.1)不锁熔断,每请求竞速白烧 3s。此刻真失败也累计,达阈值
+        is_circuit_open('local') 为真。
+        """
+        store = ProxyStore()
+        r = Router(store, listen_host=HOST, listen_port=10816,
+                   max_retries=2, enable_http_cache=False,
+                   enable_local_racing=True,
+                   db_path=tempfile.mktemp(suffix='.db'))
+        try:
+            assert r.enable_local_racing is True
+            # 真失败累计(模拟建连被取消 -> 单发失败)
+            for _ in range(r.selector.circuit_threshold):
+                r.selector.record_failure('local')
+            assert r.selector.is_circuit_open('local') is True
+        finally:
+            r.stop()
+
+    def test_local_respected_when_circuit_open_in_race_builders(self):
+        """熔断中的 local 不进入竞速候选(_prep_http/_build_racing_tasks_http)。
+
+        local 仅在 enable_local_racing + 策略放行 + 未熔断时加入竞速;熔断后
+        local 候选消失,不再每次白烧 3s。
+        """
+        store = ProxyStore()
+        r = Router(store, listen_host=HOST, listen_port=10817,
+                   max_retries=2, enable_http_cache=False,
+                   enable_local_racing=True,
+                   db_path=tempfile.mktemp(suffix='.db'))
+        try:
+            for _ in range(r.selector.circuit_threshold):
+                r.selector.record_failure('local')
+            assert r.selector.is_circuit_open('local') is True
+            # HTTP 竞速构建:local 不应出现在任何占位
+            hp_initial, hp_remaining = r._prep_http(['p1', 'p2'], 'example.com')
+            assert 'local' not in hp_initial
+            assert 'local' not in hp_remaining
+            assert 'local' not in r._build_racing_tasks_http(['p1', 'p2'], 'example.com')
+            # CONNECT 竞速构建
+            cp_initial, cp_remaining = r._prep_connect(['p1', 'p2'], 'example.com:443')
+            assert ('local', 'example.com:443') not in cp_initial
+            assert ('local', 'example.com:443') not in cp_remaining
+            assert ('local', 'example.com:443') not in r._build_racing_tasks_connect(['p1', 'p2'], 'example.com:443')
+            # 熔断解除后 local 重新可参与
+            r.selector.reset_circuits()
+            assert r.selector.is_circuit_open('local') is False
+            assert 'local' in r._build_racing_tasks_http(['p1', 'p2'], 'example.com')
+        finally:
+            r.stop()
+
+    def test_local_real_failure_through_try_tunnel_except(self):
+        """真失败经 _try_tunnel 的 except 喂熔断:record_failure('local') 被调用。
+
+        空 target 抛 ValueError(真失败,非取消)——except 内应调用
+        record_failure('local'),使 consec_fail 增长;连续 3 次后熔断。
+        """
+        store = ProxyStore()
+        r = Router(store, listen_host=HOST, listen_port=10818,
+                   max_retries=2, enable_http_cache=False,
+                   enable_local_racing=True,
+                   db_path=tempfile.mktemp(suffix='.db'))
+
+        async def drive():
+            for _ in range(3):
+                try:
+                    await r._try_tunnel('local', '', None, None, None)
+                except ValueError:
+                    pass
+
+        try:
+            asyncio.run(drive())
+            assert r.selector.is_circuit_open('local') is True, \
+                "3 次真失败应熔断 local"
+        finally:
+            r.stop()
