@@ -765,13 +765,19 @@ async def main():
     parser.add_argument("--api-user", default="", help="Management API auth username (overrides config)")
     parser.add_argument("--api-pass", default="", help="Management API auth password (overrides config)")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
-    parser.add_argument("--api-url", help="Connect to running instance via API (e.g., http://localhost:18080)")
+    parser.add_argument("--api-url", default="",
+                        help="Connect to running instance via API (e.g., http://localhost:18080). "
+                             "Default http://127.0.0.1:18080 for --metrics/--domains-list.")
 
     args = parser.parse_args()
 
     # --metrics / --domains-list 只读指标视图:允许无 url。
     if not args.url and not args.metrics and not args.domains_list:
         parser.error("需要提供 URL 位置参数(或使用 --metrics / --domains-list)")
+
+    # 指标视图默认连本机运行中的管理 API;原分析(无 --metrics)仍走本地模式。
+    if (args.metrics or args.domains_list) and not args.api_url:
+        args.api_url = "http://127.0.0.1:18080"
 
     # 指标视图的目标:优先 --domain,回退 url 推导;明文 https→host:443 等。
     metrics_target = args.domain or args.url
