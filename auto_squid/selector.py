@@ -45,6 +45,30 @@ _LB_BIAS_DEFAULT = 1.0
 # 早一步反应);成功清零 consec_fail 后自动回归。0=关闭(熔断兜底)。
 _FAIL_PENALTY_DEFAULT = 4.0
 
+# ── 可观测性增强指标(Phase 1,见 IMPROVEMENT_PLAN.md)────────────
+# 这些指标只用于观测/暴露(Phase 5)与未来的排序加权(Phase 2),**不改变**现有
+# 选择逻辑(_quality/_domain_quality 的 ewma_ttfb/obs 原样保留供排序)。每个
+# (pid) 或 (domain, pid) 维护一个滑动窗口:
+#   - ttfb_samples / ttlb_samples: 有界样本列表,供 P50/P95/P99 分位数。
+#   - success / total: 成功率。
+#   - errors: 错误分类计数(timeout/connect/http_5xx/tls/protocol/other)。
+#   - ttlb_ewma / throughput_ewma: 完整耗时与吞吐的 EWMA(Phase 2 加权输入)。
+#   - WINDOW 界定样本上限(环形截断,存最近 N 个,内存有界)。
+_OBS_WINDOW = 256          # 每个序列保留的最近样本数(分位数用)
+_TTLB_ALPHA = 0.3          # ttlb / throughput 的 EWMA 平滑系数(与 EWMA_ALPHA 一致)
+_THROUGHPUT_ALPHA = 0.3
+
+# 错误分类键(统一枚举,供 _try_http/_try_tunnel 的 except 归类,见 record_failure)。
+ERROR_TIMEOUT = "timeout"
+ERROR_CONNECT = "connect"
+ERROR_HTTP_5XX = "http_5xx"
+ERROR_TLS = "tls"
+ERROR_PROTOCOL = "protocol"
+ERROR_CANCELLED = "cancelled"
+ERROR_OTHER = "other"
+_ERROR_KEYS = (ERROR_TIMEOUT, ERROR_CONNECT, ERROR_HTTP_5XX,
+               ERROR_TLS, ERROR_PROTOCOL, ERROR_CANCELLED, ERROR_OTHER)
+
 
 class ProxySelector:
     """从 ProxyStore 产出代理 id 的有序列表,供竞速使用。
@@ -112,6 +136,15 @@ class ProxySelector:
         #   很快"的事实(生产案例:247-246 全局 EWMA 快但被其他域名拖累,对
         #   github.com 其实很快,却因全局 EWMA 恶化被降级剔除)。
         self._domain_quality: dict[str, dict[str, dict[str, float]]] = {}
+        # ── 可观测性增强指标(Phase 1)────────────────────────────
+        # 与 _quality/_domain_quality 并行的独立结构:排序继续用 ewma_ttfb/obs,
+        # 此处收集完整耗时/吞吐/成功率/错误分类/分位数,仅供观测与 Phase 5 暴露
+        # (详见 IMPROVEMENT_PLAN.md). 结构:
+        #   _proxy_metrics:   {pid: metric_dict}
+        #   _domain_metrics:  {domain: {pid: metric_dict}}
+        # metric_dict 字段见 _ensure_metrics 注释。
+        self._proxy_metrics: dict[str, dict] = {}
+        self._domain_metrics: dict[str, dict[str, dict]] = {}
         # 每代理熔断/慢启动状态(与 _quality 分开维护,含未观测过的新代理):
         #   {pid: {"consec_fail": int, "open_until": float(monotonic 秒), "backoff": float}}
         self._circuit: dict[str, dict[str, float]] = {}
@@ -224,6 +257,13 @@ class ProxySelector:
             entry = self._apply_ewma(per_pid, pid, ttfb)
             if entry is not None:
                 entry["ts"] = time.monotonic()
+        # ── 可观测性增强(Phase 1):记录 ttfb 样本 + success/total ──
+        # 收到响应头即视为一次"成功观测"(与选择逻辑一致);ttfb 样本入分位数窗口。
+        # total 在成功(success+1)与失败(record_failure,total+1)两侧同步累加。
+        for scope in (self._metrics_for(pid, domain), self._metrics_for(pid, None)):
+            scope["success"] += 1
+            scope["total"] += 1
+            self._append_sample(scope["ttfb_samples"], ttfb)
 
     @staticmethod
     def _apply_ewma(table: dict, pid: str, ttfb: float) -> Optional[dict]:
@@ -294,6 +334,207 @@ class ProxySelector:
         ewma = q.get("ewma_ttfb")
         return float(ewma) if isinstance(ewma, (int, float)) else None
 
+    # ── 可观测性增强指标(Phase 1)───────────────────────────────
+    # 这些结构仅用于观测/暴露,不参与现有排序(排序仍读 _quality/_domain_quality
+    # 的 ewma_ttfb/obs)。见 IMPROVEMENT_PLAN.md Phase 1 / Phase 5。
+
+    @staticmethod
+    def _ensure_metrics(m: dict) -> dict:
+        """惰性初始化一个 metric_dict(幂等,热路径 O(1) 获取字段)。
+
+        字段:
+          ttfb_samples:  最近 _OBS_WINDOW 个 ttfb(秒),算 P50/P95/P99。
+          ttlb_samples:  最近 _OBS_WINDOW 个 ttlb(秒,HTTP 完整响应)。
+          ttlb_ewma:     ttlb 的 EWMA(秒),初始 None。
+          throughput_ewma: 吞吐 EWMA(MB/s),初始 None。
+          success / total: 成功数与总尝试数(成功率 = success/total)。
+          errors:        错误分类计数 {key: n}。
+          total_bytes:  累计转发 body 字节数(吞吐分母之一)。
+          transfer_time: 累计"转发 body"耗时(秒)。
+        """
+        if "metrics" not in m:
+            m["metrics"] = {
+                "ttfb_samples": [],
+                "ttlb_samples": [],
+                "ttlb_ewma": None,
+                "throughput_ewma": None,
+                "success": 0,
+                "total": 0,
+                "errors": {k: 0 for k in _ERROR_KEYS},
+                "total_bytes": 0.0,
+                "transfer_time": 0.0,
+            }
+        return m["metrics"]
+
+    def _metrics_for(self, pid: str, domain: Optional[str]) -> dict:
+        """取 (自适应 domain 存在时) 域名级或全局级 metric_dict,带惰性初始化。"""
+        if domain is not None:
+            per = self._domain_metrics.setdefault(domain, {})
+            return self._ensure_metrics(per.setdefault(pid, {}))
+        return self._ensure_metrics(self._proxy_metrics.setdefault(pid, {}))
+
+    @staticmethod
+    def _append_sample(samples: list, value: float):
+        """向有界样本列表追加一个值,超出 _OBS_WINDOW 丢弃最旧(环形截断)。"""
+        samples.append(value)
+        if len(samples) > _OBS_WINDOW:
+            del samples[0]
+
+    @staticmethod
+    def _percentile(samples: list, p: float) -> Optional[float]:
+        """返回样本列表的 p 分位数(0-100);空列表返回 None。"""
+        if not samples:
+            return None
+        s = sorted(samples)
+        if len(s) == 1:
+            return s[0]
+        k = (len(s) - 1) * (p / 100.0)
+        lo = int(k)
+        hi = min(lo + 1, len(s) - 1)
+        frac = k - lo
+        return s[lo] * (1.0 - frac) + s[hi] * frac
+
+    @staticmethod
+    def _percentiles(samples: list) -> dict:
+        """返回 {p50, p95, p99, min, max, mean} 汇总;空列表返回空。"""
+        if not samples:
+            return {}
+        return {
+            "p50": ProxySelector._percentile(samples, 50),
+            "p95": ProxySelector._percentile(samples, 95),
+            "p99": ProxySelector._percentile(samples, 99),
+            "min": min(samples),
+            "max": max(samples),
+            "mean": sum(samples) / len(samples),
+            "samples": len(samples),
+        }
+
+    def record_complete(self, pid: str, body_bytes: int, body_duration: float,
+                        body_ttfb: float = 0.0, domain: Optional[str] = None):
+        """记录一次 HTTP **body 转发完成**的耗时与吞吐(Phase 1.1,TTLB 维度)。
+
+        与 record_ttfb 互补:record_ttfb 在收到响应头即调用(首字节),本方法在
+        body 全部转发给客户端后调用(最后字节)。这里把"body 转发耗时"作为
+        TTLB−TTFB 的增量信号:TTFB 观感延迟 + body 下载时间 = 用户感知的完整
+        加载时长。对大文件/慢链路,仅看 TTFB 会低估代理的真实速度,本指标补上。
+
+        - body_duration:body 从首个数据块到读完全部的耗时(秒)= TTLB - TTFB。
+        - body_bytes:实际转发的 body 字节数。
+        - body_ttfb:本响应的 TTFB(秒),仅用于吞吐分母修正;若调用方未提供则
+          视为 0(即吞吐 = body_bytes / body_duration)。
+
+        产出:
+          - ttlb_samples / ttlb_ewma:body 转发耗时的样本与 EWMA(Phase 2 加权输入)。
+          - throughput_ewma:吞吐 EWMA(MB/s)= body_bytes / body_duration。
+          - total_bytes / transfer_time:累计值(便宜的平均吞吐也能直接除)。
+        """
+        m = self._metrics_for(pid, domain)
+        g = self._metrics_for(pid, None)
+        # 全局桶与(存在时)域名桶都更新:全局供 /quality/meta 跨域名聚合,域名桶
+        # 单独保留便于"特定 URL 实测"(与 record_ttfb 的双作用域写入一致)。
+        for sc in (g, m) if m is not g else (g,):
+            if body_duration > 0:
+                self._append_sample(sc["ttlb_samples"], body_duration)
+                old = sc["ttlb_ewma"]
+                sc["ttlb_ewma"] = body_duration if old is None else (
+                    (1.0 - _TTLB_ALPHA) * old + _TTLB_ALPHA * body_duration)
+                if body_bytes > 0:
+                    transfer = max(body_duration - max(body_ttfb, 0.0), 0.0)
+                    denom = transfer if transfer > 0 else body_duration
+                    mbps = (body_bytes / 1024.0 / 1024.0) / denom
+                    old = sc["throughput_ewma"]
+                    sc["throughput_ewma"] = mbps if old is None else (
+                        (1.0 - _THROUGHPUT_ALPHA) * old + _THROUGHPUT_ALPHA * mbps)
+                sc["total_bytes"] += body_bytes
+                sc["transfer_time"] += body_duration
+
+    def record_http_error(self, pid: str, status_code: int,
+                          domain: Optional[str] = None):
+        """记录一次 HTTP 5xx 响应(header 已收到但为 5xx)。
+
+        5xx 不抛异常(_race 判为"非可接受胜出"),record_failure 捕获不到,故单独
+        计入 error 分类(IMPROVEMENT_PLAN.md Phase 1.3)。
+        """
+        if status_code >= 500:
+            for scope in (self._metrics_for(pid, domain), self._metrics_for(pid, None)):
+                scope["errors"][ERROR_HTTP_5XX] += 1
+
+    def get_proxy_metrics(self) -> dict:
+        """返回全局(跨域名聚合)代理指标快照 {pid: metric_dict},供 /metrics 展示。
+
+        注意全局桶的 ttfb/ttlb 样本是**所有域名合并**的;域名级明细见
+        get_domain_metrics(见下)。返回拷贝,调用方改不动内部。
+        """
+        import copy
+        return {pid: copy.deepcopy(m["metrics"]) for pid, m in self._proxy_metrics.items()}
+
+    def get_domain_metrics(self) -> dict:
+        """返回域名级代理指标快照 {domain: {pid: metric_dict}},供 /domains/meta。
+
+        增加 per-pid 的 P50/P95/P99 汇总(分位数从该域名样本窗口算)。
+        返回拷贝,调用方改不动内部。
+        """
+        out = {}
+        for d, per_pid in self._domain_metrics.items():
+            for pid, m in per_pid.items():
+                mm = m["metrics"]
+                out.setdefault(d, {})[pid] = dict(mm)
+                out[d][pid]["percentiles"] = {
+                    "ttfb": ProxySelector._percentiles(mm.get("ttfb_samples", [])),
+                    "ttlb": ProxySelector._percentiles(mm.get("ttlb_samples", [])),
+                }
+        return out
+
+    def get_pid_quality_v2(self) -> dict:
+        """返回每代理的增强指标摘要(Phase 5 /quality 暴露)。
+
+        含 P50/P95/P99(ttfb)、成功率、错误分类、吞吐、ttlb_ewma。内部
+        _append_sample 把样本留存在内存供分位,此处只读不拷贝样本(避免大对象)。
+        """
+        out = {}
+        for pid, m in self._proxy_metrics.items():
+            mm = m["metrics"]
+            per = {
+                "ttfb": ProxySelector._percentiles(mm.get("ttfb_samples", [])),
+                "ttlb": ProxySelector._percentiles(mm.get("ttlb_samples", [])),
+                "ttlb_ewma_seconds": mm.get("ttlb_ewma"),
+                "throughput_ewma_mbps": mm.get("throughput_ewma"),
+                "success_count": mm.get("success", 0),
+                "total_attempts": mm.get("total", 0),
+                "success_rate": (mm["success"] / mm["total"]) if mm.get("total", 0) else None,
+                "errors": dict(mm.get("errors", {})),
+                "total_bytes_transferred": mm.get("total_bytes", 0.0),
+            }
+            out[pid] = per
+        return out
+
+    def prune_domain_metrics(self, max_entries: int = 10_000):
+        """域名级指标表容量保护:条目超上限按字典序淘汰最旧域名(不排序,由
+        domain_metrics 本身按域名字典序;保守额度保守,不被常用)。
+
+        目前域名级指标与 _domain_quality 同规模,由 _flush_loop 经
+        prune_domain_quality 一并治理;此处提供独立清理入口,防阶段性超量。
+        """
+        if max_entries <= 0:
+            self._domain_metrics.clear()
+            return
+        total = sum(len(per_pid) for per_pid in self._domain_metrics.values())
+        if total <= max_entries:
+            return
+        # 均匀地删:按域名遍历砍掉多余条目(简单、无偏的容量保护)。
+        to_free = total - max_entries
+        for d, per_pid in list(self._domain_metrics.items()):
+            if to_free <= 0:
+                break
+            drop = min(len(per_pid), to_free)
+            for pid in list(per_pid.keys())[:drop]:
+                per_pid.pop(pid, None)
+                self._domain_quality.get(d, {}).pop(pid, None)
+            to_free -= drop
+            if not per_pid:
+                self._domain_metrics.pop(d, None)
+                self._domain_quality.pop(d, None)
+
     def prune_domain_quality(self, max_entries: int = 10_000):
         """域名级质量表容量保护:条目超上限时按最近观测 ts 淘汰最旧条目。
 
@@ -330,6 +571,8 @@ class ProxySelector:
         self._circuit.clear()
         self._in_flight.clear()
         self._conc.clear()  # 并发上限随质量重学(P3)
+        self._proxy_metrics.clear()   # 可观测性指标随质量一并重置(Phase 1)
+        self._domain_metrics.clear()
 
     def reset_circuits(self):
         """手动解除全部代理的熔断并清空连续失败计数(运维介入后调用)。
@@ -348,11 +591,18 @@ class ProxySelector:
             self._circuit[pid] = s
         return s
 
-    def record_failure(self, pid: str):
+    def record_failure(self, pid: str, error_type: Optional[str] = None,
+                       domain: Optional[str] = None):
         """记录一次上游失败(连接失败/超时/5xx)。连续失败达阈值即熔断。
 
         退避期指数增长:首熔断 backoff=1s,此后每次新熔断翻倍(上限
         circuit_max_backoff)。退避期内 open_until 未到,该代理不参与竞速/单发。
+
+        Phase 1:error_type 为错误分类键(_ERROR_KEYS 之一,默认 'other'),
+        domain 为域名(HTTP 的 domain key / CONNECT 的 target)时,同步记录到
+        域名级与全局级指标的错误分类与 total。注意**被竞速取消的败者
+        (CancelledError)不应喂 record_failure**(由调用方跳过),故此处不再引入
+        error_type='cancelled' 入口——取消在调用方(_try_http/_try_tunnel)判断。
         """
         self._conc_observe_failure(pid)  # 自适应并发:失败 → 乘性降低上限(P3)
         s = self._circuit_state(pid)
@@ -364,6 +614,11 @@ class ProxySelector:
             s["consec_fail"] = 0  # 熔断后计数清零,恢复后的失败重新累计
             self.circuit_open_count += 1
             logger.warning("circuit opened for proxy %s, backoff=%.1fs", pid, s["backoff"])
+        # ── 可观测性增强(Phase 1):错误分类 + total ──
+        etype = error_type if error_type in _ERROR_KEYS else ERROR_OTHER
+        for scope in (self._metrics_for(pid, domain), self._metrics_for(pid, None)):
+            scope["total"] += 1
+            scope["errors"][etype] += 1
 
     def record_success(self, pid: str):
         """记录一次上游成功,连续失败计数归零。

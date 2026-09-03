@@ -51,7 +51,9 @@ from .config_schema import PolicyConfig, RouterConfig
 from .pools import ConnectionPools, _discard_conn, _ESTABLISHED_KEY_CAP, _ESTABLISHED_PROBE_TIMEOUT
 from .selector import (ProxySelector, _CIRCUIT_THRESHOLD, _CIRCUIT_MAX_BACKOFF,
                        _SLOW_START_WINDOW, _SLOW_START_SUCCESS, _LB_BIAS_DEFAULT,
-                       _FAIL_PENALTY_DEFAULT)
+                       _FAIL_PENALTY_DEFAULT,
+                       ERROR_TIMEOUT, ERROR_CONNECT, ERROR_HTTP_5XX, ERROR_TLS,
+                       ERROR_PROTOCOL, ERROR_CANCELLED, ERROR_OTHER)
 from .http_cache import HttpCache, CACHEABLE_STATUS, _INVALIDATING_METHODS
 from .sticky import StickyCache
 from .cluster import ClusterGraph
@@ -2064,7 +2066,12 @@ class Router:
             # 接连真失败即 is_circuit_open('local') 移出竞速/单发(local-add 与
             # _get_fresh_proxy/sticky 已加门控),消除每请求白烧 3s。
             if not isinstance(ex, asyncio.CancelledError):
-                self.selector.record_failure(pid)
+                # Phase 1.3:错误分类(带域名),供 /quality /domains/meta 暴露
+                # 各代理对该域名的失败构成(连接/超时/TLS/协议/其他)。
+                # 被竞速取消的败者(CancelledError)不算失败,不喂 record_failure
+                # (与熔断语义一致,避免健康慢代理被误计)。ERROR_CANCELLED 键保留
+                # 但此处不启用——竞速取消是常态,不作"错误"归因。
+                self.selector.record_failure(pid, self._classify_error(ex), domain)
             # per-attempt 失败观测:每次上游尝试失败都记(含被取消的竞速败者,区分
             # 取消/真失败;单发失败此前只能从决策链汇总推,无 client_ip/耗时)。
             # 值 P0:让"哪个代理对哪个目标为何失败"可直接 grep 到。
@@ -2161,13 +2168,15 @@ class Router:
             self._log_attempt_failure(client_ip, target, target, pid,
                                       RuntimeError(f'connect to {proxy_host or target} timed out or failed: {e}'),
                                       _perf_t0)
-            self.selector.record_failure(pid)
+            # Phase 1.3:建连阶段失败 → 归为 connect/timeout 错误分类(带 target 域名)。
+            etype = ERROR_TIMEOUT if isinstance(e, asyncio.TimeoutError) else ERROR_CONNECT
+            self.selector.record_failure(pid, etype, target)
             raise RuntimeError(f'connect to {proxy_host or target} timed out or failed: {e}') from e
         except ValueError as e:
             # 非法 CONNECT target(空 host / 坏端口):同样记 per-attempt 日志与熔断
             # (真失败),原样重抛(调用方按 ValueError 处理,不转 RuntimeError)。
             self._log_attempt_failure(client_ip, target, target, pid, e, _perf_t0)
-            self.selector.record_failure(pid)
+            self.selector.record_failure(pid, ERROR_OTHER, target)
             raise
         # 首字节计时:从 CONNECT 发出到收到 200。用于 EWMA 质量跟踪(竞速排序)。
         # 复用已握手隧道时无 CONNECT 往返,计时为 0(不做 EWMA 观测)。
@@ -2223,7 +2232,9 @@ class Router:
             # 的 127.0.0.1:26128/6128)经 is_circuit_open('local') 移出竞速/单发
             # (4 处 local-add 与 _get_fresh_proxy/sticky 已加门控),消除每请求白烧 3s。
             if not isinstance(ex, asyncio.CancelledError):
-                self.selector.record_failure(pid)
+                # Phase 1.3:CONNECT 握手/建连失败归因。RuntimeError 通常来自上游
+                # 非 200 / 无响应(协议/上游错误),OSError 等为连接层失败。
+                self.selector.record_failure(pid, self._classify_error(ex), target)
             # per-attempt 失败观测(同 _try_http):每次 CONNECT 尝试失败都记(含取消
             # 的竞速败者),带 client_ip/异常类型/耗时,可直接 grep 定位事故源。
             self._log_attempt_failure(client_ip, target, target, pid, ex, _perf_t0)
@@ -2565,6 +2576,63 @@ class Router:
                     "elapsed=%.1fms", client_ip or "-", domain, target, pid,
                     type(err).__name__, str(err)[:200] or "-", elapsed_ms)
 
+    @staticmethod
+    def _classify_error(err: BaseException) -> str:
+        """把上游尝试异常归类为 error 分类键(供 record_failure / /quality 暴露)。
+
+        按可抛异常类型尽力区分:
+          - asyncio.TimeoutError / httpx 超时 → 'timeout'
+          - 连接层(httpx.ConnectError / httpx.NetworkError / httpx.ConnectTimeout,
+            OSError / ConnectionError) → 'connect'
+          - 传输/TLS(httpx.RemoteProtocolError / httpx.LocalProtocolError /
+            httpx.ProxyError / ssl.SSLError) → 'tls' 或 'protocol'
+          - RuntimeError(上游非 200 / 无响应) → 'protocol'
+          - 其余 → 'other'
+        逻辑保守:识别不到具体类型一律回退 'other',绝不把竞速取消(CancelledError)
+        在此算错——调用方已在 is CancelledError 分支跳过 record_failure。
+        """
+        tn = type(err).__name__
+        mod = type(err).__module__
+        full = f"{mod}.{tn}"
+        # httpx 超时基类(ReadTimeout/ConnectTimeout/WriteTimeout/PoolTimeout 均继承)
+        if isinstance(err, asyncio.TimeoutError):
+            return "timeout"
+        # 尝试安全的 httpx/ssl 导入判定(运行时常在,避免顶层导入副作用)。
+        try:
+            import httpx
+            if isinstance(err, (httpx.HTTPError,)):
+                # 先判超时子类(它们同为 ConnectError 子类,顺序在先)
+                if isinstance(err, getattr(httpx, "TimeoutException", ())):
+                    return "timeout"
+                if isinstance(err, (getattr(httpx, "ConnectError", ()),)):
+                    return "connect"
+                if isinstance(err, (getattr(httpx, "RemoteProtocolError", ()),
+                                    getattr(httpx, "LocalProtocolError", ()),
+                                    getattr(httpx, "HTTPStatusError", ()))):
+                    return "protocol"
+        except Exception:
+            pass
+        try:
+            import ssl
+            if isinstance(err, ssl.SSLError):
+                return "tls"
+        except Exception:
+            pass
+        if isinstance(err, (OSError, ConnectionError)):
+            return "connect"
+        if isinstance(err, RuntimeError):
+            # 上游返回非 200 / 无响应 由本模块 raise RuntimeError 标记协议层失败
+            return "protocol"
+        if "Timeout" in full or "TimeoutError" in full:
+            return "timeout"
+        if "Connect" in full or "ConnectionError" in tn:
+            return "connect"
+        if "SSLError" in tn or "TLS" in tn:
+            return "tls"
+        if "Protocol" in tn:
+            return "protocol"
+        return "other"
+
     async def _forward_single(self, writer, method: str, url: str, hdrs: dict, body, domain: str,
                              pid: str | None = None, instantiated=None, sticky: bool = False,
                              client_ip: str = ""):
@@ -2602,7 +2670,16 @@ class Router:
             else:
                 self.domain_cache_hits += 1
         try:
-            buffered = await self._stream_upstream_response(writer, resp, method, url)
+            buffered, body_bytes, body_duration = await self._stream_upstream_response(writer, resp, method, url)
+            # Phase 1.1:完整响应观测——TTLB(body 转发耗时)与吞吐(见 record_complete)。
+            # instantiated(竞速赢家)路径同样在此记录:赢家是最终面向客户端的代理,
+            # 它的 body 下载耗时/吞吐正是用户感知速度,补 TTFB 之外的第二维度。
+            if body_duration > 0:
+                self.selector.record_complete(pid, body_bytes, body_duration, domain=domain)
+            # Phase 1.3:HTTP 5xx 归因(header 收到但为服务端错误,不抛异常,需要单独
+            # 计入错误分类;5xx 已计入 success_rate 分子,这里补错误维度)。
+            if resp.status_code >= 500:
+                self.selector.record_http_error(pid, resp.status_code, domain=domain)
             if buffered is not None and resp.status_code in CACHEABLE_STATUS:
                 self.httpcache._http_cache_set(method, url, resp.status_code, resp.reason_phrase,
                                                 list(resp.headers.multi_items()), buffered)
@@ -2694,7 +2771,7 @@ class Router:
             _pid, _m, url, resp, _c = await self._try_http(
                 'local', None, method, url, hdrs, body, domain, relaxed=True, client_ip=client_ip)
             self._observe_single_send(client_ip, domain, url, 'local', _perf_t0)
-            buffered = await self._stream_upstream_response(writer, resp, method, url)
+            buffered, _bb, _bd = await self._stream_upstream_response(writer, resp, method, url)
             if buffered is not None and resp.status_code in CACHEABLE_STATUS:
                 self.httpcache._http_cache_set(method, url, resp.status_code, resp.reason_phrase,
                                                 list(resp.headers.multi_items()), buffered)
@@ -2936,7 +3013,11 @@ class Router:
         原始字节,与该值语义一致,长度正确);否则用 HTTP/1.1 chunked 传输编码
         逐块写出。两种方式都保证客户端能正确界定 body 边界,且不破坏流式收益。
 
-        返回缓冲的 body(若未超上限);超过上限返回 None 表示放弃缓存。
+        返回 (buffered, streamed, body_duration):
+          - buffered:缓冲的 body(若未超上限);超过上限返回 None 表示放弃缓存。
+          - streamed / body_duration:实际转发的 body 字节数与 body 转发耗时(秒,
+            TTLB−TTFB),供 Phase 1.1 记录 TTLB/吞吐(见 _forward_single /
+            selector.record_complete)。
         客户端断开时静默,但仍尽量把已读字节丢弃以释放上游连接。
         """
         client_disconnected = False
@@ -2966,8 +3047,11 @@ class Router:
         buffered = bytearray()
         buffering = True
         streamed = 0
+        total_streamed = 0  # 无论 chunked 与否都累计原始 body 字节(供 Phase 1.1 吞吐)
+        _body_t0 = time.perf_counter()
         try:
             async for chunk in resp.aiter_raw():
+                total_streamed += len(chunk)
                 if buffering:
                     if len(buffered) + len(chunk) <= self.httpcache._stream_cache_limit:
                         buffered.extend(chunk)
@@ -3011,9 +3095,10 @@ class Router:
             except Exception:
                 pass
         # 返回缓冲:仅当未超上限且仍在 buffering 状态。
+        body_duration = time.perf_counter() - _body_t0
         if buffering:
-            return bytes(buffered)
-        return None
+            return bytes(buffered), total_streamed, body_duration
+        return None, total_streamed, body_duration
 
     # ── CONNECT 处理 ──────────────────────────────────────────
 

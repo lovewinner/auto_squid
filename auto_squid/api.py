@@ -98,6 +98,20 @@ async def quality():
     return _router.selector.get_quality()
 
 
+@app.get("/quality/meta")
+async def quality_meta():
+    """返回每代理的增强指标(Phase 1,IMPROVEMENT_PLAN.md)。
+
+    在原有 EWMA TTFB 之外补充 TTFB/TTLB 分位数(P50/P95/P99)、成功率、错误分类、
+    吞吐与累计字节。供运维/仪表盘评估"特定 URL 实测速度"(TTFB + TTLB 双维度,
+    避免只看首字节而低估大文件/慢链路)。返回 {pid: metric},见
+    selector.get_pid_quality_v2()。
+    """
+    if not _router:
+        return {}
+    return _router.selector.get_pid_quality_v2()
+
+
 @app.post("/quality/reset")
 async def quality_reset():
     """清空全部代理 EWMA 质量数据(网络切换/代理分组变化后调用)。
@@ -167,8 +181,23 @@ async def metrics():
     domain_stats = _router.get_domain_stats_from_db() if _router else {}
     # 服务端性能计数器(缓存命中/竞速扇出),供压测跨进程读取算命中率/放大率。
     counters = _router.snapshot_counters() if _router else {}
+    # Phase 1:每代理增强指标(成功率/错误分类/TTLB/吞吐分位数),见 /quality/meta。
+    proxy_metrics = _router.selector.get_proxy_metrics() if _router else {}
     return {"request_counts": counts, "attempted_counts": attempts, "domain_stats": domain_stats,
-            "counters": counters}
+            "counters": counters, "proxy_metrics": proxy_metrics}
+
+
+@app.get("/metrics/per-destination")
+async def metrics_per_destination():
+    """每分钟度(域名,代理)的增强指标(Phase 1,IMPROVEMENT_PLAN.md)。
+
+    评估"特定 URL(如 https://github.com 的 domain key github.com:443)实测速度":
+    返回 {domain: {pid: {ttfb/ttlb 分位数, 成功率, 错误分类, 吞吐}}}。见
+    selector.get_domain_metrics()。
+    """
+    if not _router:
+        return {}
+    return _router.selector.get_domain_metrics()
 
 
 @app.get("/server-stats")
@@ -206,10 +235,19 @@ async def domains():
 @app.get("/domains/meta")
 async def domains_meta():
     """返回域名缓存元数据（当前默认代理、更新时间；自适应 TTL 开启时含
-    ttl/expires_at/switch_count）"""
+    ttl/expires_at/switch_count）。
+
+    Phase 1 增强:每个域名追加 proxy_metrics = {pid: {ttfb/ttlb 分位数, 成功率,
+    错误分类, 吞吐}}——用于评估"特定 URL(如 github.com:443)在各代理上的实测
+    速度差异"(TTFB+TTLB 双维度)。见 selector.get_domain_metrics()。
+    """
     if not _router:
         return {}
-    return _router.get_domain_meta_enriched()
+    out = _router.get_domain_meta_enriched()
+    per_dest = _router.selector.get_domain_metrics()
+    for d, per_pid in per_dest.items():
+        out.setdefault(d, {})["proxy_metrics"] = per_pid
+    return out
 
 
 @app.get("/stickiness")

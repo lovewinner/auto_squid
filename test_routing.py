@@ -269,6 +269,9 @@ class RoutingAnalyzer:
         circuit_state = self.router.selector.get_circuit_state()
         in_flight = self.router.selector.get_in_flight()
         concurrency_limits = self.router.selector.get_concurrency_limits()
+        # Phase 1 增强指标:每代理成功率/错误分类/TTLB/吞吐(见 /quality/meta)。
+        pid_v2 = self.router.selector.get_pid_quality_v2()
+        domain_v2 = self.router.selector.get_domain_metrics().get(self.domain, {})
 
         results = []
         for rank, pid in enumerate(ordered, 1):
@@ -279,6 +282,10 @@ class RoutingAnalyzer:
             dq = domain_quality.get(self.domain, {}).get(pid, {})
             domain_ewma = dq.get("ewma_ttfb")
             domain_obs = dq.get("obs", 0)
+
+            # Phase 1:该代理对该域名的实测指标(特定 URL 速度评估核心)。
+            v2 = pid_v2.get(pid)
+            dv2 = domain_v2.get(pid)   # 完整域名级条目:{metrics, percentiles}
 
             circuit = circuit_state.get(pid, {})
             circuit_open = circuit.get("open", False)
@@ -309,6 +316,9 @@ class RoutingAnalyzer:
                 "global_obs": obs,
                 "domain_ewma_seconds": domain_ewma,
                 "domain_obs": domain_obs,
+                # Phase 1 增强指标(见 /quality/meta 与 /domains/meta)
+                "v2": v2,               # 全局(跨域名)每代理指标
+                "v2_domain": dv2,       # 仅该域名的每代理指标(特定 URL 评估)
                 "in_flight": in_flight_count,
                 "concurrency_limit": conc_limit,
                 "circuit_open": circuit_open,
@@ -559,7 +569,41 @@ def format_output(analysis: Dict[str, Any], json_output: bool = False) -> str:
         if p.get('concurrency_limit'):
             conc_str = f" 并发上限={p['concurrency_limit']}"
 
-        lines.append(f"  #{p.get('rank','?')}: {p['proxy_id']}{ewma_str}{conc_str} 并发={p.get('in_flight',0)} 连续失败={p.get('consec_fail',0)} {status_str}")
+        # Phase 1:TTFB/TTLB 分位数 + 成功率 + 错误分类(优先仅该域名的,回退全局)。
+        phase1 = ""
+        dom = p.get('v2_domain')  # {metrics, percentiles} 或 None
+        dom_metrics = (dom or {}).get('metrics') if dom else None
+        base = dom_metrics or (p.get('v2') or {})
+        ttfb_p = None
+        ttlb_p = None
+        if dom:
+            ttfb_p = dom.get('percentiles', {}).get('ttfb')
+            ttlb_p = dom.get('percentiles', {}).get('ttlb')
+        if not ttfb_p and p.get('v2'):
+            ttfb_p = p['v2'].get('ttfb')
+        if not ttlb_p and p.get('v2'):
+            ttlb_p = p['v2'].get('ttlb')
+        if base:
+            tot = base.get('total', 0)
+            suc = base.get('success', 0)
+            rate = (suc / tot) if tot else None
+            errs = base.get('errors', {})
+            err_str = ",".join(f"{k}:{v}" for k, v in errs.items() if v)
+            bits = []
+            if ttfb_p and ttfb_p.get('samples'):
+                bits.append(f"TTFB p50/p95/p99={ttfb_p.get('p50',0)*1000:.0f}/{ttfb_p.get('p95',0)*1000:.0f}/{ttfb_p.get('p99',0)*1000:.0f}ms(n={ttfb_p['samples']})")
+            if ttlb_p and ttlb_p.get('samples'):
+                bits.append(f"TTLB p50/p99={ttlb_p.get('p50',0)*1000:.0f}/{ttlb_p.get('p99',0)*1000:.0f}ms")
+            if rate is not None:
+                bits.append(f"成功率={rate*100:.0f}%({suc}/{tot})")
+            if err_str:
+                bits.append(f"错误[{err_str}]")
+            if base.get('throughput_ewma') is not None:
+                bits.append(f"吞吐≈{base['throughput_ewma']:.1f}MB/s")
+            if bits:
+                phase1 = "  " + "  ".join(bits)
+
+        lines.append(f"  #{p.get('rank','?')}: {p['proxy_id']}{ewma_str}{conc_str} 并发={p.get('in_flight',0)} 连续失败={p.get('consec_fail',0)} {status_str}{phase1}")
     lines.append("")
 
     # 统计
