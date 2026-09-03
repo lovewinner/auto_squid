@@ -6295,6 +6295,92 @@ async def test_local_direct_http_failure_502_no_upstream():
 
 
 @pytest.mark.asyncio
+async def test_local_direct_http_circuit_short_no_local_call():
+    """local 熔断短路:白名单目标在 local 熔断期直接 502,不打 local 服务端(节省
+    10s 超时)。consec_fail 不被累加(否则永熔断),等熔断自然冷却后下次恢复。"""
+    local_srv = await run_local_http_server(HOST, LOCAL_HTTP_PORT)
+    router = _local_direct_router()
+    await router.start()
+    try:
+        # 手动让 local 进入熔断退避:直接写 circuit dict,控制 backoff 时长。
+        import time as _t
+        router.selector._circuit['local'] = {
+            'consec_fail': 0,
+            'open_until': _t.monotonic() + 10.0,  # 10s 退避
+            'backoff': 10.0,
+        }
+        assert router.selector.is_circuit_open('local')
+        url = f"http://{HOST}:{LOCAL_HTTP_PORT}/".encode()
+        status = await send_http_get_status(HOST, ROUTER_PORT, url=url)
+        assert b'502' in status, f"expected 502, got {status}"
+        counters = router.snapshot_counters()
+        assert counters['local_direct_circuit_short'] >= 1, \
+            f"expected local_direct_circuit_short>=1, got {counters}"
+        assert counters['local_direct_failures'] >= 1
+    finally:
+        await router.stop()
+        local_srv.close()
+        await local_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_local_direct_connect_circuit_short_502():
+    """CONNECT 白名单目标:local 熔断期直接 502,不打 local 端口。"""
+    local_srv = await run_local_http_server(HOST, LOCAL_HTTP_PORT)
+    router = _local_direct_router()
+    await router.start()
+    try:
+        import time as _t
+        router.selector._circuit['local'] = {
+            'consec_fail': 0,
+            'open_until': _t.monotonic() + 10.0,
+            'backoff': 10.0,
+        }
+        assert router.selector.is_circuit_open('local')
+        # 手写 CONNECT 响应检查,不用 send_connect(它内部断言 200)。
+        r, w = await asyncio.open_connection(HOST, ROUTER_PORT)
+        w.write(b"CONNECT " + f"{HOST}:{LOCAL_HTTP_PORT}".encode() + b" HTTP/1.1\r\n\r\n")
+        await w.drain()
+        status = await r.readline()
+        w.close()
+        await w.wait_closed()
+        assert b'502' in status, f"expected 502 CONNECT, got {status}"
+        counters = router.snapshot_counters()
+        assert counters['local_direct_circuit_short'] >= 1
+    finally:
+        await router.stop()
+        local_srv.close()
+        await local_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_local_direct_http_circuit_recovers_after_backoff():
+    """熔断退避到期后,白名单请求恢复直连:local_direct_circuit_short 不再涨。"""
+    local_srv = await run_local_http_server(HOST, LOCAL_HTTP_PORT)
+    router = _local_direct_router()
+    await router.start()
+    try:
+        import time as _t
+        router.selector._circuit['local'] = {
+            'consec_fail': 0,
+            'open_until': _t.monotonic() + 0.05,  # 50ms 后到期
+            'backoff': 0.05,
+        }
+        # 退避到期后再请求。
+        _t.sleep(0.1)
+        url = f"http://{HOST}:{LOCAL_HTTP_PORT}/".encode()
+        body = await send_http_get(HOST, ROUTER_PORT, url=url)
+        assert b'local-response' in body, "backoff expired → 直连应恢复"
+        counters = router.snapshot_counters()
+        assert counters['local_direct_circuit_short'] == 0, \
+            f"backoff 已冷却,不应短路,got {counters}"
+    finally:
+        await router.stop()
+        local_srv.close()
+        await local_srv.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_local_direct_http_cache_still_works():
     """白名单请求仍走 HTTP 响应缓存:第二次命中缓存,local 只打一次。"""
     local_srv = await run_local_http_server(HOST, LOCAL_HTTP_PORT)

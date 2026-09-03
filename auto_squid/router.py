@@ -458,6 +458,7 @@ class Router:
         self._local_direct_timeout = self.local_direct_timeout_sec
         self.local_direct_hits = 0        # 白名单命中(强制本机直连)次数
         self.local_direct_failures = 0    # 白名单直连失败(回 502)次数
+        self.local_direct_circuit_short = 0  # 白名单命中但 local 熔断短路次数
         # "降级中"代理集合(可观测,非门控):被单发降级判定命中的代理记录于此。
         # 注意真正的门控是每次选择时实时重估 _single_send_degraded(代理恢复后立即
         # 重新可单发,无需冷却),此集合只供 /metrics /circuit 展示"当前被判定降级的
@@ -1184,6 +1185,7 @@ class Router:
             "single_send_slow_log_ms": self.single_send_slow_log_ms,
             "local_direct_hits": self.local_direct_hits,
             "local_direct_failures": self.local_direct_failures,
+            "local_direct_circuit_short": self.local_direct_circuit_short,
             "connect_tunnel_timeout_sec": self.connect_tunnel_timeout_sec,
             "http_read_timeout_sec": self.http_read_timeout_sec,
             "domain_ttl_grows": self.domain_ttl_grows,
@@ -2666,7 +2668,26 @@ class Router:
         静态资源/RSC 可缓存);失败直接回 502 不绕远端(用户决策:白名单目标若
         绕远端又会被全局 3s 掐断)。不进入 sticky/域名缓存/竞速三层——白名单即
         显式授权直连,不走远端代理,也不计 domain_cache_hits/sticky 命中。
+
+        熔断短路:local 在熔断退避期时不浪费时间直连(白名单目标同 host 同样
+        502),直接回 502+计数。**不**喂 consec_fail(否则永熔断),等熔断自然
+        冷却后下次请求再尝试直连。这与竞速路径 4 个 local-add 站点的
+        is_circuit_open('local') gate 同构。
         """
+        # 熔断短路:local 处于退避期时直接 502,不尝试 local 直连(避免再耗一个
+        # 10s 超时窗口——事故 09-02 日志:6 代理 + local 全挂,10.14.25.86 之类
+        # 白名单内网域名仍硬扛 10s 后才回 502,白烧客户端时间)。
+        if self.selector.is_circuit_open('local'):
+            self.local_direct_failures += 1
+            self.local_direct_circuit_short += 1
+            logger.warning("local-direct short-circuit (local circuit open) "
+                           "client=%s domain=%s", client_ip or '-', domain)
+            try:
+                await self._write_cached_response(writer, 502, 'Bad Gateway',
+                                                  {'Content-Type': 'text/plain'}, b'Bad Gateway')
+            except Exception:
+                pass
+            return 502
         resp = None
         try:
             _perf_t0 = time.perf_counter()
@@ -3124,7 +3145,21 @@ class Router:
         用 local_direct_timeout_sec(默认 10s)放宽建连/读响应,本机回环不被全局 3s
         掐断。透传复用 _relay_tunnel(proxy_host=None → 不归还 established 池不预热,
         正确)。失败回 502 不绕远端(用户决策:白名单目标若绕远端又会被全局 3s 掐)。
+
+        熔断短路:同 _forward_local_direct_http,local 熔断时直接 502。
         """
+        # 熔断短路:local 处于退避期时直接 502,不尝试直连。
+        if self.selector.is_circuit_open('local'):
+            self.local_direct_failures += 1
+            self.local_direct_circuit_short += 1
+            logger.warning("local-direct CONNECT short-circuit (local circuit open) "
+                          "client=%s target=%s", client_ip or '-', target)
+            try:
+                client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n\r\nBad Gateway")
+                await client_writer.drain()
+            except Exception:
+                pass
+            return
         up_reader = up_writer = None
         try:
             _perf_t0 = time.perf_counter()
