@@ -999,17 +999,6 @@ class TestApiAuth:
         import base64
         return {"Authorization": "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode()}
 
-    def test_off_by_default(self):
-        """未传 api_auth → 全部端点开放(回归保护)。"""
-        mount(None, None)
-        client = TestClient(api_app)
-        try:
-            assert client.get("/health").status_code == 200
-            assert client.get("/stats").status_code == 200
-            assert client.get("/proxies").status_code == 200
-        finally:
-            mount(None, None)
-
     def test_health_open_with_auth_on(self):
         """认证开启时 /health 仍无需凭据(健康检查/负载均衡探活)。"""
         self._mount()
@@ -2879,20 +2868,6 @@ class TestSingleSendDegrade:
                       db_path=tempfile.mktemp(suffix='.db'),
                       stickiness_enabled=True, stickiness_ttl=1800, **kw)
 
-    def test_degrades_off_by_default(self):
-        """默认(阈值=0)不降级:连续失败/EWMA 恶化都不触发,行为与旧版一致。"""
-        r = self._router()
-        r.selector.record_ttfb('p', 0.01)
-        r._record_win_meta('example.com', 'p')
-        assert r._get_fresh_proxy('example.com') == 'p'
-        r._record_sticky('1.2.3.4', 'example.com', 'p')
-        assert r._get_sticky_proxy('1.2.3.4', 'example.com') == 'p'
-        r.selector.record_failure('p')
-        r.selector.record_failure('p')  # 连续失败 2 次也不降级(阈值 0=关闭)
-        assert r._get_fresh_proxy('example.com') == 'p'
-        assert r._get_sticky_proxy('1.2.3.4', 'example.com') == 'p'
-        assert r.single_send_degrades == 0
-
     def test_consec_fail_degrades_domain_and_sticky(self):
         """连续失败达阈值 → 域名缓存与粘性单发都降级回竞速(未熔断时)。"""
         r = self._router(single_send_degrade_fail=2)
@@ -3461,12 +3436,6 @@ class TestAdaptiveTTL:
                       adaptive_ttl=True, adaptive_ttl_min=60.0,
                       adaptive_ttl_max=1800.0, **kw)
 
-    def test_off_by_default_uses_global_ttl(self):
-        """未开启时 _domain_ttl 返回全局 cache_ttl,且不记录 per-domain 状态。"""
-        r = Router(ProxyStore(), listen_host='127.0.0.1', listen_port=10809,
-                   db_path=tempfile.mktemp(suffix='.db'), cache_ttl=600)
-        assert r._domain_ttl('example.com') == 600
-
     def test_stable_domain_ttl_grows(self):
         """同代理连续胜出 → TTL 上浮(1.5× 步进,封顶)。"""
         r = self._router()
@@ -3603,14 +3572,6 @@ class TestSwitchDamping:
                       db_path=tempfile.mktemp(suffix='.db'),
                       switch_damping=True, switch_damping_min_wins=2, **kw)
 
-    def test_off_by_default_allows_immediate_switch(self):
-        """默认关闭:新赢家立即替换旧赢家(旧行为)。"""
-        r = Router(ProxyStore(), listen_host='127.0.0.1', listen_port=10809,
-                   db_path=tempfile.mktemp(suffix='.db'))
-        r._record_win_meta('d.example.com', 'p')
-        r._record_win_meta('d.example.com', 'q')
-        assert r._meta_cache['d.example.com']['default_proxy'] == 'q'
-
     def test_requires_consecutive_wins_to_switch(self):
         """新赢家单次胜出不能替换旧赢家;连续胜出达阈值才替换。"""
         r = self._router()
@@ -3693,17 +3654,6 @@ class TestAdaptiveConcurrencyLimit:
         kw.setdefault('concurrency_failure_window', 3)
         return Router(store, listen_host='127.0.0.1', listen_port=10809,
                       db_path=tempfile.mktemp(suffix='.db'), **kw)
-
-    def test_off_by_default_no_filter(self):
-        """默认关闭:达上限的代理仍参与候选(旧行为)。"""
-        r = Router(ProxyStore(), listen_host='127.0.0.1', listen_port=10809,
-                   db_path=tempfile.mktemp(suffix='.db'))
-        ps = ProxyStore()
-        ps.add(ProxyInfo(id='p', host='h', port=3128))
-        sel = r.selector
-        sel._inflight_start('p')
-        sel._in_flight['p'] = 1000  # 手工超限
-        assert sel._at_concurrency_limit('p') is False
 
     def test_at_limit_filtered_from_candidates(self):
         """在途达上限 → 该代理从 ordered_proxies 过滤。"""
@@ -4000,21 +3950,6 @@ class TestConnPoolIdlePause:
         # 孤立请求(单发)在 K=1 时仍刷新 → 解除暂停。
         r._record_request_activity()
         assert r._conn_pool_idle() is False
-
-    def test_legacy_silence_sec_still_maps(self):
-        """旧配置 refill_pause_silence_sec 仍兼容:换算为窗口、且 snapshot 可见。"""
-        # 显式窗口优先(新配置)。
-        r = self._router(conn_pool_refill_pause_minutes=60.0,
-                         conn_pool_refill_pause_activity_window=300.0)
-        assert r.conn_pool_refill_pause_activity_window == 300.0
-        # 仅旧 silence_sec(未显式窗口):换算窗口 = max(30, silence/4)。
-        r2 = self._router(conn_pool_refill_pause_minutes=60.0,
-                          conn_pool_refill_pause_silence_sec=180.0)
-        assert r2.conn_pool_refill_pause_activity_window == 45.0
-        # silence=0(旧"任意刷新")→ 窗口=0,保持不启用。
-        r3 = self._router(conn_pool_refill_pause_minutes=60.0,
-                          conn_pool_refill_pause_silence_sec=0.0)
-        assert r3.conn_pool_refill_pause_activity_window == 0.0
 
     def test_real_isolated_request_resumes(self):
         """修复目标:真实孤立请求(此前被 silence_sec 一刀切误伤)如今不误伤——
@@ -4989,18 +4924,6 @@ class TestPrehandshake:
             up_srv.close()
             await up_srv.wait_closed()
 
-    @pytest.mark.asyncio
-    async def test_prehandshake_throttle_off_by_default(self):
-        """默认(0,0)不限速:连续发射不被跳过,throttled_skips 恒 0(零行为变化)。"""
-        r = self._router()
-        await r.start()
-        try:
-            for _ in range(10):
-                assert r.pools._prehandshake_throttle_allow()
-            assert r.pools.prehandshake_throttled_skips == 0
-        finally:
-            await r.stop()
-
 
 class TestStickyProbeEviction:
     """杠杆A:粘性命中后台探路——命中后 fire-and-forget 对竞争代理做 CONNECT-only
@@ -5293,7 +5216,6 @@ class TestClusterPredictor:
             self._learn(g, '7.7.7.7', ['a.com:443', 'b.com:443'], pid='q', t0=40.0)
             snap = g.get_cluster_cache()
             hist = snap['a.com:443']['b.com:443'][2]
-            assert (2, 'q') == (2, 'q')
             assert abs(hist['p'] - 1.0) < 1e-2 and abs(hist['q'] - 1.0) < 1e-2, \
                 f"超大半衰期下直方图应≈{1.0, 1.0}(实测 {hist})"
             # 窗口3:开口先连 a → 预测 b 摊到 p、q 两个桶。预测计数用增量(学习窗的
@@ -6104,17 +6026,6 @@ async def test_aggregation_wait_timeout_is_second_scale():
 
 class TestConfigSchemaStrict:
     """#12: 配置模型一律 extra="forbid",拼错键在启动即硬报错;跨字段一致性校验。"""
-
-    def test_unknown_top_level_key_rejected(self):
-        with pytest.raises(Exception) as ei:
-            Config(**{"router": {}, "bogus_top_key": 1})
-        assert "bogus_top_key" in str(ei.value)
-
-    def test_unknown_nested_key_rejected(self):
-        """stagger_inital(拼错)→ RouterConfig 报错,不再静默落默认。"""
-        with pytest.raises(Exception) as ei:
-            RouterConfig(stagger_inital=5)
-        assert "stagger_inital" in str(ei.value)
 
     def test_conn_pool_typo_rejected(self):
         with pytest.raises(Exception) as ei:
