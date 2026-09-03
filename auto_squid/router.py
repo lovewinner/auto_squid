@@ -57,6 +57,7 @@ from .selector import (ProxySelector, _CIRCUIT_THRESHOLD, _CIRCUIT_MAX_BACKOFF,
 from .http_cache import HttpCache, CACHEABLE_STATUS, _INVALIDATING_METHODS
 from .sticky import StickyCache
 from .cluster import ClusterGraph
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -583,6 +584,8 @@ class Router:
         # 非线程安全,用锁串行化所有 DB 写入,避免 "database is locked"。
         # 热路径(转发)只读写下方内存缓存,不经此锁。
         self._db_lock = threading.Lock()
+        self._metrics_dirty = False
+        # 热路径(转发)只读写下方内存缓存,不经此锁。
         self._db.execute("""
             CREATE TABLE IF NOT EXISTS domain_stats (
                 domain TEXT NOT NULL,
@@ -599,7 +602,25 @@ class Router:
                 ref_ewma REAL
             )
         """)
-        # 迁移:老库的 domain_meta 无 ref_ewma 列(GOAL #6 之前)。CREATE TABLE IF NOT
+        # 监控指标表:proxy 级全局指标
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS proxy_metrics (
+                proxy_id TEXT PRIMARY KEY,
+                metrics_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        # 监控指标表:域名 × 代理 实测指标
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS domain_metrics (
+                domain TEXT NOT NULL,
+                proxy_id TEXT NOT NULL,
+                metrics_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (domain, proxy_id)
+            )
+        """)
+        # 迁移:老库的 domain_meta 无 ref_ewma 列(GOAL #6 之前)。CREATE TABLE IF
         # EXISTS 不会给已存在的表补列,这里检查 PRAGMA 并 ALTER ADD COLUMN,保证
         # 既有部署升级后启动不崩(老行 ref_ewma 为 NULL,降级判定按"无基线"处理)。
         cols = {row[1] for row in self._db.execute("PRAGMA table_info(domain_meta)")}
@@ -682,6 +703,43 @@ class Router:
                 "_updated_mono": mono,
                 "ref_ewma": (float(ewma) if ewma is not None else None),
             }
+
+        self._load_metrics_from_db()
+
+    def _load_metrics_from_db(self):
+        """启动时一次性把 proxy_metrics / domain_metrics 载入 selector 内存。
+
+        之后热路径只读写 selector 内存,DB 只在后台周期 flush 更新。
+        """
+        import json
+        with self._db_lock:
+            proxy_rows = self._db.execute(
+                "SELECT proxy_id, metrics_json FROM proxy_metrics").fetchall()
+            domain_rows = self._db.execute(
+                "SELECT domain, proxy_id, metrics_json FROM domain_metrics").fetchall()
+
+        # 恢复 proxy 级全局指标
+        proxy_data = {}
+        for pid, mj in proxy_rows:
+            try:
+                proxy_data[pid] = json.loads(mj)
+            except Exception:
+                logger.warning("无法解析 proxy_metrics for %s: %s", pid, mj)
+        if proxy_data:
+            self.selector.set_proxy_metrics(proxy_data)
+            logger.info("已从 DB 恢复 %d 个 proxy 级监控指标", len(proxy_data))
+
+        # 恢复域名 × 代理 实测指标
+        domain_data = {}
+        for d, pid, mj in domain_rows:
+            try:
+                m = json.loads(mj)
+                domain_data.setdefault(d, {})[pid] = m
+            except Exception:
+                logger.warning("无法解析 domain_metrics for %s %s: %s", d, pid, mj)
+        if domain_data:
+            self.selector.set_domain_metrics(domain_data)
+            logger.info("已从 DB 恢复 %d 个域名的监控指标", len(domain_data))
 
     @staticmethod
     def _norm_host(host: str) -> str:
@@ -880,8 +938,8 @@ class Router:
         注意:这里是幂等的全量覆盖——把内存当前值写回,而非增量累加,因此
         多次 flush 结果一致;即使中间 flush 丢失,下一次 flush 仍能补齐。
         """
-        if not (self._stats_dirty or self._meta_dirty):
-            return
+        dirty = self._stats_dirty or self._meta_dirty
+        # 监控指标总是 flush:数据量大时性能可接受,保证监控数据不过期。
         with self._db_lock:
             if self._stats_dirty:
                 # 全量重建 domain_stats:内存是权威源(已含历史累加)。
@@ -901,6 +959,22 @@ class Router:
                      for d, m in self._meta_cache.items()],
                 )
                 self._meta_dirty = False
+            # 监控指标:proxy 级全局指标
+            now = datetime.now(timezone.utc).isoformat()
+            self._db.execute("DELETE FROM proxy_metrics")
+            for pid, m in self.selector.get_proxy_metrics().items():
+                self._db.execute(
+                    "INSERT INTO proxy_metrics (proxy_id, metrics_json, updated_at)"
+                    " VALUES (?, ?, ?)",
+                    (pid, json.dumps(m), now))
+            # 监控指标:域名 × 代理 实测指标
+            self._db.execute("DELETE FROM domain_metrics")
+            for d, per_pid in self.selector.get_domain_metrics().items():
+                for pid, mm in per_pid.items():
+                    self._db.execute(
+                        "INSERT INTO domain_metrics (domain, proxy_id, metrics_json, updated_at)"
+                        " VALUES (?, ?, ?, ?)",
+                        (d, pid, json.dumps(mm), now))
             self._db.commit()
 
     async def _flush_loop(self):

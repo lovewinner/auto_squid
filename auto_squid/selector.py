@@ -563,16 +563,56 @@ class ProxySelector:
         """清空全部质量数据(RFC 8305 §4:历史 RTT 不可跨网络沿用)。
 
         网络切换/代理分组变化后调用,让排序回到无偏状态重新学习。熔断/慢启动
-        状态一并清空(旧网络的连续失败计数对当前网络无意义)。域名级质量表
-        (跨域名分离的 EWMA)同样清空——旧网络的域名级历史对当前网络无意义。
+        状态一并清空(旧网络的连续失败对当前网络无意义);单发降级失效集合
+        一并清空(旧网络的降级标记不可沿用)。
         """
         self._quality.clear()
         self._domain_quality.clear()
         self._circuit.clear()
         self._in_flight.clear()
-        self._conc.clear()  # 并发上限随质量重学(P3)
-        self._proxy_metrics.clear()   # 可观测性指标随质量一并重置(Phase 1)
+        self._conc.clear()
+        self._proxy_metrics.clear()
         self._domain_metrics.clear()
+
+    def set_proxy_metrics(self, data: dict):
+        """从 DB 恢复 proxy 级全局指标。
+
+        覆盖内存中的 _proxy_metrics:JSON 里存的 metric_dict 映射到
+        {"metrics": metric_dict} 结构(_metrics_for 约定)。
+        跳过缺失字段的行,保证内部结构完整。
+        """
+        for pid, m in data.items():
+            if not isinstance(m, dict):
+                continue
+            needed = {"ttfb_samples", "ttlb_samples", "ttlb_ewma",
+                      "throughput_ewma", "success", "total",
+                      "errors", "total_bytes", "transfer_time"}
+            if not needed.issubset(m):
+                logger.debug("proxy_metrics %s 缺少字段,跳过: %s", pid, set(m.keys()))
+                continue
+            self._proxy_metrics[pid] = {"metrics": m}
+
+    def set_domain_metrics(self, data: dict):
+        """从 DB 恢复域名 × 代理 实测指标。
+
+        data = {domain: {pid: metric_dict}}。
+        覆盖内存中的 _domain_metrics:JSON 里存的 metric_dict 映射到
+        {"metrics": metric_dict} 结构(_metrics_for 约定)。
+        跳过缺失字段的行,保证内部结构完整。
+        """
+        for d, per_pid in data.items():
+            if not isinstance(per_pid, dict):
+                continue
+            for pid, m in per_pid.items():
+                if not isinstance(m, dict):
+                    continue
+                needed = {"ttfb_samples", "ttlb_samples", "ttlb_ewma",
+                          "throughput_ewma", "success", "total",
+                          "errors", "total_bytes", "transfer_time"}
+                if not needed.issubset(m):
+                    logger.debug("domain_metrics %s %s 缺少字段,跳过", d, pid)
+                    continue
+                self._domain_metrics.setdefault(d, {})[pid] = {"metrics": m}
 
     def reset_circuits(self):
         """手动解除全部代理的熔断并清空连续失败计数(运维介入后调用)。

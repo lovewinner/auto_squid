@@ -315,6 +315,11 @@ select:focus{border-color:#e94560}
 .stat-card .pid{font-size:15px;font-weight:600;color:#a8d8ea}
 .stat-card .count{font-size:20px;font-weight:700;color:#e94560;margin-top:2px}
 .stat-card .label{font-size:10px;color:#666;margin-top:1px}
+.metrics-tabs{display:flex;gap:8px;margin-bottom:12px}
+.metrics-tabs .view-btn{padding:6px 16px}
+.metric-cell-num{text-align:center;font-variant-numeric:tabular-nums}
+.metric-cell-muted{color:#555;text-align:center;font-variant-numeric:tabular-nums}
+td.err-cell{font-size:11px;color:#a8d8ea}
 </style>
 </head>
 <body>
@@ -322,6 +327,8 @@ select:focus{border-color:#e94560}
 <div class="toolbar">
 <button id="view-domains" class="view-btn active" onclick="setView('domains')">域名统计</button>
 <button id="view-stickiness" class="view-btn" onclick="setView('stickiness')">会话粘性</button>
+<button id="view-metrics" class="view-btn" onclick="setView('metrics')">监控指标</button>
+<select id="metrics-domain" style="display:none" onchange="metricsDomain = this.value; renderMetrics();"></select>
 <input id="filter" placeholder="Filter..." oninput="onFilter()">
 <select id="interval" onchange="onIntervalChange(this)">
 <option value="0">关闭</option>
@@ -333,11 +340,15 @@ select:focus{border-color:#e94560}
 <option value="300">5m</option>
 <option value="600">10m</option>
 </select>
-<button onclick="fetchData()">Refresh</button>
+<button onclick="doRefresh()">Refresh</button>
 <span id="autorefresh-label" class="autorefresh-label"></span>
 </div>
 <div id="stats" class="stats"></div>
 <div id="filter-banner" class="filter-banner"></div>
+<div id="metrics-tabs" class="metrics-tabs" style="display:none">
+<button id="metricsub-global" class="view-btn active" onclick="setMetricsSub('global')">全局概览</button>
+<button id="metricsub-domain" class="view-btn" onclick="setMetricsSub('domain')">域名详情</button>
+</div>
 <div id="table-wrap"></div>
 <div id="pager" class="pager"></div>
 <div id="footer" class="footer"></div>
@@ -348,6 +359,10 @@ let refreshTimer = null;
 let refreshInterval = 30;
 let cfg = {};
 let view = 'domains';
+let metricsSub = 'global';
+let metricsDomain = '';
+let qmeta = {}, perDest = {};
+let stickMetrics = false;
 let sticky = [], stickyStats = {size: 0, hits: 0, evictions: 0};
 let activeProxy = new URLSearchParams(location.search).get('default_proxy') || null;
 
@@ -358,7 +373,11 @@ function onIntervalChange(sel) {
   const label = document.getElementById('autorefresh-label');
   if (refreshInterval > 0) {
     label.textContent = '每 ' + sel.options[sel.selectedIndex].text + ' 自动刷新';
-    refreshTimer = setInterval(() => { view === 'stickiness' ? renderStickiness() : fetchData(); }, refreshInterval * 1000);
+    refreshTimer = setInterval(() => {
+      if (view === 'stickiness') renderStickiness();
+      else if (view === 'metrics') fetchMetrics();
+      else fetchData();
+    }, refreshInterval * 1000);
   } else {
     label.textContent = '';
   }
@@ -368,14 +387,27 @@ function setView(v) {
   view = v;
   document.getElementById('view-domains').classList.toggle('active', v === 'domains');
   document.getElementById('view-stickiness').classList.toggle('active', v === 'stickiness');
+  document.getElementById('view-metrics').classList.toggle('active', v === 'metrics');
+  document.getElementById('metrics-domain').style.display = (v === 'metrics' && metricsSub === 'domain') ? '' : 'none';
+  document.getElementById('metrics-tabs').style.display = v === 'metrics' ? '' : 'none';
+  document.getElementById('filter').style.display = v === 'metrics' ? 'none' : '';
   document.getElementById('filter').placeholder = v === 'stickiness' ? 'Filter client|domain / proxy...' : 'Filter domains...';
   document.getElementById('stats').innerHTML = '';
   document.getElementById('filter-banner').style.display = 'none';
   if (v === 'stickiness') { renderStickiness(); return; }
+  if (v === 'metrics') { fetchMetrics(); return; }
   page = 0;
   render();
   renderBanner();
   renderStats();
+}
+
+function setMetricsSub(s) {
+  metricsSub = s;
+  document.getElementById('metricsub-global').classList.toggle('active', s === 'global');
+  document.getElementById('metricsub-domain').classList.toggle('active', s === 'domain');
+  document.getElementById('metrics-domain').style.display = s === 'domain' ? '' : 'none';
+  renderMetrics();
 }
 
 async function fetchData() {
@@ -399,7 +431,113 @@ async function fetchData() {
   render();
   renderBanner();
   renderStats();
-  if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = setInterval(() => { view === 'stickiness' ? renderStickiness() : fetchData(); }, refreshInterval * 1000); }
+  if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = setInterval(() => { view === 'stickiness' ? renderStickiness() : (view === 'metrics' ? fetchMetrics() : fetchData()); }, refreshInterval * 1000); }
+}
+
+function doRefresh() {
+  if (view === 'stickiness') renderStickiness();
+  else if (view === 'metrics') fetchMetrics();
+  else fetchData();
+}
+
+const ERR_LABELS = {timeout:'超时', connect:'连接', http_5xx:'5xx', tls:'TLS', protocol:'协议', cancelled:'取消', other:'其他'};
+
+async function fetchMetrics() {
+  const [r1, r2] = await Promise.all([fetch('/quality/meta'), fetch('/metrics/per-destination')]);
+  qmeta = await r1.json();
+  perDest = await r2.json();
+  // 数据变更时保持域名下拉同步
+  const sel = document.getElementById('metrics-domain');
+  const keys = Object.keys(perDest).sort();
+  if (sel.options.length !== keys.length) {
+    sel.innerHTML = keys.map(k => `<option value="${k.replace(/"/g,'&quot;')}">${k}</option>`).join('');
+    sel.value = (metricsDomain && keys.includes(metricsDomain)) ? metricsDomain : '';
+    metricsDomain = sel.value;
+  }
+  renderMetrics();
+}
+
+function renderMetrics() {
+  const wrap = document.getElementById('table-wrap');
+  document.getElementById('stats').innerHTML = '';
+  document.getElementById('filter-banner').style.display = 'none';
+  if (metricsSub === 'global') { renderMetricsGlobal(wrap); return; }
+  renderMetricsDomain(wrap);
+}
+
+function fmtPct(p) { return p == null ? '—' : (p * 100).toFixed(1) + '%'; }
+function fmtMs(v) { return v == null ? '—' : Math.round(v * 1000) + 'ms'; }
+function fmtMbps(v) { return v == null ? '—' : v.toFixed(2) + ' MB/s'; }
+function fmtBytes(b) {
+  if (b == null) return '—';
+  if (b >= 1e9) return (b/1e9).toFixed(2) + ' GB';
+  if (b >= 1e6) return (b/1e6).toFixed(1) + ' MB';
+  if (b >= 1e3) return (b/1e3).toFixed(1) + ' KB';
+  return b + ' B';
+}
+
+function errStr(errs) {
+  const items = Object.entries(errs || {}).filter(([,v]) => v > 0).map(([k,v]) => (ERR_LABELS[k]||k) + ':' + v);
+  return items.length ? items.join(', ') : '—';
+}
+
+function renderMetricsGlobal(wrap) {
+  const pids = Object.keys(qmeta).sort();
+  if (!pids.length) { wrap.innerHTML = '<div class="no-data">No data</div>'; document.getElementById('pager').innerHTML=''; document.getElementById('footer').textContent=''; return; }
+  page = 0;
+  let html = '<table><thead><tr><th>代理</th><th>TTFB P50/P95/P99</th><th>TTLB P99</th><th>成功率</th><th>吞吐</th><th>成功/总数</th><th>错误分类</th><th>字节</th></tr></thead><tbody>';
+  for (const pid of pids) {
+    const m = qmeta[pid] || {};
+    const tfb = m.ttfb || {}, tlb = m.ttlb || {};
+    const ttfbS = tfb.samples ? (Math.round((tfb.p50||0)*1000) + '/' + Math.round((tfb.p95||0)*1000) + '/' + Math.round((tfb.p99||0)*1000) + 'ms') : '—';
+    const ttlbS = tlb.samples ? Math.round((tlb.p99||0)*1000) + 'ms' : '—';
+    html += `<tr><td class="default-proxy">${pid}</td>`;
+    html += `<td class="metric-cell-num">${ttfbS}</td>`;
+    html += `<td class="metric-cell-num">${ttlbS}</td>`;
+    html += `<td class="metric-cell-num">${fmtPct(m.success_rate)}</td>`;
+    html += `<td class="metric-cell-num">${fmtMbps(m.throughput_ewma_mbps)}</td>`;
+    html += `<td class="metric-cell-num">${m.success_count||0}/${m.total_attempts||0}</td>`;
+    html += `<td class="metric-cell-num err-cell">${errStr(m.errors)}</td>`;
+    html += `<td class="metric-cell-num">${fmtBytes(m.total_bytes_transferred)}</td></tr>`;
+  }
+  html += '</tbody></table>';
+  wrap.innerHTML = html;
+  document.getElementById('pager').innerHTML = '';
+  document.getElementById('footer').textContent = pids.length + ' proxies \u00b7 全局每代理概览(跨域名聚合)';
+}
+
+function renderMetricsDomain(wrap) {
+  if (!metricsDomain || !perDest[metricsDomain]) {
+    const keys = Object.keys(perDest);
+    if (!keys.length) { wrap.innerHTML = '<div class="no-data">No per-domain metrics</div>'; document.getElementById('pager').innerHTML=''; document.getElementById('footer').textContent=''; return; }
+    wrap.innerHTML = '<div class="no-data">请在上方选择域名</div>';
+    document.getElementById('pager').innerHTML=''; document.getElementById('footer').textContent='';
+    return;
+  }
+  const per = perDest[metricsDomain];
+  const pids = Object.keys(per).sort((a,b) => (per[b].total||0)-(per[a].total||0));
+  let html = `<div class="filter-banner" style="display:flex"><strong>${metricsDomain}</strong>&nbsp;各代理实测指标</div>`;
+  html += '<table><thead><tr><th>代理</th><th>TTFB P50/P95/P99</th><th>TTLB P99</th><th>成功率</th><th>吞吐</th><th>错误分类</th><th>总请求</th></tr></thead><tbody>';
+  for (const pid of pids) {
+    const m = per[pid] || {};
+    const per_t = m.percentiles || {};
+    const tfb = per_t.ttfb || {}, tlb = per_t.ttlb || {};
+    const ttfbS = tfb.samples ? (Math.round((tfb.p50||0)*1000) + '/' + Math.round((tfb.p95||0)*1000) + '/' + Math.round((tfb.p99||0)*1000) + 'ms(n=' + tfb.samples + ')') : '—';
+    const ttlbS = tlb.samples ? Math.round((tlb.p99||0)*1000) + 'ms(n=' + tlb.samples + ')' : '—';
+    const total = m.total || 0;
+    const rate = total ? m.success / total : null;
+    html += `<tr><td class="default-proxy">${pid}</td>`;
+    html += `<td class="metric-cell-num">${ttfbS}</td>`;
+    html += `<td class="metric-cell-num">${ttlbS}</td>`;
+    html += `<td class="metric-cell-num">${fmtPct(rate)}</td>`;
+    html += `<td class="metric-cell-num">${fmtMbps(m.throughput_ewma)}</td>`;
+    html += `<td class="metric-cell-num err-cell">${errStr(m.errors)}</td>`;
+    html += `<td class="metric-cell-num">${total}</td></tr>`;
+  }
+  html += '</tbody></table>';
+  wrap.innerHTML = html;
+  document.getElementById('pager').innerHTML = '';
+  document.getElementById('footer').textContent = pids.length + ' proxies \u00b7 域名: ' + metricsDomain;
 }
 
 function selectProxy(pid) {
