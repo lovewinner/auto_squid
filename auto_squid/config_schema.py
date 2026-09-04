@@ -424,6 +424,37 @@ class CircuitConfig(ConfigBase):
     cost_throughput_min_bytes: int = Field(1_000_000, description="吞吐项所需累计字节下限(默认 1MB),低于则吞吐项不参与")
 
 
+class AutoTuneConfig(ConfigBase):
+    """Cost 权重自动调参器(P1,默认关闭)。
+
+    保守爬山:每个评估窗口对当前基线权重做单维度 ±step 相对扰动试跑,
+    窗口结束后按「赢家 TTFB 均值 + 成功率守卫」双门槛判定——改进超过滞回
+    阈值才采纳,恶化立即回滚,噪声带内拒绝(不采纳也不算恶化)。objective
+    是相对比较(基线窗口 vs 试跑窗口),对时段性流量漂移不敏感。
+
+    enabled:            总开关(默认 False)。手动热更新(POST /cost)始终可用,
+                        与本开关无关。
+    window_sec:         评估窗口时长(秒,默认 900=15min)。窗口越长噪声越小,
+                        但调参节奏越慢;这是"保守"风格的直接旋钮。
+    min_samples:        窗口内最少赢家样本数,不足则扩窗(最多 3 次),防低流量
+                        时把噪声当信号。
+    step:               单维度相对扰动步长(默认 0.25 = ±25%)。
+    hysteresis:         采纳/判恶化的滞回阈值(默认 0.05 = 5%)。试跑均值需比
+                        基线好 5% 以上才采纳;差 5% 以上判恶化回滚;之间为噪声带。
+    sr_guard:           成功率守卫(默认 0.005):试跑窗口全局窗口成功率相比基线
+                        跌幅超过该绝对值即拒绝——不允许为降延迟牺牲成功率。
+    persist:            采纳的基线权重是否持久化到 SQLite tuner_state 表
+                        (跨重启恢复,默认 True)。
+    """
+    enabled: bool = Field(False, description="Cost 权重自动调参总开关,默认关闭(手动热更新 POST /cost 不受此开关限制)")
+    window_sec: float = Field(900.0, description="评估窗口时长(秒),默认 900=15min")
+    min_samples: int = Field(50, description="窗口内最少赢家样本数,不足则扩窗(最多3次)")
+    step: float = Field(0.25, description="单维度相对扰动步长(0.25 = ±25%)")
+    hysteresis: float = Field(0.05, description="采纳/判恶化滞回阈值(0.05 = 5%)")
+    sr_guard: float = Field(0.005, description="成功率守卫:试跑窗口成功率相比基线跌幅超过该绝对值即拒绝")
+    persist: bool = Field(True, description="采纳的基线权重持久化到 SQLite tuner_state 表,跨重启恢复")
+
+
 class RouterConfig(ConfigBase):
     """路由行为配置。
 
@@ -460,6 +491,7 @@ class RouterConfig(ConfigBase):
     switch_damping: SwitchDampingConfig = Field(default_factory=SwitchDampingConfig, description="域名赢家切换阻尼(见 SwitchDampingConfig)")
     concurrency_limit: ConcurrencyLimitConfig = Field(default_factory=ConcurrencyLimitConfig, description="自适应并发限制(见 ConcurrencyLimitConfig)")
     conn_pool: ConnPoolConfig = Field(default_factory=ConnPoolConfig, description="CONNECT 上游 TCP 预热池(见 ConnPoolConfig)")
+    auto_tune: AutoTuneConfig = Field(default_factory=AutoTuneConfig, description="Cost 权重自动调参器(默认关闭,见 AutoTuneConfig)")
 
     @model_validator(mode="after")
     def _check_cross_field(self):

@@ -369,10 +369,10 @@ def _single_send_degraded(self, domain, pid, ref_ewma):
 | 优先级 | 事项 | 为什么 |
 |--------|------|--------|
 | **P0（先做）** | **重启线上实例加载新代码，进入观测期** | 不重启则一切改动不生效；观测 1-2 周是 Phase 2 调参的前提（计划 §五第 2 步）。盯 `/quality/meta` 与 `/metrics/per-destination` 的 p99/成功率/吞吐，异常即 `cost_sort_enabled: false` 回滚 |
-| **P1（观测期内做）** | **Cost 分解输出暴露**：`/quality/meta` 增 `cost_breakdown`（`latency_cost`/`success_cost`/`throughput_cost` + 归一化后的原始值） | §六.3 刻意留到观测期的项。观测期最需要的正是这个分解视图——否则"该调哪个权重"只能凭感觉。纯观测增强，不改路由行为 |
-| **P1** | **配置运行时热更新**（权重/`cost_sort_enabled` 不重启可改可回滚） | §六.7。观测期发现权重不对时，热更新比重启（丢全部窗口态）代价小得多；紧急回滚也更及时 |
+| **P1 ✅** | **Cost 分解输出暴露**：`/quality/meta` 增 `cost_breakdown`（`latency_cost`/`success_cost`/`throughput_cost` + 归一化后的原始值） | §六.3 刻意留到观测期的项。观测期最需要的正是这个分解视图——否则"该调哪个权重"只能凭感觉。纯观测增强，不改路由行为。（**未做**，观测期开始前/中实现均可） |
+| **P1 ✅ 已完成** | **Cost 权重热更新 + 自动调参器**：`GET/POST /cost`（运行时改权重，下一次排序即生效）+ `POST /tuner`（启停）+ `AutoTuner`（`auto_tune.enabled` 默认 False；开启后保守爬山：每窗口单维 ±25% 扰动，赢家 TTFB 均值改进 ≥5% 且成功率守卫达标才采纳，恶化立即回滚，基线权重持久化 SQLite 跨重启恢复） | 手动热更新比重启（丢全部窗口态）代价小得多，紧急回滚更及时；自动调参把观测期"看数据→调权重"闭环自动化。objective 采集走 asyncio task 侧信道取**纯赢家 TTFB**（record_ttfb 混入败者不能用；结果元组不能追加——`_cleanup_tunnel_result` 用 `result[-1]`，追加会炸清理路径）。安全边界硬编码（latency∈[0.2,4.0] 等），`POST /cost` 未知键 422 |
 | **P2** | **预置告警**：整体 success_rate 下降、p99 超阈、探测失败率升高 | §六.6。观测期的人工盯屏替代；建议先用最简单的阈值轮询实现 |
-| **P2** | **性能测试**：采集开销（CPU/内存/锁争用）与采样率上限 | §六.9。t-digest 与 Cost 计算都进了热路径（`ordered_proxies` 每请求调用），需确认无回归 |
+| **P2** | **性能测试**：采集开销（CPU/内存/锁争用）与采样率上限 | §六.9。t-digest、Cost 计算与调参采样都进了热路径（`ordered_proxies` 每请求调用），需确认无回归 |
 | **P3（可选）** | Cost 不确定性折扣（`/sqrt(1+k/obs)`）、探索策略（epsilon-greedy）、path-level 观测、CDN 识别、metrics 标签规范 | §六 中剩余的进阶项；等观测数据说话后再决定做哪个 |
 
 ### 明确不建议现在做的

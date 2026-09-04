@@ -738,6 +738,22 @@ class ProxySelector:
             out[pid] = per
         return out
 
+    def global_window_success(self) -> tuple[int, int]:
+        """全局窗口成功率 (success, total):对所有代理的 outcome_samples 求和。
+
+        供 AutoTuner 的成功率守卫使用(轻量:不构建 get_pid_quality_v2 的大
+        dict,只扫一层代理表)。outcome_samples 是 _OBS_WINDOW 环形缓冲,
+        1=成功 0=失败,5xx 时末尾 1 被改写 0(口径与窗口成功率一致)。
+        """
+        succ = 0
+        total = 0
+        for m in self._proxy_metrics.values():
+            outcomes = m.get("metrics", {}).get("outcome_samples")
+            if outcomes:
+                total += len(outcomes)
+                succ += sum(outcomes)
+        return succ, total
+
     def prune_domain_metrics(self, max_entries: int = 10_000):
         """域名级指标表容量保护:条目超上限按字典序淘汰最旧域名(不排序,由
         domain_metrics 本身按域名字典序;保守额度保守,不被常用)。

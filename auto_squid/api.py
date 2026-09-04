@@ -224,6 +224,95 @@ async def router_config():
     return {"enable_local_racing": _router.enable_local_racing}
 
 
+# ── Cost 权重热更新 + 自动调参器控制(P1) ──────────────────────
+
+class CostUpdateRequest(BaseModel):
+    """POST /cost 入参:Cost 排序参数的运行时更新。
+
+    extra="forbid":拼错的键名直接 422,而不是静默忽略造成"以为改了其实没改"。
+    全部字段可选——只传要改的。权重经 max(0.0, ·) 钳制,与 selector 构造语义一致。
+    """
+    model_config = {"extra": "forbid"}
+
+    cost_sort_enabled: bool | None = None
+    cost_latency_metric: str | None = None
+    cost_weight_latency: float | None = None
+    cost_weight_success_rate: float | None = None
+    cost_weight_throughput: float | None = None
+    cost_latency_min_samples: int | None = None
+    cost_throughput_min_bytes: int | None = None
+
+
+class TunerToggleRequest(BaseModel):
+    """POST /tuner 入参:自动调参器运行时启停。"""
+    model_config = {"extra": "forbid"}
+    enabled: bool
+
+
+def _validate_cost_update(data: dict) -> dict:
+    """校验并钳制 Cost 更新值(语义与 ProxySelector.__init__ 一致),非法即 422。"""
+    out = {}
+    if "cost_latency_metric" in data:
+        if data["cost_latency_metric"] not in ("p99", "ewma"):
+            raise HTTPException(status_code=422,
+                                detail="cost_latency_metric must be 'p99' or 'ewma'")
+        out["cost_latency_metric"] = data["cost_latency_metric"]
+    if "cost_sort_enabled" in data:
+        out["cost_sort_enabled"] = bool(data["cost_sort_enabled"])
+    if "cost_weight_latency" in data:
+        out["cost_weight_latency"] = max(0.0, float(data["cost_weight_latency"]))
+    if "cost_weight_success_rate" in data:
+        out["cost_weight_success_rate"] = max(0.0, float(data["cost_weight_success_rate"]))
+    if "cost_weight_throughput" in data:
+        out["cost_weight_throughput"] = max(0.0, float(data["cost_weight_throughput"]))
+    if "cost_latency_min_samples" in data:
+        out["cost_latency_min_samples"] = max(1, int(data["cost_latency_min_samples"]))
+    if "cost_throughput_min_bytes" in data:
+        out["cost_throughput_min_bytes"] = max(0, int(data["cost_throughput_min_bytes"]))
+    return out
+
+
+@app.get("/cost")
+async def get_cost():
+    """Cost 排序参数 + 自动调参器状态快照(只读)。"""
+    if not _router:
+        raise HTTPException(status_code=503, detail="router not ready")
+    snap = _router.tuner.snapshot()
+    snap["cost_sort_enabled"] = _router.selector.cost_sort_enabled
+    snap["cost_latency_metric"] = _router.selector.cost_latency_metric
+    snap["cost_latency_min_samples"] = _router.selector.cost_latency_min_samples
+    snap["cost_throughput_min_bytes"] = _router.selector.cost_throughput_min_bytes
+    return snap
+
+
+@app.post("/cost")
+async def update_cost(req: CostUpdateRequest):
+    """运行时更新 Cost 排序参数(热更新,下一次排序即生效,无需重启)。
+
+    自动调参器开启时,手动更新会置位 pending_baseline:调参器下一窗口把手动值
+    重测为新基线,避免旧基线与人类决策打架(见 AutoTuner.manual_override)。
+    """
+    if not _router:
+        raise HTTPException(status_code=503, detail="router not ready")
+    updates = _validate_cost_update(req.model_dump(exclude_none=True))
+    if not updates:
+        raise HTTPException(status_code=422, detail="no updatable fields provided")
+    sel = _router.selector
+    for k, v in updates.items():
+        setattr(sel, k, v)
+    _router.tuner.manual_override()
+    return {"updated": updates, "snapshot": _router.tuner.snapshot()}
+
+
+@app.post("/tuner")
+async def toggle_tuner(req: TunerToggleRequest):
+    """运行时启停自动调参器。关闭时回滚到最近已采纳的基线权重(若有)。"""
+    if not _router:
+        raise HTTPException(status_code=503, detail="router not ready")
+    _router.tuner.set_enabled(req.enabled)
+    return _router.tuner.snapshot()
+
+
 @app.get("/domains")
 async def domains():
     """返回各域名在各代理上的获胜次数"""
