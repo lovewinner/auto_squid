@@ -8,6 +8,7 @@ __pycache__/
 /proxies.yaml
 /config.yaml
 *.db
+*.db.bak
 *.log
 *.egg-info/
 bench_report.json
