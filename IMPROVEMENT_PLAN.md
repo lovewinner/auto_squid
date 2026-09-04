@@ -161,6 +161,14 @@ def _single_send_degraded(self, domain, pid, ref_ewma):
 > `/quality` 消费方（其返回 `{pid: {ewma_ttfb, obs}}` 结构未变）。`test_routing.py`
 > 每代理排序行同步展示握手/源站首字节分位、成功率、错误分类、吞吐。
 
+**仪表盘「窗口 / 累计」双表拆分**（提交 `7ccb4ae` / `7958c68`，Phase 5 的 UI 延续完善）：
+
+- `_proxy_metrics` 实际落地为**两族并行指标**（详见 `CODEBUDDY.md` 的「Metrics: windowed EWMA vs cumulative」说明）：
+  - **窗口族**（`_OBS_WINDOW=256` 样本）：TTFB/OFB 分位、EWMA 延迟、错误分类、近期 `window_success_rate`/`window_success_count`/`window_total`（新增 `outcome_samples` 环形缓冲记录近 256 次成功/失败，5xx 时把末尾 `1` 改写 `0`，口径与累计一致）。反映**近期**表现，即路由排序实际使用的信号。
+  - **累计族**（终身 `cum_*` 计数器 → `_cumulative_view`）：`cum_success`/`cum_failure_transport`/`cum_failure_5xx`、均值、单调 `total_bytes`/`transfer_time`，派生真·终身 `success_rate`/`avg_ttfb_ms`/`avg_ofb_ms`/`throughput_mbps`，**持久化 SQLite、跨重启可追溯**，是唯一永久有意义的数字。
+- 仪表盘全局与按域名指标改为**并排双表**：窗口表（P50/P95/P99 + 近期成功率/成功-总数 + 近 256 错误分类）与累计表（握手/源站首字节均值 + 累计吞吐 + 终身成功率 + 累计字节），同列同代理便于左右对比。`cumLine` 改用 `cum_failure_transport`/`cum_failure_5xx` 正确显示累计失败数。
+- **一致性约定（不可破坏）**：仪表盘主表展示累计（永久值）为主、窗口 EWMA 为辅；两者同源同一份内存数据，勿再引入「主表 EWMA + 某行累计」的错位展示。
+
 ---
 
 ## 四、权衡与建议
@@ -184,6 +192,8 @@ def _single_send_degraded(self, domain, pid, ref_ewma):
 > 下一步（可选）: 线上重启加载新代码后,用 `/quality/meta` 与
 > `/metrics/per-destination` 对 `github.com:443` 实测,确认握手/源站首字节/成功率/
 > 错误分类采集到位;随后据此推进 Phase 2 加权排序与 Phase 1.4 协议/复用标记采集。
+> Phase 5 的仪表盘「窗口/累计」双表拆分与窗口成功率已落地（提交 `7ccb4ae`/`7958c68`）,
+> 运维可直接从双表对比代理的近况与历史表现。
 
 ---
 
