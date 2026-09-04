@@ -497,6 +497,7 @@ class ProxySelector:
             "avg_ttfb_ms": avg_ttfb_ms,
             "avg_ofb_ms": avg_ofb_ms,
             "throughput_mbps": throughput_mbps,
+            "total_bytes": total_bytes,
         }
 
     def record_complete(self, pid: str, body_bytes: int, body_duration: float,

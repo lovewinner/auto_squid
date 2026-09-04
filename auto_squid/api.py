@@ -322,6 +322,11 @@ select:focus{border-color:#e94560}
 td.err-cell{font-size:11px;color:#a8d8ea}
 .ewma-sub{color:#888;font-size:0.82em}
 tr.cum-row td{font-size:11px;color:#888;padding-top:0;padding-bottom:8px;font-variant-numeric:tabular-nums}
+/* 监控指标:窗口 / 累计 两表并排,列对齐直接对比 */
+.metrics-split{display:flex;flex-direction:column;gap:24px}
+.metrics-pane .pane-title{margin:0 0 8px;font-size:13px;color:#a8d8ea;font-weight:500;text-align:center}
+.metrics-table{table-layout:fixed;width:100%}
+.metrics-table th:first-child,.metrics-table td:first-child{width:90px;min-width:90px;max-width:90px}
 </style>
 </head>
 <body>
@@ -502,7 +507,8 @@ function cumLine(cum) {
   const ob = (cum.avg_ofb_ms != null) ? Math.round(cum.avg_ofb_ms) + 'ms' : '—';
   return '累计(永久值, n=' + cum.samples + '): 平均握手(代理)=' + at
        + ' 平均源站首字节=' + ob
-       + ' | 失败:' + cum.failure + '(传输' + cum.failure_transport + '+5xx' + cum.failure_5xx + ')';
+       + ' | 失败:' + (cum.cum_failure_transport + cum.cum_failure_5xx)
+       + '(传输' + cum.cum_failure_transport + '+5xx' + cum.cum_failure_5xx + ')';
 }
 
 function errStr(errs) {
@@ -514,21 +520,33 @@ function renderMetricsGlobal(wrap) {
   const pids = Object.keys(qmeta).sort();
   if (!pids.length) { wrap.innerHTML = '<div class="no-data">No data</div>'; document.getElementById('pager').innerHTML=''; document.getElementById('footer').textContent=''; return; }
   page = 0;
-  let html = '<table><thead><tr><th>代理</th><th>握手 P50/P95/P99</th><th>源站首字节 P50/P95/P99</th><th>成功率(累计)</th><th>吞吐(累计)</th><th>成功/总数</th><th>错误分类</th><th>字节</th></tr></thead><tbody>';
+  // 两表列错开各展所长:窗口表重在 EWMA 趋势与近期计数(代理近况);
+  // 累计表重在永久累计与均值(代理历史表现,跨重启可追溯)。
+  let win = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 P50/P95/P99</th><th>源站首字节 P50/P95/P99</th><th>错误分类(近 256)</th></tr></thead><tbody>';
+  let cum = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 均值</th><th>源站首字节 均值</th><th>吞吐 累计</th><th>成功率(全)</th><th>成功/总数(全)</th><th>累计字节</th></tr></thead><tbody>';
   for (const pid of pids) {
     const m = qmeta[pid] || {};
-    const cum = m.cumulative || {};
-    html += `<tr><td class="default-proxy">${pid}</td>`;
-    html += `<td class="metric-cell-num">${pctCell(m.ttfb)}</td>`;
-    html += `<td class="metric-cell-num">${pctCell(m.ofb)}</td>`;
-    html += `<td class="metric-cell-num">${cumCell(cum.success_rate, m.success_rate, fmtPct)}</td>`;
-    html += `<td class="metric-cell-num">${cumCell(cum.throughput_mbps, m.throughput_ewma_mbps, fmtMbps)}</td>`;
-    html += `<td class="metric-cell-num">${m.success_count||0}/${m.total_attempts||0}</td>`;
-    html += `<td class="metric-cell-num err-cell">${errStr(m.errors)}</td>`;
-    html += `<td class="metric-cell-num">${fmtBytes(m.total_bytes_transferred)}</td></tr>`;
-    html += `<tr class="cum-row"><td colspan="8">${cumLine(cum)}</td></tr>`;
+    const c = m.cumulative || {};
+    // 窗口行
+    win += `<tr><td class="default-proxy">${pid}</td>`;
+    win += `<td class="metric-cell-num">${pctCell(m.ttfb)}</td>`;
+    win += `<td class="metric-cell-num">${pctCell(m.ofb)}</td>`;
+    win += `<td class="metric-cell-num err-cell">${errStr(m.errors)}</td></tr>`;
+    // 累计行(同列同代理,便于左右对比)
+    cum += `<tr><td class="default-proxy">${pid}</td>`;
+    cum += `<td class="metric-cell-num">${c.avg_ttfb_ms != null ? Math.round(c.avg_ttfb_ms)+'ms' : '\u2014'}</td>`;
+    cum += `<td class="metric-cell-num">${c.avg_ofb_ms != null ? Math.round(c.avg_ofb_ms)+'ms' : '\u2014'}</td>`;
+    cum += `<td class="metric-cell-num">${fmtMbps(c.throughput_mbps)}</td>`;
+    cum += `<td class="metric-cell-num">${fmtPct(c.success_rate)}</td>`;
+    cum += `<td class="metric-cell-num">${c.success||0}/${c.samples||0}</td>`;
+    cum += `<td class="metric-cell-num">${fmtBytes(c.total_bytes || 0)}</td></tr>`;
   }
-  html += '</tbody></table>';
+  win += '</tbody></table>';
+  cum += '</tbody></table>';
+  let html = '<div class="metrics-split">'
+           + '<div class="metrics-pane"><h3 class="pane-title">窗口(近期 _OBS_WINDOW=256 · 用于路由决策)</h3>' + win + '</div>'
+           + '<div class="metrics-pane"><h3 class="pane-title">累计(永久值,跨重启 · 历史可追溯)</h3>' + cum + '</div>'
+           + '</div>';
   wrap.innerHTML = html;
   document.getElementById('pager').innerHTML = '';
   document.getElementById('footer').textContent = pids.length + ' proxies \u00b7 全局每代理概览(跨域名聚合)';
@@ -544,24 +562,36 @@ function renderMetricsDomain(wrap) {
   }
   const per = perDest[metricsDomain];
   const pids = Object.keys(per).sort((a,b) => (per[b].total||0)-(per[a].total||0));
-  let html = `<div class="filter-banner" style="display:flex"><strong>${metricsDomain}</strong>&nbsp;各代理实测指标</div>`;
-  html += '<table><thead><tr><th>代理</th><th>握手 P50/P95/P99</th><th>源站首字节 P50/P95/P99</th><th>成功率(累计)</th><th>吞吐(累计)</th><th>错误分类</th><th>总请求</th></tr></thead><tbody>';
+  let banner = `<div class="filter-banner" style="display:flex"><strong>${metricsDomain}</strong>&nbsp;各代理实测指标</div>`;
+  // 两表列错开:窗口表 P50/P95/P99 + EWMA 吞吐(近况);累计表 均值 + 永久计数 + 累计字节(历史)。
+  let win = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 P50/P95/P99</th><th>源站首字节 P50/P95/P99</th><th>错误分类(近 256)</th></tr></thead><tbody>';
+  let cum = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 均值</th><th>源站首字节 均值</th><th>吞吐 累计</th><th>成功率(全)</th><th>总请求(全)</th><th>累计字节</th></tr></thead><tbody>';
   for (const pid of pids) {
     const m = per[pid] || {};
     const per_t = m.percentiles || {};
     const total = m.total || 0;
     const rate = total ? m.success / total : null;
-    const cum = m.cumulative || {};
-    html += `<tr><td class="default-proxy">${pid}</td>`;
-    html += `<td class="metric-cell-num">${pctCell(per_t.ttfb)}</td>`;
-    html += `<td class="metric-cell-num">${pctCell(per_t.ofb)}</td>`;
-    html += `<td class="metric-cell-num">${cumCell(cum.success_rate, rate, fmtPct)}</td>`;
-    html += `<td class="metric-cell-num">${cumCell(cum.throughput_mbps, m.throughput_ewma, fmtMbps)}</td>`;
-    html += `<td class="metric-cell-num err-cell">${errStr(m.errors)}</td>`;
-    html += `<td class="metric-cell-num">${total}</td></tr>`;
-    html += `<tr class="cum-row"><td colspan="7">${cumLine(cum)}</td></tr>`;
+    const c = m.cumulative || {};
+    // 窗口行
+    win += `<tr><td class="default-proxy">${pid}</td>`;
+    win += `<td class="metric-cell-num">${pctCell(per_t.ttfb)}</td>`;
+    win += `<td class="metric-cell-num">${pctCell(per_t.ofb)}</td>`;
+    win += `<td class="metric-cell-num err-cell">${errStr(m.errors)}</td></tr>`;
+    // 累计行(同列同代理,便于左右对比)
+    cum += `<tr><td class="default-proxy">${pid}</td>`;
+    cum += `<td class="metric-cell-num">${c.avg_ttfb_ms != null ? Math.round(c.avg_ttfb_ms)+'ms' : '\u2014'}</td>`;
+    cum += `<td class="metric-cell-num">${c.avg_ofb_ms != null ? Math.round(c.avg_ofb_ms)+'ms' : '\u2014'}</td>`;
+    cum += `<td class="metric-cell-num">${fmtMbps(c.throughput_mbps)}</td>`;
+    cum += `<td class="metric-cell-num">${fmtPct(c.success_rate)}</td>`;
+    cum += `<td class="metric-cell-num">${c.samples||0}</td></tr>`;
   }
-  html += '</tbody></table>';
+  win += '</tbody></table>';
+  cum += '</tbody></table>';
+  let html = banner
+           + '<div class="metrics-split">'
+           + '<div class="metrics-pane"><h3 class="pane-title">窗口(近期 _OBS_WINDOW=256 · 用于路由决策)</h3>' + win + '</div>'
+           + '<div class="metrics-pane"><h3 class="pane-title">累计(永久值,跨重启 · 历史可追溯)</h3>' + cum + '</div>'
+           + '</div>';
   wrap.innerHTML = html;
   document.getElementById('pager').innerHTML = '';
   document.getElementById('footer').textContent = pids.length + ' proxies \u00b7 域名: ' + metricsDomain;
