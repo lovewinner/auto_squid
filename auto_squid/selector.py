@@ -58,6 +58,21 @@ _OBS_WINDOW = 256          # 每个序列保留的最近样本数(分位数用)
 _TTLB_ALPHA = 0.3          # ttlb / throughput 的 EWMA 平滑系数(与 EWMA_ALPHA 一致)
 _THROUGHPUT_ALPHA = 0.3
 
+# 终身累计指标字段(随每次观测单调增长,经 DB 恢复后继续累加,是唯一跨重启
+# 的"永久值")。与窗口化指标(ttfb_samples 分位 / *_ewma)并存:后者反映近期
+# 瞬时,本组反映该 (代理[,域名]) 自首次观测(含 DB 恢复)以来的累计表现。
+# 计数字段放同一 metric_dict,由 _flush_to_db 随 metrics_json 落盘、set_*_metrics
+# 恢复;旧 DB 行缺这些字段时由 set_*_metrics 用本默认值补齐。
+_CUM_FIELDS = {
+    "cum_success": 0,                 # 累计成功(收到非 5xx 响应头)
+    "cum_failure_transport": 0,       # 累计传输层失败(连接/超时/TLS/协议/其他)
+    "cum_failure_5xx": 0,             # 累计业务层失败(HTTP 5xx)
+    "cum_ttfb_sum": 0.0,              # 累计首字节耗时和(秒),供平均首字节延迟
+    "cum_ttfb_n": 0,                  # 累计首字节观测次数
+    "cum_ttlb_sum": 0.0,              # 累计 body 转发耗时和(秒),供平均完整延迟
+    "cum_ttlb_n": 0,                  # 累计 body 转发观测次数
+}
+
 # 错误分类键(统一枚举,供 _try_http/_try_tunnel 的 except 归类,见 record_failure)。
 ERROR_TIMEOUT = "timeout"
 ERROR_CONNECT = "connect"
@@ -264,6 +279,13 @@ class ProxySelector:
             scope["success"] += 1
             scope["total"] += 1
             self._append_sample(scope["ttfb_samples"], ttfb)
+            # ── 终身累计(跨重启永久):成功数 + TTFB 累加和/计数(算平均首字节)。
+            #   5xx 响应也会走到本分支(record_ttfb 在收到响应头即记),但随后
+            #   record_http_error 会把 cum_success 回退并计入 cum_failure_5xx,
+            #   故 cum_success 最终只含非 5xx 成功(见 record_http_error)。
+            scope["cum_success"] += 1
+            scope["cum_ttfb_sum"] += ttfb
+            scope["cum_ttfb_n"] += 1
 
     @staticmethod
     def _apply_ewma(table: dict, pid: str, ttfb: float) -> Optional[dict]:
@@ -363,6 +385,7 @@ class ProxySelector:
                 "errors": {k: 0 for k in _ERROR_KEYS},
                 "total_bytes": 0.0,
                 "transfer_time": 0.0,
+                **_CUM_FIELDS,
             }
         return m["metrics"]
 
@@ -590,6 +613,12 @@ class ProxySelector:
             if not needed.issubset(m):
                 logger.debug("proxy_metrics %s 缺少字段,跳过: %s", pid, set(m.keys()))
                 continue
+            # 惰性补全终身累计字段(_CUM_FIELDS):旧 DB 行缺这些键时补默认值,使
+            # record_ttfb/record_http_error 的 scope[...] 读写不抛 KeyError(09-04
+            # 事故:旧行无 cum_* → 热路径 KeyError → 全请求失败 → 熔断全开)。
+            for k, v in _CUM_FIELDS.items():
+                if k not in m:
+                    m[k] = v
             self._proxy_metrics[pid] = {"metrics": m}
 
     def set_domain_metrics(self, data: dict):
@@ -612,6 +641,10 @@ class ProxySelector:
                 if not needed.issubset(m):
                     logger.debug("domain_metrics %s %s 缺少字段,跳过", d, pid)
                     continue
+                # 惰性补全终身累计字段,同 set_proxy_metrics。
+                for k, v in _CUM_FIELDS.items():
+                    if k not in m:
+                        m[k] = v
                 self._domain_metrics.setdefault(d, {})[pid] = {"metrics": m}
 
     def reset_circuits(self):

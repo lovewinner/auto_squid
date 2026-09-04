@@ -2135,6 +2135,39 @@ class TestProxySelectorEWMA:
         sel.reset_quality()
         assert sel._quality == {}
 
+    def test_legacy_metrics_restore_without_cum_fields_no_keyerror(self):
+        """09-04 bug 回归:旧 DB 行(set_proxy_metrics 恢复)缺 cum_* 字段时,
+        record_ttfb 不能抛 KeyError(热路径崩溃 → 全请求失败 → 熔断全开)。
+        set_*_metrics 需惰性补全 _CUM_FIELDS 缺键。"""
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host='h', port=3128))
+        sel = ProxySelector(store)
+        def _legacy_metric() -> dict:
+            """构造一份独立的旧格式 metric dict(无 cum_* 字段)。"""
+            return {
+                "ttfb_samples": [0.1, 0.2],
+                "ttlb_samples": [],
+                "ttlb_ewma": None,
+                "throughput_ewma": None,
+                "success": 3,
+                "total": 4,
+                "errors": {"timeout": 1},
+                "total_bytes": 100.0,
+                "transfer_time": 0.5,
+            }
+        sel.set_proxy_metrics({"p": _legacy_metric()})
+        sel.set_domain_metrics({"example.com": {"p": _legacy_metric()}})
+        # 恢复后 record_ttfb 不再抛 KeyError;cum_* 已被补全。
+        sel.record_ttfb('p', 0.05)                     # 全局 scope
+        sel.record_ttfb('p', 0.06, 'example.com')      # 域名 scope
+        m = sel._proxy_metrics['p']['metrics']
+        # record_ttfb 对所有 scope 类记:0.05(无 domain)全局 +2,0.06(有 domain)
+        # 全局 +1(循环第二个 _metrics_for(pid,None) 恒为全局)→ 全局共 3。
+        assert m['cum_success'] == 3
+        assert m['cum_ttfb_n'] == 3
+        dm = sel._domain_metrics['example.com']['p']['metrics']
+        assert dm['cum_success'] == 1
+
 
 class TestOrderedForDomain:
     """杠杆B:域名级竞速候选排序(ordered_for_domain)。
