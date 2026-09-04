@@ -298,6 +298,19 @@ class StickyCache:
         粘性键集合(客户端 IP)可能远大于域名集合,若放任不管会缓慢累积;
         过期清扫把表规模收敛到"最近 TTL 内活跃的客户端+域名"。
         """
+        # 先做探路节流表清扫(审计 P2#3):_sticky_probe_last 只在探路间隔>0 时
+        # 写入,键集合理论上随"客户端×域名"无界增长;若粘性表为空就提前返回,
+        # 会连这个独立表也一起漏清,故把该清扫放在空表早退**之前**。按
+        # "距最后探路超过若干倍探路间隔(至少 TTL)"淘汰,让表规模收敛到活跃键;
+        # 探路间隔<=0(特性关闭)时表本就为空,零开销。用"较长空闲即淘汰",
+        # 避免与 active session 的探路节流冲突。
+        if self.stickiness_probe_interval_sec > 0 and self._sticky_probe_last:
+            idle_cutoff = time.monotonic() - max(
+                float(self.stickiness_ttl), 8.0 * self.stickiness_probe_interval_sec)
+            for key in [k for k, last in self._sticky_probe_last.items()
+                        if last < idle_cutoff]:
+                self._sticky_probe_last.pop(key, None)
+
         if not self._sticky_cache:
             return
         now = datetime.now(timezone.utc)

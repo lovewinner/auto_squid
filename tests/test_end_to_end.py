@@ -807,6 +807,21 @@ class TestCheckAuth:
     def test_malformed_header(self):
         assert check_auth({'Proxy-Authorization': 'Basic not-base64!!'}, True, 'u', 'p')[0] is False
 
+    def test_proxy_authorization_case_insensitive(self):
+        """审计 P2#4:HTTP 头大小写不敏感——小写/混合大小写键应同样识别。
+        旧实现固定键名 get,发送 `proxy-authorization:` 会被误拒为 407。"""
+        token = base64.b64encode(b'u:p').decode()
+        assert check_auth({'proxy-authorization': f'Basic {token}'}, True, 'u', 'p') == (True, None)
+        assert check_auth({'PrOxY-AuThOrIzAtIoN': f'Basic {token}'}, True, 'u', 'p') == (True, None)
+        assert check_auth({'authorIZATION': f'Basic {token}'}, True, 'u', 'p') == (True, None)
+
+    def test_proxy_authorization_takes_precedence(self):
+        """两个头都出现时以 Proxy-Authorization 为准(标准代理凭据位)。"""
+        good = base64.b64encode(b'u:p').decode()
+        bad = base64.b64encode(b'u:wrong').decode()
+        assert check_auth({'Authorization': f'Basic {bad}',
+                           'proxy-authorization': f'Basic {good}'}, True, 'u', 'p') == (True, None)
+
 
 async def run_echo_proxy(host, port):
     """HTTP mock proxy that echoes the request body back verbatim (binary-safe)."""
@@ -6865,3 +6880,282 @@ class TestDispatchSingleUnified:
                 "3 次真失败应熔断 local"
         finally:
             r.stop()
+
+
+class TestHttpCachePrivacy:
+    """审计 P2#2 回归:共享缓存对"携带 Cookie/Authorization 的请求"在读、写
+    两侧都按私密头集收敛,防止 A 客户端的个性化响应串给 B 客户端。"""
+
+    def _router(self, **kw):
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host='h', port=3128))
+        return Router(store, listen_host=HOST, listen_port=10809,
+                      db_path=tempfile.mktemp(suffix='.db'), **kw)
+
+    def test_get_with_cookie_header_is_miss(self):
+        """带 Cookie 的请求不命中共享缓存(键只有 method:url,命中即串读)。"""
+        r = self._router()
+        r._http_cache_set('GET', 'http://personal.example.com/', 200, 'OK', {}, b'for-bob')
+        assert r._http_cache_get('GET', 'http://personal.example.com/', headers={'cookie': 'sid=bob'}) is None
+        # 无凭据的请求仍可命中(共享缓存本义保留)。
+        assert r._http_cache_get('GET', 'http://personal.example.com/') is not None
+
+    def test_get_with_authorization_header_is_miss(self):
+        r = self._router()
+        r._http_cache_set('GET', 'http://personal.example.com/', 200, 'OK', {}, b'for-bob')
+        assert r._http_cache_get('GET', 'http://personal.example.com/',
+                                 headers={'Authorization': 'Bearer x', 'X-Other': '1'}) is None
+
+    def test_get_empty_headers_still_hits(self):
+        """headers={} 视为无私密头 → 正常命中(与缺省 None 等价)。"""
+        r = self._router()
+        r._http_cache_set('GET', 'http://personal.example.com/', 200, 'OK', {}, b'for-bob')
+        assert r._http_cache_get('GET', 'http://personal.example.com/', headers={}) is not None
+
+    def test_set_with_cookie_request_does_not_pollute(self):
+        """带 Cookie 的请求拿回可缓存响应也不许写共享缓存,否则下次无凭据
+        客户端会命中这条"个人化"响应。"""
+        r = self._router()
+        r._http_cache_set('GET', 'http://personal.example.com/', 200, 'OK', {}, b'for-bob',
+                          request_headers={'cookie': 'sid=bob'})
+        assert r._http_cache_get('GET', 'http://personal.example.com/') is None
+        # 不带 request_headers 的写入不受影响。
+        r._http_cache_set('GET', 'http://personal.example.com/', 200, 'OK', {}, b'public')
+        assert r._http_cache_get('GET', 'http://personal.example.com/') is not None
+
+
+class TestStickyProbePrune:
+    """审计 P2#3 回归:_prune_sticky 顺带收紧 _sticky_probe_last 节流表,
+    且探路表清扫不依赖粘性表非空(空表早退也会漏清这个独立表)。"""
+
+    def _router(self, **kw):
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host='h', port=3128))
+        return Router(store, listen_host=HOST, listen_port=10809,
+                      db_path=tempfile.mktemp(suffix='.db'), **kw)
+
+    def test_probe_pruning_removes_stale_entries_with_empty_sticky_cache(self):
+        r = self._router(sticky_probe_interval_sec=1.0, stickiness_ttl=10)
+        assert not r._sticky_cache  # 粘性表为空:探路表仍应被清扫
+        r._sticky_probe_last['1.2.3.4|a.com'] = time.monotonic() - 100.0
+        r._sticky_probe_last['1.2.3.4|b.com'] = time.monotonic() - 50.0
+        r._sticky_probe_last['5.6.7.8|c.com'] = time.monotonic()  # 刚探过,保留
+        r.sticky._prune_sticky()
+        assert '1.2.3.4|a.com' not in r._sticky_probe_last
+        assert '1.2.3.4|b.com' not in r._sticky_probe_last
+        assert '5.6.7.8|c.com' in r._sticky_probe_last
+
+    def test_probe_pruning_keeps_recent_entries(self):
+        r = self._router(sticky_probe_interval_sec=1.0, stickiness_ttl=10)
+        r._sticky_probe_last['1.2.3.4|a.com'] = time.monotonic()
+        r.sticky._prune_sticky()
+        assert '1.2.3.4|a.com' in r._sticky_probe_last
+
+    def test_probe_pruning_skipped_when_feature_off(self):
+        r = self._router(sticky_probe_interval_sec=0.0, stickiness_ttl=10)
+        r._sticky_probe_last['1.2.3.4|a.com'] = time.monotonic() - 100.0
+        r.sticky._prune_sticky()
+        # 特性关闭:表为空,不清也无需清——这里验证不因这路径抛错。
+        assert '1.2.3.4|a.com' in r._sticky_probe_last
+
+
+class TestDupHeaderParse:
+    """审计 P2#5 回归:同名重复请求头在 handle_client 解析期合并(不覆盖),
+    保证"首个常为关键的 Cookie"不再丢失。
+
+    解析内联在 handle_client,不单独提炼;wire 级覆盖见
+    test_duplicate_request_headers_forwarded_to_upstream。
+    """
+
+
+@pytest.mark.asyncio
+async def test_duplicate_request_headers_forwarded_to_upstream():
+    """E2E(审计 P2#5):客户端发两个同名 Cookie / X-Dup,上游必须同时收到两个
+    值(旧实现 dict 后者覆盖前者,Cookie 首个值丢失)。"""
+    proxy_srv = await run_header_echo_proxy(HOST, PROXY_PORT)
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        reader, writer = await asyncio.open_connection(HOST, ROUTER_PORT)
+        req = (b"GET http://dup.test.example.com/ HTTP/1.1\r\n"
+               b"Host: dup.test.example.com\r\n"
+               b"Cookie: a=1\r\n"
+               b"Cookie: b=2\r\n"
+               b"X-Dup: one\r\n"
+               b"X-Dup: two\r\n"
+               b"\r\n")
+        writer.write(req)
+        await writer.drain()
+        status = await reader.readline()
+        assert b'200' in status, f"expected 200, got {status}"
+        cl = 0
+        while True:
+            h = await reader.readline()
+            if not h or h in (b"\r\n", b"\n"):
+                break
+            if h.lower().startswith(b'content-length:'):
+                cl = int(h.split(b':', 1)[1].strip())
+        echoed = await reader.readexactly(cl) if cl else b''
+        writer.close()
+        await writer.wait_closed()
+        assert b'cookie: a=1; b=2' in echoed.lower(), f"Cookie 值丢失: {echoed!r}"
+        assert b'x-dup: one, two' in echoed.lower(), f"重复头值丢失: {echoed!r}"
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_auth_accepts_lowercase_proxy_authorization():
+    """E2E(审计 P2#4):发送小写 `proxy-authorization:` 也应通过认证(fail-open
+    修复前会被误拒为 407)。"""
+    proxy_srv = await run_header_echo_proxy(HOST, PROXY_PORT)
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                    auth_enabled=True, auth_username='asuser', auth_password='s3cretRRxc68a',
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        reader, writer = await asyncio.open_connection(HOST, ROUTER_PORT)
+        tok = base64.b64encode(b'asuser:s3cretRRxc68a').decode()
+        req = (f"GET http://lower.test.example.com/ HTTP/1.1\r\n"
+               f"Host: lower.test.example.com\r\n"
+               f"proxy-authorization: Basic {tok}\r\n"
+               f"\r\n").encode()
+        writer.write(req)
+        await writer.drain()
+        status = await reader.readline()
+        assert b'200' in status, f"expected 200, got {status} (lowercase header must be accepted)"
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
+
+async def run_mock_proxy_bogus_connect(host, port):
+    """上游 mock:CONNECT 回 `HTTP/1.1 2000 <reason>`(状态码==2000,但子串
+    含 "200"),HTTP 请求回 200 空 body。用于验证 CONNECT 状态码按"精确解析"
+    而非子串匹配(审计 P3#7)。"""
+    async def handle(reader, writer):
+        try:
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+                if line.upper().startswith(b'CONNECT '):
+                    writer.write(b"HTTP/1.1 2000 WeirdStatus\r\n\r\n")
+                    await writer.flush()
+                    # CONNECT 建立后 echo 数据,让误判成功的路径有数据可测。
+                    while True:
+                        data = await reader.read(4096)
+                        if not data:
+                            break
+                        writer.write(b'echo:' + data)
+                        await writer.flush()
+                    break
+                # 普通 HTTP 请求:P3#7 只测 CONNECT,HTTP 直接回 200 空 body。
+                while True:
+                    h = await reader.readline()
+                    if not h or h in (b"\r\n", b"\n"):
+                        break
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                await writer.flush()
+                # 单请求即断开,避免 keep-alive 复用干扰下一连接。
+                break
+        except Exception:
+            pass
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+    server = await asyncio.start_server(handle, host=host, port=port)
+    return server
+
+
+@pytest.mark.asyncio
+async def test_connect_status_code_requires_exact_200():
+    """E2E(审计 P3#7):上游 CONNECT 回 `HTTP/1.1 2000`,状态码不是 200,路由
+    必须判失败(旧实现 `'200' in status_text` 会当成功并打通隧道)。"""
+    up_srv = await run_mock_proxy_bogus_connect(HOST, PROXY_PORT)
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                    max_retries=1, db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        r, w = await asyncio.open_connection(HOST, ROUTER_PORT)
+        w.write(f"CONNECT {HOST}:{PROXY_PORT} HTTP/1.1\r\n\r\n".encode())
+        await w.drain()
+        status = await r.readline()
+        w.close()
+        await w.wait_closed()
+        assert b'502' in status, f"expected 502 for bogus 2000 CONNECT, got {status}"
+    finally:
+        await router.stop()
+        up_srv.close()
+        await up_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_invalid_content_length_returns_400():
+    """E2E(审计 P3#8):`Content-Length: abc`(非数值)应回明确 400,而不是
+    int() 抛 ValueError 落到外层 except 静默断连。"""
+    proxy_srv = await run_mock_proxy(HOST, PROXY_PORT)
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        reader, writer = await asyncio.open_connection(HOST, ROUTER_PORT)
+        writer.write(b"GET http://cl.test.example.com/ HTTP/1.1\r\n"
+                     b"Host: cl.test.example.com\r\n"
+                     b"Content-Length: abc\r\n"
+                     b"\r\n")
+        await writer.drain()
+        status = await reader.readline()
+        writer.close()
+        await writer.wait_closed()
+        assert b'400' in status, f"expected 400 for non-numeric content-length, got {status}"
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_slow_client_header_timeout_closes_connection():
+    """E2E(审计 P1#1):客户端发送半截请求头后停顿,超过 _CLIENT_HEADER_TIMEOUT
+    即被断开——慢速客户端不能无限期挂住连接与 task(slow-loris)。"""
+    import auto_squid.router as router_mod
+    proxy_srv = await run_mock_proxy(HOST, PROXY_PORT)
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    orig = router_mod._CLIENT_HEADER_TIMEOUT
+    router_mod._CLIENT_HEADER_TIMEOUT = 0.3  # 缩短等待窗口,测试可快速通过
+    await router.start()
+    try:
+        reader, writer = await asyncio.open_connection(HOST, ROUTER_PORT)
+        writer.write(b"GET http://slow.test.example.com/ HTTP/1.1\r\nHost: slow.test.example.com\r\nX-Half:")
+        await writer.drain()
+        # 只发半个头并停住:连接应在 ~0.3s 后被服务端关闭(read 返回 EOF)。
+        data = await asyncio.wait_for(reader.read(1), timeout=5.0)
+        assert data == b'', f"expected connection close on header timeout, got {data!r}"
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        router_mod._CLIENT_HEADER_TIMEOUT = orig
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()

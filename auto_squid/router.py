@@ -92,6 +92,15 @@ _AGG_WAIT_TIMEOUT = 3.0
 _MAX_REQUEST_HEADER_LINES = 100
 _MAX_REQUEST_HEADER_BYTES = 64 * 1024
 
+# 客户端连接读超时(秒)。上游侧有 _upstream_timeout,但"客户端→代理"这一跳
+# 此前完全没有超时,慢速/断连客户端可无限期占住 socket 与 handle_client task,
+# 批量发起即可耗尽 fd(审计 P1#1,slow-loris)。这里给"读首行+请求头"与
+# "读请求体"分别设 timeout:头部超时取仅覆盖慢发包(对正常客户端远宽裕),
+# body 超时给上传留更多余量(大文件慢上传)。超时统一由 handle_client 的
+# except 分支关闭连接并移除 task,不区分是否收到过首字节。
+_CLIENT_HEADER_TIMEOUT = 30.0
+_CLIENT_BODY_TIMEOUT = 120.0
+
 # 败者清理后台 task 的软上限。超过则在 _race 里就地排空一次,防止持续高吞吐
 # 下 _pending_cleanups 无界堆积(soak 模式曾观测 fd_peak 冲到 569)。
 _MAX_PENDING_CLEANUPS = 64
@@ -2485,7 +2494,11 @@ class Router:
                 if not status:
                     raise RuntimeError('no response from upstream')
                 status_text = status.decode('latin-1')
-                if '200' not in status_text:
+                # 审计 P3#7:精确解析状态码(HTTP/1.x <code> <reason>),而不是子串
+                # 匹配——"HTTP/1.1 2000" 或原因短语含 "200" 会被旧实现误判为成功。
+                _parts = status_text.split(' ', 2)
+                status_code = _parts[1] if (len(_parts) >= 2 and _parts[0].startswith('HTTP/')) else ''
+                if status_code != '200':
                     while True:
                         h = await up_reader.readline()
                         if not h or h in (b"\r\n", b"\n"):
@@ -2545,7 +2558,10 @@ class Router:
         logger.debug("client connected %s", peer)
         self._set_nodelay(writer)
         try:
-            line = await reader.readline()
+            # 首行与请求头读取设超时(审计 P1#1):慢速/断连客户端不能无限期挂住
+            # 连接与 task。整段头部读取共用一个线性超时预算:每次 readline 都
+            # 用 wait_for 包一层,超时抛 TimeoutError 落到底部 except 关闭连接。
+            line = await asyncio.wait_for(reader.readline(), timeout=_CLIENT_HEADER_TIMEOUT)
             if not line:
                 return
             first = line.decode('latin-1').strip()
@@ -2557,7 +2573,7 @@ class Router:
             headers = bytearray()
             header_lines = 0
             while True:
-                h = await reader.readline()
+                h = await asyncio.wait_for(reader.readline(), timeout=_CLIENT_HEADER_TIMEOUT)
                 if not h:
                     break
                 if h in (b"\r\n", b"\n"):
@@ -2569,14 +2585,23 @@ class Router:
                                    peer, header_lines, len(headers))
                     raise ConnectionError('request header limit exceeded')
             logger.debug("first line: %s", first)
-            # 一次性把请求头字节解析成 dict(键保留原大小写),auth 与 body
+            # 一次性把请求头字节解析成 dict(键小写归一),auth 与 body
             # 长度判定及下游转发共用此 dict,不再各自重新 decode+split 头部。
             # HTTP 头字段为 ASCII,latin-1 解码安全;body 不在此解码(见下)。
+            # 键小写归一 + 重复头合并(审计 P2#5):dict 无法表达同名重复头,若
+            # 后者覆盖前者会丢失首个(常为关键)的 Cookie 值;这里把重复键按
+            # 语义拼接——Cookie 用 `; `(RFC 6265),其余用 `, `(RFC 9110 多值),
+            # 保证下游(httpx dict)转发时值不丢失,且头名小写化后转发合规。
             req_headers = {}
             for h in headers.decode('latin-1').split('\r\n'):
                 if ':' in h:
                     k, v = h.split(':', 1)
-                    req_headers[k.strip()] = v.strip()
+                    k = k.strip().lower()
+                    v = v.strip()
+                    if k in req_headers:
+                        req_headers[k] = req_headers[k] + ("; " if k == 'cookie' else ", ") + v
+                    else:
+                        req_headers[k] = v
             # 客户端认证：在 CONNECT/HTTP 分流前统一校验，未通过则返回 407，
             # 不进行任何上游连接/竞速/DB 写入。auth_enabled=False 时放行。
             if self.auth_enabled:
@@ -2606,21 +2631,30 @@ class Router:
                 cl = None
                 for k, v in req_headers.items():
                     if k.lower() == 'content-length':
-                        cl = int(v)
+                        try:
+                            cl = int(v)
+                        except ValueError:
+                            # 审计 P3#8:非数值 Content-Length(如 "abc")原先让 int()
+                            # 抛 ValueError 落到外层 except 静默断连,未回明确 400。
+                            logger.warning("rejecting client %s: invalid content-length %r", peer, v)
+                            writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nBad Request")
+                            await writer.drain()
+                            return
                         break
                 if cl is not None and cl > 0:
                     if cl > MAX_BODY:
                         writer.write(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 15\r\n\r\nPayload Too Large")
                         await writer.drain()
                         return
-                    body = await reader.readexactly(cl)
+                    # body 读取设超时(审计 P1#1):慢速上传也能挂住连接,统一设超时。
+                    body = await asyncio.wait_for(reader.readexactly(cl), timeout=_CLIENT_BODY_TIMEOUT)
                 elif cl is None and method.upper() in ('POST', 'PUT', 'PATCH'):
                     # 无 Content-Length 头：分块读取至上限，避免 read(-1) 阻塞到
                     # 客户端关闭连接而破坏 HTTP keep-alive。注意 cl is None 与
                     # cl == 0 不同——后者表示头部存在但 body 为空，应直接用 b''。
                     body = bytearray()
                     while len(body) < MAX_BODY:
-                        chunk = await reader.read(MAX_BODY - len(body))
+                        chunk = await asyncio.wait_for(reader.read(MAX_BODY - len(body)), timeout=_CLIENT_BODY_TIMEOUT)
                         if not chunk:
                             break
                         body.extend(chunk)
@@ -2734,7 +2768,9 @@ class Router:
             self.httpcache._http_cache_invalidate(domain)
 
         # 1) HTTP 响应缓存:GET 幂等响应直接命中,完全不经上游。
-        cached_entry = self.httpcache._http_cache_get(method, url)
+        #    传 hdrs 供共享缓存判定:请求带 Cookie/Authorization 时不命中共享缓存
+        #    (审计 P2#2,避免把 A 客户端的个性化内容串给 B 客户端)。
+        cached_entry = self.httpcache._http_cache_get(method, url, headers=hdrs)
         if cached_entry:
             # 翻转:命中响应缓存,把入口记的 miss 撤回、改记 hit。
             self.http_cache_misses -= 1
@@ -2975,7 +3011,8 @@ class Router:
                 self.selector.record_protocol(pid, http_ver, domain=domain)
             if buffered is not None and resp.status_code in CACHEABLE_STATUS:
                 self.httpcache._http_cache_set(method, url, resp.status_code, resp.reason_phrase,
-                                                list(resp.headers.multi_items()), buffered)
+                                                list(resp.headers.multi_items()), buffered,
+                                                request_headers=hdrs)
             return resp.status_code
         finally:
             # 无论 _stream_upstream_response 是否抛 BaseException,都释放流式 resp 及其
@@ -3069,7 +3106,8 @@ class Router:
             buffered, _bb, _bd = await self._stream_upstream_response(writer, resp, method, url)
             if buffered is not None and resp.status_code in CACHEABLE_STATUS:
                 self.httpcache._http_cache_set(method, url, resp.status_code, resp.reason_phrase,
-                                                list(resp.headers.multi_items()), buffered)
+                                                list(resp.headers.multi_items()), buffered,
+                                                request_headers=hdrs)
             return resp.status_code
         except Exception as e:
             # local 直连失败:不 record_failure(pid=='local' 既有约定,见 _try_http),
@@ -3477,6 +3515,12 @@ class Router:
                 return_when=asyncio.FIRST_COMPLETED)
             for t in pending:
                 t.cancel()
+            # 审计 P2#6:被取消的 pipe task 必须 await 排空,否则其 CancelledError
+            # 不在此处收集,可能触发 "Task was destroyed but it is pending" 警告
+            # 且"客户端→上游"方向 buffered 数据/资源释放时机不确定。return_exceptions
+            # 保证任一方向的异常(如 close_writer 路径)不影响本隧道的归还判定。
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
             for t in done:
                 try:
                     await t

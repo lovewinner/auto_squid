@@ -25,9 +25,10 @@ def check_auth(headers: dict[str, str], auth_enabled: bool,
     """校验客户端的 HTTP Basic 凭据是否匹配预期值。
 
     参数:
-        headers:          客户端请求头的字典(键保留原始大小写,本函数用
-                          固定键名 `Proxy-Authorization` / `Authorization` 读取,
-                          因此调用方需保证这两个键的大小写与客户端一致)。
+        headers:          客户端请求头的字典(键保留原始大小写)。本函数按
+                          HTTP 头大小写不敏感语义扫描 `Proxy-Authorization` /
+                          `Authorization`(审计 P2#4),因此客户端用任意大小写
+                          发送均可识别,无需调用方预归一化)。
         auth_enabled:     是否启用认证。为 False 时直接放行(开放代理)。
         expected_username:预期的用户名。
         expected_password:预期的密码。
@@ -41,8 +42,17 @@ def check_auth(headers: dict[str, str], auth_enabled: bool,
         return True, None
 
     # 代理场景的标准头是 Proxy-Authorization;部分客户端(或普通 HTTP 请求)
-    # 只带 Authorization,作为回退也接受。
-    auth_header = headers.get('Proxy-Authorization') or headers.get('Authorization')
+    # 只带 Authorization,作为回退也接受。HTTP 头大小写不敏感,而调用方传的
+    # dict 键保留了客户端原始大小写(审计 P2#4),故这里大小写不敏感地扫描,
+    # 否则发送 `proxy-authorization:`(小写)的合法客户端会被误拒(fail-closed)。
+    auth_header = None
+    for k, v in headers.items():
+        lk = k.lower()
+        if lk == 'proxy-authorization':
+            auth_header = v
+            break
+        if lk == 'authorization':
+            auth_header = v
     if not auth_header:
         # 没有任何认证头 → 提示需要认证(触发客户端补发凭据)。
         return False, "Authentication required"

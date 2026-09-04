@@ -81,15 +81,26 @@ class HttpCache:
         """响应缓存键:"方法:URL"。仅 GET 缓存,故方法实际恒为 GET。"""
         return f"{method}:{url}"
 
-    def _http_cache_get(self, method: str, url: str) -> Optional[dict]:
+    def _http_cache_get(self, method: str, url: str, headers=None) -> Optional[dict]:
         """取 GET 的缓存响应;非 GET 或未命中或已过期返回 None。过期项顺便清除。
 
         enable_http_cache=False 时一律未命中(用于压测隔离缓存层,测纯路由性能)。
         P2:命中刷新 last_access(滑动 TTL 兼作 LRU 顺序);过期项按 LRU 淘汰
         路径清除(同步维护 _http_cache_bytes 与二级索引)。
+
+        headers(审计 P2#2):传入本次请求头时,若携带 Cookie / Authorization /
+        Proxy-Authorization 等"随客户端变化"的私密头,则视为未命中——共享缓存
+        键只含 method:url,若把某客户端的个性化响应直接给另一客户端会造成
+        跨用户数据串读。缺省(None)保留旧行为(仅聚合/内务路径用)。
         """
         if not self.enable_http_cache or method != 'GET':
             return None
+        if headers:
+            # 大小写不敏感地检查私密头:携带即不命中共享缓存,回源取各自内容。
+            for k in headers:
+                lk = k.lower()
+                if lk in ('cookie', 'authorization', 'proxy-authorization'):
+                    return None
         key = self._http_cache_key(method, url)
         entry = self._http_cache.get(key)
         if not entry:
@@ -120,7 +131,7 @@ class HttpCache:
                 del self._http_cache_domain_index[cached_host]
         return True
 
-    def _http_cache_set(self, method: str, url: str, status_code, reason_phrase, headers, content) -> None:
+    def _http_cache_set(self, method: str, url: str, status_code, reason_phrase, headers, content, request_headers=None) -> None:
         """缓存一个 GET 可缓存响应(状态码、原因、头、body、时间戳)。
 
         可缓存状态码由调用方按 CACHEABLE_STATUS 判断。无论上游是否给出
@@ -129,12 +140,23 @@ class HttpCache:
         no-store/no-cache 同理。原实现仅在缺 Content-Length 时查 Cache-Control,
         扩展到 3xx/404 后必须无条件查,否则会把源站标 private 的 302 也缓存。
 
+        审计 P2#2:request_headers 传入本次请求头时,若请求携带 Cookie /
+        Authorization / Proxy-Authorization 等私密头,则不写入共享缓存——该
+        响应是"面向请求者"的个性化内容,存进 method:url 键会被无凭据的
+        后续客户端命中串读。与 _http_cache_get 的对称检查配套:读和写两侧都
+        按同一套私密头集合收发一致,避免"漏读"或"污染"两条泄漏路径。
+
         P2:写入前按 max_entries / max_bytes 做 LRU 淘汰(淘汰 last_access 最旧
         的条目),并维护 _http_cache_bytes。单一超大响应(>max_bytes 的一半)不缓存,
         避免单条即打满总预算。更新已有 key 时先归还旧字节再计入新字节。
         """
         if method != 'GET':
             return
+        if request_headers:
+            for k in request_headers:
+                lk = k.lower()
+                if lk in ('cookie', 'authorization', 'proxy-authorization'):
+                    return
         # 共享缓存必须尊重源站的 Cache-Control 禁存指令(无论是否有
         # Content-Length)。no-cache 在此保守按"不存"处理:本代理不做再校验
         # (发条件请求),存了也只是徒增一次过期清除,不如直接不存。

@@ -109,3 +109,20 @@
 6. **#7 / #8**(一行修×2,可并入 #9 的 400 化改造)
 7. **#10 / #6**(小修)
 8. **#3**(复用 sticky 清理;杠杆A开启前修即可)
+
+---
+
+## 修复状态(2026-09-05 全部完成)
+
+| 条目 | 状态 | 落地 |
+| --- | --- | --- |
+| P1#1 slow-loris 客户端读超时 | ✅ 已修复 | `router.py` 新增 `_CLIENT_HEADER_TIMEOUT=30.0` / `_CLIENT_BODY_TIMEOUT=120.0`,首行/逐头/body(`readexactly` 与分块 `read`)读取均包 `asyncio.wait_for`;超时落入既有 except 关闭连接并移除 task。回归:`test_slow_client_header_timeout_closes_connection` |
+| P2#2 缓存跨客户端个人内容 | ✅ 已修复 | `http_cache.py:_http_cache_get/_http_cache_set` 新增可选 `headers`/`request_headers` 参数,请求带 Cookie/Authorization/Proxy-Authorization 时读侧不命中、写侧不落缓存(读/写两侧对称)。回归:`TestHttpCachePrivacy` |
+| P2#3 `_sticky_probe_last` 无界 | ✅ 已修复 | `sticky.py:_prune_sticky` 前置清扫该表(按 `max(TTL, 8×interval)` 空闲淘汰),且不被空粘性表早退短路。回归:`TestStickyProbePrune` |
+| P2#4 代理侧认证大小写 | ✅ 已修复 | `auth.py:check_auth` 改为大小写不敏感扫描 `Proxy-Authorization`(优先)/`Authorization`。回归:`TestCheckAuth` 两项 + `test_auth_accepts_lowercase_proxy_authorization` |
+| P2#5 重复请求头被折叠 | ✅ 已修复 | `router.py` 头解析键小写归一,Cookie 重复头按 `; `、其余按 `, ` 合并,值不丢失。回归:`test_duplicate_request_headers_forwarded_to_upstream` |
+| P2#6 `_relay_tunnel` cancel 未 await | ✅ 已修复 | `router.py:_relay_tunnel` 对 `pending` 先 `cancel()` 再 `asyncio.gather(*pending, return_exceptions=True)` 排空,避免悬挂 task 与资源释放时机不定 |
+| P3#7 CONNECT 200 子串匹配 | ✅ 已修复 | `router.py:_try_tunnel` 改为精确解析状态码(`HTTP/x <code>`),`2000` 等不再误判成功。回归:`test_connect_status_code_requires_exact_200` |
+| P3#8 `Content-Length` 非数值 | ✅ 已修复 | `router.py:handle_client` 捕获 `ValueError` 回显式 400。回归:`test_invalid_content_length_returns_400` |
+
+验证:`uv run pytest -q --timeout=60` → 342 passed(原 328 + 新增 14)。4 个 warning 为存量测试 tear-down 未 `await r.stop()`,与本次修复无关。
