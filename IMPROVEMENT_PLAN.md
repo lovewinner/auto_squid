@@ -61,7 +61,7 @@
 
 | # | 变更点 | 说明 | 预估工作量 | 状态 |
 |---|--------|------|------------|------|
-| 1.1 | `selector.py:record_ttfb()` | 同步记录 **完整请求耗时**（TTLB）与 **响应体大小**，计算吞吐 | 1-2h | [x] |
+| 1.1 | `selector.py:record_ttfb()` | 同步记录 **响应体大小** 与 **吞吐**(`body_bytes / transfer_time`,EWMA 平滑)。TTLB 维度已移除:盲 HTTPS 隧道无 per-response body 边界,改用「源站首字节 OFB」补足源站侧延迟(详见 §1.1 注) | 1-2h | [x] |
 | 1.2 | `selector.py` 新增 | 维护**每代理/域名的滑动窗口统计**：`success_count`, `total_count`, `latency_samples[]`(环形缓冲存 P50/P95/P99 计算) | 3-4h | [x] |
 | 1.3 | `router.py:_try_http/_try_tunnel` | 在 finally 块捕获**错误分类**（timeout/connect_error/5xx/tls_error/cancelled），写入域名级错误计数器 | 2h | [x] |
 | 1.4 | `selector.py` 新增 | 域名级 **HTTP 协议版本、连接复用、TLS 会话恢复** 标记采集（从 httpx response/connection 拿） | 2h | [ ] |
@@ -70,8 +70,10 @@
 > - 为不破坏既有排序/熔断语义,新增观测结构与选择用 `_quality`/`_domain_quality`
 >   完全**并行**(`_proxy_metrics`/`_domain_metrics`),不改动任何排序/权重逻辑,
 >   零行为变化。
-> - TTLB 用"body 转发耗时"表达(即 TTLB−TTFB 增量),同时算吞吐
->   (`body_bytes / transfer_time`,EWMA 平滑)。
+> - 吞吐用 `body_bytes / transfer_time`(EWMA 平滑)估算;TTLB 维度已移除。
+> - 盲 HTTPS 隧道无 per-response body 边界,改用「源站首字节 OFB」:
+>   隧道建立 → 上游→客户端方向首个数据块的耗时 ≈ 源站 TCP + TLS 握手首字节,
+>   与 TTFB(代理侧 CONNECT 握手)互补,覆盖整条"代理→源站"链路(详见 §1.1)。
 > - 错误分类键: `timeout` / `connect` / `http_5xx` / `tls` / `protocol` /
 >   `cancelled` / `other`。竞速取消的败者(CancelledError)**不计**为错误(与熔断
 >   语义一致,避免健康慢代理被误统计),5xx 经 `record_http_error` 单独归因。
@@ -81,8 +83,7 @@
 > ```python
 > _proxy_metrics[pid]["metrics"] = _domain_metrics[domain][pid]["metrics"] = {
 >     "ttfb_samples": [float, ...],   # 最近 _OBS_WINDOW(256) 个 TTFB,算 P50/P95/P99
->     "ttlb_samples": [float, ...],   # 最近 N 个 TTLB(body 转发耗时)
->     "ttlb_ewma": float,             # TTLB EWMA
+>     "ofb_samples":  [float, ...],   # 最近 N 个源站首字节(源站侧延迟,见 §1.1)
 >     "throughput_ewma": float,       # 吞吐 EWMA (MB/s)
 >     "success": int, "total": int,   # 成功率 = success/total
 >     "errors": {timeout: n, connect: n, http_5xx: n, tls: n, protocol: n,
@@ -140,7 +141,7 @@ def _single_send_degraded(self, domain, pid, ref_ewma):
 
 ### Phase 4: 探测/预热对齐（一致性）
 
-- `_probe_proxy()` 目前只做 CONNECT 握手，**不拉取业务数据** → 探测延迟 ≠ 业务 TTFB/TTLB
+- `_probe_proxy()` 目前只做 CONNECT 握手，**不拉取业务数据** → 探测延迟 ≠ 业务 TTFB/OFB
 - **改进**: 探活可选模式 `--probe-with-get` 对关键域名（如 `api.github.com`）做轻量 GET，记录完整指标
 - 预热池 `ClusterGraph` 预测桶应共享**域名级质量表**，而非仅用全局 EWMA
 
@@ -153,12 +154,12 @@ def _single_send_degraded(self, domain, pid, ref_ewma):
 | 端点 | 新增字段 | 状态 |
 |------|----------|------|
 | `/quality` | `p50`, `p95`, `p99`, `success_rate`, `throughput_mbps`, `error_breakdown` | [x] 经新增 `/quality/meta` 暴露 `get_pid_quality_v2()` |
-| `/domains/meta` | 域名级完整统计（上述所有） | [x] 每域名增 `proxy_metrics`（含 TTFB/TTLB 分位、成功率、错误分类、吞吐） |
+| `/domains/meta` | 域名级完整统计（上述所有） | [x] 每域名增 `proxy_metrics`（含握手/源站首字节分位、成功率、错误分类、吞吐） |
 | `/metrics` | 暴露分位数、成功率、吞吐、错误分类计数器 | [x] `/metrics` 增 `proxy_metrics`；新增 `/metrics/per-destination` 提供 (域名,代理) 粒度 |
 
 > 计划中的 `/quality` 原位扩字段改为**新增 `/quality/meta` 端点',避免破坏既有
 > `/quality` 消费方（其返回 `{pid: {ewma_ttfb, obs}}` 结构未变）。`test_routing.py`
-> 每代理排序行同步展示 TTFB/TTLB 分位、成功率、错误分类、吞吐。
+> 每代理排序行同步展示握手/源站首字节分位、成功率、错误分类、吞吐。
 
 ---
 
@@ -176,13 +177,13 @@ def _single_send_degraded(self, domain, pid, ref_ewma):
 
 ## 五、最小可行增强建议
 
-1. **先落 Phase 1.1-1.3**（采集 TTLB、吞吐、成功率、错误分类、P99 样本）+ Phase 5 暴露 — ✅ **已完成**（提交 `1128150`）
+1. **先落 Phase 1.1-1.3**（采集吞吐、成功率、错误分类、P99 样本、握手+源站首字节分位）+ Phase 5 暴露 — ✅ **已完成**（提交 `1128150`,TTLB 维度随后替换为 OFB）
 2. 观测 1-2 周生产数据，确认哪些指标与用户感知强相关
 3. 再决定 Phase 2 权重公式的具体形式（线性加权 vs 分段函数 vs 学习式）
 
 > 下一步（可选）: 线上重启加载新代码后,用 `/quality/meta` 与
-> `/metrics/per-destination` 对 `github.com:443` 实测,确认 TTFB/TTLB/成功率/错误
-> 分类采集到位;随后据此推进 Phase 2 加权排序与 Phase 1.4 协议/复用标记采集。
+> `/metrics/per-destination` 对 `github.com:443` 实测,确认握手/源站首字节/成功率/
+> 错误分类采集到位;随后据此推进 Phase 2 加权排序与 Phase 1.4 协议/复用标记采集。
 
 ---
 
@@ -198,7 +199,7 @@ def _single_send_degraded(self, domain, pid, ref_ewma):
 - 计时请使用 monotonic 时钟（time.perf_counter）以防系统时间跳变污染指标。
 
 2) 指标设计细节（现有指标补充）
-- 明确所有指标单位与命名：TTFB/TTLB 用毫秒(ms)，吞吐用 MB/s（或明确 MiB/s）；EWMA 的 alpha/半衰期需文档化。
+- 明确所有指标单位与命名：TTFB(握手)/OFB(源站首字节)/吞吐用毫秒(ms)/MB/s；EWMA 的 alpha/半衰期需文档化。
 - 明确定义重试/重传如何计数（一次请求发生多次重试时如何统计 success/total/ retry_rate）。
 - 记录响应体大小分布与 request size bucket（短/中/长），便于区分“下载慢”与“首字节慢”。
 - 把连接复用率、HTTP/2/3 支持、TLS session reuse 作为可选采集字段，并考虑将它们纳入健康分数。

@@ -2027,13 +2027,15 @@ class Router:
                 pass
 
     @staticmethod
-    async def _pipe(reader, writer, close_writer: bool = True):
+    async def _pipe(reader, writer, close_writer: bool = True, on_chunk=None):
         """把 reader 的数据单向搬运到 writer,直至 EOF 或超时/异常。
 
         用于 CONNECT 隧道的双向透传(两个 _pipe 反向组合)。300s 读超时
         防止半开连接永久占用;任何异常都静默关闭 writer。
         close_writer=False 时结束不关 writer——供隧道归还场景:客户端断开后
         保留上游连接,由 _relay_tunnel 判断是否归还已握手池。
+        on_chunk: 可选回调,每搬运一块数据(len(data) 字节)时调用一次,用于
+        累计透传字节数(HTTPS CONNECT 隧道的吞吐/累计字节统计,见 _relay_tunnel)。
         """
         try:
             while True:
@@ -2042,6 +2044,11 @@ class Router:
                     break
                 writer.write(data)
                 await writer.drain()
+                if on_chunk is not None:
+                    try:
+                        on_chunk(len(data))
+                    except Exception:
+                        pass
         except Exception:
             pass
         if close_writer:
@@ -2745,9 +2752,9 @@ class Router:
                 self.domain_cache_hits += 1
         try:
             buffered, body_bytes, body_duration = await self._stream_upstream_response(writer, resp, method, url)
-            # Phase 1.1:完整响应观测——TTLB(body 转发耗时)与吞吐(见 record_complete)。
-            # instantiated(竞速赢家)路径同样在此记录:赢家是最终面向客户端的代理,
-            # 它的 body 下载耗时/吞吐正是用户感知速度,补 TTFB 之外的第二维度。
+            # Phase 1.1:吞吐观测(见 record_complete)。instantiated(竞速赢家)
+            # 路径同样在此记录:赢家是最终面向客户端的代理,其中转速率正是用户
+            # 感知速度,补 TTFB 之外的第二维度。不再产生 TTLB 分位(已移除)。
             if body_duration > 0:
                 self.selector.record_complete(pid, body_bytes, body_duration, domain=domain)
             # Phase 1.3:HTTP 5xx 归因(header 收到但为服务端错误,不抛异常,需要单独
@@ -2918,7 +2925,7 @@ class Router:
                     self._spawn_sticky_probe(client_ip, domain_key, sticky_pid)
                     await self._connect_established(client_writer, up_writer)
                     await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer,
-                                             ph, pp, target)
+                                             ph, pp, target, pid=sticky_pid)
                     return None
                 except Exception:
                     # 慢单发失败采样已在 _forward_single(HTTP)/_connect_single_send
@@ -2953,7 +2960,7 @@ class Router:
                     self.sticky._record_sticky(client_ip, domain_key, cached_pid)
                     await self._connect_established(client_writer, up_writer)
                     await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer,
-                                             ph, pp, target)
+                                             ph, pp, target, pid=cached_pid)
                     return None
                 except Exception:
                     logger.debug("cached proxy %s failed for %s", cached_pid, domain_key)
@@ -3050,7 +3057,7 @@ class Router:
             await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer,
                                      win_proxy.host if win_proxy is not None else None,
                                      win_proxy.port if win_proxy is not None else None,
-                                     target)
+                                     target, pid=pid)
             return None
 
         # 4) 全失败:HTTP 写 502;CONNECT 写 502 并关闭客户端连接(与旧内联体一致)。
@@ -3090,8 +3097,8 @@ class Router:
         返回 (buffered, streamed, body_duration):
           - buffered:缓冲的 body(若未超上限);超过上限返回 None 表示放弃缓存。
           - streamed / body_duration:实际转发的 body 字节数与 body 转发耗时(秒,
-            TTLB−TTFB),供 Phase 1.1 记录 TTLB/吞吐(见 _forward_single /
-            selector.record_complete)。
+            即原 TTLB−TTFB 的增量),供 Phase 1.1 记录吞吐(见 _forward_single /
+            selector.record_complete)。TTLB 分位维度已移除,只用于吞吐与累计字节。
         客户端断开时静默,但仍尽量把已读字节丢弃以释放上游连接。
         """
         client_disconnected = False
@@ -3220,13 +3227,25 @@ class Router:
         await client_writer.drain()
 
     async def _relay_tunnel(self, client_reader, up_writer, up_reader, client_writer,
-                            proxy_host=None, proxy_port=None, target=None):
+                            proxy_host=None, proxy_port=None, target=None, pid=None):
         """双向透传一个已建立的隧道。
 
         任一方向结束即结束透传。若启用了已握手隧道复用(conn_pool_established_reuse
         且经上游代理)、且上游连接健康(未关闭、无残留缓冲),则归还 _established_pool
         供下一条同 (proxy, target) 请求复用;否则关闭上游连接。客户端侧连接始终关闭。
+        pid: 本隧道胜出的代理 id(含 'local' 直连),用于累计 HTTPS 透传字节与
+        吞吐统计(record_complete);为 None 时不统计(旧行为/安全兜底)。
         """
+        # 双向字节计数(累计透传体积,供吞吐/累计指标);索引 0=客户端→上游,
+        # 1=上游→客户端。lambda 写可变列表元素,避免不可变 int 闭包陷阱。
+        _bytes = [0, 0]
+        _t0 = time.perf_counter()
+        # 源站首字节(OFB):隧道建立 → 上游→客户端方向首个数据块的耗时。用列表
+        # 承载以便 lambda 内赋值(None 表示尚未收到首字节)。
+        _ofb = [None]
+        # 复用已握手隧道时不再有 TLS 握手,首个上行字节是应用响应数据而非
+        # ServerHello,语义不同 —— 该情形不记 OFB(判据同 _try_tunnel)。
+        _reused = bool(getattr(up_writer, '_established_reused', False))
         # 客户端→上游 方向的 _pipe 结束时**不关上游**(close_writer=False),让
         # _relay_tunnel 在结束时统一判断归还/关闭;上游→客户端 方向照常关客户端。
         # wait(FIRST_COMPLETED):任一端结束(客户端断开 EOF / 上游结束 / 超时)
@@ -3235,8 +3254,12 @@ class Router:
         # 若上游长连不关则归还延迟到其 idle 超时。
         try:
             done, pending = await asyncio.wait(
-                {asyncio.create_task(Router._pipe(client_reader, up_writer, close_writer=False)),
-                 asyncio.create_task(Router._pipe(up_reader, client_writer))},
+                {asyncio.create_task(Router._pipe(client_reader, up_writer, close_writer=False,
+                                                  on_chunk=lambda n: _bytes.__setitem__(0, _bytes[0] + n))),
+                 asyncio.create_task(Router._pipe(up_reader, client_writer,
+                                                  on_chunk=lambda n: (_ofb.__setitem__(0, time.perf_counter())
+                                                                      if _ofb[0] is None else None,
+                                                                      _bytes.__setitem__(1, _bytes[1] + n))))},
                 return_when=asyncio.FIRST_COMPLETED)
             for t in pending:
                 t.cancel()
@@ -3246,6 +3269,23 @@ class Router:
                 except (asyncio.CancelledError, Exception):
                     pass
         finally:
+            # HTTPS 隧道的吞吐/累计字节:以双向透传总字节 / 隧道存活时长估算。
+            # 与 HTTP 的 body 转发耗时语义不同(此处是整条隧道寿命,而非单响应
+            # body 下载),但足以反映该代理对该 target 的真实中转速率,填补此前
+            # CONNECT 无吞吐统计的空白(吞吐/累计字节此前只对 HTTP 生效)。
+            # 源站首字节(仅新建隧道):新建隧道的首个上行字节是 TLS ServerHello,
+            # 故 ofb ≈ 源站 TCP 建连 + TLS 握手首字节,是盲隧道里唯一能观测到的
+            # 源站侧延迟(与 record_ttfb 的"代理侧握手"互补,覆盖整条链路)。
+            if pid is not None and not _reused and _ofb[0] is not None:
+                self.selector.record_origin_first_byte(
+                    pid, _ofb[0] - _t0, domain=target)
+            total = _bytes[0] + _bytes[1]
+            if pid is not None and total > 0:
+                duration = time.perf_counter() - _t0
+                if duration > 0:
+                    # 隧道寿命只用于吞吐/累计字节;不再是任何"完整响应耗时"分位
+                    # (原 TTLB 维度已移除,见 selector.record_complete)。
+                    self.selector.record_complete(pid, total, duration, domain=target)
             # 统一归还判定:抽到 _maybe_return_established,与竞速败者清理共用。
             await self._maybe_return_established(up_writer, up_reader, proxy_host, proxy_port, target)
 
@@ -3327,7 +3367,7 @@ class Router:
             self._observe_single_send(client_ip, self._try_tunnel_host(target), target, 'local', _perf_t0)
             await self._connect_established(client_writer, up_writer)
             await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer,
-                                     None, None, target)
+                                     None, None, target, pid='local')
         except Exception as e:
             self.local_direct_failures += 1
             logger.error("local-direct CONNECT FAILED client=%s target=%s err=%s",

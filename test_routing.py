@@ -269,7 +269,7 @@ class RoutingAnalyzer:
         circuit_state = self.router.selector.get_circuit_state()
         in_flight = self.router.selector.get_in_flight()
         concurrency_limits = self.router.selector.get_concurrency_limits()
-        # Phase 1 增强指标:每代理成功率/错误分类/TTLB/吞吐(见 /quality/meta)。
+        # Phase 1 增强指标:每代理成功率/错误分类/握手+源站首字节/吞吐(见 /quality/meta)。
         pid_v2 = self.router.selector.get_pid_quality_v2()
         domain_v2 = self.router.selector.get_domain_metrics().get(self.domain, {})
 
@@ -569,20 +569,20 @@ def format_output(analysis: Dict[str, Any], json_output: bool = False) -> str:
         if p.get('concurrency_limit'):
             conc_str = f" 并发上限={p['concurrency_limit']}"
 
-        # Phase 1:TTFB/TTLB 分位数 + 成功率 + 错误分类(优先仅该域名的,回退全局)。
+        # Phase 1:握手/源站首字节分位数 + 成功率 + 错误分类(优先仅该域名的,回退全局)。
         phase1 = ""
         dom = p.get('v2_domain')  # {metrics, percentiles} 或 None
         dom_metrics = (dom or {}).get('metrics') if dom else None
         base = dom_metrics or (p.get('v2') or {})
         ttfb_p = None
-        ttlb_p = None
+        ofb_p = None
         if dom:
             ttfb_p = dom.get('percentiles', {}).get('ttfb')
-            ttlb_p = dom.get('percentiles', {}).get('ttlb')
+            ofb_p = dom.get('percentiles', {}).get('ofb')
         if not ttfb_p and p.get('v2'):
             ttfb_p = p['v2'].get('ttfb')
-        if not ttlb_p and p.get('v2'):
-            ttlb_p = p['v2'].get('ttlb')
+        if not ofb_p and p.get('v2'):
+            ofb_p = p['v2'].get('ofb')
         if base:
             tot = base.get('total', 0)
             suc = base.get('success', 0)
@@ -591,9 +591,9 @@ def format_output(analysis: Dict[str, Any], json_output: bool = False) -> str:
             err_str = ",".join(f"{k}:{v}" for k, v in errs.items() if v)
             bits = []
             if ttfb_p and ttfb_p.get('samples'):
-                bits.append(f"TTFB p50/p95/p99={ttfb_p.get('p50',0)*1000:.0f}/{ttfb_p.get('p95',0)*1000:.0f}/{ttfb_p.get('p99',0)*1000:.0f}ms(n={ttfb_p['samples']})")
-            if ttlb_p and ttlb_p.get('samples'):
-                bits.append(f"TTLB p50/p99={ttlb_p.get('p50',0)*1000:.0f}/{ttlb_p.get('p99',0)*1000:.0f}ms")
+                bits.append(f"握手 p50/p95/p99={ttfb_p.get('p50',0)*1000:.0f}/{ttfb_p.get('p95',0)*1000:.0f}/{ttfb_p.get('p99',0)*1000:.0f}ms(n={ttfb_p['samples']})")
+            if ofb_p and ofb_p.get('samples'):
+                bits.append(f"源站首字节 p50/p95/p99={ofb_p.get('p50',0)*1000:.0f}/{ofb_p.get('p95',0)*1000:.0f}/{ofb_p.get('p99',0)*1000:.0f}ms(n={ofb_p['samples']})")
             if rate is not None:
                 bits.append(f"成功率={rate*100:.0f}%({suc}/{tot})")
             if err_str:
@@ -654,6 +654,54 @@ _ERROR_LABELS = {
 }
 
 
+def _fmt_cumulative(cum, detail_only=False) -> str:
+    """把累计视图格式化成一行可读字符串(终身累计/跨重启永久值)。
+
+    cum 为 selector._cumulative_view 的产物,含 success/failure*/samples/
+    success_rate/avg_ttfb_ms/avg_ofb_ms/throughput_mbps。无样本时给占位。
+    detail_only=True 时不重复输出主表已展示的 成功率/吞吐,只给平均时延与失败细分。
+    """
+    if not isinstance(cum, dict) or not cum.get("samples"):
+        return "  累计(永久值): — 暂无样本"
+    at = cum.get("avg_ttfb_ms")
+    at_s = f"{at:.0f}ms" if at is not None else "—"
+    ob = cum.get("avg_ofb_ms")
+    ob_s = f"{ob:.0f}ms" if ob is not None else "—"
+    fp = (f"失败:{cum['failure']}(传输{cum['failure_transport']}"
+          f"+5xx{cum['failure_5xx']})")
+    if detail_only:
+        return (f"  累计(永久值, n={cum['samples']}): 平均握手(代理)={at_s} "
+                f"平均源站首字节={ob_s} | {fp}")
+    sr = cum.get("success_rate")
+    sr_s = f"{sr*100:.1f}%" if sr is not None else "—"
+    tp = cum.get("throughput_mbps")
+    tp_s = f"{tp:.2f}MB/s" if tp is not None else "—"
+    return (f"  累计(永久值, n={cum['samples']}): 成功率={sr_s} "
+            f"平均握手(代理)={at_s} 平均源站首字节={ob_s} 吞吐={tp_s} | {fp}")
+
+
+def _fmt_pct(p) -> str:
+    """分位数单元格: 'p50/p95/p99(n=样本数)'; 无样本给占位。
+
+    入参是 selector._percentiles 的产物(ttfb / ofb 窗口)。
+    """
+    if not isinstance(p, dict) or not p.get("samples"):
+        return "—"
+    return (f"{p.get('p50', 0)*1000:.0f}/{p.get('p95', 0)*1000:.0f}/"
+            f"{p.get('p99', 0)*1000:.0f}(n={p['samples']})")
+
+
+def _fmt_cum_ewma(cum_val, ewma_val, fmt) -> str:
+    """累计(永久值)为主, 窗口化 EWMA 为辅, 以 '累计/近期' 形式输出单格。"""
+    c = fmt(cum_val) if cum_val is not None else None
+    e = fmt(ewma_val) if ewma_val is not None else None
+    if c is None and e is None:
+        return "—"
+    if c is not None and e is not None:
+        return f"{c}/{e}"
+    return c if c is not None else e
+
+
 def _render_metrics_header(api_url: str) -> List[str]:
     return [f"=== auto_squid 采集指标 @ {api_url}  {datetime.now(timezone.utc).isoformat()} ==="]
 
@@ -673,30 +721,28 @@ def _render_per_destination_metrics(dom_metrics: Dict[str, Any], keys: List[str]
         return lines
     for dkey, per in matched.items():
         lines.append(f"  ▶ 域名键: {dkey}")
-        header = (f"      {'代理':<10}{'TTFB p50/p95/p99':<26}{'TTLB p99':<12}"
-                  f"{'成功率':<10}{'吞吐':<12}{'错误分类'}")
+        header = (f"      {'代理':<10}{'握手 p50/p95/p99':<26}{'源站首字节 p50/p95/p99':<26}"
+                  f"{'成功率(累/近)':<14}{'吞吐(累/近)':<22}{'错误分类'}")
         lines.append(header)
         lines.append("      " + "-" * (len(header) - 6))
         order = sorted(per.items(), key=lambda kv: (quality.get(kv[0], {}).get("ewma_ttfb") or 1e9))
         for pid, m in order:
             per_t = m.get("percentiles") or {}
-            tfb, tlb = per_t.get("ttfb") or {}, per_t.get("ttlb") or {}
-            tf = "—"
-            if tfb.get("samples"):
-                tf = (f"{tfb.get('p50',0)*1000:.0f}/{(tfb.get('p95') or 0)*1000:.0f}/"
-                      f"{(tfb.get('p99') or 0)*1000:.0f}(n={tfb['samples']})")
-            tl = "—"
-            if tlb.get("samples"):
-                tl = f"{tlb.get('p99', 0)*1000:.0f}(n={tlb['samples']})"
+            tf = _fmt_pct(per_t.get("ttfb"))
+            tl = _fmt_pct(per_t.get("ofb"))
             errs = {k: v for k, v in (m.get("errors") or {}).items() if v}
             err_str = ",".join(f"{_ERROR_LABELS.get(k, k)}:{v}" for k, v in errs.items()) or "—"
             total = m.get("total", 0)
             rate = (m.get("success", 0) / total) if total else None
-            rate_s = "—" if rate is None else f"{rate*100:.1f}%"
-            thr = m.get("throughput_ewma")
-            thr_s = "—" if thr is None else f"{thr:.2f}MB/s"
-            lines.append(f"      {pid:<10}{tf:<26}{tl:<12}{rate_s:<10}{thr_s:<12}{err_str}"
+            cum = m.get("cumulative") or {}
+            rate_s = _fmt_cum_ewma(cum.get("success_rate"), rate,
+                                   lambda p: f"{p*100:.1f}%")
+            thr_s = _fmt_cum_ewma(cum.get("throughput_mbps"), m.get("throughput_ewma"),
+                                  lambda v: f"{v:.2f}MB/s")
+            lines.append(f"      {pid:<10}{tf:<26}{tl:<26}{rate_s:<14}{thr_s:<22}{err_str}"
                          f"  <<n={total}")
+            # 累计(永久值)平均时延与失败细分, 成功率/吞吐已并入主列。
+            lines.append(_fmt_cumulative(cum, detail_only=True))
         lines.append("")
     return lines
 
@@ -721,26 +767,23 @@ def _render_proxy_overview(qm: Dict[str, Any]) -> List[str]:
         lines.append("  (尚无观测)")
         lines.append("")
         return lines
-    header = (f"  {'代理':<10}{'TTFB p50/p95/p99':<26}{'TTLB p99':<12}"
-              f"{'成功率':<10}{'吞吐':<12}{'错误分类'}")
+    header = (f"  {'代理':<10}{'握手 p50/p95/p99':<26}{'源站首字节 p50/p95/p99':<26}"
+              f"{'成功率(累/近)':<14}{'吞吐(累/近)':<22}{'错误分类'}")
     lines.append(header)
     lines.append("  " + "-" * (len(header) - 2))
     for pid, m in sorted(qm.items(), key=lambda kv: (kv[1].get("success_rate") or 0)):
-        tfb, tlb = m.get("ttfb") or {}, m.get("ttlb") or {}
-        tf = "—"
-        if tfb.get("samples"):
-            tf = (f"{tfb.get('p50',0)*1000:.0f}/{(tfb.get('p95') or 0)*1000:.0f}/"
-                  f"{(tfb.get('p99') or 0)*1000:.0f}(n={tfb['samples']})")
-        tl = "—"
-        if tlb.get("samples"):
-            tl = f"{tlb.get('p99', 0)*1000:.0f}(n={tlb['samples']})"
+        tf = _fmt_pct(m.get("ttfb"))
+        tl = _fmt_pct(m.get("ofb"))
         errs = {k: v for k, v in (m.get("errors") or {}).items() if v}
         err_str = ",".join(f"{_ERROR_LABELS.get(k, k)}:{v}" for k, v in errs.items()) or "—"
-        rate = m.get("success_rate")
-        rate_s = "—" if rate is None else f"{rate*100:.1f}%"
-        thr = m.get("throughput_ewma_mbps")
-        thr_s = "—" if thr is None else f"{thr:.2f}MB/s"
-        lines.append(f"  {pid:<10}{tf:<26}{tl:<12}{rate_s:<10}{thr_s:<12}{err_str}")
+        cum = m.get("cumulative") or {}
+        rate_s = _fmt_cum_ewma(cum.get("success_rate"), m.get("success_rate"),
+                               lambda p: f"{p*100:.1f}%")
+        thr_s = _fmt_cum_ewma(cum.get("throughput_mbps"), m.get("throughput_ewma_mbps"),
+                              lambda v: f"{v:.2f}MB/s")
+        lines.append(f"  {pid:<10}{tf:<26}{tl:<12}{rate_s:<14}{thr_s:<22}{err_str}")
+        # 累计(永久值)平均时延与失败细分, 成功率/吞吐已并入主列。
+        lines.append(_fmt_cumulative(cum, detail_only=True))
     lines.append("")
     return lines
 
@@ -750,7 +793,7 @@ async def main():
     parser.add_argument("url", nargs="?", default="", help="URL to analyze (e.g., https://github.com/user/repo)")
     parser.add_argument("--domain", default="", help="Domain or host:port for the metrics view (overrides url)")
     parser.add_argument("--metrics", action="store_true",
-                        help="Show collected Phase 1 metrics (TTFB/TTLB percentiles, success rate, errors, throughput)")
+                        help="Show collected Phase 1 metrics (handshake/OFB percentiles, success rate, errors, throughput)")
     parser.add_argument("--domains-list", action="store_true",
                         help="List all observed domains with per-proxy attempt counts")
     parser.add_argument("--client-ip", help="Client IP for sticky cache analysis")

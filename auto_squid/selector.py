@@ -49,13 +49,13 @@ _FAIL_PENALTY_DEFAULT = 4.0
 # 这些指标只用于观测/暴露(Phase 5)与未来的排序加权(Phase 2),**不改变**现有
 # 选择逻辑(_quality/_domain_quality 的 ewma_ttfb/obs 原样保留供排序)。每个
 # (pid) 或 (domain, pid) 维护一个滑动窗口:
-#   - ttfb_samples / ttlb_samples: 有界样本列表,供 P50/P95/P99 分位数。
+#   - ttfb_samples: 有界样本列表,供 P50/P95/P99 分位数(隧道握手时延,代理侧)。
+#   - ofb_samples:  有界样本列表,供 P50/P95/P99 分位数(源站首字节,源站侧)。
 #   - success / total: 成功率。
 #   - errors: 错误分类计数(timeout/connect/http_5xx/tls/protocol/other)。
-#   - ttlb_ewma / throughput_ewma: 完整耗时与吞吐的 EWMA(Phase 2 加权输入)。
+#   - throughput_ewma: 吞吐的 EWMA(Phase 2 加权输入)。
 #   - WINDOW 界定样本上限(环形截断,存最近 N 个,内存有界)。
 _OBS_WINDOW = 256          # 每个序列保留的最近样本数(分位数用)
-_TTLB_ALPHA = 0.3          # ttlb / throughput 的 EWMA 平滑系数(与 EWMA_ALPHA 一致)
 _THROUGHPUT_ALPHA = 0.3
 
 # 终身累计指标字段(随每次观测单调增长,经 DB 恢复后继续累加,是唯一跨重启
@@ -67,10 +67,10 @@ _CUM_FIELDS = {
     "cum_success": 0,                 # 累计成功(收到非 5xx 响应头)
     "cum_failure_transport": 0,       # 累计传输层失败(连接/超时/TLS/协议/其他)
     "cum_failure_5xx": 0,             # 累计业务层失败(HTTP 5xx)
-    "cum_ttfb_sum": 0.0,              # 累计首字节耗时和(秒),供平均首字节延迟
-    "cum_ttfb_n": 0,                  # 累计首字节观测次数
-    "cum_ttlb_sum": 0.0,              # 累计 body 转发耗时和(秒),供平均完整延迟
-    "cum_ttlb_n": 0,                  # 累计 body 转发观测次数
+    "cum_ttfb_sum": 0.0,              # 累计隧道握手耗时和(秒),供平均握手延迟(代理侧)
+    "cum_ttfb_n": 0,                  # 累计隧道握手观测次数
+    "cum_ofb_sum": 0.0,               # 累计源站首字节耗时和(秒),供平均源站首字节(源站侧)
+    "cum_ofb_n": 0,                   # 累计源站首字节观测次数
 }
 
 # 错误分类键(统一枚举,供 _try_http/_try_tunnel 的 except 归类,见 record_failure)。
@@ -287,6 +287,32 @@ class ProxySelector:
             scope["cum_ttfb_sum"] += ttfb
             scope["cum_ttfb_n"] += 1
 
+    def record_origin_first_byte(self, pid: str, ofb: float,
+                                 domain: Optional[str] = None):
+        """记录一次 HTTPS 隧道的「源站首字节」耗时(秒,源站侧延迟)。
+
+        盲 CONNECT 隧道(不解密)里唯一能观测到的源站侧延迟:计时起点是隧道
+        建立(_relay_tunnel 开始透传),终点是上游→客户端方向收到**第一个字节**。
+        该字节即源站回的 TLS ServerHello,故本指标 ≈ 源站 TCP 建连 + TLS 握手
+        首字节,补上 record_ttfb(隧道握手,代理侧)覆盖不到的那一半链路。
+
+        注意它不是 HTTP 响应首字节——后者埋在加密流里,不解密无从分辨(TLS1.3
+        0-RTT / 会话复用 / HTTP2 都会改变往返形态,做突发分析很脆)。
+
+        只在**新建隧道**上记录:命中已握手隧道复用(_established_reused)时不再
+        有 TLS 握手,首个上行字节其实是应用响应数据,语义不同,混入会失真——
+        故该情形由调用方直接跳过(见 router._relay_tunnel)。
+
+        双作用域写入与 record_ttfb 一致:域名桶 + 全局桶。domain 为 None 时两
+        次取到同一个全局桶(既有行为,比值类指标不受影响)。
+        """
+        if ofb <= 0:
+            return
+        for scope in (self._metrics_for(pid, domain), self._metrics_for(pid, None)):
+            self._append_sample(scope["ofb_samples"], ofb)
+            scope["cum_ofb_sum"] += ofb
+            scope["cum_ofb_n"] += 1
+
     @staticmethod
     def _apply_ewma(table: dict, pid: str, ttfb: float) -> Optional[dict]:
         """在 table[pid] 上应用 EWMA_ALPHA 公式,返回更新后的条目(首次建新)。
@@ -365,9 +391,8 @@ class ProxySelector:
         """惰性初始化一个 metric_dict(幂等,热路径 O(1) 获取字段)。
 
         字段:
-          ttfb_samples:  最近 _OBS_WINDOW 个 ttfb(秒),算 P50/P95/P99。
-          ttlb_samples:  最近 _OBS_WINDOW 个 ttlb(秒,HTTP 完整响应)。
-          ttlb_ewma:     ttlb 的 EWMA(秒),初始 None。
+          ttfb_samples:  最近 _OBS_WINDOW 个隧道握手耗时(秒,代理侧),算 P50/P95/P99。
+          ofb_samples:   最近 _OBS_WINDOW 个源站首字节耗时(秒,源站侧),算 P50/P95/P99。
           throughput_ewma: 吞吐 EWMA(MB/s),初始 None。
           success / total: 成功数与总尝试数(成功率 = success/total)。
           errors:        错误分类计数 {key: n}。
@@ -377,8 +402,7 @@ class ProxySelector:
         if "metrics" not in m:
             m["metrics"] = {
                 "ttfb_samples": [],
-                "ttlb_samples": [],
-                "ttlb_ewma": None,
+                "ofb_samples": [],
                 "throughput_ewma": None,
                 "success": 0,
                 "total": 0,
@@ -432,24 +456,70 @@ class ProxySelector:
             "samples": len(samples),
         }
 
+    @staticmethod
+    def _cumulative_view(m: dict) -> dict:
+        """从 metric_dict 计算终身累计(跨重启持久)派生指标。
+
+        与窗口化指标(ttfb_samples 分位 / *_ewma)并存:后者反映近期瞬时,本视图
+        反映该 (代理[,域名]) 自首次观测(含 DB 恢复)以来的累计表现。计数字段
+        (cum_*) 随每次观测单调增长,经 selector.set_*_metrics 从 DB 恢复后继续
+        累加,因此是唯一跨重启真正的"永久值"——这正是 test_routing.py --metrics
+        想看到的"数据库里的永久值"。
+
+        派生:
+          - samples:        累计总样本 = 成功 + 失败(传输层 + 5xx)。
+          - success_rate:   端到端累计成功率 = cum_success / samples(5xx 计失败)。
+          - avg_ttfb_ms:    累计平均隧道握手延迟 = cum_ttfb_sum / cum_ttfb_n(ms,代理侧)。
+          - avg_ofb_ms:     累计平均源站首字节 = cum_ofb_sum / cum_ofb_n(ms,源站侧,仅
+                            HTTPS 新建隧道;复用隧道无 TLS 握手,不计)。
+          - throughput_mbps:累计平均吞吐 = total_bytes / transfer_time(MB/s,HTTP+HTTPS)。
+        """
+        cum_success = m.get("cum_success", 0)
+        cum_fail_t = m.get("cum_failure_transport", 0)
+        cum_fail_5 = m.get("cum_failure_5xx", 0)
+        cum_fail = cum_fail_t + cum_fail_5
+        cum_samples = cum_success + cum_fail
+        success_rate = (cum_success / cum_samples) if cum_samples else None
+        n_ttfb = m.get("cum_ttfb_n", 0)
+        avg_ttfb_ms = (m.get("cum_ttfb_sum", 0.0) / n_ttfb * 1000.0) if n_ttfb else None
+        n_ofb = m.get("cum_ofb_n", 0)
+        avg_ofb_ms = (m.get("cum_ofb_sum", 0.0) / n_ofb * 1000.0) if n_ofb else None
+        transfer_time = m.get("transfer_time", 0.0)
+        total_bytes = m.get("total_bytes", 0.0)
+        throughput_mbps = ((total_bytes / 1024.0 / 1024.0) / transfer_time) if transfer_time > 0 else None
+        return {
+            "success": cum_success,
+            "failure_transport": cum_fail_t,
+            "failure_5xx": cum_fail_5,
+            "failure": cum_fail,
+            "samples": cum_samples,
+            "success_rate": success_rate,
+            "avg_ttfb_ms": avg_ttfb_ms,
+            "avg_ofb_ms": avg_ofb_ms,
+            "throughput_mbps": throughput_mbps,
+        }
+
     def record_complete(self, pid: str, body_bytes: int, body_duration: float,
                         body_ttfb: float = 0.0, domain: Optional[str] = None):
-        """记录一次 HTTP **body 转发完成**的耗时与吞吐(Phase 1.1,TTLB 维度)。
+        """记录一次 **body 转发/隧道透传完成**的吞吐与累计字节(Phase 1.1)。
 
-        与 record_ttfb 互补:record_ttfb 在收到响应头即调用(首字节),本方法在
-        body 全部转发给客户端后调用(最后字节)。这里把"body 转发耗时"作为
-        TTLB−TTFB 的增量信号:TTFB 观感延迟 + body 下载时间 = 用户感知的完整
-        加载时长。对大文件/慢链路,仅看 TTFB 会低估代理的真实速度,本指标补上。
+        HTTP:body_duration 是 body 从首个数据块到读完全部的耗时;
+        HTTPS:是整条 CONNECT 隧道的存活时长(见 router._relay_tunnel)。两者
+        都用于吞吐与累计字节——这是代理对"该 target 中转速率"的可观测量。
 
-        - body_duration:body 从首个数据块到读完全部的耗时(秒)= TTLB - TTFB。
-        - body_bytes:实际转发的 body 字节数。
+        注意:这里**不再**产生任何"完整响应耗时"分位指标。原 TTLB(body 下载
+        时间)维度已移除——它是 HTTP-only 指标,在 HTTPS 主导的负载下绝大多数
+        代理恒为 n/a;且对 CONNECT 而言"隧道寿命"受 keep-alive 影响,语义与
+        "body 下载时间"完全不同,混在一起会毁掉分位数。HTTPS 的延迟画像改由
+        隧道握手时延(TTFB,代理侧)+ 源站首字节(OFB,源站侧)两个维度刻画。
+
+        - body_bytes:实际转发/透传的字节数。
         - body_ttfb:本响应的 TTFB(秒),仅用于吞吐分母修正;若调用方未提供则
           视为 0(即吞吐 = body_bytes / body_duration)。
 
         产出:
-          - ttlb_samples / ttlb_ewma:body 转发耗时的样本与 EWMA(Phase 2 加权输入)。
           - throughput_ewma:吞吐 EWMA(MB/s)= body_bytes / body_duration。
-          - total_bytes / transfer_time:累计值(便宜的平均吞吐也能直接除)。
+          - total_bytes / transfer_time:累计值(平均吞吐直接相除)。
         """
         m = self._metrics_for(pid, domain)
         g = self._metrics_for(pid, None)
@@ -457,10 +527,6 @@ class ProxySelector:
         # 单独保留便于"特定 URL 实测"(与 record_ttfb 的双作用域写入一致)。
         for sc in (g, m) if m is not g else (g,):
             if body_duration > 0:
-                self._append_sample(sc["ttlb_samples"], body_duration)
-                old = sc["ttlb_ewma"]
-                sc["ttlb_ewma"] = body_duration if old is None else (
-                    (1.0 - _TTLB_ALPHA) * old + _TTLB_ALPHA * body_duration)
                 if body_bytes > 0:
                     transfer = max(body_duration - max(body_ttfb, 0.0), 0.0)
                     denom = transfer if transfer > 0 else body_duration
@@ -481,11 +547,18 @@ class ProxySelector:
         if status_code >= 500:
             for scope in (self._metrics_for(pid, domain), self._metrics_for(pid, None)):
                 scope["errors"][ERROR_HTTP_5XX] += 1
+                # 终身累计:5xx 视作业务层失败。record_ttfb 在收到响应头时已将本
+                # 请求计入 cum_success(非 5xx 假设),此处回退并计入 cum_failure_5xx,
+                # 使 cum_success 只含非 5xx 成功、累计成功率 = cum_success/样本数
+                # 真正反映端到端成功率(5xx 算失败)。
+                scope["cum_failure_5xx"] += 1
+                if scope["cum_success"] > 0:
+                    scope["cum_success"] -= 1
 
     def get_proxy_metrics(self) -> dict:
         """返回全局(跨域名聚合)代理指标快照 {pid: metric_dict},供 /metrics 展示。
 
-        注意全局桶的 ttfb/ttlb 样本是**所有域名合并**的;域名级明细见
+        注意全局桶的 ttfb/ofb 样本是**所有域名合并**的;域名级明细见
         get_domain_metrics(见下)。返回拷贝,调用方改不动内部。
         """
         import copy
@@ -504,29 +577,32 @@ class ProxySelector:
                 out.setdefault(d, {})[pid] = dict(mm)
                 out[d][pid]["percentiles"] = {
                     "ttfb": ProxySelector._percentiles(mm.get("ttfb_samples", [])),
-                    "ttlb": ProxySelector._percentiles(mm.get("ttlb_samples", [])),
+                    "ofb": ProxySelector._percentiles(mm.get("ofb_samples", [])),
                 }
+                # 终身累计(跨重启永久):与窗口化分位并存,供 --metrics 展示"永久值"。
+                out[d][pid]["cumulative"] = ProxySelector._cumulative_view(mm)
         return out
 
     def get_pid_quality_v2(self) -> dict:
         """返回每代理的增强指标摘要(Phase 5 /quality 暴露)。
 
-        含 P50/P95/P99(ttfb)、成功率、错误分类、吞吐、ttlb_ewma。内部
-        _append_sample 把样本留存在内存供分位,此处只读不拷贝样本(避免大对象)。
+        含 P50/P95/P99(ttfb 隧道握手 / ofb 源站首字节)、成功率、错误分类、吞吐。
+        内部 _append_sample 把样本留存在内存供分位,此处只读不拷贝样本(避免大对象)。
         """
         out = {}
         for pid, m in self._proxy_metrics.items():
             mm = m["metrics"]
             per = {
                 "ttfb": ProxySelector._percentiles(mm.get("ttfb_samples", [])),
-                "ttlb": ProxySelector._percentiles(mm.get("ttlb_samples", [])),
-                "ttlb_ewma_seconds": mm.get("ttlb_ewma"),
+                "ofb": ProxySelector._percentiles(mm.get("ofb_samples", [])),
                 "throughput_ewma_mbps": mm.get("throughput_ewma"),
                 "success_count": mm.get("success", 0),
                 "total_attempts": mm.get("total", 0),
                 "success_rate": (mm["success"] / mm["total"]) if mm.get("total", 0) else None,
                 "errors": dict(mm.get("errors", {})),
                 "total_bytes_transferred": mm.get("total_bytes", 0.0),
+                # 终身累计(跨重启永久):成功率/平均首字节/吞吐,与窗口化指标并存。
+                "cumulative": ProxySelector._cumulative_view(mm),
             }
             out[pid] = per
         return out
@@ -607,12 +683,15 @@ class ProxySelector:
         for pid, m in data.items():
             if not isinstance(m, dict):
                 continue
-            needed = {"ttfb_samples", "ttlb_samples", "ttlb_ewma",
-                      "throughput_ewma", "success", "total",
+            needed = {"ttfb_samples", "throughput_ewma", "success", "total",
                       "errors", "total_bytes", "transfer_time"}
             if not needed.issubset(m):
                 logger.debug("proxy_metrics %s 缺少字段,跳过: %s", pid, set(m.keys()))
                 continue
+            # ofb_samples 为后加字段(TTLB 移除后新增的源站首字节窗口):旧 DB 行
+            # 没有,补空列表,否则热路径 _append_sample 会 KeyError。
+            if "ofb_samples" not in m:
+                m["ofb_samples"] = []
             # 惰性补全终身累计字段(_CUM_FIELDS):旧 DB 行缺这些键时补默认值,使
             # record_ttfb/record_http_error 的 scope[...] 读写不抛 KeyError(09-04
             # 事故:旧行无 cum_* → 热路径 KeyError → 全请求失败 → 熔断全开)。
@@ -635,12 +714,14 @@ class ProxySelector:
             for pid, m in per_pid.items():
                 if not isinstance(m, dict):
                     continue
-                needed = {"ttfb_samples", "ttlb_samples", "ttlb_ewma",
-                          "throughput_ewma", "success", "total",
+                needed = {"ttfb_samples", "throughput_ewma", "success", "total",
                           "errors", "total_bytes", "transfer_time"}
                 if not needed.issubset(m):
                     logger.debug("domain_metrics %s %s 缺少字段,跳过", d, pid)
                     continue
+                # 同 set_proxy_metrics:旧 DB 行补 ofb_samples 空列表。
+                if "ofb_samples" not in m:
+                    m["ofb_samples"] = []
                 # 惰性补全终身累计字段,同 set_proxy_metrics。
                 for k, v in _CUM_FIELDS.items():
                     if k not in m:
@@ -692,6 +773,9 @@ class ProxySelector:
         for scope in (self._metrics_for(pid, domain), self._metrics_for(pid, None)):
             scope["total"] += 1
             scope["errors"][etype] += 1
+            # 终身累计:传输层失败(连接/超时/TLS/协议/其他),与 cum_failure_5xx
+            # 一并构成累计失败总数(见 _cumulative_view)。
+            scope["cum_failure_transport"] += 1
 
     def record_success(self, pid: str):
         """记录一次上游成功,连续失败计数归零。

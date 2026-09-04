@@ -102,9 +102,9 @@ async def quality():
 async def quality_meta():
     """返回每代理的增强指标(Phase 1,IMPROVEMENT_PLAN.md)。
 
-    在原有 EWMA TTFB 之外补充 TTFB/TTLB 分位数(P50/P95/P99)、成功率、错误分类、
-    吞吐与累计字节。供运维/仪表盘评估"特定 URL 实测速度"(TTFB + TTLB 双维度,
-    避免只看首字节而低估大文件/慢链路)。返回 {pid: metric},见
+    在原有 EWMA TTFB 之外补充握手/源站首字节分位数(P50/P95/P99)、成功率、错误
+    分类、吞吐与累计字节。供运维/仪表盘评估"特定 URL 实测速度"(握手=代理侧、
+    源站首字节=源站侧,两维度覆盖"代理→源站"整条链路)。返回 {pid: metric},见
     selector.get_pid_quality_v2()。
     """
     if not _router:
@@ -181,7 +181,7 @@ async def metrics():
     domain_stats = _router.get_domain_stats_from_db() if _router else {}
     # 服务端性能计数器(缓存命中/竞速扇出),供压测跨进程读取算命中率/放大率。
     counters = _router.snapshot_counters() if _router else {}
-    # Phase 1:每代理增强指标(成功率/错误分类/TTLB/吞吐分位数),见 /quality/meta。
+    # Phase 1:每代理增强指标(成功率/错误分类/握手+源站首字节/吞吐分位数),见 /quality/meta。
     proxy_metrics = _router.selector.get_proxy_metrics() if _router else {}
     return {"request_counts": counts, "attempted_counts": attempts, "domain_stats": domain_stats,
             "counters": counters, "proxy_metrics": proxy_metrics}
@@ -192,7 +192,7 @@ async def metrics_per_destination():
     """每分钟度(域名,代理)的增强指标(Phase 1,IMPROVEMENT_PLAN.md)。
 
     评估"特定 URL(如 https://github.com 的 domain key github.com:443)实测速度":
-    返回 {domain: {pid: {ttfb/ttlb 分位数, 成功率, 错误分类, 吞吐}}}。见
+    返回 {domain: {pid: {ttfb/ofb 分位数, 成功率, 错误分类, 吞吐}}}。见
     selector.get_domain_metrics()。
     """
     if not _router:
@@ -237,9 +237,9 @@ async def domains_meta():
     """返回域名缓存元数据（当前默认代理、更新时间；自适应 TTL 开启时含
     ttl/expires_at/switch_count）。
 
-    Phase 1 增强:每个域名追加 proxy_metrics = {pid: {ttfb/ttlb 分位数, 成功率,
+    Phase 1 增强:每个域名追加 proxy_metrics = {pid: {ttfb/ofb 分位数, 成功率,
     错误分类, 吞吐}}——用于评估"特定 URL(如 github.com:443)在各代理上的实测
-    速度差异"(TTFB+TTLB 双维度)。见 selector.get_domain_metrics()。
+    速度差异"(握手+源站首字节双维度)。见 selector.get_domain_metrics()。
     """
     if not _router:
         return {}
@@ -320,6 +320,8 @@ select:focus{border-color:#e94560}
 .metric-cell-num{text-align:center;font-variant-numeric:tabular-nums}
 .metric-cell-muted{color:#555;text-align:center;font-variant-numeric:tabular-nums}
 td.err-cell{font-size:11px;color:#a8d8ea}
+.ewma-sub{color:#888;font-size:0.82em}
+tr.cum-row td{font-size:11px;color:#888;padding-top:0;padding-bottom:8px;font-variant-numeric:tabular-nums}
 </style>
 </head>
 <body>
@@ -476,6 +478,33 @@ function fmtBytes(b) {
   return b + ' B';
 }
 
+// 累计(永久值)为主, 窗口化 EWMA 作为括号里的次要列。无累计时回退到 EWMA。
+function cumCell(cumVal, ewmaVal, fmtFn) {
+  const c = (cumVal != null) ? fmtFn(cumVal) : null;
+  const e = (ewmaVal != null) ? fmtFn(ewmaVal) : null;
+  if (c == null && e == null) return '—';
+  if (c != null && e != null) return c + ' <span class="ewma-sub">(' + e + ')</span>';
+  return c != null ? c : e;
+}
+
+// 分位数单元格: 'p50/p95/p99(n=样本数)'; 无样本给占位。
+function pctCell(p) {
+  if (!p || !p.samples) return '—';
+  return Math.round((p.p50||0)*1000) + '/' + Math.round((p.p95||0)*1000) + '/'
+       + Math.round((p.p99||0)*1000) + 'ms(n=' + p.samples + ')';
+}
+
+// 累计明细行, 措辞与 test_routing.py --metrics 的 "累计(永久值...)" 行保持一致
+// (分位数无法累计: 累计只存 sum/n, 故这里给平均时延 + 失败细分)。
+function cumLine(cum) {
+  if (!cum || !cum.samples) return '累计(永久值): — 暂无样本';
+  const at = (cum.avg_ttfb_ms != null) ? Math.round(cum.avg_ttfb_ms) + 'ms' : '—';
+  const ob = (cum.avg_ofb_ms != null) ? Math.round(cum.avg_ofb_ms) + 'ms' : '—';
+  return '累计(永久值, n=' + cum.samples + '): 平均握手(代理)=' + at
+       + ' 平均源站首字节=' + ob
+       + ' | 失败:' + cum.failure + '(传输' + cum.failure_transport + '+5xx' + cum.failure_5xx + ')';
+}
+
 function errStr(errs) {
   const items = Object.entries(errs || {}).filter(([,v]) => v > 0).map(([k,v]) => (ERR_LABELS[k]||k) + ':' + v);
   return items.length ? items.join(', ') : '—';
@@ -485,20 +514,19 @@ function renderMetricsGlobal(wrap) {
   const pids = Object.keys(qmeta).sort();
   if (!pids.length) { wrap.innerHTML = '<div class="no-data">No data</div>'; document.getElementById('pager').innerHTML=''; document.getElementById('footer').textContent=''; return; }
   page = 0;
-  let html = '<table><thead><tr><th>代理</th><th>TTFB P50/P95/P99</th><th>TTLB P99</th><th>成功率</th><th>吞吐</th><th>成功/总数</th><th>错误分类</th><th>字节</th></tr></thead><tbody>';
+  let html = '<table><thead><tr><th>代理</th><th>握手 P50/P95/P99</th><th>源站首字节 P50/P95/P99</th><th>成功率(累计)</th><th>吞吐(累计)</th><th>成功/总数</th><th>错误分类</th><th>字节</th></tr></thead><tbody>';
   for (const pid of pids) {
     const m = qmeta[pid] || {};
-    const tfb = m.ttfb || {}, tlb = m.ttlb || {};
-    const ttfbS = tfb.samples ? (Math.round((tfb.p50||0)*1000) + '/' + Math.round((tfb.p95||0)*1000) + '/' + Math.round((tfb.p99||0)*1000) + 'ms') : '—';
-    const ttlbS = tlb.samples ? Math.round((tlb.p99||0)*1000) + 'ms' : '—';
+    const cum = m.cumulative || {};
     html += `<tr><td class="default-proxy">${pid}</td>`;
-    html += `<td class="metric-cell-num">${ttfbS}</td>`;
-    html += `<td class="metric-cell-num">${ttlbS}</td>`;
-    html += `<td class="metric-cell-num">${fmtPct(m.success_rate)}</td>`;
-    html += `<td class="metric-cell-num">${fmtMbps(m.throughput_ewma_mbps)}</td>`;
+    html += `<td class="metric-cell-num">${pctCell(m.ttfb)}</td>`;
+    html += `<td class="metric-cell-num">${pctCell(m.ofb)}</td>`;
+    html += `<td class="metric-cell-num">${cumCell(cum.success_rate, m.success_rate, fmtPct)}</td>`;
+    html += `<td class="metric-cell-num">${cumCell(cum.throughput_mbps, m.throughput_ewma_mbps, fmtMbps)}</td>`;
     html += `<td class="metric-cell-num">${m.success_count||0}/${m.total_attempts||0}</td>`;
     html += `<td class="metric-cell-num err-cell">${errStr(m.errors)}</td>`;
     html += `<td class="metric-cell-num">${fmtBytes(m.total_bytes_transferred)}</td></tr>`;
+    html += `<tr class="cum-row"><td colspan="8">${cumLine(cum)}</td></tr>`;
   }
   html += '</tbody></table>';
   wrap.innerHTML = html;
@@ -517,22 +545,21 @@ function renderMetricsDomain(wrap) {
   const per = perDest[metricsDomain];
   const pids = Object.keys(per).sort((a,b) => (per[b].total||0)-(per[a].total||0));
   let html = `<div class="filter-banner" style="display:flex"><strong>${metricsDomain}</strong>&nbsp;各代理实测指标</div>`;
-  html += '<table><thead><tr><th>代理</th><th>TTFB P50/P95/P99</th><th>TTLB P99</th><th>成功率</th><th>吞吐</th><th>错误分类</th><th>总请求</th></tr></thead><tbody>';
+  html += '<table><thead><tr><th>代理</th><th>握手 P50/P95/P99</th><th>源站首字节 P50/P95/P99</th><th>成功率(累计)</th><th>吞吐(累计)</th><th>错误分类</th><th>总请求</th></tr></thead><tbody>';
   for (const pid of pids) {
     const m = per[pid] || {};
     const per_t = m.percentiles || {};
-    const tfb = per_t.ttfb || {}, tlb = per_t.ttlb || {};
-    const ttfbS = tfb.samples ? (Math.round((tfb.p50||0)*1000) + '/' + Math.round((tfb.p95||0)*1000) + '/' + Math.round((tfb.p99||0)*1000) + 'ms(n=' + tfb.samples + ')') : '—';
-    const ttlbS = tlb.samples ? Math.round((tlb.p99||0)*1000) + 'ms(n=' + tlb.samples + ')' : '—';
     const total = m.total || 0;
     const rate = total ? m.success / total : null;
+    const cum = m.cumulative || {};
     html += `<tr><td class="default-proxy">${pid}</td>`;
-    html += `<td class="metric-cell-num">${ttfbS}</td>`;
-    html += `<td class="metric-cell-num">${ttlbS}</td>`;
-    html += `<td class="metric-cell-num">${fmtPct(rate)}</td>`;
-    html += `<td class="metric-cell-num">${fmtMbps(m.throughput_ewma)}</td>`;
+    html += `<td class="metric-cell-num">${pctCell(per_t.ttfb)}</td>`;
+    html += `<td class="metric-cell-num">${pctCell(per_t.ofb)}</td>`;
+    html += `<td class="metric-cell-num">${cumCell(cum.success_rate, rate, fmtPct)}</td>`;
+    html += `<td class="metric-cell-num">${cumCell(cum.throughput_mbps, m.throughput_ewma, fmtMbps)}</td>`;
     html += `<td class="metric-cell-num err-cell">${errStr(m.errors)}</td>`;
     html += `<td class="metric-cell-num">${total}</td></tr>`;
+    html += `<tr class="cum-row"><td colspan="7">${cumLine(cum)}</td></tr>`;
   }
   html += '</tbody></table>';
   wrap.innerHTML = html;
