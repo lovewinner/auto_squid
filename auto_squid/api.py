@@ -523,7 +523,7 @@ function renderMetricsGlobal(wrap) {
   // 两表列错开各展所长:窗口表重在 EWMA 趋势与近期计数(代理近况);
   // 累计表重在永久累计与均值(代理历史表现,跨重启可追溯)。
   let win = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 P50/P95/P99</th><th>源站首字节 P50/P95/P99</th><th>错误分类(近 256)</th></tr></thead><tbody>';
-  let cum = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 均值</th><th>源站首字节 均值</th><th>吞吐 累计</th><th>成功率(全)</th><th>成功/总数(全)</th><th>累计字节</th></tr></thead><tbody>';
+  let cum = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 均值</th><th>源站首字节 均值</th><th>吞吐 累计</th><th>成功率</th><th>成功/总数</th><th>累计字节</th></tr></thead><tbody>';
   for (const pid of pids) {
     const m = qmeta[pid] || {};
     const c = m.cumulative || {};
