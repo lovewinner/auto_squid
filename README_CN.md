@@ -8,16 +8,25 @@
 
 - 在网关主机运行，接受 HTTP/HTTPS 代理流量，将每个请求转发到上游代理
 - **并行竞速 + 错峰启动**：每次请求按 EWMA 延迟排序候选，先发最优 1~2 个（RFC 8305 §5），间隔 ~250ms 补发；首个首字节成功即取消其余并释放连接。错峰大幅减少 CONNECT 隧道扇出与 HTTP 双写流量
+- **多目标 Cost 排序（Phase 2）**：竞速候选按「延迟（P99 尾部优先）+ 成功率 + 吞吐」加权 Cost 排列，候选集内 min–max 归一化——"首字节快但爱失败"的代理不再压过"稍慢但稳"的代理。默认开启，`cost_sort_enabled: false` 一键回滚纯 EWMA 排序
+- **自调节（P1）**：Cost 权重支持运行时热更新（`POST /cost`，下一次竞速即生效，无需重启）；可选的保守自动调参器（`router.auto_tune`）以实测赢家 TTFB 为目标爬山调权重，带成功率守卫与自动回滚
 - **域名缓存**：某个代理为某域名竞速胜出后，在 `cache_ttl` 有效期内复用该代理，避免每个请求都竞速
 - **会话粘性**：可选，同一客户端 IP + 域名/目标复用同一代理（保持 egress IP 稳定），粘性代理失败/返回 5xx 即驱逐并回落竞速（redispatch），并按 `recheck_hits` 周期探路重竞速
 - **HTTP 响应缓存**：幂等 `GET` 响应在内存中缓存（TTL 60s，遵循 `Cache-Control`）
 - **本机竞速**：可选，让网关主机自身作为代理节点直接参与竞速（不走上游）
+- **可观测性**：每代理/每域名的窗口（近期 256 次）与**终身**（t-digest，跨重启）双族分位数、错误分类、HTTP 协议版本分布、能看出"哪个分量主导排序"的 **Cost 分解**、带低样本警示的贝叶斯平滑成功率
 - **域名统计**：各域名胜出次数持久化到 SQLite，重启不丢失
 - **Web 界面**：内置仪表盘 `/`，可浏览域名统计、默认代理、胜出次数，支持自动刷新；点击统计卡片可过滤出以该代理为 Default Proxy 的域名
 
 ## 功能
 
 - HTTP 与 HTTPS（`CONNECT`）转发，**并行竞速多个上游代理**（按 EWMA 排序 + 错峰启动）
+- **多目标 Cost 排序**（Phase 2，默认开启）：候选序 = `w_延迟·norm(延迟) + w_成功率·norm(1−成功率) + w_吞吐·norm(1−吞吐)`，候选集内 min–max 归一化（权重直接可比、与量纲无关）。延迟主项用**终身 TTFB P99**（t-digest，尾部优先），不足回退 EWMA；成功率 Laplace 平滑（域名级优先）；吞吐需累计字节过门槛才参与（隧道流量基本测不到按响应体的吞吐，故权重极小）。缺数据项中性（0.5）。`cost_sort_enabled: false` = 一键回滚纯 EWMA 排序
+- **Cost 热更新 + 自动调参器**（P1）：`GET/POST /cost` 运行时读/改全部 Cost 参数（下一次竞速即生效，无需重启）；`POST /tuner` 启停自动调参器——每评估窗口对三权重做一次 ±25% 单维扰动，赢家 TTFB 均值改进 ≥5% 且不拿成功率换延迟（守卫）才采纳，恶化立即回滚，已采纳基线持久化到 SQLite
+- **单发降级门控**（Phase 3，阈值默认全关）：除连续失败/EWMA 恶化信号外，被钉住（粘性/域名缓存）的代理在域名级成功率、P99 延迟或吞吐越过阈值时主动降级回竞速——补上"握手快但爱失败/下载慢"的盲区
+- **业务对齐探测**（Phase 4，`probe_with_get`，默认关闭）：可选在 CONNECT 探活后经该上游对白名单 URL 发一次轻量 GET（按 代理+目标 限速、独立短连接），把 TTFB/协议/吞吐写入**该域名的真实指标桶**——探活延迟终于贴近业务延迟
+- **指标鲁棒性**：自包含 t-digest 的终身分位数（内存有界、JSON 落盘、跨重启）与近期 256 窗口并存；低样本分位数带 `low_confidence` 警示；成功率 Laplace 平滑，1/1 的代理不再显示完美 1.0
+- **HTTP 协议版本统计**（Phase 1.4）：HTTP 路径按代理/域名累计 `HTTP/1.1`/`HTTP/2`/`HTTP/3` 计数（H2 占比兼作连接复用的代理信号；CONNECT 隧道的复用/TLS 会话恢复对正向代理架构上不可见，不伪造指标）
 - 域名级缓存（`cache_ttl`），按域名复用胜出代理
 - 会话粘性（per-client+domain，内存-only，滑动 TTL），粘性代理失败自动回落竞速并回填；5xx 驱逐、周期重竞速、容量上限
 - 慢单发采样日志（`router.circuit.single_send_slow_log_ms`）：粘性/域名缓存命中的单发（跳过竞速的路径）"发起到首字节"耗时超阈值即记一条**带客户端 IP** 的日志——成功路径不打 IP 日志,这是按 IP 归因"打不开/要反复刷新"的唯一锚点
@@ -188,7 +197,9 @@ router:
 | 文件 | 负责 |
 |------|------|
 | `router.py` | `Router`——客户端处理、竞速、域名缓存、单发降级、策略路由、SQLite 持久化，以及到各协作类的转发 shim |
-| `selector.py` | `ProxySelector`——每代理 EWMA 延迟、熔断 + slow-start、自适应并发限制、竞速排序 |
+| `selector.py` | `ProxySelector`——每代理 EWMA 延迟、熔断 + slow-start、自适应并发限制、多目标 Cost 排序与分解、竞速排序 |
+| `tuner.py` | `AutoTuner`——三个 Cost 权重的保守爬山自动调参器（P1，默认关闭） |
+| `digest.py` | `TDigest`——自包含 t-digest（dict 子类、可 JSON 落盘），支撑终身分位数 |
 | `pools.py` | `ConnectionPools`——三套 CONNECT 预热池（通用池 / 目标半预连接 / 已建握手复用） |
 | `sticky.py` | `StickyCache`——per-client+domain 会话粘性表 |
 | `http_cache.py` | `HttpCache`——GET 响应缓存（LRU、在途去重聚合、写方法失效） |
@@ -200,24 +211,65 @@ domain_cache 簇（`_meta_cache`、自适应 TTL、切换阻尼、质量感知�
 
 ## API 端点
 
+均在管理端口 `:18080`。`POST` 请求体为 JSON；未知字段直接拒绝（`422`）。`api.auth` 开启后，除 `/health` 外全部端点需要 HTTP Basic 凭据。
+
+### 代理与统计
+
 | 端点 | 说明 |
 |------|------|
 | `GET /` | Web 仪表盘（域名统计、默认代理、自动刷新；点击统计卡片可按 Default Proxy 过滤域名） |
-| `GET /health` | 健康检查 |
+| `GET /health` | 健康检查（始终开放，`api.auth` 开启时也不例外） |
 | `GET /proxies` | 列出已配置代理 |
-| `POST /proxies` | 添加代理（JSON body） |
-| `GET /stats` | `request_counts` + `attempted_counts` |
-| `GET /metrics` | `request_counts`、`attempted_counts`、域名统计与服务端性能计数器（缓存命中 / 竞速扇出） |
-| `GET /server-stats` | 服务端资源采样（CPU 占用、事件循环延迟），由压测子进程填充；正常运行返回空快照 |
-| `GET /config` | 路由配置（`enable_local_racing`） |
+| `POST /proxies` | 添加代理（`ProxyIn` JSON：`id`、`host`、`port`、`protocol`、`auth`、`enabled`、`tags`）；持久化到 `proxies.yaml` |
+| `GET /stats` | `request_counts`（胜出）+ `attempted_counts`（总尝试） |
 | `GET /domains` | 从 SQLite 读取的域名胜出统计 |
 | `GET /domains/meta` | 各域名默认代理 + 最近更新时间（自适应 TTL 开启时含 `ttl`/`expires_at`/`switch_count`） |
 | `GET /stickiness` | 会话粘性表（客户端IP\|域名 → 粘性代理 + 更新时间） |
-| `GET /quality` | 各代理 EWMA 首字节延迟（秒），竞速排序依据 |
+| `GET /policies` | 策略路由配置快照（匹配条件 + 允许的代理子集） |
+| `GET /config` | 路由配置（`enable_local_racing`） |
+
+### 指标与质量
+
+| 端点 | 说明 |
+|------|------|
+| `GET /metrics` | `request_counts`、`attempted_counts`、域名统计与服务端性能计数器（缓存命中、竞速扇出、探活计数含 `probe_get_sent/ok/failed/throttled`） |
+| `GET /metrics/per-destination` | 按（域名，代理）的实测指标：窗口分位数、成功率、错误分类，及 `cumulative` 子对象（终身均值、平滑成功率、t-digest 的 `ttfb_percentiles`/`ofb_percentiles`、累计字节） |
+| `GET /quality` | 各代理 EWMA 首字节延迟（秒），旧版竞速排序依据 |
+| `GET /quality/meta` | **增强版每代理指标**：窗口 P50/P95/P99、平滑窗口成功率、错误分类、HTTP 协议版本计数、`cumulative` 终身对象，以及每代理的 `cost_breakdown`（见 [Cost 排序与自动调参](#cost-排序与自动调参)） |
 | `POST /quality/reset` | 清空全部代理 EWMA 质量（网络切换后调用） |
 | `GET /circuit` | 各代理熔断 + 探活状态（`open`、退避、`probes_sent/ok/skipped`、`single_send_degrades`、`single_send_slow_log_ms`/`logged`） |
-| `GET /policies` | 策略路由配置快照（匹配条件 + 允许的代理子集） |
 | `POST /circuit/reset` | 手动解除全部熔断（保留 EWMA 质量） |
+| `GET /server-stats` | 服务端资源采样（CPU 占用、事件循环延迟），由压测子进程填充；正常运行返回空快照 |
+
+### Cost 排序与自动调参（P1）
+
+| 端点 | 说明 |
+|------|------|
+| `GET /cost` | 当前 7 个 Cost 参数、自动调参器状态（`enabled`、安全边界、`baseline`、窗口样本、`last_decision`） |
+| `POST /cost` | 热更新任意子集：`cost_sort_enabled`、`cost_latency_metric`（`"p99"`/`"ewma"`）、`cost_weight_latency`、`cost_weight_success_rate`、`cost_weight_throughput`、`cost_latency_min_samples`、`cost_throughput_min_bytes`——**下一次竞速即生效**，无需重启。负权重钳 0；调参器开启时手动更新会使其重测基线（下一窗口把手动值测为新已知好点） |
+| `POST /tuner` | `{"enabled": true|false}`——运行时启停自动调参器。开启=全新开始（重测基线）；关闭=回滚到最近采纳的基线权重。详见 [Cost 排序与自动调参](#cost-排序与自动调参) |
+
+使用示例：
+
+```bash
+# 当前排序长什么样?每个代理哪个分量在主导?
+curl http://127.0.0.1:18080/quality/meta | jq '.["239-192"].cost_breakdown'
+# → {"rank":2,"cost":0.31,"latency":{"raw":0.124,...,"contrib":0.21},
+#     "success_rate":{"failure":0.026,...,"contrib":0.05},"throughput":{...},"load_mult":1.0}
+
+# 成功率还行但下载慢 → 调大吞吐权重,无需重启
+curl -X POST http://127.0.0.1:18080/cost \
+     -H 'Content-Type: application/json' \
+     -d '{"cost_weight_throughput": 0.4}'
+
+# 行为不对劲 → 立即回滚,不碰进程
+curl -X POST http://127.0.0.1:18080/cost -d '{"cost_sort_enabled": false}'
+
+# 运行时启停自动调参器
+curl -X POST http://127.0.0.1:18080/tuner -d '{"enabled": true}'
+```
+
+每代理 `cost_breakdown` 含：`rank`（与竞速同排序键：slow-start 分层 → 未知质量 → cost）、`cost`（总）、三分量的 `raw`/`norm`（0=最优，1=最差，0.5=无数据）/`contrib`（权重×norm——**贡献最大者即当前排序主导因素**）、`load_mult`（连续失败×在途惩罚，已折进延迟）、`slow_start_rank`/`unknown_quality` 标记（区分"cost 差"与"恢复期垫底"）。不在当前候选集的代理（熔断/禁用/并发超限）为 `cost_breakdown: null`。
 
 ## 配置
 
@@ -242,12 +294,57 @@ router:
     single_send_degrade_fail: 2     # 单发降级:连续失败阈值(熔断早告警,0=关闭)
     single_send_degrade_ratio: 3.0  # 单发降级:EWMA 相对钉住基线恶化倍数(0=关闭)
     single_send_degrade_slack_ms: 10  # 降级绝对下限(ms),防极低延迟误判
+    # ── Phase 3: 域名级单发降级信号(默认全 0=关闭) ──
+    single_send_degrade_success_rate: 0.0   # 域名成功率低于此值即降级(需样本>=8)
+    single_send_degrade_p99_ms: 0.0         # TTFB/OFB 取较大者,超此毫秒即降级(需样本>=4)
+    single_send_degrade_min_throughput: 0.0 # 域名吞吐 EWMA 低于此 MB/s 即降级(需样本>=4)
     single_send_slow_log_ms: 1500     # 慢单发采样日志(ms,0=关闭):粘性/域缓存命中的单发"发起到首字节"耗时超阈值即记一条含客户端 IP 的日志(成功路径不打 IP,这是按 IP 归因"打不开/要刷新"的唯一锚点);单发失败(建连/握手超阈值)记 slow single send FAILED(计入 single_send_fail_logged),补上建连失败型卡顿的 IP 归因
     connect_tunnel_timeout_sec: 3.0   # CONNECT 隧道建连/读响应超时(秒,默认 3,原硬编码 15):_try_tunnel 向源站 CONNECT 的统一上限,防某代理 egress→源站建连/握手偶发卡死把请求拖成 10s+。测得 CDN 首字节实际 0.6s,3s 给 5 倍余量
     http_read_timeout_sec: 3.0        # HTTP 单发读首字节超时(秒,默认 3,原 10):_upstream_timeout.read。曾有收紧 header 等待非净赢(引爆 soak p99+fd 已回退),生产灰度须盯 p99/fd
+    # ── Phase 4: 业务对齐探测(默认关闭) ──
+    probe_with_get: false             # CONNECT 探活后追加一次轻量 GET
+    probe_get_targets: []             # 白名单,如 ["https://api.github.com/"];按代理轮转
+    probe_get_interval_sec: 60.0      # 每(代理,目标)最小间隔——不要打爆目标站
+    probe_get_timeout_sec: 5.0
+    probe_get_max_bytes: 65536        # 够算吞吐即可,不做大下载
+    # ── Phase 2: 多目标 Cost 排序(默认开启) ──
+    cost_sort_enabled: true           # false = 一键回滚纯 EWMA 排序
+    cost_latency_metric: "p99"        # 延迟主项: "p99"(尾部优先) 或 "ewma"
+    cost_weight_latency: 1.0
+    cost_weight_success_rate: 0.6
+    cost_weight_throughput: 0.1       # 保持极小:隧道流量基本测不到按响应体的吞吐
+    cost_latency_min_samples: 1       # P99 项所需 digest 最小样本(1 = 与 EWMA obs>=1 一致)
+    cost_throughput_min_bytes: 1000000  # 吞吐项需累计字节 >=1MB
+  # ── P1: Cost 权重自动调参器(默认关闭) ──
+  # auto_tune:
+  #   enabled: true        # 对三权重做保守爬山
+  #   window_sec: 900      # 评估窗口(15 分钟)
+  #   min_samples: 50      # 每窗口最少赢家样本数(不足自动扩窗,最多 3 次)
+  #   step: 0.25           # 每窗口单维度 ±25% 扰动
+  #   hysteresis: 0.05     # 改进 >=5% 才采纳;恶化超 5% 判退化
+  #   sr_guard: 0.005      # 试跑成功率跌幅超 0.5pp 即拒绝
+  #   persist: true        # 已采纳基线持久化到 SQLite,跨重启恢复
 logging:
   file: "auto_squid.log"
 ```
+
+## Cost 排序与自动调参
+
+Phase 2 把单信号（EWMA）竞速排序升级为**多目标 Cost**——根治"首字节快但爱失败/下载慢"的代理被选中。权重依据生产数据推定：成功率高度聚集（0.94–0.98，区分度低）、TTFB 跨度大（66–151ms，主信号）、隧道流量基本测不到按响应体的吞吐（近 0 → 极小权重 + 1MB 字节门槛）。
+
+**观测工作流**（整套功能围绕这个闭环搭建）：
+
+1. `python test_routing.py --metrics`（或 `GET /quality/meta`）——每个代理一行 `cost_breakdown`，如 `rank=3 cost=1.65 [延迟1.00 成功率0.60 吞吐0.05] (p99=800ms 失败率=50.0%)`。**贡献最大的分量即当前排序主导因素**——那就是值得调的权重。
+2. 观察几天。代理因 P99 尾部尖峰频繁换位？那是 `cost_latency_metric: "p99"` 在起作用；嫌抖就换 `"ewma"`。
+3. 调参要么手动（`POST /cost`，下一次竞速即生效），要么交给自动调参器（`auto_tune.enabled: true` / `POST /tuner`）。
+
+**自动调参器保证**（保守爬山，(1+1)-ES 风格）：
+
+- 每窗口（默认 15 分钟）只试跑**一个** ±25% 扰动（维度×方向轮转）；硬安全边界（`latency ∈ [0.2, 4.0]`、`success_rate ∈ [0, 2.0]`、`throughput ∈ [0, 1.0]`）。
+- 目标是**赢家 TTFB 均值**（纯赢家样本，在竞速胜出点经 task 侧信道采集——单用 `record_ttfb` 会混入未被取消的败者）。
+- 采纳需 **改进 ≥5%** 且成功率跌幅 ≤0.5pp；恶化 ≥5%（或守卫被突破）**立即回滚**；两者之间视为噪声，换下一个扰动重试。
+- 每 10 个窗口强制重测基线（防流量结构漂移）；低流量窗口自动扩窗（最多 3 次）而不是在噪声上做决策；已采纳基线持久化 SQLite（`tuner_state`），跨重启恢复。
+- 调参器只动三个权重——绝不碰 stagger/max_retries/超时。三重熔断：`POST /tuner {"enabled": false}` → `POST /cost {"cost_sort_enabled": false}` → 改配置重启。
 
 ## 速度调优
 
@@ -337,7 +434,9 @@ curl -x http://127.0.0.1:10808 http://www.baidu.com
 .venv/bin/python -m pytest -q
 ```
 
-测试套件（**260** 个用例）覆盖 HTTP/CONNECT 转发、HTTP 响应缓存（含 LRU/淘汰与在途去重聚合）、域名缓存、竞速/聚合超时、客户端认证、熔断/探活/EWMA 选路/在途加权、会话粘性（含质量感知单发降级**与慢单发采样日志**）、域名统计 + SQLite 持久化、UTF-8 头安全、二进制安全的请求体处理、连接预热（通用池 + target 半预连接 + 已建握手隧道复用）+ 空闲暂停（含"暂停不卡请求路径"回归）、健壮性（请求头行数/字节上限、截断响应检测）、配置层（`extra="forbid"` 拒绝拼错键、跨字段校验、退出码 2），以及模块拆分回归（`router_cfg=` vs kwarg 等价、池/缓存/粘性转发同一性）。
+测试套件（**328** 个用例）覆盖 HTTP/CONNECT 转发、HTTP 响应缓存（含 LRU/淘汰与在途去重聚合）、域名缓存、竞速/聚合超时、客户端认证、熔断/探活/EWMA 选路/在途加权、会话粘性（含质量感知单发降级**与慢单发采样日志**）、域名统计 + SQLite 持久化、UTF-8 头安全、二进制安全的请求体处理、连接预热（通用池 + target 半预连接 + 已建握手隧道复用）+ 空闲暂停（含"暂停不卡请求路径"回归）、健壮性（请求头行数/字节上限、截断响应检测）、配置层（`extra="forbid"` 拒绝拼错键、跨字段校验、退出码 2），以及模块拆分回归（`router_cfg=` vs kwarg 等价、池/缓存/粘性转发同一性）。
+
+Phase 2+ 的指标/排序层有专属测试文件：`tests/test_phase_metrics.py`（t-digest 上界/往返/精度、协议版本统计、双作用域双计数回归、Phase 3 降级门控、Phase 4 GET 探测、Phase 2 Cost 排序含 EWMA 等价与回滚等价、Cost 分解）与 `tests/test_tuner.py`（采纳/拒绝/回滚判定、成功率守卫、扰动轮转与边界、赢家 TTFB task 侧信道、基线持久化/恢复、`/cost` + `/tuner` 热更新端点）。
 
 CI 通过 GitHub Actions（`.github/workflows/test.yml`）在 **Python 3.10 与 3.11 与 3.12** 三版本跑测试套件，并带单测试超时（`pytest --timeout=60`），挂起的测试会快速失败并报出测试名，而非无限阻塞任务。
 

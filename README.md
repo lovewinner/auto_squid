@@ -8,16 +8,25 @@ Lightweight forward proxy with parallel racing, domain-based caching, an HTTP re
 
 - Runs on a gateway host, accepts HTTP/HTTPS proxy traffic, and forwards each request through upstream proxies
 - **Parallel racing + staggered start**: races upstreams sorted by per-proxy EWMA latency, launching the best 1–2 first (RFC 8305 §5) and refilling at ~250ms intervals; the first first-byte response wins and the rest are cancelled. Staggering cuts CONNECT tunnel fan-out and HTTP double-write traffic dramatically
+- **Multi-objective Cost ranking (Phase 2)**: racing order is a weighted Cost of **latency (P99-tail-first) + success rate + throughput**, min-max normalized within the candidate set — a fast-but-flaky proxy no longer outranks a slightly slower but reliable one. On by default, `cost_sort_enabled: false` rolls back to pure-EWMA ranking instantly
+- **Self-tuning (P1)**: Cost weights can be changed at runtime (`POST /cost`, effective on the very next race, no restart), and an optional conservative auto-tuner (`router.auto_tune`) hill-climbs the weights against measured winner-TTFB with a success-rate guard and automatic rollback
 - **Domain cache**: once a proxy wins a race for a domain, it is reused for that domain until `cache_ttl` expires — avoids racing every request
 - **Session stickiness**: optional; the same client IP + domain/target reuses the same proxy (keeps the egress IP stable); a failing or 5xx-returning sticky proxy evicts its entry and falls back to racing (redispatch), and sticky entries are re-raced periodically (`recheck_hits`)
 - **HTTP response cache**: idempotent `GET` responses are cached in memory (TTL 60s, respects `Cache-Control`)
 - **Local racing**: optionally lets the gateway host itself race as a proxy node (direct, no upstream)
+- **Observability**: per-proxy & per-domain windowed (recent 256) **and** lifetime (t-digest, cross-restart) percentiles, error classification, HTTP protocol version distribution, a per-proxy **Cost breakdown** that shows which component dominates the ranking, and Bayesian-smoothed success rates with low-confidence flags
 - **Domain stats**: per-domain win counts tracked in SQLite, survive restarts
 - **Web UI**: a built-in dashboard at `/` for browsing domain stats, default proxies, and win counts with auto-refresh; clicking a stat card filters the domain table to the domains using that proxy as Default Proxy
 
 ## Features
 
 - HTTP and HTTPS (`CONNECT`) forwarding with parallel racing across upstream proxies (EWMA-sorted + staggered start)
+- **Multi-objective Cost ranking** (Phase 2, default on): candidate order = `w_lat·norm(latency) + w_sr·norm(1−success_rate) + w_tp·norm(1−throughput)` with min–max normalization inside the candidate set (weights directly comparable, scale-free). The latency term uses the **lifetime TTFB P99** (t-digest, tail-first) with EWMA fallback; success rate is Laplace-smoothed (domain-level preferred); throughput only participates once cumulative bytes pass a floor (tunnel traffic rarely yields per-body throughput, so its weight is tiny). Missing data is neutral (0.5). `cost_sort_enabled: false` = instant rollback to pure-EWMA ranking
+- **Cost hot-reload + auto-tuner** (P1): `GET/POST /cost` reads/updates all cost parameters at runtime (next race picks them up, no restart); `POST /tuner` toggles the auto-tuner, which hill-climbs the three weights one ±25% step per evaluation window, adopting only improvements ≥5% in winner-TTFB mean that do not trade away success rate (guard), rolling back degradations immediately, and persisting the adopted baseline to SQLite
+- **Single-send degrade gating** (Phase 3, all thresholds default off): besides consecutive-fail and EWMA-degradation signals, a pinned (sticky/domain-cache) proxy is demoted back to racing when its domain-level success rate, P99 latency, or throughput crosses a configured threshold — closing the "fast handshake but flaky/slow transfer" blind spot
+- **Business-aligned probing** (Phase 4, `probe_with_get`, default off): optionally follow the CONNECT liveness probe with a lightweight GET through the upstream against a whitelist of URLs (rate-limited per proxy+target, isolated short-lived client), recording TTFB / protocol / throughput into the *real* domain metric buckets — probe latency finally matches business latency
+- **Metrics robustness**: lifetime percentiles via a self-contained t-digest (bounded memory, JSON-persisted, survives restarts) alongside the recent-256 window; `low_confidence` flags on percentiles with few samples; Laplace-smoothed success rates so a 1/1 proxy never shows a perfect 1.0
+- **HTTP protocol version stats** (Phase 1.4): per-proxy/per-domain `HTTP/1.1`/`HTTP/2`/`HTTP/3` counters from the HTTP path (H2 share doubles as a connection-reuse proxy signal; CONNECT tunnel reuse/TLS resumption is architecturally invisible to a forward proxy and is not fabricated)
 - Domain-level caching (`cache_ttl`) of the winning proxy per domain
 - Session stickiness (per-client+domain, in-memory, sliding TTL) with redispatch on sticky-proxy failure, 5xx eviction, periodic re-race, and a capacity cap
 - CONNECT upstream TCP warm pool (Phase 1, `router.conn_pool`): keeps a few idle TCP connections per upstream so CONNECTs skip the "this host → upstream proxy" connect; target half-preconnection (Phase 2, `conn_pool.target_prewarm`) pre-opens "to upstream" TCP for hot CONNECT targets on domain-cache/sticky hits **or racing wins** (warmed in pairs so a peek leaves a spare), shared fd budget + idle timeout
@@ -188,7 +197,9 @@ The router is split into a thin orchestration shell plus focused collaborator mo
 | File | Holds |
 |------|-------|
 | `router.py` | `Router` — client handling, racing, domain cache, single-send degrade, policy routing, SQLite persistence, and the forwarding shim to the collaborators |
-| `selector.py` | `ProxySelector` — per-proxy EWMA latency, circuit breaker + slow-start, adaptive concurrency limit, warm-up order |
+| `selector.py` | `ProxySelector` — per-proxy EWMA latency, circuit breaker + slow-start, adaptive concurrency limit, multi-objective Cost ranking + breakdown, warm-up order |
+| `tuner.py` | `AutoTuner` — conservative hill-climb auto-tuner for the three cost weights (P1, off by default) |
+| `digest.py` | `TDigest` — self-contained t-digest (dict subclass, JSON-persistable) behind the lifetime percentiles |
 | `pools.py` | `ConnectionPools` — the three CONNECT warm pools (generic, target prewarm, established-handshake reuse) |
 | `sticky.py` | `StickyCache` — per-client+domain session stickiness table |
 | `http_cache.py` | `HttpCache` — GET response cache (LRU, in-flight coalescing, write-method invalidation) |
@@ -200,24 +211,65 @@ The domain-cache cluster (`_meta_cache`, adaptive TTL, switch damping, quality-d
 
 ## API Endpoints
 
+All on the management port `:18080`. `POST` bodies are JSON; unknown fields are rejected (`422`). When `api.auth` is enabled, everything except `/health` requires HTTP Basic credentials.
+
+### Proxy & stats
+
 | Endpoint | Description |
 |----------|-------------|
 | `GET /` | Web UI dashboard (domain stats, default proxies, auto-refresh; click a stat card to filter domains by Default Proxy) |
-| `GET /health` | Health check |
+| `GET /health` | Health check (always open, even with `api.auth`) |
 | `GET /proxies` | List configured proxies |
-| `POST /proxies` | Add a proxy (JSON body) |
-| `GET /stats` | `request_counts` + `attempted_counts` |
-| `GET /metrics` | `request_counts`, `attempted_counts`, domain stats, and server perf counters (cache hits / racing fan-out) |
-| `GET /server-stats` | server resource sampling (CPU %, event-loop lag) filled by the bench subprocess; empty in normal runs |
-| `GET /config` | Router config (`enable_local_racing`) |
+| `POST /proxies` | Add a proxy (`ProxyIn` JSON: `id`, `host`, `port`, `protocol`, `auth`, `enabled`, `tags`); persisted to `proxies.yaml` |
+| `GET /stats` | `request_counts` (wins) + `attempted_counts` (total attempts) per proxy |
 | `GET /domains` | Per-domain win stats from SQLite |
 | `GET /domains/meta` | Per-domain default proxy + last-updated time (+ `ttl`/`expires_at`/`switch_count` when adaptive TTL is enabled) |
 | `GET /stickiness` | Session stickiness table (client_ip\|domain → sticky proxy + updated time) |
-| `GET /quality` | Per-proxy EWMA first-byte latency (s), the racing-order basis |
+| `GET /policies` | Policy-routing config snapshot (match + allowed proxy subset) |
+| `GET /config` | Router config (`enable_local_racing`) |
+
+### Metrics & quality
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /metrics` | `request_counts`, `attempted_counts`, domain stats, server perf counters (cache hits, racing fan-out, probe counters incl. `probe_get_sent/ok/failed/throttled`) |
+| `GET /metrics/per-destination` | Per (domain, proxy) metrics: windowed percentiles, success rates, error classification, plus a `cumulative` sub-object (lifetime means, smoothed success rate, `ttfb_percentiles`/`ofb_percentiles` from the t-digest, total bytes) |
+| `GET /quality` | Per-proxy EWMA first-byte latency (s) — the legacy racing-order basis |
+| `GET /quality/meta` | **Enhanced per-proxy metrics**: windowed P50/P95/P99, smoothed windowed success rate, error breakdown, HTTP protocol version counts, a `cumulative` lifetime object, and a `cost_breakdown` per proxy (see [Cost ranking & auto-tuning](#cost-ranking--auto-tuning)) |
 | `POST /quality/reset` | Clear all proxy EWMA quality (call after network changes) |
 | `GET /circuit` | Circuit-breaker + probe state per proxy (`open`, backoff, `probes_sent/ok/skipped`, `single_send_degrades`, `single_send_slow_log_ms`/`logged`) |
-| `GET /policies` | Policy-routing config snapshot (match + allowed proxy subset) |
 | `POST /circuit/reset` | Un-break all circuits, keep EWMA quality |
+| `GET /server-stats` | Server resource sampling (CPU %, event-loop lag) filled by the bench subprocess; empty in normal runs |
+
+### Cost ranking & auto-tuning (P1)
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /cost` | Current cost parameters (7 fields), the auto-tuner state (`enabled`, bounds, `baseline`, window samples, `last_decision`), and the safety bounds |
+| `POST /cost` | Hot-update any subset of `cost_sort_enabled`, `cost_latency_metric` (`"p99"`/`"ewma"`), `cost_weight_latency`, `cost_weight_success_rate`, `cost_weight_throughput`, `cost_latency_min_samples`, `cost_throughput_min_bytes` — effective on the **next race**, no restart. Negative weights are clamped to 0; if the auto-tuner is on, a manual update re-baselines it (its next window re-measures the manual values as the new known-good point) |
+| `POST /tuner` | `{"enabled": true|false}` — toggle the auto-tuner at runtime. Enabling starts fresh (baseline re-measured); disabling reverts the weights to the last adopted baseline. See [Cost ranking & auto-tuning](#cost-ranking--auto-tuning) |
+
+Example session:
+
+```bash
+# What does the ranking look like right now, and which component dominates each proxy?
+curl http://127.0.0.1:18080/quality/meta | jq '.["239-192"].cost_breakdown'
+# → {"rank":2,"cost":0.31,"latency":{"raw":0.124,...,"contrib":0.21},
+#     "success_rate":{"failure":0.026,...,"contrib":0.05},"throughput":{...},"load_mult":1.0}
+
+# Success rate is fine but transfers are slow → raise the throughput weight, no restart
+curl -X POST http://127.0.0.1:18080/cost \
+     -H 'Content-Type: application/json' \
+     -d '{"cost_weight_throughput": 0.4}'
+
+# Something looks wrong → instant rollback, without touching the process
+curl -X POST http://127.0.0.1:18080/cost -d '{"cost_sort_enabled": false}'
+
+# Turn the auto-tuner on/off at runtime
+curl -X POST http://127.0.0.1:18080/tuner -d '{"enabled": true}'
+```
+
+`cost_breakdown` per proxy contains: `rank` (same sort key as the racer: slow-start tier → unknown-quality → cost), `cost` (total), the three components' `raw`/`norm` (0 = best, 1 = worst, 0.5 = no data) /`contrib` (weight × norm — the largest contrib is the dominant ranking factor), `load_mult` (consecutive-fail × in-flight penalty folded into the latency), and `slow_start_rank`/`unknown_quality` markers so "ranked last" can be told apart from "recovering". Proxies outside the current candidate set (circuit-open/disabled/concurrency-capped) have `cost_breakdown: null`.
 
 ## Config
 
@@ -242,9 +294,36 @@ router:
     single_send_degrade_fail: 2     # single-send demote: consec-fail threshold (early warn, 0=off)
     single_send_degrade_ratio: 3.0  # single-send demote: EWMA vs pin-time baseline ratio (0=off)
     single_send_degrade_slack_ms: 10  # absolute floor (ms) against false positives at tiny latencies
+    # ── Phase 3: domain-level single-send demote signals (all 0 = off) ──
+    single_send_degrade_success_rate: 0.0   # demote when domain success/total < this (needs >=8 samples)
+    single_send_degrade_p99_ms: 0.0         # demote when max(TTFB,OFB) P99 > this ms (needs >=4 samples)
+    single_send_degrade_min_throughput: 0.0 # demote when domain throughput EWMA < this MB/s (needs >=4 samples)
     single_send_slow_log_ms: 1500     # slow single-send sampling log (ms, 0=off): when a sticky/domain-cache single-send "request → first byte" exceeds this, log one line carrying the client IP (the only IP-attribution anchor for "won't open / needs refresh" — success path logs no IP). Single-send FAILURES (connect-timeout / handshake failure past the threshold) log a `slow single send FAILED` line too (counted under single_send_fail_logged), closing the IP-attribution blind spot for connect-failure stalls.
     connect_tunnel_timeout_sec: 3.0   # CONNECT tunnel connect/read-response timeout (s, default 3; was hardcoded 15): upper bound for _try_tunnel's CONNECT to origin, stops one proxy's egress→origin connect/handshake stall from dragging a request to 10s+. Measured CDN first byte ≈ 0.6s, so 3s gives 5× headroom.
     http_read_timeout_sec: 3.0        # HTTP single-send first-byte read timeout (s, default 3; was 10): _upstream_timeout.read. NOTE: tightening header wait was once found non-net-win (soak p99 + fd buildup, reverted), so watch p99/fd during production gray.
+    # ── Phase 4: business-aligned probing (default off) ──
+    probe_with_get: false             # follow the CONNECT probe with a lightweight GET
+    probe_get_targets: []             # whitelist, e.g. ["https://api.github.com/"]; rotated per proxy
+    probe_get_interval_sec: 60.0      # min interval per (proxy, target) — never hammer the origin
+    probe_get_timeout_sec: 5.0
+    probe_get_max_bytes: 65536        # enough to compute throughput, no big downloads
+    # ── Phase 2: multi-objective Cost ranking (default ON) ──
+    cost_sort_enabled: true           # false = instant rollback to pure-EWMA ranking
+    cost_latency_metric: "p99"        # latency term: "p99" (tail-first) or "ewma"
+    cost_weight_latency: 1.0
+    cost_weight_success_rate: 0.6
+    cost_weight_throughput: 0.1       # keep tiny: tunnel traffic rarely yields per-body throughput
+    cost_latency_min_samples: 1       # min digest samples for the P99 term (1 = same as EWMA obs>=1)
+    cost_throughput_min_bytes: 1000000  # throughput term needs >=1MB cumulative bytes
+  # ── P1: Cost-weight auto-tuner (default off) ──
+  # auto_tune:
+  #   enabled: true        # conservative hill-climb on the three weights
+  #   window_sec: 900      # evaluation window (15 min)
+  #   min_samples: 50      # min winner-TTFB samples per window (else extends, max 3x)
+  #   step: 0.25           # single-dimension ±25% perturbation per window
+  #   hysteresis: 0.05     # adopt only >=5% winner-TTFB improvement; beyond +5% = degrade
+  #   sr_guard: 0.005      # reject any trial whose success rate drops >0.5pp
+  #   persist: true        # persist the adopted baseline to SQLite, restored across restarts
   # optional speed features (all off by default):
   # policies:                        # narrow the racing candidate set per domain/tag
   #   - match: {domain_suffix: [".cn", "baidu.com"]}
@@ -256,6 +335,24 @@ router:
 logging:
   file: "auto_squid.log"
 ```
+
+## Cost ranking & auto-tuning
+
+Phase 2 replaced the single-signal (EWMA) racing order with a **multi-objective Cost** — the core fix for "fast handshake but flaky or slow transfer" proxies getting picked. Weights were derived from production data: success rates cluster tightly (0.94–0.98, low discrimination), TTFB spans widely (66–151ms, the main signal), and tunnel traffic rarely yields per-body throughput (near-zero → tiny weight + a 1 MB byte floor).
+
+**Observation workflow** (this is the loop the features are built around):
+
+1. `python test_routing.py --metrics` (or `GET /quality/meta`) — every proxy shows a `cost_breakdown` line like `rank=3 cost=1.65 [延迟1.00 成功率0.60 吞吐0.05] (p99=800ms 失败率=50.0%)`. The **largest contribution is the dominant ranking factor** — that's the weight to consider tuning.
+2. Watch it for a few days. Proxies switching ranks on P99 tail spikes? That's `cost_latency_metric: "p99"` doing its job; if too twitchy, switch to `"ewma"`.
+3. Tune either by hand (`POST /cost`, next race picks it up) or let the auto-tuner do it (`auto_tune.enabled: true` / `POST /tuner`).
+
+**Auto-tuner guarantees** (conservative hill-climb, `(1+1)`-ES style):
+
+- One window (default 15 min) tests exactly **one** ±25% perturbation of one weight, rotating dimensions/directions; hard safety bounds (`latency ∈ [0.2, 4.0]`, `success_rate ∈ [0, 2.0]`, `throughput ∈ [0, 1.0]`).
+- The objective is the **winner-TTFB mean** (pure winners only, captured at the race win point via a task side-channel — `record_ttfb` alone would include non-cancelled losers).
+- Adopt requires **≥5% improvement** *and* no success-rate drop beyond 0.5pp; degradation ≥5% (or a guard breach) **reverts immediately**; everything in between is treated as noise and retried with the next perturbation.
+- Every 10 windows the baseline is re-measured (guards against traffic drift); low-traffic windows auto-extend (max 3×) instead of deciding on noise; the adopted baseline persists to SQLite (`tuner_state`) and survives restarts.
+- The tuner only ever touches the three weights — never stagger/max_retries/timeouts. Triple kill-switch: `POST /tuner {"enabled": false}` → `POST /cost {"cost_sort_enabled": false}` → config + restart.
 
 ## Speed tuning
 
@@ -344,7 +441,9 @@ curl -x http://127.0.0.1:10808 http://www.baidu.com
 .venv/bin/python -m pytest -q
 ```
 
-The suite (260 tests) covers HTTP/CONNECT forwarding, the HTTP response cache (incl. LRU/eviction and in-flight coalescing), the domain cache, racing/aggregation timeouts, client auth, circuit breaker / probing / EWMA selection / in-flight weighting, session stickiness (incl. quality-driven single-send degrade **and slow single-send sampling logs**), per-domain stats + SQLite persistence, UTF-8 header safety, binary-safe request body handling, connection warm pools + established-handshake reuse + idle pause (with the "pause never blocks the request path" guarantee), robustness (request-header limits, truncated-response detection), the config layer (`extra="forbid"` rejects typos, cross-field validation, exit code 2), and the module-split regressions (router_cfg= vs kwarg equivalence and pool/cache/sticky forwarding identity).
+The suite (328 tests) covers HTTP/CONNECT forwarding, the HTTP response cache (incl. LRU/eviction and in-flight coalescing), the domain cache, racing/aggregation timeouts, client auth, circuit breaker / probing / EWMA selection / in-flight weighting, session stickiness (incl. quality-driven single-send degrade **and slow single-send sampling logs**), per-domain stats + SQLite persistence, UTF-8 header safety, binary-safe request body handling, connection warm pools + established-handshake reuse + idle pause (with the "pause never blocks the request path" guarantee), robustness (request-header limits, truncated-response detection), the config layer (`extra="forbid"` rejects typos, cross-field validation, exit code 2), and the module-split regressions (router_cfg= vs kwarg equivalence and pool/cache/sticky forwarding identity).
+
+The Phase-2+ metric/ranking layer has its own focused suites: `tests/test_phase_metrics.py` (t-digest bounds/roundtrip/accuracy, protocol-version stats, dual-scope double-count regression, Phase-3 demote gating, Phase-4 GET probing, Phase-2 Cost ordering incl. EWMA-equivalence and rollback equivalence, cost breakdown) and `tests/test_tuner.py` (adopt/reject/rollback decisions, SR guard, perturbation rotation + bounds, the win-TTFB task side-channel, baseline persistence/recovery, and the `/cost` + `/tuner` hot-reload endpoints).
 
 CI runs the suite on **Python 3.10, 3.11 and 3.12** via GitHub Actions (`.github/workflows/test.yml`), with a per-test timeout (`pytest --timeout=60`) so a hanging test fails fast instead of blocking the job.
 
