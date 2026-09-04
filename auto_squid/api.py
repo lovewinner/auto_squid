@@ -565,7 +565,7 @@ function renderMetricsDomain(wrap) {
   let banner = `<div class="filter-banner" style="display:flex"><strong>${metricsDomain}</strong>&nbsp;各代理实测指标</div>`;
   // 两表列错开:窗口表 P50/P95/P99 + EWMA 吞吐(近况);累计表 均值 + 永久计数 + 累计字节(历史)。
   let win = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 P50/P95/P99</th><th>源站首字节 P50/P95/P99</th><th>错误分类(近 256)</th></tr></thead><tbody>';
-  let cum = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 均值</th><th>源站首字节 均值</th><th>吞吐 累计</th><th>成功率(全)</th><th>总请求(全)</th><th>累计字节</th></tr></thead><tbody>';
+  let cum = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 均值</th><th>源站首字节 均值</th><th>吞吐 累计</th><th>成功率</th><th>总请求</th><th>累计字节</th></tr></thead><tbody>';
   for (const pid of pids) {
     const m = per[pid] || {};
     const per_t = m.percentiles || {};
