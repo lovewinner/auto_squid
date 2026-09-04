@@ -148,17 +148,22 @@ final     = 上面三项加权和（负载因子已折进延迟值再归一化�
 
 **实现位置**: `selector.py:_cost_raw_inputs()` / `_cost_scores()` / `ordered_proxies()` / `ordered_for_domain()`；`router.py` 配置解包与透传；`config_schema.py: CircuitConfig`。
 
-> ⚠️ **排查中发现的既有 bug（非本次引入，HEAD 已存在 4 处，尚未修，列为独立待办）**：
-> `record_ttfb` / `record_origin_first_byte` / `record_http_error` / `record_failure` 的双作用域
-> 循环写成 `for scope in (self._metrics_for(pid, domain), self._metrics_for(pid, None))`——
+> ✅ **已修复的既有 bug**（排查 Phase 2 Cost 排序时发现，随后单独提交修复）：
+> `record_ttfb` / `record_origin_first_byte` / `record_http_error` / `record_failure` 的
+> 双作用域循环写成 `for scope in (self._metrics_for(pid, domain), self._metrics_for(pid, None))`——
 > 当 `domain=None` 时两次调用返回**同一个全局 dict**，循环对它写**两次**，故非域名流量的
-> 全局 `success/total/ttfb_samples/cum_ttfb_digest` 被双重计数（实测单次 `record_ttfb`
-> 后 `success=2, total=2, digest n=2`，而带 domain 时正确为 1）。
-> 后果：混合了域名/非域名记录时，全局成功率会向非域名流量倾斜（其权重被放大 2 倍），
-> 且 Laplace 平滑的先验项相对变弱。分位数取值不受影响（重复相同值）。
-> 修法：参照 `record_protocol` 的去重写法 `(g, m) if m is not g else (g,)`。
-> 未并入本次提交的原因：它会改变已落盘/运行中的指标语义与绝对值，需单独验证、
-> 并决定历史 DB 数据如何处理。
+> 全局 `success/total/ttfb_samples/cum_*` 被双重计数（实测单次 `record_ttfb` 后
+> `success=2, total=2, digest n=2`，而带 domain 时正确为 1）。
+> 影响：探活（`_probe_proxy` 无 domain，只写全局桶）等非域名记录被放大 2 倍，
+> **全局成功率向非域名流量倾斜**——直接污染 Phase 2 的成功率输入项。
+> 修法：统一改为 `record_protocol` 的去重写法 `(g, m) if m is not g else (g,)`（4 处）。
+> 连带修正：`test_legacy_metrics_restore_without_cum_fields_no_keyerror` 的
+> `cum_success == 3` 断言编码的是 bug 行为，已更正为 2（域名桶仍 1）。
+> 新增 3 个回归用例锁定单计/双写/5xx 单次回退语义。
+> **历史数据说明**：修复只对之后的新样本生效；`auto_squid.db` 中已落盘的行仍带
+> 膨胀计数（无法从膨胀值反推真实的域名/非域名混合比例，故不做回溯改写）。
+> 偏差会随新数据累积自然衰减；如需立即干净起步，可用 `/quality/reset` 清空 EWMA，
+> 或自行决定是否重置 `proxy_metrics`/`domain_metrics` 表。
 
 ---
 

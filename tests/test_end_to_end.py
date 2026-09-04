@@ -2161,10 +2161,12 @@ class TestProxySelectorEWMA:
         sel.record_ttfb('p', 0.05)                     # 全局 scope
         sel.record_ttfb('p', 0.06, 'example.com')      # 域名 scope
         m = sel._proxy_metrics['p']['metrics']
-        # record_ttfb 对所有 scope 类记:0.05(无 domain)全局 +2,0.06(有 domain)
-        # 全局 +1(循环第二个 _metrics_for(pid,None) 恒为全局)→ 全局共 3。
-        assert m['cum_success'] == 3
-        assert m['cum_ttfb_n'] == 3
+        # 双作用域双写(已修 domain=None 时的双重计数):0.05(无 domain)全局 +1;
+        # 0.06(有 domain)域名桶 +1、全局桶 +1 → 全局共 2、域名共 1。
+        # 修复前无 domain 的那次会被写两遍(全局 +2),导致全局共 3 —— 该旧期望
+        # 编码的是 bug,已随修复更正。
+        assert m['cum_success'] == 2
+        assert m['cum_ttfb_n'] == 2
         dm = sel._domain_metrics['example.com']['p']['metrics']
         assert dm['cum_success'] == 1
 

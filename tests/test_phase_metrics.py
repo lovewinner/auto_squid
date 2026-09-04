@@ -75,6 +75,51 @@ def test_digest_accuracy_within_tolerance():
         assert abs(pc[f"p{p}"] - e) / e < 0.05, f"p{p} 误差过大"
 
 
+# ── 双作用域双写:domain=None 不得重复计数 ──────────────
+def test_metrics_not_double_counted_when_domain_none():
+    """domain=None 时两个作用域是同一全局 dict,必须只写一次(既有 bug 回归)。
+
+    修复前 record_ttfb/record_failure/record_ofb/record_http_error 在 domain=None
+    时对该 dict 写两遍 → 非域名流量的 success/total/样本/digest 全部翻倍,
+    使全局成功率向非域名流量倾斜(相对域名流量被放大 2 倍)。
+    """
+    sel = _selector()
+    sel.record_ttfb("p1", 0.10)
+    m = sel._proxy_metrics["p1"]["metrics"]
+    assert m["success"] == 1 and m["total"] == 1
+    assert len(m["ttfb_samples"]) == 1
+    assert m["cum_ttfb_digest"]["n"] == 1
+    assert m["cum_success"] == 1 and m["cum_ttfb_n"] == 1
+
+    sel.record_failure("p1")
+    assert m["total"] == 2 and m["cum_failure_transport"] == 1
+
+    sel.record_origin_first_byte("p1", 0.05)
+    assert len(m["ofb_samples"]) == 1
+    assert m["cum_ofb_n"] == 1 and m["cum_ofb_digest"]["n"] == 1
+
+
+def test_metrics_dual_written_when_domain_given():
+    """带 domain 时域名桶与全局桶各写一次(双写语义必须保留)。"""
+    sel = _selector()
+    sel.record_ttfb("p1", 0.10, domain="gh:443")
+    dm = sel._domain_metrics["gh:443"]["p1"]["metrics"]
+    gm = sel._proxy_metrics["p1"]["metrics"]
+    assert dm["success"] == 1 and dm["total"] == 1
+    assert gm["success"] == 1 and gm["total"] == 1
+    assert dm is not gm  # 两个不同的桶
+
+
+def test_http_error_rollback_not_double_counted():
+    """5xx 回退 cum_success 只扣一次(修复前双写会双扣,触发 cum_success>0 守卫)。"""
+    sel = _selector()
+    sel.record_ttfb("p1", 0.10)
+    sel.record_http_error("p1", 500)
+    m = sel._proxy_metrics["p1"]["metrics"]
+    assert m["cum_success"] == 0
+    assert m["cum_failure_5xx"] == 1
+
+
 # ── Phase 1.4 协议版本 ──────────────────────────────────
 def _selector():
     store = ProxyStore.__new__(ProxyStore)

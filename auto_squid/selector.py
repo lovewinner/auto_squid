@@ -300,7 +300,12 @@ class ProxySelector:
         # ── 可观测性增强(Phase 1):记录 ttfb 样本 + success/total ──
         # 收到响应头即视为一次"成功观测"(与选择逻辑一致);ttfb 样本入分位数窗口。
         # total 在成功(success+1)与失败(record_failure,total+1)两侧同步累加。
-        for scope in (self._metrics_for(pid, domain), self._metrics_for(pid, None)):
+        # 双作用域双写:域名桶 + 全局桶。domain=None 时两者是**同一个**全局 dict,
+        # 必须去重只写一次——否则非域名流量的 success/total/样本/digest 全部被
+        # 双重计数(既有 bug:全局指标相对域名指标被放大 2 倍,污染全局成功率)。
+        g = self._metrics_for(pid, None)
+        m = self._metrics_for(pid, domain)
+        for scope in (g, m) if m is not g else (g,):
             scope["success"] += 1
             scope["total"] += 1
             self._append_sample(scope["ttfb_samples"], ttfb)
@@ -336,7 +341,10 @@ class ProxySelector:
         """
         if ofb <= 0:
             return
-        for scope in (self._metrics_for(pid, domain), self._metrics_for(pid, None)):
+        # 同 record_ttfb:domain=None 时两个桶是同一对象,去重只写一次。
+        g = self._metrics_for(pid, None)
+        m = self._metrics_for(pid, domain)
+        for scope in (g, m) if m is not g else (g,):
             self._append_sample(scope["ofb_samples"], ofb)
             scope["cum_ofb_sum"] += ofb
             scope["cum_ofb_n"] += 1
@@ -616,7 +624,11 @@ class ProxySelector:
         计入 error 分类(IMPROVEMENT_PLAN.md Phase 1.3)。
         """
         if status_code >= 500:
-            for scope in (self._metrics_for(pid, domain), self._metrics_for(pid, None)):
+            # 同 record_ttfb:domain=None 时两个桶是同一对象,去重只写一次
+            # (否则 5xx 会被双扣 cum_success、双计 cum_failure_5xx)。
+            g = self._metrics_for(pid, None)
+            m = self._metrics_for(pid, domain)
+            for scope in (g, m) if m is not g else (g,):
                 scope["errors"][ERROR_HTTP_5XX] += 1
                 # 终身累计:5xx 视作业务层失败。record_ttfb 在收到响应头时已将本
                 # 请求计入 cum_success(非 5xx 假设),此处回退并计入 cum_failure_5xx,
@@ -913,7 +925,12 @@ class ProxySelector:
             logger.warning("circuit opened for proxy %s, backoff=%.1fs", pid, s["backoff"])
         # ── 可观测性增强(Phase 1):错误分类 + total ──
         etype = error_type if error_type in _ERROR_KEYS else ERROR_OTHER
-        for scope in (self._metrics_for(pid, domain), self._metrics_for(pid, None)):
+        # 同 record_ttfb:domain=None 时两个桶是同一对象,去重只写一次
+        # (否则非域名失败的 total/错误分类/cum_failure_transport 被双计,
+        #  使全局成功率向非域名流量倾斜)。
+        g = self._metrics_for(pid, None)
+        m = self._metrics_for(pid, domain)
+        for scope in (g, m) if m is not g else (g,):
             scope["total"] += 1
             scope["errors"][etype] += 1
             self._append_sample(scope["outcome_samples"], 0)  # 窗口版 success/fail 环形缓冲
