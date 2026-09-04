@@ -436,3 +436,73 @@ def test_cost_thresholds_reachable_from_config():
     assert cc.cost_latency_metric == "ewma"
     assert cc.cost_weight_success_rate == 0.9
     assert RouterConfig().circuit.cost_sort_enabled is True  # 默认开
+
+
+# ── P1: Cost 分解输出(观测/调参) ─────────────────────────
+def _store4():
+    store = ProxyStore()
+    for i, pid in enumerate(("fast", "mid", "slow", "dead")):
+        store.add(ProxyInfo(id=pid, host=f"h{i}", port=3128))
+    return store
+
+
+def test_cost_breakdown_components_and_rank():
+    """分解含三分量原始值/归一化/贡献,贡献之和=总 cost,rank 与 cost 同序。"""
+    sel = ProxySelector(_store4())
+    sel.record_ttfb("fast", 0.02)
+    sel.record_ttfb("mid", 0.10)
+    sel.record_ttfb("slow", 0.80)
+    sel._proxy_metrics["slow"]["metrics"].update(success=50, total=100)
+    bd = sel.cost_breakdown()
+    assert bd["cost_sort_enabled"] is True
+    assert bd["latency_metric"] == "p99"
+    assert bd["weights"] == {"latency": 1.0, "success_rate": 0.6,
+                             "throughput": 0.1}
+    cands = bd["candidates"]
+    assert set(cands) == {"fast", "mid", "slow", "dead"}
+    for pid, d in cands.items():
+        total = (d["latency"]["contrib"] + d["success_rate"]["contrib"]
+                 + d["throughput"]["contrib"])
+        assert d["cost"] == pytest.approx(total)
+        assert 0.0 <= d["latency"]["norm"] <= 1.0
+        assert d["rank"] >= 1
+    # fast 延迟最优 → 延迟贡献 0、rank 1;slow 延迟最差且成功率差 → 双高贡献
+    assert cands["fast"]["latency"]["contrib"] == pytest.approx(0.0)
+    assert cands["fast"]["rank"] == 1
+    assert cands["slow"]["latency"]["norm"] == pytest.approx(1.0)
+    assert cands["slow"]["success_rate"]["failure"] == pytest.approx(0.5)
+    # 无数据代理:各分量中性 0.5
+    dead = cands["dead"]
+    assert dead["latency"]["raw"] is None
+    assert dead["latency"]["norm"] == pytest.approx(0.5)
+    assert dead["success_rate"]["failure"] is None
+    # rank 按 (slow-start, 未知质量, cost) 与 ordered_proxies 同键:
+    # 已知质量代理内 cost 升序;无观测的 dead 即使 cost 更低也垫底(未知质量)。
+    assert cands["dead"]["unknown_quality"] == 1
+    assert cands["dead"]["rank"] == 4
+    known_costs = [cands[p]["cost"] for p in ("fast", "mid", "slow")]
+    assert known_costs == sorted(known_costs)
+
+
+def test_cost_breakdown_load_mult_visible():
+    """连续失败惩罚折进延迟:load_mult 反映在分解里且抬高有效延迟。"""
+    sel = ProxySelector(_store4())
+    sel.record_ttfb("fast", 0.10)
+    sel.record_ttfb("mid", 0.10)
+    sel.record_failure("mid")  # mid 连失一次 → fail_mult = 1+1*4 = 5
+    bd = sel.cost_breakdown()["candidates"]
+    assert bd["mid"]["load_mult"] == pytest.approx(5.0)
+    assert bd["mid"]["latency"]["effective"] == pytest.approx(0.5)
+    assert bd["fast"]["load_mult"] == pytest.approx(1.0)
+
+
+def test_cost_breakdown_excludes_non_candidates():
+    """熔断代理不在候选集:v2 里其 cost_breakdown 为 None(指标仍在窗口/累计)。"""
+    sel = ProxySelector(_store4())
+    sel.record_ttfb("fast", 0.02)
+    for _ in range(3):
+        sel.record_failure("slow")  # 熔断
+    v2 = sel.get_pid_quality_v2()
+    assert v2["fast"]["cost_breakdown"] is not None
+    assert v2["slow"]["cost_breakdown"] is None
+    assert v2["slow"]["cumulative"] is not None  # 指标本身仍可见

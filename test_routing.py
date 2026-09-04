@@ -785,6 +785,30 @@ def _render_domain_list(dom_metrics: Dict[str, Any]) -> List[str]:
     return lines
 
 
+def _fmt_cost_breakdown(cb) -> str:
+    """Cost 分解(P1):一行展示排位/总 cost/三分量贡献/关键原始值。
+
+    回答"该调哪个权重":贡献最大的分量就是当前排序的主导因素。
+    cb 为 None 表示该代理不在当前候选集(熔断/禁用/并发超限)。
+    """
+    if not cb:
+        return "  cost: — (非候选:熔断/禁用/并发超限)"
+    lat, sr, tp = cb["latency"], cb["success_rate"], cb["throughput"]
+    lat_raw = lat.get("raw")
+    lat_raw_s = f"{lat_raw*1000:.0f}ms" if lat_raw is not None else "无数据"
+    fail = sr.get("failure")
+    fail_s = f"{fail*100:.1f}%" if fail is not None else "无数据"
+    extras = []
+    if cb.get("slow_start_rank"):
+        extras.append("slow-start恢复期")
+    if cb.get("unknown_quality"):
+        extras.append("无观测")
+    extra_s = (" [" + ",".join(extras) + "]") if extras else ""
+    return (f"  cost: rank={cb['rank']} 总={cb['cost']:.3f} "
+            f"[延迟{lat['contrib']:.2f} 成功率{sr['contrib']:.2f} 吞吐{tp['contrib']:.2f}] "
+            f"(p99={lat_raw_s} 失败率={fail_s} 负载×{cb['load_mult']:.1f}){extra_s}")
+
+
 def _render_proxy_overview(qm: Dict[str, Any]) -> List[str]:
     """把 /quality/meta 的 {pid: metric} 渲染成每代理全局概览表。"""
     lines = ["全局每代理概览(跨域名聚合)", "-" * 40]
@@ -809,6 +833,8 @@ def _render_proxy_overview(qm: Dict[str, Any]) -> List[str]:
         lines.append(f"  {pid:<10}{tf:<26}{tl:<12}{rate_s:<14}{thr_s:<22}{err_str}")
         # 累计(永久值)平均时延与失败细分, 成功率/吞吐已并入主列。
         lines.append(_fmt_cumulative(cum, detail_only=True))
+        # Cost 分解(P1 观测):排位/总 cost/三分量贡献/关键原始值。
+        lines.append(_fmt_cost_breakdown(m.get("cost_breakdown")))
     lines.append("")
     return lines
 

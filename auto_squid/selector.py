@@ -736,6 +736,13 @@ class ProxySelector:
                 "cumulative": ProxySelector._cumulative_view(mm),
             }
             out[pid] = per
+        # Cost 分解(P1 观测):当前候选集内各代理的三分量原始值/归一化值/加权
+        # 贡献与排位——回答"该调哪个权重"。非候选(熔断/禁用/并发超限)为 None
+        # (其原始指标仍在上面的窗口/累计字段里)。注意 cost_sort_enabled=False
+        # 时实际排序走纯 EWMA,rank 是 cost 口径仅供参考(响应含标志位)。
+        breakdown = self.cost_breakdown()["candidates"]
+        for pid in out:
+            out[pid]["cost_breakdown"] = breakdown.get(pid)
         return out
 
     def global_window_success(self) -> tuple[int, int]:
@@ -1156,8 +1163,23 @@ class ProxySelector:
 
         归一化使各维度权重直接可比、与量纲无关:低优指标 norm=(x-min)/(max-min),
         高优(吞吐)用 (max-x)/(max-min);max==min 该项贡献 0;缺数据项中性 0.5。
-        最终乘 _failure_penalty_mult 与 (1+active)^lb_bias,保留既有负载均衡 /
-        早告警语义(与 _weighted_rank 一致)。返回 {pid: cost}。
+        最终负载因子折进延迟值再归一化(见 _cost_details)。返回 {pid: cost}。
+        """
+        return {pid: d["cost"] for pid, d in self._cost_details(candidates, domain).items()}
+
+    def _cost_details(self, candidates: List[str], domain: Optional[str]) -> dict:
+        """同 _cost_scores,但保留**分解**(P1 观测/调参用):每 pid 各分量的
+        原始值、归一化值、加权贡献、折进延迟的负载因子与总 cost。
+
+        归一化使各维度权重直接可比、与量纲无关:低优指标 norm=(x-min)/(max-min),
+        高优(吞吐)用 (max-x)/(max-min);max==min 该项贡献 0;缺数据项中性 0.5。
+        负载因子(fail_penalty × least-active)先折进**延迟值本身**再归一化:
+        legacy _weighted_rank = ewma × load_mult,归一化作用于单代理值;若先归一化
+        再乘 load_mult,会因"全局归一化 vs 每代理乘子"错配而破坏与纯 EWMA 的顺序
+        等价性。折进延迟后 norm(lat_eff) 与 (ewma×load_mult) 单调同序,故"仅延迟"
+        场景下 cost 排序与 legacy 逐位等价(既有排序测试不破)。
+        返回 {pid: {cost, load_mult, latency:{raw,effective,norm,contrib},
+        success_rate:{failure,norm,contrib}, throughput:{mbps,norm,contrib}}}。
         """
         raw = {pid: self._cost_raw_inputs(pid, domain) for pid in candidates}
 
@@ -1167,7 +1189,6 @@ class ProxySelector:
                 return None, None
             return min(vals), max(vals)
 
-        lat_min, lat_max = _bounds(0)
         sr_min, sr_max = _bounds(1)
         tp_min, tp_max = _bounds(2)
         # 负载因子(fail_penalty × least-active)先折进**延迟值本身**,再对"有效延迟"
@@ -1176,6 +1197,7 @@ class ProxySelector:
         # 纯 EWMA 的顺序等价性。折进延迟后 norm(lat_eff) 与 (ewma×load_mult) 单调同序,
         # 故"仅延迟"场景下 cost 排序与 legacy 逐位等价(既有排序测试不破)。
         lat_eff = {}
+        load_mult = {}
         for pid in candidates:
             lat = raw[pid][0]
             mult = self._failure_penalty_mult(pid)
@@ -1183,10 +1205,11 @@ class ProxySelector:
                 active = self._in_flight.get(pid, 0)
                 if active:
                     mult *= (1.0 + active) ** self.lb_bias
+            load_mult[pid] = mult
             lat_eff[pid] = (lat * mult) if lat is not None else None
         eff_vals = [v for v in lat_eff.values() if v is not None]
         eff_min, eff_max = (min(eff_vals), max(eff_vals)) if eff_vals else (None, None)
-        scores = {}
+        details = {}
         for pid in candidates:
             lat, sr_fail, tp = raw[pid]
             # 延迟:用折过负载的有效延迟做 min-max;缺延迟则中性 0.5。
@@ -1205,10 +1228,63 @@ class ProxySelector:
             else:
                 tp_norm = 0.5
             # base:三项加权和;成功率/吞吐作为质量项与延迟项并列(均不额外乘负载因子)。
-            scores[pid] = (self.cost_weight_latency * lat_norm
-                           + self.cost_weight_success_rate * sr_norm
-                           + self.cost_weight_throughput * tp_norm)
-        return scores
+            lat_contrib = self.cost_weight_latency * lat_norm
+            sr_contrib = self.cost_weight_success_rate * sr_norm
+            tp_contrib = self.cost_weight_throughput * tp_norm
+            details[pid] = {
+                "cost": lat_contrib + sr_contrib + tp_contrib,
+                "load_mult": load_mult[pid],
+                "latency": {"raw": lat, "effective": lat_eff[pid],
+                            "norm": lat_norm, "contrib": lat_contrib},
+                "success_rate": {"failure": sr_fail, "norm": sr_norm,
+                                 "contrib": sr_contrib},
+                "throughput": {"mbps": tp, "norm": tp_norm, "contrib": tp_contrib},
+            }
+        return details
+
+    def _filtered_candidates(self) -> list:
+        """竞速候选过滤(ordered_proxies / ordered_for_domain / cost_breakdown
+        三处共用):enabled → 非熔断 → 未达自适应并发上限。
+
+        不 shuffle(同权重随机打乱是排序方的职责);is_circuit_open 有副作用
+        (退避到期在此解熔断并置 slow-start),与既有语义一致。
+        """
+        enabled = [p for p in self.proxy_store.list() if p.enabled]
+        # 过滤熔断中的代理(is_circuit_open 同时处理退避到期解熔断)。
+        enabled = [p for p in enabled if not self.is_circuit_open(p.id)]
+        # 自适应并发限制(P3):在途已达上限的代理不参与候选(防慢代理被堆死)。
+        if self.concurrency_enabled:
+            enabled = [p for p in enabled if not self._at_concurrency_limit(p.id)]
+        return enabled
+
+    def cost_breakdown(self) -> dict:
+        """当前竞速候选集的 Cost 分解(P1 观测/调参用,非热路径)。
+
+        回答"该调哪个权重":每代理三个分量的原始值/归一化值/加权贡献一目了然,
+        贡献最大的分量就是当前排序的主导因素。附排位(rank,与 ordered_proxies
+        同排序键:slow-start 分层 → 未知质量 → cost)与 slow-start/未知标记,
+        便于区分"cost 差"与"恢复期垫底"。cost_sort_enabled=False 时排序实际走
+        纯 EWMA,此时 rank 是 cost 口径仅供参考(响应里有 cost_sort_enabled 标志)。
+        """
+        cands = self._filtered_candidates()
+        pids = [p.id for p in cands]
+        details = self._cost_details(pids, None)
+        for p in cands:
+            details[p.id]["slow_start_rank"] = self._slow_start_rank(p.id)
+            details[p.id]["unknown_quality"] = self._quality_rank(p.id)[0]
+        ordered = sorted(pids, key=lambda pid: (details[pid]["slow_start_rank"],
+                                                details[pid]["unknown_quality"],
+                                                details[pid]["cost"]))
+        for rank, pid in enumerate(ordered, 1):
+            details[pid]["rank"] = rank
+        return {
+            "cost_sort_enabled": self.cost_sort_enabled,
+            "latency_metric": self.cost_latency_metric,
+            "weights": {"latency": self.cost_weight_latency,
+                        "success_rate": self.cost_weight_success_rate,
+                        "throughput": self.cost_weight_throughput},
+            "candidates": details,
+        }
 
     def ordered_proxies(self) -> List[str]:
         """返回按加权 least-request 权重(快且不忙者靠前)排序的已启用代理列表。
@@ -1220,13 +1296,7 @@ class ProxySelector:
         - 同权重段随机打乱,均衡负载的同时保持"快且不忙者先竞速"。
         退避到期的代理在此被解熔断并置入 slow-start(is_circuit_open 副作用)。
         """
-        proxies = self.proxy_store.list()
-        enabled = [p for p in proxies if p.enabled]
-        # 过滤熔断中的代理(is_circuit_open 同时处理退避到期解熔断)。
-        enabled = [p for p in enabled if not self.is_circuit_open(p.id)]
-        # 自适应并发限制(P3):在途已达上限的代理不参与候选(防慢代理被堆死)。
-        if self.concurrency_enabled:
-            enabled = [p for p in enabled if not self._at_concurrency_limit(p.id)]
+        enabled = self._filtered_candidates()
         random.shuffle(enabled)
         if self.cost_sort_enabled:
             scores = self._cost_scores([p.id for p in enabled], None)
@@ -1295,13 +1365,7 @@ class ProxySelector:
             per = self._domain_quality.get(domain)
             if per:
                 domain_obs = per
-        proxies = self.proxy_store.list()
-        enabled = [p for p in proxies if p.enabled]
-        # 过滤熔断中的代理(is_circuit_open 同时处理退避到期解熔断)。
-        enabled = [p for p in enabled if not self.is_circuit_open(p.id)]
-        # 自适应并发限制(P3):在途已达上限的代理不参与候选(防慢代理被堆死)。
-        if self.concurrency_enabled:
-            enabled = [p for p in enabled if not self._at_concurrency_limit(p.id)]
+        enabled = self._filtered_candidates()
         random.shuffle(enabled)
         if self.cost_sort_enabled:
             scores = self._cost_scores([p.id for p in enabled], domain)
