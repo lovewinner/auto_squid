@@ -156,7 +156,7 @@ class Router:
     生命周期:start() 开始监听 → handle_client 处理每个连接 → stop() 优雅关闭。
     """
 
-    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, sticky_probe_interval_sec: float = 0.0, sticky_probe_fanout: int = 2, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, fail_penalty_weight: float = _FAIL_PENALTY_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, single_send_slow_log_ms: float = 0.0, connect_tunnel_timeout_sec: float = 3.0, http_read_timeout_sec: float = 3.0, local_direct_domains: Optional[List[str]] = None, local_direct_timeout_sec: float = 10.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False, conn_pool_refill_pause_minutes: float = 60.0, conn_pool_refill_pause_silence_sec: float = 120.0, conn_pool_refill_pause_activity_window: Optional[float] = None, conn_pool_refill_pause_min_requests: int = 3, conn_pool_established_reuse: bool = False, conn_pool_established_idle_timeout: Optional[float] = None, conn_pool_prehandshake: bool = False, conn_pool_prehandshake_throttle_window_sec: float = 0.0, conn_pool_prehandshake_throttle_max_per_window: int = 0, cluster_predict: bool = False, cluster_window_sec: float = 2.0, cluster_predict_topk: int = 3, cluster_min_support: int = 2, cluster_graph_ttl_sec: int = 86400, cluster_graph_max_entries: int = 100_000, cluster_predict_throttle_sec: float = 30.0, cluster_proxy_fanout: int = 2, cluster_probe_decay_sec: float = 3600.0, cluster_pool_idle_timeout: float = 600.0, router_cfg: Optional[RouterConfig] = None):
+    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, sticky_probe_interval_sec: float = 0.0, sticky_probe_fanout: int = 2, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, probe_with_get: bool = False, probe_get_targets: Optional[List[str]] = None, probe_get_interval_sec: float = 60.0, probe_get_timeout_sec: float = 5.0, probe_get_max_bytes: int = 65536, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, fail_penalty_weight: float = _FAIL_PENALTY_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, single_send_degrade_success_rate: float = 0.0, single_send_degrade_p99_ms: float = 0.0, single_send_degrade_min_throughput: float = 0.0, single_send_slow_log_ms: float = 0.0, connect_tunnel_timeout_sec: float = 3.0, http_read_timeout_sec: float = 3.0, local_direct_domains: Optional[List[str]] = None, local_direct_timeout_sec: float = 10.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False, conn_pool_refill_pause_minutes: float = 60.0, conn_pool_refill_pause_silence_sec: float = 120.0, conn_pool_refill_pause_activity_window: Optional[float] = None, conn_pool_refill_pause_min_requests: int = 3, conn_pool_established_reuse: bool = False, conn_pool_established_idle_timeout: Optional[float] = None, conn_pool_prehandshake: bool = False, conn_pool_prehandshake_throttle_window_sec: float = 0.0, conn_pool_prehandshake_throttle_max_per_window: int = 0, cluster_predict: bool = False, cluster_window_sec: float = 2.0, cluster_predict_topk: int = 3, cluster_min_support: int = 2, cluster_graph_ttl_sec: int = 86400, cluster_graph_max_entries: int = 100_000, cluster_predict_throttle_sec: float = 30.0, cluster_proxy_fanout: int = 2, cluster_probe_decay_sec: float = 3600.0, cluster_pool_idle_timeout: float = 600.0, router_cfg: Optional[RouterConfig] = None):
         """构造路由器。
 
         参数:
@@ -296,12 +296,20 @@ class Router:
             probe_interval_sec = cc.probe_interval_sec
             probe_canary = cc.probe_canary
             probe_canaries = [x.model_dump() for x in cc.probe_canaries]
+            probe_with_get = cc.probe_with_get
+            probe_get_targets = list(cc.probe_get_targets)
+            probe_get_interval_sec = cc.probe_get_interval_sec
+            probe_get_timeout_sec = cc.probe_get_timeout_sec
+            probe_get_max_bytes = cc.probe_get_max_bytes
             circuit_threshold, circuit_max_backoff = cc.circuit_threshold, cc.circuit_max_backoff
             slow_start_window, slow_start_success = cc.slow_start_window, cc.slow_start_success
             lb_bias = cc.lb_bias
             fail_penalty_weight = cc.fail_penalty_weight
             single_send_degrade_fail, single_send_degrade_ratio, single_send_degrade_slack_ms = (
                 cc.single_send_degrade_fail, cc.single_send_degrade_ratio, cc.single_send_degrade_slack_ms)
+            single_send_degrade_success_rate = cc.single_send_degrade_success_rate
+            single_send_degrade_p99_ms = cc.single_send_degrade_p99_ms
+            single_send_degrade_min_throughput = cc.single_send_degrade_min_throughput
             single_send_slow_log_ms = cc.single_send_slow_log_ms
             connect_tunnel_timeout_sec, http_read_timeout_sec = cc.connect_tunnel_timeout_sec, cc.http_read_timeout_sec
             auth_enabled, auth_username, auth_password = auth.enabled, auth.username, auth.password
@@ -380,6 +388,22 @@ class Router:
         self.probes_ok = 0
         self.probes_skipped = 0  # 因本机→canary 不可达(环境原因)而跳过的探活次数
         self.probes_failed = 0   # 经上游 CONNECT 失败的探活次数(上游侧真故障)
+        # ── 探测对齐(Phase 4):CONNECT 之外的轻量 GET 探活 ──────────
+        # 纯 CONNECT 只验证"上游存活",其延迟(建连+握手)与业务 TTFB/吞吐并不同构,
+        # 故可选对白名单 URL 追加一次轻量 GET,把探活数据对齐到业务指标维度。
+        # 默认关闭;开启时必须白名单 + 限速率,否则合成流量会污染域名级业务指标。
+        self.probe_with_get = bool(probe_with_get)
+        self.probe_get_targets: List[str] = list(probe_get_targets or [])
+        self.probe_get_interval_sec = max(0.0, float(probe_get_interval_sec))
+        self.probe_get_timeout_sec = max(0.1, float(probe_get_timeout_sec))
+        self.probe_get_max_bytes = max(1, int(probe_get_max_bytes))
+        # 每个(代理,目标)上次 GET 探活时刻,用于限速率;以及轮转游标(每轮只测一个目标)。
+        self._probe_get_last: dict = {}
+        self._probe_get_rr = 0
+        self.probe_get_sent = 0
+        self.probe_get_ok = 0
+        self.probe_get_failed = 0
+        self.probe_get_throttled = 0
         # 熔断开启计数归 ProxySelector 维护(开启时刻在 record_failure 内),经
         # snapshot_counters 经 selector.circuit_open_count 读取。
         self.enable_local_racing = enable_local_racing
@@ -432,6 +456,11 @@ class Router:
         self.single_send_degrade_fail = max(0, int(single_send_degrade_fail))
         self.single_send_degrade_ratio = max(0.0, float(single_send_degrade_ratio))
         self.single_send_degrade_slack_ms = max(0.0, float(single_send_degrade_slack_ms))
+        # Phase 3:域名级成功率/P99 延迟/吞吐下限 阈值(0=关闭),配合既有连续失败与
+        # EWMA 恶化信号,防止缓存/粘性路径钉死"高延迟、低成功率、低吞吐"的劣质代理。
+        self.single_send_degrade_success_rate = max(0.0, float(single_send_degrade_success_rate))
+        self.single_send_degrade_p99_ms = max(0.0, float(single_send_degrade_p99_ms))
+        self.single_send_degrade_min_throughput = max(0.0, float(single_send_degrade_min_throughput))
         # 慢单发采样日志(毫秒):粘性/域名缓存命中的单发"发起到首字节"耗时超阈值
         # 即记一条带 client_ip 的日志(见 HTTP _forward_single / CONNECT 单发)。默认
         # 0=关闭。同时记录采样日志条数供 opt.log 观测阈值触发频率。
@@ -1126,6 +1155,9 @@ class Router:
             self.selector.record_ttfb(proxy.id, time.perf_counter() - t0)
             self.selector.record_success(proxy.id)
             self.probes_ok += 1
+            # Phase 4:CONNECT 已证明上游存活,再补一次轻量 GET 让探活贴近业务指标。
+            # GET 失败不影响 CONNECT 的结论(上游仍存活),故吞掉其异常。
+            await self._maybe_probe_get(proxy)
         except (asyncio.TimeoutError, OSError, ConnectionError, RuntimeError):
             self.selector.record_failure(proxy.id)
             self.probes_failed += 1
@@ -1135,6 +1167,69 @@ class Router:
                 await up_writer.wait_closed()
             except Exception:
                 pass
+
+    async def _maybe_probe_get(self, proxy) -> None:
+        """按需发起一次轻量 GET 探活(Phase 4):白名单轮转 + 每(代理,目标)限速率。
+
+        与业务请求隔离:不走 `self._client_pool`(那是业务长连接池),而是每次
+        新建独立 httpx client(单连接、无 keep-alive),避免探活占用/污染业务连接。
+        """
+        if not self.probe_with_get or not self.probe_get_targets:
+            return
+        # 轮转:每轮每个代理只测一个目标,避免一次性放大流量。
+        url = self.probe_get_targets[self._probe_get_rr % len(self.probe_get_targets)]
+        self._probe_get_rr += 1
+        key = (proxy.id, url)
+        now = time.perf_counter()
+        last = self._probe_get_last.get(key)
+        if last is not None and (now - last) < self.probe_get_interval_sec:
+            self.probe_get_throttled += 1
+            return
+        self._probe_get_last[key] = now
+        self.probe_get_sent += 1
+        try:
+            await self._probe_get(proxy, url)
+            self.probe_get_ok += 1
+        except Exception as e:
+            # 探活 GET 失败只计观测,不当作上游故障(连通性由 CONNECT 段判定),
+            # 否则目标站限流/拒绝对会被误记成上游熔断。
+            logger.debug("probe-get failed pid=%s url=%s: %s", proxy.id, url, e)
+            self.probe_get_failed += 1
+
+    async def _probe_get(self, proxy, url: str) -> None:
+        """经该上游对 url 发一次轻量 GET(最多读 probe_get_max_bytes),记录业务级指标。
+
+        记录的维度与真实请求一致:隧道/建连耗时(TTFB)、body 吞吐、协议版本、5xx
+        归因,且写入**该域名的真实指标桶**——这正是探测对齐的目的(让冷域名也有
+        业务级观测)。代价是合成流量会混入业务指标,故必须白名单 + 限速率。
+        """
+        from urllib.parse import urlsplit
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        domain = f"{host}:{port}"
+        proxy_url = self.proxy_store.proxy_url(proxy.id)
+        timeout = httpx.Timeout(self.probe_get_timeout_sec, connect=self.probe_get_timeout_sec)
+        # 独立 client(单连接/无 keep-alive):与业务 _client_pool 隔离,用完即关。
+        limits = httpx.Limits(max_connections=1, max_keepalive_connections=0)
+        t0 = time.perf_counter()
+        async with httpx.AsyncClient(proxy=proxy_url, timeout=timeout, limits=limits,
+                                     follow_redirects=True) as client:
+            async with client.stream("GET", url) as resp:
+                ttfb = time.perf_counter() - t0
+                self.selector.record_ttfb(proxy.id, ttfb, domain=domain)
+                self.selector.record_protocol(proxy.id, resp.http_version, domain=domain)
+                nbytes = 0
+                t_body = time.perf_counter()
+                async for chunk in resp.aiter_bytes():
+                    nbytes += len(chunk)
+                    if nbytes >= self.probe_get_max_bytes:
+                        break
+                body_dur = time.perf_counter() - t_body
+                if body_dur > 0:
+                    self.selector.record_complete(proxy.id, nbytes, body_dur, domain=domain)
+                if resp.status_code >= 500:
+                    self.selector.record_http_error(proxy.id, resp.status_code, domain=domain)
 
     def get_domain_stats_from_db(self) -> dict[str, dict[str, int]]:
         """读取全量域名胜出统计,组织为 {domain: {proxy_id: wins}}。
@@ -1253,6 +1348,11 @@ class Router:
             "probes_ok": self.probes_ok,
             "probes_skipped": self.probes_skipped,
             "probes_failed": self.probes_failed,
+            # Phase 4 探测对齐:轻量 GET 探活(与 CONNECT 探活分开计,便于看限流/失败)
+            "probe_get_sent": self.probe_get_sent,
+            "probe_get_ok": self.probe_get_ok,
+            "probe_get_failed": self.probe_get_failed,
+            "probe_get_throttled": self.probe_get_throttled,
             "circuit_open_count": self.selector.circuit_open_count,
             "circuit_state": self.selector.get_circuit_state(),
             "single_send_degrades": self.single_send_degrades,
@@ -1443,6 +1543,36 @@ class Router:
                 if (cur - ref_ewma) > slack:
                     self.single_send_degrades += 1
                     return True
+        # Phase 3:域名级 成功率 / P99 延迟 / 吞吐下限 信号(均 0=关闭),与既有
+        # 连续失败 / EWMA 恶化 并列,任一命中即降级回竞速。直接消费 Phase 1 采集的
+        # 域名级指标,填补"首字节不慢但成功率低 / 下载慢"的盲区。
+        if (self.single_send_degrade_success_rate > 0
+                or self.single_send_degrade_p99_ms > 0
+                or self.single_send_degrade_min_throughput > 0):
+            dm = self.selector._domain_metrics.get(domain, {}).get(pid, {}).get("metrics")
+            if dm:
+                total = int(dm.get("total", 0))
+                # 成功率信号(需样本 >=8,避免低样本噪声误判把偶发失败当劣质)
+                if self.single_send_degrade_success_rate > 0 and total >= 8:
+                    sr = dm.get("success", 0) / total
+                    if sr < self.single_send_degrade_success_rate:
+                        self.single_send_degrades += 1
+                        return True
+                # P99 延迟信号(需样本 >=4):TTFB 与 OFB 分位 P99 取较大者,覆盖
+                # "代理握手 + 源站首字节"整条链路,单发钉死高延迟代理时重竞速。
+                if self.single_send_degrade_p99_ms > 0 and total >= 4:
+                    ttfb_p99 = self.selector._percentiles(dm.get("ttfb_samples", [])).get("p99")
+                    ofb_p99 = self.selector._percentiles(dm.get("ofb_samples", [])).get("p99")
+                    cand = [x for x in (ttfb_p99, ofb_p99) if x is not None]
+                    if cand and max(cand) * 1000.0 > self.single_send_degrade_p99_ms:
+                        self.single_send_degrades += 1
+                        return True
+                # 吞吐下限信号(需样本 >=4):防"首字节快但下载慢"的代理被钉死。
+                if self.single_send_degrade_min_throughput > 0 and total >= 4:
+                    tp = dm.get("throughput_ewma")
+                    if tp is not None and tp < self.single_send_degrade_min_throughput:
+                        self.single_send_degrades += 1
+                        return True
         return False
 
     def _degrade_send_proxy(self, pid: str, domain: str) -> None:

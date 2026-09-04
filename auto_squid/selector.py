@@ -19,6 +19,7 @@ import random
 import time
 from typing import List, Optional
 
+from .digest import TDigest
 from .proxy_store import ProxyStore
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,11 @@ _FAIL_PENALTY_DEFAULT = 4.0
 #   - WINDOW 界定样本上限(环形截断,存最近 N 个,内存有界)。
 _OBS_WINDOW = 256          # 每个序列保留的最近样本数(分位数用)
 _THROUGHPUT_ALPHA = 0.3
+# 分位数低置信度阈值:样本数低于此值的分位数标注「低置信度」(见 IMPROVEMENT_PLAN Phase 6.1)。
+_PCT_LOW_CONF_N = 8
+# 贝叶斯(Laplace)平滑先验:避免低样本下 success_rate 取 0/1 极值污染展示与(未来)Phase 2 权重。
+_PRIOR_ALPHA = 0.5
+_PRIOR_BETA = 0.5
 
 # 终身累计指标字段(随每次观测单调增长,经 DB 恢复后继续累加,是唯一跨重启
 # 的"永久值")。与窗口化指标(ttfb_samples 分位 / *_ewma)并存:后者反映近期
@@ -287,6 +293,8 @@ class ProxySelector:
             scope["cum_success"] += 1
             scope["cum_ttfb_sum"] += ttfb
             scope["cum_ttfb_n"] += 1
+            # 终身分位数 rollup(有界内存,与窗口 ttfb_samples 并存)
+            scope["cum_ttfb_digest"].add(ttfb)
 
     def record_origin_first_byte(self, pid: str, ofb: float,
                                  domain: Optional[str] = None):
@@ -313,6 +321,8 @@ class ProxySelector:
             self._append_sample(scope["ofb_samples"], ofb)
             scope["cum_ofb_sum"] += ofb
             scope["cum_ofb_n"] += 1
+            # 终身分位数 rollup(有界内存,与窗口 ofb_samples 并存)
+            scope["cum_ofb_digest"].add(ofb)
 
     @staticmethod
     def _apply_ewma(table: dict, pid: str, ttfb: float) -> Optional[dict]:
@@ -412,6 +422,10 @@ class ProxySelector:
                 "total_bytes": 0.0,
                 "transfer_time": 0.0,
                 "http_versions": {},  # Phase 1.4:协议版本累计计数 {版本串: n}(跨重启持久)
+                # 终身分位数 rollup(t-digest 风格,质心数有硬上限):窗口样本只能回答
+                # "最近 256 次",这两份摘要回答"长期到底多快",且内存 O(1)、可持久。
+                "cum_ttfb_digest": TDigest(),
+                "cum_ofb_digest": TDigest(),
                 **_CUM_FIELDS,
             }
         return m["metrics"]
@@ -457,7 +471,22 @@ class ProxySelector:
             "max": max(samples),
             "mean": sum(samples) / len(samples),
             "samples": len(samples),
+            # Phase 6.1:低样本分位数噪声大,标注低置信度供 UI/Phase 2 跳过。
+            "low_confidence": len(samples) < _PCT_LOW_CONF_N,
         }
+
+    @staticmethod
+    def _smooth_rate(success: int, total: int) -> Optional[float]:
+        """贝叶斯(Laplace)平滑成功率(Phase 6.1,IMPROVEMENT_PLAN §6.1)。
+
+        (success + α) / (total + α + β),α=β=0.5。避免低样本下 0/1 极值:
+        全成功小样本不会是精确 1.0、全失败不会是精确 0.0,且与先验(成功率 0.5)
+        平滑过渡。total<=0 返回 None(无观测,不估计)。
+        仅用于展示与(未来)Phase 2 权重;原始 success/total 计数仍独立保留。
+        """
+        if not total or total <= 0:
+            return None
+        return (success + _PRIOR_ALPHA) / (total + _PRIOR_ALPHA + _PRIOR_BETA)
 
     @staticmethod
     def _cumulative_view(m: dict) -> dict:
@@ -482,7 +511,7 @@ class ProxySelector:
         cum_fail_5 = m.get("cum_failure_5xx", 0)
         cum_fail = cum_fail_t + cum_fail_5
         cum_samples = cum_success + cum_fail
-        success_rate = (cum_success / cum_samples) if cum_samples else None
+        success_rate = ProxySelector._smooth_rate(cum_success, cum_samples)
         n_ttfb = m.get("cum_ttfb_n", 0)
         avg_ttfb_ms = (m.get("cum_ttfb_sum", 0.0) / n_ttfb * 1000.0) if n_ttfb else None
         n_ofb = m.get("cum_ofb_n", 0)
@@ -501,7 +530,26 @@ class ProxySelector:
             "avg_ofb_ms": avg_ofb_ms,
             "throughput_mbps": throughput_mbps,
             "total_bytes": total_bytes,
+            # 终身分位数(t-digest rollup,有界内存):补上"累计只有均值"的缺口——
+            # 原累计视图只能给 avg_ttfb_ms/avg_ofb_ms,长期 p95/p99 无从回答。
+            # 与窗口分位数(ttfb_samples/ofb_samples,近 256 次)语义不同:这是全历史。
+            "ttfb_percentiles": ProxySelector._digest_percentiles(m, "cum_ttfb_digest"),
+            "ofb_percentiles": ProxySelector._digest_percentiles(m, "cum_ofb_digest"),
         }
+
+    @staticmethod
+    def _digest_percentiles(m: dict, key: str) -> dict:
+        """取某份终身 t-digest 的分位数;字段缺失/损坏时回退空 dict(不抛异常)。
+
+        热路径与 DB 恢复都可能遇到旧行(dict 是 JSON 反序列化来的普通 dict,
+        没有 TDigest 方法),故统一在这里包一层,保证 /quality/meta 等消费者不炸。
+        """
+        d = m.get(key)
+        if isinstance(d, TDigest):
+            return d.percentiles()
+        if isinstance(d, dict):
+            return TDigest(d).percentiles()
+        return {}
 
     def record_complete(self, pid: str, body_bytes: int, body_duration: float,
                         body_ttfb: float = 0.0, domain: Optional[str] = None):
@@ -617,7 +665,7 @@ class ProxySelector:
                 win_succ = sum(win_outcomes)
                 out[d][pid]["window_success_count"] = win_succ
                 out[d][pid]["window_total"] = win_n
-                out[d][pid]["window_success_rate"] = (win_succ / win_n) if win_n else None
+                out[d][pid]["window_success_rate"] = ProxySelector._smooth_rate(win_succ, win_n)
                 # 终身累计(跨重启永久):与窗口化分位并存,供 --metrics 展示"永久值"。
                 out[d][pid]["cumulative"] = ProxySelector._cumulative_view(mm)
         return out
@@ -645,11 +693,11 @@ class ProxySelector:
                 # 窗口版(近期 _OBS_WINDOW,内存中重置,跨重启清零):用于仪表盘"近期表现"列
                 "window_success_count": win_succ,
                 "window_total": win_n,
-                "window_success_rate": (win_succ / win_n) if win_n else None,
+                "window_success_rate": ProxySelector._smooth_rate(win_succ, win_n),
                 # 终身累计(语义:全部历史,含跨重启)——与上面窗口版并存
                 "success_count": mm.get("success", 0),
                 "total_attempts": mm.get("total", 0),
-                "success_rate": (mm["success"] / mm["total"]) if mm.get("total", 0) else None,
+                "success_rate": ProxySelector._smooth_rate(mm.get("success", 0), mm.get("total", 0)),
                 "errors": dict(mm.get("errors", {})),
                 "http_versions": dict(mm.get("http_versions", {})),
                 "total_bytes_transferred": mm.get("total_bytes", 0.0),
@@ -752,6 +800,12 @@ class ProxySelector:
             # 字典,否则 record_protocol 热路径 scope["http_versions"] KeyError。
             if "http_versions" not in m:
                 m["http_versions"] = {}
+            # 终身分位数 rollup(后加字段):旧 DB 行没有就新建;有的话是 JSON 反
+            # 序列化出来的**普通 dict**,没有 TDigest 方法,必须重新包一层,否则
+            # record_ttfb 热路径的 .add() 会 AttributeError。
+            for k in ("cum_ttfb_digest", "cum_ofb_digest"):
+                v = m.get(k)
+                m[k] = TDigest(v) if isinstance(v, dict) else TDigest()
             # 惰性补全终身累计字段(_CUM_FIELDS):旧 DB 行缺这些键时补默认值,使
             # record_ttfb/record_http_error 的 scope[...] 读写不抛 KeyError(09-04
             # 事故:旧行无 cum_* → 热路径 KeyError → 全请求失败 → 熔断全开)。
@@ -788,6 +842,10 @@ class ProxySelector:
                 # 同 set_proxy_metrics:旧 DB 行补 http_versions 空字典。
                 if "http_versions" not in m:
                     m["http_versions"] = {}
+                # 同 set_proxy_metrics:终身分位数 rollup 补全/重新包装为 TDigest。
+                for k in ("cum_ttfb_digest", "cum_ofb_digest"):
+                    v = m.get(k)
+                    m[k] = TDigest(v) if isinstance(v, dict) else TDigest()
                 # 惰性补全终身累计字段,同 set_proxy_metrics。
                 for k, v in _CUM_FIELDS.items():
                     if k not in m:

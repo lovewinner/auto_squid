@@ -321,6 +321,7 @@ select:focus{border-color:#e94560}
 .metric-cell-muted{color:#555;text-align:center;font-variant-numeric:tabular-nums}
 td.err-cell{font-size:11px;color:#a8d8ea}
 .ewma-sub{color:#888;font-size:0.82em}
+.low-conf{color:#e9a23b;font-size:0.82em;font-weight:500}
 tr.cum-row td{font-size:11px;color:#888;padding-top:0;padding-bottom:8px;font-variant-numeric:tabular-nums}
 /* 监控指标:窗口 / 累计 两表并排,列对齐直接对比 */
 .metrics-split{display:flex;flex-direction:column;gap:24px}
@@ -492,11 +493,13 @@ function cumCell(cumVal, ewmaVal, fmtFn) {
   return c != null ? c : e;
 }
 
-// 分位数单元格: 'p50/p95/p99(n=样本数)'; 无样本给占位。
+// 分位数单元格: 'p50/p95/p99(n=样本数)'; 低样本(obs < 8)追加「⚠低样本」置信度标识。
 function pctCell(p) {
   if (!p || !p.samples) return '—';
-  return Math.round((p.p50||0)*1000) + '/' + Math.round((p.p95||0)*1000) + '/'
-       + Math.round((p.p99||0)*1000) + 'ms(n=' + p.samples + ')';
+  let s = Math.round((p.p50||0)*1000) + '/' + Math.round((p.p95||0)*1000) + '/'
+        + Math.round((p.p99||0)*1000) + 'ms(n=' + p.samples + ')';
+  if (p.low_confidence) s += ' <span class="low-conf">⚠低样本</span>';
+  return s;
 }
 
 // 累计明细行, 措辞与 test_routing.py --metrics 的 "累计(永久值...)" 行保持一致
@@ -514,6 +517,17 @@ function cumLine(cum) {
 function errStr(errs) {
   const items = Object.entries(errs || {}).filter(([,v]) => v > 0).map(([k,v]) => (ERR_LABELS[k]||k) + ':' + v);
   return items.length ? items.join(', ') : '—';
+}
+
+// 终身分位数明细行(t-digest rollup):窗口表给"近 256 次",这行给"全历史"分位。
+function lifePctLine(cum) {
+  const t = cum.ttfb_percentiles, o = cum.ofb_percentiles;
+  if (!t || !t.samples) return '';
+  const f = (p) => (p && p.samples)
+    ? Math.round(p.p50*1000) + '/' + Math.round(p.p95*1000) + '/' + Math.round(p.p99*1000) + 'ms'
+    : '—';
+  return '终身分位(全历史 n=' + t.samples + '): 握手 P50/P95/P99=' + f(t)
+       + ' 源站首字节=' + f(o);
 }
 
 // 协议版本累计计数 {版本串: n} → 紧凑展示,如 "H2 62% / H1 38%";无数据显 "—"。
@@ -554,6 +568,8 @@ function renderMetricsGlobal(wrap) {
     cum += `<td class="metric-cell-num">${c.success||0}/${c.samples||0}</td>`;
     cum += `<td class="metric-cell-num">${fmtBytes(c.total_bytes || 0)}</td>`;
     cum += `<td class="metric-cell-num">${protoStr(m.http_versions)}</td></tr>`;
+    const lp = lifePctLine(c);
+    if (lp) cum += `<tr class="cum-row"><td colspan="8">${lp}</td></tr>`;
   }
   win += '</tbody></table>';
   cum += '</tbody></table>';
@@ -602,6 +618,8 @@ function renderMetricsDomain(wrap) {
     cum += `<td class="metric-cell-num">${c.samples||0}</td>`;
     cum += `<td class="metric-cell-num">${fmtBytes(c.total_bytes || 0)}</td>`;
     cum += `<td class="metric-cell-num">${protoStr(m.http_versions)}</td></tr>`;
+    const lp = lifePctLine(c);
+    if (lp) cum += `<tr class="cum-row"><td colspan="8">${lp}</td></tr>`;
   }
   win += '</tbody></table>';
   cum += '</tbody></table>';

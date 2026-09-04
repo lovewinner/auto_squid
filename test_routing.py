@@ -670,14 +670,36 @@ def _fmt_cumulative(cum, detail_only=False) -> str:
     fp = (f"失败:{cum['failure']}(传输{cum['failure_transport']}"
           f"+5xx{cum['failure_5xx']})")
     if detail_only:
-        return (f"  累计(永久值, n={cum['samples']}): 平均握手(代理)={at_s} "
+        # 主表已展示 成功率/吞吐,这里只给平均时延与失败细分。
+        base = (f"  累计(永久值, n={cum['samples']}): 平均握手(代理)={at_s} "
                 f"平均源站首字节={ob_s} | {fp}")
-    sr = cum.get("success_rate")
-    sr_s = f"{sr*100:.1f}%" if sr is not None else "—"
-    tp = cum.get("throughput_mbps")
-    tp_s = f"{tp:.2f}MB/s" if tp is not None else "—"
-    return (f"  累计(永久值, n={cum['samples']}): 成功率={sr_s} "
-            f"平均握手(代理)={at_s} 平均源站首字节={ob_s} 吞吐={tp_s} | {fp}")
+    else:
+        sr = cum.get("success_rate")
+        sr_s = f"{sr*100:.1f}%" if sr is not None else "—"
+        tp = cum.get("throughput_mbps")
+        tp_s = f"{tp:.2f}MB/s" if tp is not None else "—"
+        base = (f"  累计(永久值, n={cum['samples']}): 成功率={sr_s} "
+                f"平均握手(代理)={at_s} 平均源站首字节={ob_s} 吞吐={tp_s} | {fp}")
+    # 终身分位数(t-digest rollup,有界内存):补"累计只有均值"的缺口,给全历史分位。
+    lifeline = _fmt_lifetime_pct(cum)
+    return base if not lifeline else base + "\n" + lifeline
+
+
+def _fmt_lifetime_pct(cum) -> str:
+    """终身分位数行(有界内存 t-digest rollup),无样本时返回空串。"""
+    t = cum.get("ttfb_percentiles") or {}
+    o = cum.get("ofb_percentiles") or {}
+    if not t.get("samples"):
+        return ""
+
+    def _f(p):
+        if not p or not p.get("samples"):
+            return "—"
+        return (f"{p.get('p50', 0)*1000:.0f}/{p.get('p95', 0)*1000:.0f}/"
+                f"{p.get('p99', 0)*1000:.0f}ms")
+
+    return (f"    终身分位(全历史 n={t['samples']}): 握手 P50/P95/P99={_f(t)} "
+            f"源站首字节={_f(o)}")
 
 
 def _fmt_pct(p) -> str:
@@ -687,8 +709,11 @@ def _fmt_pct(p) -> str:
     """
     if not isinstance(p, dict) or not p.get("samples"):
         return "—"
-    return (f"{p.get('p50', 0)*1000:.0f}/{p.get('p95', 0)*1000:.0f}/"
-            f"{p.get('p99', 0)*1000:.0f}(n={p['samples']})")
+    s = (f"{p.get('p50', 0)*1000:.0f}/{p.get('p95', 0)*1000:.0f}/"
+         f"{p.get('p99', 0)*1000:.0f}(n={p['samples']})")
+    if p.get("low_confidence"):
+        s += " ⚠低样本"
+    return s
 
 
 def _fmt_cum_ewma(cum_val, ewma_val, fmt) -> str:

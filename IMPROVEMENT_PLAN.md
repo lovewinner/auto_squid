@@ -127,6 +127,17 @@ Cost = w1 × Latency_P99 + w2 × (1 - Success_Rate) + w3 × (1/Throughput) + w4 
 
 **增强**: 引入**域名级成功率阈值**、**P99 延迟阈值**、**吞吐下限**作为额外降级触发条件。
 
+> 状态: [x] **已完成**。`_single_send_degraded()` 在既有「连续失败 / EWMA 恶化」之外新增三条
+> 域名级信号,直接消费 Phase 1 采集的指标(任一阈值 >0 才启用,默认全关闭=零行为变化):
+> - `single_send_degrade_success_rate`:域名级 `success/total` 低于阈值即降级(需样本 >=8,
+>   避免低样本噪声把偶发失败误判为劣质)。
+> - `single_send_degrade_p99_ms`:域名级 TTFB 与 OFB 分位 P99 取较大者(覆盖「代理握手 +
+>   源站首字节」整条链路),超阈即降级(需样本 >=4)。
+> - `single_send_degrade_min_throughput`:域名级吞吐 EWMA 低于下限即降级(需样本 >=4),
+>   防「首字节快但下载慢」的代理被钉死。
+> 阈值新增于 `CircuitConfig`(router 经 `router_cfg.circuit` 读取),并同步加入 `Router.__init__`
+> 的关键字参数与默认值(=0 关闭),保证 kwargs 与 router_cfg 两条构造路径一致。
+
 ```python
 # Router._single_send_degraded() 扩展
 def _single_send_degraded(self, domain, pid, ref_ewma):
@@ -147,9 +158,12 @@ def _single_send_degraded(self, domain, pid, ref_ewma):
 
 ### Phase 4: 探测/预热对齐（一致性）
 
-- `_probe_proxy()` 目前只做 CONNECT 握手，**不拉取业务数据** → 探测延迟 ≠ 业务 TTFB/OFB
-- **改进**: 探活可选模式 `--probe-with-get` 对关键域名（如 `api.github.com`）做轻量 GET，记录完整指标
-- 预热池 `ClusterGraph` 预测桶应共享**域名级质量表**，而非仅用全局 EWMA
+> 状态: [x] 已完成（待提交）。
+
+- `_probe_proxy()` 此前只做 CONNECT 握手，**不拉取业务数据** → 探测延迟 ≠ 业务 TTFB/OFB
+- **改进**: 新增 `probe_with_get`（`--probe-with-get` 开关 + 白名单 `probe_get_targets` + 间隔 `probe_get_interval_sec` / 超时 / 最大字节）：每轮每个上游只测一个目标、按 `(代理,目标)` 限速率、独立短连接 client（与业务 `_client_pool` 隔离，用完即关），经上游发轻量 GET 并把 TTFB/协议版本/吞吐/5xx 写入**该域名真实指标桶**（探测对齐目的）。默认关闭、新增流量受白名单 + 限速率约束。
+- 探针失败只计观测（`probe_get_failed`），**不**当作上游故障/熔断，避免目标站限流/拒绝对被误记成上游熔断（一致性约定 §5）。
+- 预热池 `ClusterGraph` 预测桶应共享**域名级质量表**，而非仅用全局 EWMA（尚未做，留待后续）
 
 ---
 
@@ -208,9 +222,9 @@ def _single_send_degraded(self, domain, pid, ref_ewma):
 为帮助后续 Phase 2/3 设计与上线，这里把审阅建议按主题给出，可直接作为 PR checklist：
 
 1) 指标与统计方法（测量质量与鲁棒性）
-- 建议接入 t-digest 或 HDRHistogram 来计算 p50/p95/p99，比分片环形缓冲更稳健且内存友好，尤其对 p99 有明显好处。
-- 为每个分位数输出观测样本数与置信度标识（如 obs < N 标注低置信度），避免低样本噪声驱动路由决策。
-- 对 success_rate 使用贝叶斯平滑（Laplace：(s+α)/(n+α+β)，α=1/2/2）以避免 0/1 极端值影响。
+- [x] t-digest 自包含实现（`auto_squid/digest.py` 的 `TDigest`：k1 尺度函数聚类似质心 + 硬上限 `MAX_CENTROIDS=96`，p50/p95 误差 <1%、p99 长尾略大；做成 `dict` 子类以随 `json.dumps` 直接落盘、旧 DB 行惰性重新包装）。已替换 `selector` 环形缓冲排序：终身累计 TTFB/OFB 分位由 digest rollup 产出（`ttfb_percentiles`/`ofb_percentiles`），窗口分位仍用 `_OBS_WINDOW` 样本（保留两族并行语义）。
+- [x] 为每个分位数输出 `samples` 数与 `low_confidence` 标识（`< _PCT_LOW_CONF_N=8` 时仪表盘标 `⚠低样本`），避免低样本噪声驱动路由决策。
+- [x] 对 success_rate 使用贝叶斯平滑（Laplace：`(s+α)/(n+α+β)`，α=β=0.5）以避免 0/1 极端值影响；窗口版与累计版均套用，原始 `success`/`total` 计数仍独立保留。
 - 在计算 EWMA/percentile 前做简单的去极值或剪裁策略（例如忽略异常超长请求或把其归入特殊 bucket）。
 - 计时请使用 monotonic 时钟（time.perf_counter）以防系统时间跳变污染指标。
 
@@ -264,9 +278,9 @@ def _single_send_degraded(self, domain, pid, ref_ewma):
 
 ## 七、可落地的短期任务（建议作为 PR checklist）
 
-- [ ] 引入 t-digest/HDRHistogram 库并实现 p50/p95/p99 接口（Phase 1 补充）
-- [ ] 为分位数暴露样本数/置信度并在 `/quality/meta` 上加标识
-- [ ] 对 success_rate 使用贝叶斯平滑与 retry_rate 分离统计
+- [x] 引入 t-digest 自包含实现并实现 p50/p95/p99 接口（见 `auto_squid/digest.py`，替代分片环形缓冲）
+- [x] 为分位数暴露样本数/置信度并在仪表盘累计表加「终身分位」行 + 低样本警示
+- [x] 对 success_rate 使用贝叶斯平滑（Laplace）与 retry_rate 分离统计
 - [ ] 实现 metrics 标签规范并在 /metrics 中限制高基数标签
 - [ ] 设计 Phase 2 的 Cost 函数草案（含归一化/对数变换 & 默认权重）并在小流量 canary 上 A/B 验证
 - [ ] 编写单元与集成测试覆盖新采集与排序逻辑

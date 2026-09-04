@@ -352,6 +352,16 @@ class CircuitConfig(ConfigBase):
     single_send_degrade_slack_ms: EWMA 降级的绝对下限(毫秒,默认 10)。基线与当前值
                        都极小时(如 0.2ms→0.9ms,比值 4.5 但绝对差距 <1ms)用纯比值
                        会误判剧烈恶化——绝对差值低于该 slack 时不降级。
+    single_send_degrade_success_rate: 单发降级:域名级成功率阈值(默认 0=关闭)。被钉住
+                       代理在该域名上的累计成功率(success/total)低于此值即降级回竞速,
+                       防缓存/粘性路径钉死"高延迟但低成功率"的劣质代理。需域名级样本
+                       >=8 才生效(低样本不触发,避免噪声误判)。建议 0.95。
+    single_send_degrade_p99_ms: 单发降级:域名级 P99 延迟阈值(毫秒,默认 0=关闭)。取
+                       该域名 TTFB 与 OFB 分位 P99 之较大者(覆盖"代理握手+源站首字节"
+                       整条链路),超过即降级回竞速。需域名级样本 >=4 才生效。
+    single_send_degrade_min_throughput: 单发降级:域名级吞吐下限(MB/s,默认 0=关闭)。
+                       被钉住代理在该域名的吞吐 EWMA 低于此值即降级回竞速,防"首字节
+                       快但下载慢"的代理被钉死。需域名级样本 >=4 才生效。
     single_send_slow_log_ms: 慢单发采样日志阈值(毫秒,默认 0=关闭)。会话粘性/域名
                        缓存命中的单发请求在"发起到首字节"耗时超过该阈值时,记一条
                        `slow single send` 日志(含客户端 IP + 域名/目标 + 所用代理 +
@@ -378,6 +388,14 @@ class CircuitConfig(ConfigBase):
     single_send_degrade_fail: int = Field(0, description="单发降级:连续失败阈值,0=关闭")
     single_send_degrade_ratio: float = Field(0.0, description="单发降级:EWMA 恶化比值阈值,0=关闭(同时用于方案C:粘性慢探路)")
     single_send_degrade_slack_ms: float = Field(10.0, description="EWMA 降级绝对下限(毫秒)")
+    single_send_degrade_success_rate: float = Field(0.0, description="单发降级:域名级成功率阈值,低于则降级回竞速,0=关闭(需样本>=8)")
+    single_send_degrade_p99_ms: float = Field(0.0, description="单发降级:域名级 P99 延迟阈值(毫秒,TTFB/OFB 取较大者),高于则降级,0=关闭(需样本>=4)")
+    single_send_degrade_min_throughput: float = Field(0.0, description="单发降级:域名级吞吐下限(MB/s),低于则降级回竞速,0=关闭(需样本>=4)")
+    probe_with_get: bool = Field(False, description="探测对齐(Phase 4):CONNECT 探活之外追加一次轻量 GET,让探活延迟贴近业务 TTFB/吞吐。需配 probe_get_targets。注意:结果会写入该域名的真实指标桶(这是探测对齐的目的),故务必白名单+限速率,避免合成流量污染业务指标")
+    probe_get_targets: List[str] = Field(default_factory=list, description="probe-with-get 白名单 URL(如 https://api.github.com/)。按代理轮转,每轮只测一个,防一次性放大流量")
+    probe_get_interval_sec: float = Field(60.0, description="每个(代理,目标)的最小 GET 探活间隔(秒),防触发目标站限流")
+    probe_get_timeout_sec: float = Field(5.0, description="GET 探活超时(秒)")
+    probe_get_max_bytes: int = Field(65536, description="GET 探活最多读取的响应体字节数(够算吞吐即可,避免大文件下载)")
     single_send_slow_log_ms: float = Field(0.0, description="慢单发采样日志阈值(毫秒),0=关闭")
     connect_tunnel_timeout_sec: float = Field(3.0, description="CONNECT 隧道建连/读响应超时(秒):_try_tunnel 向源站 CONNECT 的 open_connection 与等 200 的统一上限,防某代理 egress→源站建连/握手偶发卡死把请求拖成 10s+。原硬编码 15s。测得的 CDN 首字节实际 0.6s,3s 给 5 倍余量。")
     http_read_timeout_sec: float = Field(3.0, description="HTTP 单发读首字节超时(秒):_upstream_timeout.read,防某被钉代理转发 HTTP 首字节偶发卡死。原 10s。注意 router.py:480-483 记载收紧 header 等待曾非净赢(引爆 soak p99+fd 堆积)已回退,故本值生产灰度须盯 p99/fd。")
