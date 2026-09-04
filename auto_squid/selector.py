@@ -411,6 +411,7 @@ class ProxySelector:
                 "errors": {k: 0 for k in _ERROR_KEYS},
                 "total_bytes": 0.0,
                 "transfer_time": 0.0,
+                "http_versions": {},  # Phase 1.4:协议版本累计计数 {版本串: n}(跨重启持久)
                 **_CUM_FIELDS,
             }
         return m["metrics"]
@@ -562,6 +563,30 @@ class ProxySelector:
                 if scope["outcome_samples"] and scope["outcome_samples"][-1] == 1:
                     scope["outcome_samples"][-1] = 0
 
+    def record_protocol(self, pid: str, http_version: str,
+                        domain: Optional[str] = None):
+        """记录一次响应的 HTTP 协议版本(Phase 1.4,前向代理可观测部分)。
+
+        仅 HTTP 路径可取(httpx resp.http_version: "HTTP/1.1"/"HTTP/2"/"HTTP/3");
+        HTTPS CONNECT 为裸字节隧道,无协议版本概念,不在此记录。
+
+        前向代理局限(详见 IMPROVEMENT_PLAN.md Phase 1.4):
+          - 连接复用率:httpx 不暴露公开"连接是否复用"标记;HTTP/2 多路复用即隐含
+            复用收益,故以 http_version 分布(尤其 H2 占比)作为连接效率的可观测代理。
+          - TLS 会话恢复:CONNECT 隧道中 TLS 终止在「上游代理 ↔ 源站」之间,对本代理
+            完全不透明,无法观测,故不采集(不伪造指标)。
+        计数器累计(随 metric_dict JSON 持久,跨重启可追溯),体现该 (代理[,域名])
+        实际协商到的协议能力分布。
+        """
+        if not http_version:
+            return
+        v = str(http_version)
+        g = self._metrics_for(pid, None)
+        m = self._metrics_for(pid, domain)
+        # 与 record_ttfb/record_complete 一致:域名桶与全局桶双写;同桶时不重复计数。
+        for scope in (g, m) if m is not g else (g,):
+            scope.setdefault("http_versions", {})[v] = scope["http_versions"].get(v, 0) + 1
+
     def get_proxy_metrics(self) -> dict:
         """返回全局(跨域名聚合)代理指标快照 {pid: metric_dict},供 /metrics 展示。
 
@@ -626,6 +651,7 @@ class ProxySelector:
                 "total_attempts": mm.get("total", 0),
                 "success_rate": (mm["success"] / mm["total"]) if mm.get("total", 0) else None,
                 "errors": dict(mm.get("errors", {})),
+                "http_versions": dict(mm.get("http_versions", {})),
                 "total_bytes_transferred": mm.get("total_bytes", 0.0),
                 # 终身累计(跨重启永久):成功率/平均首字节/吞吐,与窗口化指标并存。
                 "cumulative": ProxySelector._cumulative_view(mm),
@@ -722,6 +748,10 @@ class ProxySelector:
             # DB 行没有,补空列表,否则 record_ttfb/record_failure 热路径 KeyError。
             if "outcome_samples" not in m:
                 m["outcome_samples"] = []
+            # http_versions 为后加字段(Phase 1.4 协议版本计数):旧 DB 行没有,补空
+            # 字典,否则 record_protocol 热路径 scope["http_versions"] KeyError。
+            if "http_versions" not in m:
+                m["http_versions"] = {}
             # 惰性补全终身累计字段(_CUM_FIELDS):旧 DB 行缺这些键时补默认值,使
             # record_ttfb/record_http_error 的 scope[...] 读写不抛 KeyError(09-04
             # 事故:旧行无 cum_* → 热路径 KeyError → 全请求失败 → 熔断全开)。
@@ -755,6 +785,9 @@ class ProxySelector:
                 # 同 set_proxy_metrics:旧 DB 行补 outcome_samples 空列表。
                 if "outcome_samples" not in m:
                     m["outcome_samples"] = []
+                # 同 set_proxy_metrics:旧 DB 行补 http_versions 空字典。
+                if "http_versions" not in m:
+                    m["http_versions"] = {}
                 # 惰性补全终身累计字段,同 set_proxy_metrics。
                 for k, v in _CUM_FIELDS.items():
                     if k not in m:

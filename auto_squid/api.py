@@ -516,6 +516,17 @@ function errStr(errs) {
   return items.length ? items.join(', ') : '—';
 }
 
+// 协议版本累计计数 {版本串: n} → 紧凑展示,如 "H2 62% / H1 38%";无数据显 "—"。
+function protoStr(hv) {
+  if (!hv || !Object.keys(hv).length) return '—';
+  const tot = Object.values(hv).reduce((a, b) => a + b, 0);
+  const parts = Object.keys(hv).sort().map(k => {
+    const pct = tot ? Math.round(hv[k] / tot * 100) : 0;
+    return k.replace('HTTP/', 'H') + ' ' + pct + '%';
+  });
+  return parts.join(' / ');
+}
+
 function renderMetricsGlobal(wrap) {
   const pids = Object.keys(qmeta).sort();
   if (!pids.length) { wrap.innerHTML = '<div class="no-data">No data</div>'; document.getElementById('pager').innerHTML=''; document.getElementById('footer').textContent=''; return; }
@@ -523,7 +534,7 @@ function renderMetricsGlobal(wrap) {
   // 两表列错开各展所长:窗口表重在 EWMA 趋势与近期计数(代理近况);
   // 累计表重在永久累计与均值(代理历史表现,跨重启可追溯)。
   let win = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 P50/P95/P99</th><th>源站首字节 P50/P95/P99</th><th>成功率(近)</th><th>成功/总数(近)</th><th>错误分类(近 256)</th></tr></thead><tbody>';
-  let cum = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 均值</th><th>源站首字节 均值</th><th>吞吐 累计</th><th>成功率</th><th>成功/总数</th><th>累计字节</th></tr></thead><tbody>';
+  let cum = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 均值</th><th>源站首字节 均值</th><th>吞吐 累计</th><th>成功率</th><th>成功/总数</th><th>累计字节</th><th>协议(累计)</th></tr></thead><tbody>';
   for (const pid of pids) {
     const m = qmeta[pid] || {};
     const c = m.cumulative || {};
@@ -541,7 +552,8 @@ function renderMetricsGlobal(wrap) {
     cum += `<td class="metric-cell-num">${fmtMbps(c.throughput_mbps)}</td>`;
     cum += `<td class="metric-cell-num">${fmtPct(c.success_rate)}</td>`;
     cum += `<td class="metric-cell-num">${c.success||0}/${c.samples||0}</td>`;
-    cum += `<td class="metric-cell-num">${fmtBytes(c.total_bytes || 0)}</td></tr>`;
+    cum += `<td class="metric-cell-num">${fmtBytes(c.total_bytes || 0)}</td>`;
+    cum += `<td class="metric-cell-num">${protoStr(m.http_versions)}</td></tr>`;
   }
   win += '</tbody></table>';
   cum += '</tbody></table>';
@@ -567,7 +579,7 @@ function renderMetricsDomain(wrap) {
   let banner = `<div class="filter-banner" style="display:flex"><strong>${metricsDomain}</strong>&nbsp;各代理实测指标</div>`;
   // 两表列错开:窗口表 P50/P95/P99 + EWMA 吞吐(近况);累计表 均值 + 永久计数 + 累计字节(历史)。
   let win = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 P50/P95/P99</th><th>源站首字节 P50/P95/P99</th><th>成功率(近)</th><th>成功/总数(近)</th><th>错误分类(近 256)</th></tr></thead><tbody>';
-  let cum = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 均值</th><th>源站首字节 均值</th><th>吞吐 累计</th><th>成功率</th><th>总请求</th><th>累计字节</th></tr></thead><tbody>';
+  let cum = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 均值</th><th>源站首字节 均值</th><th>吞吐 累计</th><th>成功率</th><th>总请求</th><th>累计字节</th><th>协议(累计)</th></tr></thead><tbody>';
   for (const pid of pids) {
     const m = per[pid] || {};
     const per_t = m.percentiles || {};
@@ -587,7 +599,9 @@ function renderMetricsDomain(wrap) {
     cum += `<td class="metric-cell-num">${c.avg_ofb_ms != null ? Math.round(c.avg_ofb_ms)+'ms' : '\u2014'}</td>`;
     cum += `<td class="metric-cell-num">${fmtMbps(c.throughput_mbps)}</td>`;
     cum += `<td class="metric-cell-num">${fmtPct(c.success_rate)}</td>`;
-    cum += `<td class="metric-cell-num">${c.samples||0}</td></tr>`;
+    cum += `<td class="metric-cell-num">${c.samples||0}</td>`;
+    cum += `<td class="metric-cell-num">${fmtBytes(c.total_bytes || 0)}</td>`;
+    cum += `<td class="metric-cell-num">${protoStr(m.http_versions)}</td></tr>`;
   }
   win += '</tbody></table>';
   cum += '</tbody></table>';

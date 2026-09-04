@@ -2761,6 +2761,12 @@ class Router:
             # 计入错误分类;5xx 已计入 success_rate 分子,这里补错误维度)。
             if resp.status_code >= 500:
                 self.selector.record_http_error(pid, resp.status_code, domain=domain)
+            # Phase 1.4:HTTP 协议版本采集(前向代理仅 HTTP 路径可观测;HTTPS CONNECT
+            # 为裸隧道无协议版本)。resp.http_version 为 "HTTP/1.1"/"HTTP/2"/"HTTP/3",
+            # 体现该(代理,域名)实际协商到的协议能力(含 H2 多路复用即隐含复用收益)。
+            http_ver = getattr(resp, "http_version", None)
+            if http_ver:
+                self.selector.record_protocol(pid, http_ver, domain=domain)
             if buffered is not None and resp.status_code in CACHEABLE_STATUS:
                 self.httpcache._http_cache_set(method, url, resp.status_code, resp.reason_phrase,
                                                 list(resp.headers.multi_items()), buffered)

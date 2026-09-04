@@ -64,7 +64,13 @@
 | 1.1 | `selector.py:record_ttfb()` | 同步记录 **响应体大小** 与 **吞吐**(`body_bytes / transfer_time`,EWMA 平滑)。TTLB 维度已移除:盲 HTTPS 隧道无 per-response body 边界,改用「源站首字节 OFB」补足源站侧延迟(详见 §1.1 注) | 1-2h | [x] |
 | 1.2 | `selector.py` 新增 | 维护**每代理/域名的滑动窗口统计**：`success_count`, `total_count`, `latency_samples[]`(环形缓冲存 P50/P95/P99 计算) | 3-4h | [x] |
 | 1.3 | `router.py:_try_http/_try_tunnel` | 在 finally 块捕获**错误分类**（timeout/connect_error/5xx/tls_error/cancelled），写入域名级错误计数器 | 2h | [x] |
-| 1.4 | `selector.py` 新增 | 域名级 **HTTP 协议版本、连接复用、TLS 会话恢复** 标记采集（从 httpx response/connection 拿） | 2h | [ ] |
+| 1.4 | `selector.py` 新增 | 域名级 **HTTP 协议版本、连接复用、TLS 会话恢复** 标记采集（从 httpx response/connection 拿） | 2h | [~] 部分完成（见下注） |
+
+> **Phase 1.4 实际落地说明**（前向代理可观测性边界）：
+> - **HTTP 协议版本**：✅ 已采集。`record_protocol(pid, resp.http_version, domain)` 在 HTTP 路径（收到 httpx `resp` 时）记录 `http_versions` 累计计数 `{版本串: n}`（"HTTP/1.1"/"HTTP/2"/"HTTP/3"），双作用域（全局+域名桶）双写、随 metric_dict JSON 持久（跨重启可追溯）。仪表盘累计表新增「协议(累计)」列，展示如 `H2 62% / H1 38%`。
+> - **连接复用率**：❌ 不可观测。httpx 不暴露公开「连接是否复用」标记；HTTPS CONNECT 为裸字节隧道，复用发生在上游连接池内部。以 **HTTP/2 占比**（`http_versions` 中 H2 比例）作为连接效率的可观测代理信号——H2 多路复用即隐含复用收益。
+> - **TLS 会话恢复**：❌ 不可观测。CONNECT 隧道中 TLS 终止在「上游代理 ↔ 源站」之间，对本代理完全不透明，无法采集，**不伪造指标**。
+> 结论：协议版本为 Phase 2 健康分数提供了真实输入（H2 能力/占比）；连接复用与 TLS 恢复因前向代理架构本质不可见，审阅建议中的「连接复用率 / HTTP2·3 支持 / TLS session reuse 纳入健康分数」仅协议版本维度可落地。
 
 > **实际落地的差异说明**（相对上表原设想）:
 > - 为不破坏既有排序/熔断语义,新增观测结构与选择用 `_quality`/`_domain_quality`
