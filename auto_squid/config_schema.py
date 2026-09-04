@@ -375,6 +375,20 @@ class CircuitConfig(ConfigBase):
     http_read_timeout_sec: HTTP 单发读首字节超时(秒,默认 3.0)。_upstream_timeout.read,
                        防被钉代理转发 HTTP 首字节偶发卡死(原 10s;收敛 header 等待过去
                        曾非净赢,见 router 注释,生产灰度盯 p99/fd)。
+    cost_sort_enabled: 多目标 Cost 排序(Phase 2,默认 True)。开启后竞速候选不再只按
+                       纯 EWMA 延迟排序,而是按「延迟(P99 尾部优先)+ 成功率 + 吞吐」加权
+                       Cost 升序排列(越小越优)。置 False 即完整回退纯 EWMA(零行为变化,
+                       canary/回滚开关)。权重与延迟主项见下列字段。
+    cost_latency_metric: Cost 主延迟项用哪个: "p99"(默认,累积 TTFB 的 P99,尾部保护)
+                       或 "ewma"(质量 EWMA)。P99 样本不足时自动回退 EWMA,再不足则中性。
+    cost_weight_latency: 延迟主项权重(默认 1.0)。
+    cost_weight_success_rate: 成功率项权重(默认 0.6)。用平滑成功率的失败概率(1-rate),
+                       域名级优先、缺则回退全局,避免选到最差成功率代理。
+    cost_weight_throughput: 吞吐项权重(默认 0.1)。实测隧道流量占多数时按响应体的吞吐
+                       基本测不到(近 0),故权重极低且仅当累计字节达下限才参与,否则噪声。
+    cost_latency_min_samples: P99 延迟项所需 digest 最小样本(默认 1,与 EWMA obs>=1 一致:
+                       单样本延迟即计入;多样本时才是稳健尾部估计)。
+    cost_throughput_min_bytes: 吞吐项所需累计字节下限(默认 1_000_000=1MB),低于则吞吐项不参与。
     """
     probe_interval_sec: float = Field(30.0, description="后台探活周期(秒),0=关闭主动探活")
     probe_canary: str = Field("1.1.1.1:443", description="探活目标 host:port(单 canary;被 probe_canaries 覆盖)")
@@ -400,6 +414,14 @@ class CircuitConfig(ConfigBase):
     connect_tunnel_timeout_sec: float = Field(3.0, description="CONNECT 隧道建连/读响应超时(秒):_try_tunnel 向源站 CONNECT 的 open_connection 与等 200 的统一上限,防某代理 egress→源站建连/握手偶发卡死把请求拖成 10s+。原硬编码 15s。测得的 CDN 首字节实际 0.6s,3s 给 5 倍余量。")
     http_read_timeout_sec: float = Field(3.0, description="HTTP 单发读首字节超时(秒):_upstream_timeout.read,防某被钉代理转发 HTTP 首字节偶发卡死。原 10s。注意 router.py:480-483 记载收紧 header 等待曾非净赢(引爆 soak p99+fd 堆积)已回退,故本值生产灰度须盯 p99/fd。")
     local_direct_timeout_sec: float = Field(10.0, description="本地域名白名单(local_direct_domains)强制直连的超时(秒):白名单目标的 HTTP read 与 CONNECT 建连/读响应用该值,而非全局 http_read_timeout_sec/connect_tunnel_timeout_sec(默认 3s)。本地回环/内网链路不需要 3s 那么紧——生产本机管理面板(10.14.25.86:20128)过载时被全局 3s 掐断、页面半截。默认 10s 给 4 倍余量(过载实测 ttfb 1.7-2.4s)。仅影响白名单强制路径;竞速/粘性 local 仍走全局 3s。")
+    # ── Phase 2: 多目标 Cost 排序 ──────────────────────────────
+    cost_sort_enabled: bool = Field(True, description="多目标 Cost 排序总开关(Phase 2)。True 时竞速候选按「延迟(P99 尾部优先)+ 成功率 + 吞吐」加权 Cost 升序排列;False 即回退纯 EWMA(零行为变化,canary/回滚开关)")
+    cost_latency_metric: str = Field("p99", description="Cost 主延迟项: p99(累积 TTFB P99,尾部优先) 或 ewma(质量 EWMA)。P99 样本不足自动回退 EWMA")
+    cost_weight_latency: float = Field(1.0, description="Cost 延迟主项权重")
+    cost_weight_success_rate: float = Field(0.6, description="Cost 成功率项权重(用平滑成功率的失败概率,域名级优先)")
+    cost_weight_throughput: float = Field(0.1, description="Cost 吞吐项权重(实测隧道流量占多数,按响应体吞吐近 0,故极低且仅足量字节参与)")
+    cost_latency_min_samples: int = Field(1, description="P99 延迟项所需 digest 最小样本(默认 1,与 EWMA obs>=1 一致)")
+    cost_throughput_min_bytes: int = Field(1_000_000, description="吞吐项所需累计字节下限(默认 1MB),低于则吞吐项不参与")
 
 
 class RouterConfig(ConfigBase):

@@ -121,7 +121,15 @@ class ProxySelector:
                  concurrency_limit_max: int = 128,
                  concurrency_add_on_success: int = 4,
                  concurrency_mult_on_failure: float = 0.5,
-                 concurrency_failure_window: int = 20):
+                 concurrency_failure_window: int = 20,
+                 # ── Phase 2: 多目标 Cost 排序 ──
+                 cost_sort_enabled: bool = True,
+                 cost_latency_metric: str = "p99",
+                 cost_weight_latency: float = 1.0,
+                 cost_weight_success_rate: float = 0.6,
+                 cost_weight_throughput: float = 0.1,
+                 cost_latency_min_samples: int = 1,
+                 cost_throughput_min_bytes: int = 1_000_000):
         self.proxy_store = proxy_store
         self.circuit_threshold = max(1, circuit_threshold)
         self.circuit_max_backoff = max(1.0, circuit_max_backoff)
@@ -142,6 +150,17 @@ class ProxySelector:
         self._conc_add = max(1, concurrency_add_on_success)
         self._conc_mult = max(0.0, min(1.0, concurrency_mult_on_failure))
         self._conc_win = max(1, concurrency_failure_window)
+        # ── Phase 2: 多目标 Cost 排序 ──
+        # 竞速候选不再只按纯 EWMA 延迟排序,而是按「延迟(P99 尾部优先)+ 成功率 +
+        # 吞吐」加权 Cost 升序排列(越小越优)。cost_sort_enabled=False 即完整回退
+        # 纯 EWMA(与旧 _weighted_rank 逐位等价),作为 canary/回滚开关(默认开)。
+        self.cost_sort_enabled = bool(cost_sort_enabled)
+        self.cost_latency_metric = cost_latency_metric if cost_latency_metric in ("p99", "ewma") else "p99"
+        self.cost_weight_latency = max(0.0, float(cost_weight_latency))
+        self.cost_weight_success_rate = max(0.0, float(cost_weight_success_rate))
+        self.cost_weight_throughput = max(0.0, float(cost_weight_throughput))
+        self.cost_latency_min_samples = max(1, int(cost_latency_min_samples))
+        self.cost_throughput_min_bytes = max(0, int(cost_throughput_min_bytes))
         # {pid: {"limit": int, "ok": int, "fail": int}} —— ok/fail 为最近窗口计数。
         self._conc: dict[str, dict[str, float]] = {}
         # 每代理质量: {pid: {"ewma_ttfb": float(秒), "obs": int}}。
@@ -1046,6 +1065,118 @@ class ProxySelector:
         """
         return 1 if self._in_slow_start(pid) else 0
 
+    # ── Phase 2: 多目标 Cost 排序 ──────────────────────────────
+    def _cost_raw_inputs(self, pid: str, domain: Optional[str]):
+        """取某代理在 Cost 函数三维度上的原始值(域名级优先,缺则回退全局)。
+
+        返回 (latency, sr_failure, throughput):
+          - latency: 主延迟项。cost_latency_metric=="p99" 时用累积 TTFB 的 P99
+            (digest 样本 >= cost_latency_min_samples);不足则回退域名/全局 EWMA
+            (obs>=1);都缺则 None(中性)。
+          - sr_failure: 1 - 平滑成功率(累计,域名优先)。无样本则 None。
+          - throughput: 累计 throughput_ewma,仅当 total_bytes >=
+            cost_throughput_min_bytes 才返回(防隧道零吞吐噪声);否则 None。
+        None 表示「该项无数据」,由 _cost_scores 当作中性 0.5 处理。
+        """
+        g = self._proxy_metrics.get(pid, {}).get("metrics")
+        d = None
+        if domain is not None:
+            d = self._domain_metrics.get(domain, {}).get(pid, {}).get("metrics")
+        # 延迟主项
+        lat = None
+        if self.cost_latency_metric == "p99":
+            for m in (d, g):
+                dig = m.get("cum_ttfb_digest") if m else None
+                if isinstance(dig, TDigest) and dig.get("n", 0) >= self.cost_latency_min_samples:
+                    p99 = dig.percentiles().get("p99")
+                    if p99 is not None:
+                        lat = p99
+                        break
+        if lat is None:  # 回退 EWMA(域名优先)
+            q = self._domain_quality.get(domain, {}).get(pid) if domain is not None else None
+            if q is None:
+                q = self._quality.get(pid)
+            if q:
+                ewma = q.get("ewma_ttfb")
+                if ewma is not None and int(q.get("obs", 0)) >= 1:
+                    lat = ewma
+        # 成功率失败概率(域名优先)
+        sr_fail = None
+        for m in (d, g):
+            if m:
+                tot = int(m.get("total", 0))
+                if tot >= 1:
+                    sr_fail = 1.0 - self._smooth_rate(int(m.get("success", 0)), tot)
+                    break
+        # 吞吐(仅足量字节参与)
+        tp = None
+        for m in (d, g):
+            if m and int(m.get("total_bytes", 0)) >= self.cost_throughput_min_bytes:
+                v = m.get("throughput_ewma")
+                if v is not None:
+                    tp = v
+                    break
+        return (lat, sr_fail, tp)
+
+    def _cost_scores(self, candidates: List[str], domain: Optional[str]) -> dict:
+        """计算候选集中每个代理的 Cost(越小越优),候选集内做 min-max 归一化。
+
+        归一化使各维度权重直接可比、与量纲无关:低优指标 norm=(x-min)/(max-min),
+        高优(吞吐)用 (max-x)/(max-min);max==min 该项贡献 0;缺数据项中性 0.5。
+        最终乘 _failure_penalty_mult 与 (1+active)^lb_bias,保留既有负载均衡 /
+        早告警语义(与 _weighted_rank 一致)。返回 {pid: cost}。
+        """
+        raw = {pid: self._cost_raw_inputs(pid, domain) for pid in candidates}
+
+        def _bounds(idx):
+            vals = [r[idx] for r in raw.values() if r[idx] is not None]
+            if not vals:
+                return None, None
+            return min(vals), max(vals)
+
+        lat_min, lat_max = _bounds(0)
+        sr_min, sr_max = _bounds(1)
+        tp_min, tp_max = _bounds(2)
+        # 负载因子(fail_penalty × least-active)先折进**延迟值本身**,再对"有效延迟"
+        # 做归一化。原因:legacy _weighted_rank = ewma × load_mult,归一化作用于单代理
+        # 值;若先归一化再乘 load_mult,会因"全局归一化 vs 每代理乘子"错配而破坏与
+        # 纯 EWMA 的顺序等价性。折进延迟后 norm(lat_eff) 与 (ewma×load_mult) 单调同序,
+        # 故"仅延迟"场景下 cost 排序与 legacy 逐位等价(既有排序测试不破)。
+        lat_eff = {}
+        for pid in candidates:
+            lat = raw[pid][0]
+            mult = self._failure_penalty_mult(pid)
+            if self.lb_bias > 0:
+                active = self._in_flight.get(pid, 0)
+                if active:
+                    mult *= (1.0 + active) ** self.lb_bias
+            lat_eff[pid] = (lat * mult) if lat is not None else None
+        eff_vals = [v for v in lat_eff.values() if v is not None]
+        eff_min, eff_max = (min(eff_vals), max(eff_vals)) if eff_vals else (None, None)
+        scores = {}
+        for pid in candidates:
+            lat, sr_fail, tp = raw[pid]
+            # 延迟:用折过负载的有效延迟做 min-max;缺延迟则中性 0.5。
+            if lat_eff[pid] is not None and eff_min is not None and eff_max is not None:
+                lat_norm = (lat_eff[pid] - eff_min) / (eff_max - eff_min) if eff_max > eff_min else 0.0
+            else:
+                lat_norm = 0.5
+            # 成功率失败概率(低优)
+            if sr_fail is not None and sr_min is not None and sr_max is not None:
+                sr_norm = (sr_fail - sr_min) / (sr_max - sr_min) if sr_max > sr_min else 0.0
+            else:
+                sr_norm = 0.5
+            # 吞吐(高优 -> 惩罚 = (max - x)/(max-min))
+            if tp is not None and tp_min is not None and tp_max is not None:
+                tp_norm = (tp_max - tp) / (tp_max - tp_min) if tp_max > tp_min else 0.0
+            else:
+                tp_norm = 0.5
+            # base:三项加权和;成功率/吞吐作为质量项与延迟项并列(均不额外乘负载因子)。
+            scores[pid] = (self.cost_weight_latency * lat_norm
+                           + self.cost_weight_success_rate * sr_norm
+                           + self.cost_weight_throughput * tp_norm)
+        return scores
+
     def ordered_proxies(self) -> List[str]:
         """返回按加权 least-request 权重(快且不忙者靠前)排序的已启用代理列表。
 
@@ -1064,9 +1195,15 @@ class ProxySelector:
         if self.concurrency_enabled:
             enabled = [p for p in enabled if not self._at_concurrency_limit(p.id)]
         random.shuffle(enabled)
-        enabled.sort(key=lambda p: (self._slow_start_rank(p.id),
-                                    self._quality_rank(p.id)[0],  # 未知质量垫底
-                                    self._weighted_rank(p.id)))
+        if self.cost_sort_enabled:
+            scores = self._cost_scores([p.id for p in enabled], None)
+            enabled.sort(key=lambda p: (self._slow_start_rank(p.id),
+                                        self._quality_rank(p.id)[0],  # 未知质量垫底
+                                        scores[p.id]))
+        else:
+            enabled.sort(key=lambda p: (self._slow_start_rank(p.id),
+                                        self._quality_rank(p.id)[0],  # 未知质量垫底
+                                        self._weighted_rank(p.id)))
         return [p.id for p in enabled]
 
     def _domain_quality_rank(self, domain_obs: Optional[dict], pid: str) -> tuple:
@@ -1133,9 +1270,15 @@ class ProxySelector:
         if self.concurrency_enabled:
             enabled = [p for p in enabled if not self._at_concurrency_limit(p.id)]
         random.shuffle(enabled)
-        enabled.sort(key=lambda p: (self._slow_start_rank(p.id),
-                                    self._domain_quality_rank(domain_obs, p.id)[0],
-                                    self._domain_weighted_rank(domain_obs, p.id)))
+        if self.cost_sort_enabled:
+            scores = self._cost_scores([p.id for p in enabled], domain)
+            enabled.sort(key=lambda p: (self._slow_start_rank(p.id),
+                                        self._domain_quality_rank(domain_obs, p.id)[0],
+                                        scores[p.id]))
+        else:
+            enabled.sort(key=lambda p: (self._slow_start_rank(p.id),
+                                        self._domain_quality_rank(domain_obs, p.id)[0],
+                                        self._domain_weighted_rank(domain_obs, p.id)))
         return [p.id for p in enabled]
 
     def best_proxy(self) -> Optional[str]:

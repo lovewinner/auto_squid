@@ -2184,8 +2184,14 @@ class TestOrderedForDomain:
 
     def test_domain_fast_first(self):
         """fast 全局慢但该域名快 → ordered_for_domain 首位是 fast,而
-        ordered_proxies 首位仍是 slow(全局 EWMA 污染场景)。"""
+        ordered_proxies 首位仍是 slow(全局 EWMA 污染场景)。
+
+        本测试验证的是「域名级 vs 全局」的 EWMA 排序机制,故显式关闭 Phase 2
+        多目标 Cost 排序(其默认开,主延迟项用 P99 尾部,全局赢家会随尾部而非
+        均值翻转)。Cost 排序本身由 tests/test_phase_metrics.py 的专属用例覆盖。
+        """
         sel = self._sel()
+        sel.cost_sort_enabled = False
         # slow 全局快、该域名慢;fast 全局慢、该域名快。
         sel.record_ttfb('slow', 0.02, 'other.com')
         sel.record_ttfb('slow', 0.30, 'example.com')
@@ -2420,7 +2426,12 @@ class TestCircuitBreaker:
         r = Router(ps, listen_host=HOST, listen_port=10829, max_retries=2,
                    probe_interval_sec=0.0, circuit_threshold=1,
                    circuit_max_backoff=100.0, slow_start_window=60.0,
-                   slow_start_success=2, db_path=tempfile.mktemp(suffix='.db'))
+                   slow_start_success=2, db_path=tempfile.mktemp(suffix='.db'),
+                   # 显式关闭 Phase 2 多目标 Cost 排序:本测试验证 slow-start 分层
+                   # (垫底→恢复完整权重)机制,而 p1 早期失败拉低了成功率,在 Cost
+                   # 排序下会正确地不优先——那会掩盖"是否恢复正常权重"的判据。
+                   # Cost 排序由 tests/test_phase_metrics.py 专属用例覆盖。
+                   cost_sort_enabled=False)
         try:
             sel = r.selector
             # p1 熔断(阈值 1 → 一次失败即熔断),退避期 2s(circuit_max_backoff 未达)。

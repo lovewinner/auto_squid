@@ -16,7 +16,7 @@ import pytest
 
 from auto_squid.config_schema import CircuitConfig, RouterConfig
 from auto_squid.digest import TDigest
-from auto_squid.proxy_store import ProxyStore
+from auto_squid.proxy_store import ProxyInfo, ProxyStore
 from auto_squid.router import Router
 from auto_squid.selector import ProxySelector
 
@@ -288,3 +288,106 @@ async def test_probe_get_disabled_by_default():
         await r._maybe_probe_get(mock.Mock(id="p1"))
     assert r.probe_get_sent == 0
     assert sel._domain_metrics == {}
+
+
+# ── Phase 2: 多目标 Cost 排序 ────────────────────────────
+def _store_with(*pids):
+    """建一个含指定 pid 的真实 ProxyStore(排序需要 proxy_store.list())。"""
+    store = ProxyStore()
+    for i, pid in enumerate(pids):
+        store.add(ProxyInfo(id=pid, host=f"h{i}", port=3128))
+    return store
+
+
+def test_cost_sort_default_enabled():
+    """默认开启(canary 默认 ON;关闭即回滚纯 EWMA)。"""
+    sel = ProxySelector(_store_with("p1"))
+    assert sel.cost_sort_enabled is True
+    assert sel.cost_latency_metric == "p99"
+
+
+def test_cost_sort_equivalent_to_ewma_when_only_latency():
+    """仅延迟差异时,Cost 排序与纯 EWMA 顺序一致(负载因子已折进延迟再归一化)。"""
+    sel = ProxySelector(_store_with("fast", "mid", "slow"))
+    sel.record_ttfb("fast", 0.02)
+    sel.record_ttfb("mid", 0.10)
+    sel.record_ttfb("slow", 0.80)
+    cost_order = sel.ordered_proxies()
+    sel.cost_sort_enabled = False
+    ewma_order = sel.ordered_proxies()
+    assert cost_order == ["fast", "mid", "slow"]
+    assert ewma_order == cost_order
+
+
+def test_cost_sort_prefers_high_success_rate():
+    """延迟相等、成功率差异大 → 高成功率者靠前(纯 EWMA 下会随机)。"""
+    sel = ProxySelector(_store_with("A", "B"))
+    sel.record_ttfb("A", 0.10)
+    sel.record_ttfb("B", 0.10)
+    sel._proxy_metrics["A"]["metrics"].update(success=99, total=100)
+    sel._proxy_metrics["B"]["metrics"].update(success=50, total=100)
+    for _ in range(20):
+        assert sel.ordered_proxies()[0] == "A"
+
+
+def test_cost_sort_disabled_equals_legacy():
+    """cost_sort_enabled=False 时排序与 _weighted_rank(纯 EWMA)完全一致。"""
+    sel = ProxySelector(_store_with("p1", "p2", "p3"), cost_sort_enabled=False)
+    sel.record_ttfb("p1", 0.30)
+    sel.record_ttfb("p2", 0.01)
+    sel.record_ttfb("p3", 0.10)
+    order = sel.ordered_proxies()
+    legacy = sorted(["p1", "p2", "p3"], key=sel._weighted_rank)
+    assert order == legacy == ["p2", "p3", "p1"]
+
+
+def test_cost_sort_missing_data_neutral():
+    """全缺指标的代理:cost 取中性值(各项 0.5),不崩且未知质量仍垫底。"""
+    sel = ProxySelector(_store_with("known", "unknown"))
+    sel.record_ttfb("known", 0.05)
+    scores = sel._cost_scores(["known", "unknown"], None)
+    w_sum = (sel.cost_weight_latency + sel.cost_weight_success_rate
+             + sel.cost_weight_throughput)
+    assert scores["unknown"] == pytest.approx(0.5 * w_sum)
+    assert scores["known"] < scores["unknown"]
+    assert sel.ordered_proxies()[-1] == "unknown"
+
+
+def test_cost_sort_throughput_ignored_when_bytes_low():
+    """累计字节低于 cost_throughput_min_bytes 时吞吐项不参与(隧道零吞吐噪声防护)。"""
+    sel = ProxySelector(_store_with("p1", "p2"), cost_throughput_min_bytes=1_000_000)
+    sel.record_ttfb("p1", 0.10)
+    sel.record_ttfb("p2", 0.20)
+    m1 = sel._proxy_metrics["p1"]["metrics"]
+    m2 = sel._proxy_metrics["p2"]["metrics"]
+    # 字节不足:吞吐近 0 / 极高都应被忽略 → 两代理 cost 差仅来自延迟
+    m1.update(throughput_ewma=0.0001, total_bytes=100)
+    m2.update(throughput_ewma=5.0, total_bytes=100)
+    diff_low = sel._cost_scores(["p1", "p2"], None)
+    # 字节充足:吞吐项生效,p2 的高吞吐抵消部分延迟劣势 → 差距缩小
+    m1["total_bytes"] = m2["total_bytes"] = 2_000_000
+    diff_high = sel._cost_scores(["p1", "p2"], None)
+    assert (diff_low["p2"] - diff_low["p1"]) > (diff_high["p2"] - diff_high["p1"])
+
+
+def test_cost_latency_metric_ewma_vs_p99():
+    """切换主延迟项会改变排序:均值口径选 spiky,尾部(P99)口径选 steady。"""
+    sel = ProxySelector(_store_with("spiky", "steady"), cost_latency_metric="ewma")
+    # spiky: 极快 + 极慢 → 均值小、尾部大;steady: 两次中等。
+    sel.record_ttfb("spiky", 0.02)
+    sel.record_ttfb("spiky", 0.30)
+    sel.record_ttfb("steady", 0.10)
+    sel.record_ttfb("steady", 0.20)
+    assert sel.ordered_proxies()[0] == "spiky"      # 均值口径
+    sel.cost_latency_metric = "p99"
+    assert sel.ordered_proxies()[0] == "steady"     # 尾部口径(P99 尾部优先)
+
+
+def test_cost_thresholds_reachable_from_config():
+    """Cost 配置挂在 CircuitConfig 上,router 经 router_cfg.circuit 读取。"""
+    cc = CircuitConfig(cost_sort_enabled=False, cost_latency_metric="ewma",
+                       cost_weight_success_rate=0.9)
+    assert cc.cost_sort_enabled is False
+    assert cc.cost_latency_metric == "ewma"
+    assert cc.cost_weight_success_rate == 0.9
+    assert RouterConfig().circuit.cost_sort_enabled is True  # 默认开

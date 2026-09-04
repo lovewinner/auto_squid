@@ -156,7 +156,7 @@ class Router:
     生命周期:start() 开始监听 → handle_client 处理每个连接 → stop() 优雅关闭。
     """
 
-    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, sticky_probe_interval_sec: float = 0.0, sticky_probe_fanout: int = 2, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, probe_with_get: bool = False, probe_get_targets: Optional[List[str]] = None, probe_get_interval_sec: float = 60.0, probe_get_timeout_sec: float = 5.0, probe_get_max_bytes: int = 65536, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, fail_penalty_weight: float = _FAIL_PENALTY_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, single_send_degrade_success_rate: float = 0.0, single_send_degrade_p99_ms: float = 0.0, single_send_degrade_min_throughput: float = 0.0, single_send_slow_log_ms: float = 0.0, connect_tunnel_timeout_sec: float = 3.0, http_read_timeout_sec: float = 3.0, local_direct_domains: Optional[List[str]] = None, local_direct_timeout_sec: float = 10.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False, conn_pool_refill_pause_minutes: float = 60.0, conn_pool_refill_pause_silence_sec: float = 120.0, conn_pool_refill_pause_activity_window: Optional[float] = None, conn_pool_refill_pause_min_requests: int = 3, conn_pool_established_reuse: bool = False, conn_pool_established_idle_timeout: Optional[float] = None, conn_pool_prehandshake: bool = False, conn_pool_prehandshake_throttle_window_sec: float = 0.0, conn_pool_prehandshake_throttle_max_per_window: int = 0, cluster_predict: bool = False, cluster_window_sec: float = 2.0, cluster_predict_topk: int = 3, cluster_min_support: int = 2, cluster_graph_ttl_sec: int = 86400, cluster_graph_max_entries: int = 100_000, cluster_predict_throttle_sec: float = 30.0, cluster_proxy_fanout: int = 2, cluster_probe_decay_sec: float = 3600.0, cluster_pool_idle_timeout: float = 600.0, router_cfg: Optional[RouterConfig] = None):
+    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, sticky_probe_interval_sec: float = 0.0, sticky_probe_fanout: int = 2, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, probe_with_get: bool = False, probe_get_targets: Optional[List[str]] = None, probe_get_interval_sec: float = 60.0, probe_get_timeout_sec: float = 5.0, probe_get_max_bytes: int = 65536, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, fail_penalty_weight: float = _FAIL_PENALTY_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, single_send_degrade_success_rate: float = 0.0, single_send_degrade_p99_ms: float = 0.0, single_send_degrade_min_throughput: float = 0.0, single_send_slow_log_ms: float = 0.0, cost_sort_enabled: bool = True, cost_latency_metric: str = "p99", cost_weight_latency: float = 1.0, cost_weight_success_rate: float = 0.6, cost_weight_throughput: float = 0.1, cost_latency_min_samples: int = 1, cost_throughput_min_bytes: int = 1_000_000, connect_tunnel_timeout_sec: float = 3.0, http_read_timeout_sec: float = 3.0, local_direct_domains: Optional[List[str]] = None, local_direct_timeout_sec: float = 10.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False, conn_pool_refill_pause_minutes: float = 60.0, conn_pool_refill_pause_silence_sec: float = 120.0, conn_pool_refill_pause_activity_window: Optional[float] = None, conn_pool_refill_pause_min_requests: int = 3, conn_pool_established_reuse: bool = False, conn_pool_established_idle_timeout: Optional[float] = None, conn_pool_prehandshake: bool = False, conn_pool_prehandshake_throttle_window_sec: float = 0.0, conn_pool_prehandshake_throttle_max_per_window: int = 0, cluster_predict: bool = False, cluster_window_sec: float = 2.0, cluster_predict_topk: int = 3, cluster_min_support: int = 2, cluster_graph_ttl_sec: int = 86400, cluster_graph_max_entries: int = 100_000, cluster_predict_throttle_sec: float = 30.0, cluster_proxy_fanout: int = 2, cluster_probe_decay_sec: float = 3600.0, cluster_pool_idle_timeout: float = 600.0, router_cfg: Optional[RouterConfig] = None):
         """构造路由器。
 
         参数:
@@ -311,6 +311,14 @@ class Router:
             single_send_degrade_p99_ms = cc.single_send_degrade_p99_ms
             single_send_degrade_min_throughput = cc.single_send_degrade_min_throughput
             single_send_slow_log_ms = cc.single_send_slow_log_ms
+            # ── Phase 2: 多目标 Cost 排序 ──
+            cost_sort_enabled = cc.cost_sort_enabled
+            cost_latency_metric = cc.cost_latency_metric
+            cost_weight_latency = cc.cost_weight_latency
+            cost_weight_success_rate = cc.cost_weight_success_rate
+            cost_weight_throughput = cc.cost_weight_throughput
+            cost_latency_min_samples = cc.cost_latency_min_samples
+            cost_throughput_min_bytes = cc.cost_throughput_min_bytes
             connect_tunnel_timeout_sec, http_read_timeout_sec = cc.connect_tunnel_timeout_sec, cc.http_read_timeout_sec
             auth_enabled, auth_username, auth_password = auth.enabled, auth.username, auth.password
             enable_http_cache, http_cache_ttl = hc.enabled, hc.ttl
@@ -326,6 +334,14 @@ class Router:
             concurrency_limit_min, concurrency_limit_max = cl.min, cl.max
             concurrency_add_on_success, concurrency_mult_on_failure = cl.add_on_success, cl.mult_on_failure
             concurrency_failure_window = cl.failure_window
+            # ── Phase 2: 多目标 Cost 排序 ──
+            cost_sort_enabled = cc.cost_sort_enabled
+            cost_latency_metric = cc.cost_latency_metric
+            cost_weight_latency = cc.cost_weight_latency
+            cost_weight_success_rate = cc.cost_weight_success_rate
+            cost_weight_throughput = cc.cost_weight_throughput
+            cost_latency_min_samples = cc.cost_latency_min_samples
+            cost_throughput_min_bytes = cc.cost_throughput_min_bytes
             conn_pool_enabled, conn_pool_per_proxy = pc.enabled, pc.per_proxy
             conn_pool_total, conn_pool_idle_timeout = pc.total, pc.idle_timeout
             conn_pool_refill_interval, conn_pool_refill_target = pc.refill_interval, pc.refill_target
@@ -365,7 +381,14 @@ class Router:
             concurrency_limit_max=concurrency_limit_max,
             concurrency_add_on_success=concurrency_add_on_success,
             concurrency_mult_on_failure=concurrency_mult_on_failure,
-            concurrency_failure_window=concurrency_failure_window)
+            concurrency_failure_window=concurrency_failure_window,
+            cost_sort_enabled=cost_sort_enabled,
+            cost_latency_metric=cost_latency_metric,
+            cost_weight_latency=cost_weight_latency,
+            cost_weight_success_rate=cost_weight_success_rate,
+            cost_weight_throughput=cost_weight_throughput,
+            cost_latency_min_samples=cost_latency_min_samples,
+            cost_throughput_min_bytes=cost_throughput_min_bytes)
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.max_retries = max_retries

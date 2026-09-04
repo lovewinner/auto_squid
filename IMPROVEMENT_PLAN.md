@@ -103,21 +103,62 @@
 
 ### Phase 2: 加权排序函数重构（核心收益）
 
-> 状态: [ ] 未开始。依赖 Phase 1 观测数据稳定后再定权重形式。
+> 状态: [x] **已完成**（待提交）。默认开启，配 `cost_sort_enabled` 一键回滚。
 
-**目标**: 把排序权重从单一 `EWMA_TTFB` 升级为**多目标综合 Cost**：
+**设计依据（`auto_squid.db` 实际数据，7 代理逐项核对后定权重）**：
+
+| 指标 | 实测分布 | 结论 |
+|------|----------|------|
+| 成功率(累计) | 0.935 – 0.984 | 高度聚集、区分度低；不能作唯一信号，但须纳入避免选到最差者 |
+| TTFB(avg) | 66 – 151 ms（采样数千） | 主区分信号 |
+| TTFB P99（digest） | 可用 | 选定作为主延迟项 |
+| 吞吐 EWMA | 0.0009 – 0.008 MB/s（近 0） | 多数流量为 CONNECT 隧道，按响应体计的吞吐基本测不到 → **低权重 + 仅足量字节参与**，否则除零/噪声 |
+| OFB | 样本参差(96–474) | 不作独立主信号 |
+
+**Cost 函数**（候选集内 min–max 归一化，权重直接可比、与量纲无关）：
 
 ```
-Cost = w1 × Latency_P99 + w2 × (1 - Success_Rate) + w3 × (1/Throughput) + w4 × Retry_Rate
+base_cost = w_lat × norm(latency)          # p99（默认，尾部优先）或 ewma
+          + w_sr  × norm(1 - success_rate) # 平滑成功率，域名级优先
+          + w_tp  × norm(1 - throughput)   # 仅累计字节 >= 下限时纳入
+final     = 上面三项加权和（负载因子已折进延迟值再归一化）
 ```
 
-- 可配置权重（`selector.py` 构造参数或 `RouterConfig` 字段）
-- 保留 least-active 惩罚 `(1 + in_flight)^bias`
-- 失败惩罚改用 `1 / Success_Rate` 而非线性 `consec_fail`
+**关键实现取舍（两个已修的坑）**：
+1. **负载因子必须先折进延迟值再归一化**：`lat_eff = lat × fail_penalty_mult × (1+active)^lb_bias`，再对 `lat_eff` 做 min–max。若"先归一化再乘每代理负载因子"，会因「全局归一化 vs 每代理乘子」错配而破坏与纯 EWMA 的顺序等价性（实测会让 `test_backlog_deprioritizes_fast_proxy` 等 4 个用例翻转）。折进后 `norm(lat_eff)` 与 legacy `ewma × load_mult` 单调同序，**仅延迟场景下 Cost 排序与纯 EWMA 逐位等价**。
+2. **缺失数据取中性 0.5**（既不奖也不罚）；某指标全缺则该项对所有候选贡献 0；`max==min` 时贡献 0。
 
-**实现位置**: `selector.py:_weighted_rank()`, `_domain_weighted_rank()`, `ordered_for_domain()`
+**配置**（新增于 `CircuitConfig`，router 经 `router_cfg.circuit` 读取，与 `lb_bias` 同级；`Router.__init__` 也带同名默认参数，保证 kwargs 与 router_cfg 两条构造路径一致）：
 
-**兼容性**: 旧配置（仅 EWMA）作为默认回退，新权重字段默认 0 不生效。
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `cost_sort_enabled` | **True** | 总开关。False 即完整回退纯 EWMA（零行为变化，canary/回滚） |
+| `cost_latency_metric` | `"p99"` | 主延迟项：`p99`（尾部优先）/ `ewma`；P99 样本不足自动回退 EWMA |
+| `cost_weight_latency` | 1.0 | 延迟主项权重 |
+| `cost_weight_success_rate` | 0.6 | 成功率项权重 |
+| `cost_weight_throughput` | 0.1 | 吞吐项权重（实测近 0 故极低） |
+| `cost_latency_min_samples` | 1 | P99 项所需 digest 最小样本（与 EWMA obs≥1 一致；设 8 会让单样本场景延迟项中性化→排序随机） |
+| `cost_throughput_min_bytes` | 1_000_000 | 吞吐项所需累计字节下限 |
+
+**行为变化（P99 尾部优先的预期后果）**：延迟均值与尾部不一致时，赢家会从"均值最优"翻转为"尾部最优"（例：spiky 0.02+0.30 均值 0.104 但尾部 0.30，steady 0.10+0.20 均值 0.13 但尾部 0.20 → 均值口径选 spiky，尾部口径选 steady）。这是所选策略的预期语义，非回归。
+
+**测试**（`tests/test_phase_metrics.py` 增 8 例）：默认开启、仅延迟时与 EWMA 等价、高成功率优先、关闭即等价 legacy、缺数据中性、吞吐字节下限、ewma-vs-p99 翻转、配置可达。全量 **302 通过**（基线 278）。
+
+**回归处理**：`TestOrderedForDomain::test_domain_fast_first` 与 `TestCircuitBreaker::test_backoff_expiry_triggers_slow_start` 本意是验证 legacy 机制（域名级 vs 全局 EWMA 语义 / slow-start 分层），已在测试内显式 `cost_sort_enabled=False` 保留原语义；Cost 由上述专属用例覆盖。
+
+**实现位置**: `selector.py:_cost_raw_inputs()` / `_cost_scores()` / `ordered_proxies()` / `ordered_for_domain()`；`router.py` 配置解包与透传；`config_schema.py: CircuitConfig`。
+
+> ⚠️ **排查中发现的既有 bug（非本次引入，HEAD 已存在 4 处，尚未修，列为独立待办）**：
+> `record_ttfb` / `record_origin_first_byte` / `record_http_error` / `record_failure` 的双作用域
+> 循环写成 `for scope in (self._metrics_for(pid, domain), self._metrics_for(pid, None))`——
+> 当 `domain=None` 时两次调用返回**同一个全局 dict**，循环对它写**两次**，故非域名流量的
+> 全局 `success/total/ttfb_samples/cum_ttfb_digest` 被双重计数（实测单次 `record_ttfb`
+> 后 `success=2, total=2, digest n=2`，而带 domain 时正确为 1）。
+> 后果：混合了域名/非域名记录时，全局成功率会向非域名流量倾斜（其权重被放大 2 倍），
+> 且 Laplace 平滑的先验项相对变弱。分位数取值不受影响（重复相同值）。
+> 修法：参照 `record_protocol` 的去重写法 `(g, m) if m is not g else (g,)`。
+> 未并入本次提交的原因：它会改变已落盘/运行中的指标语义与绝对值，需单独验证、
+> 并决定历史 DB 数据如何处理。
 
 ---
 
@@ -196,7 +237,7 @@ def _single_send_degraded(self, domain, pid, ref_ewma):
 | 方案 | 优点 | 缺点/风险 | 建议优先级 |
 |------|------|-----------|------------|
 | Phase 1 仅加指标不改排序 | 零风险、立即可观测真实表现 | 排序仍用旧指标，短期不改善路由 | **P0** ✅ 已完成 |
-| Phase 2 多目标 Cost 排序 | 根治"首字节快但下载慢/成功率低"代理被选中 | 需调参、权重配置复杂、可能引入震荡 | **P1（Phase1稳定后）** |
+| Phase 2 多目标 Cost 排序 | 根治"首字节快但下载慢/成功率低"代理被选中 | 需调参、权重配置复杂、可能引入震荡 | **P1** ✅ 已完成（默认开 + `cost_sort_enabled` 一键回滚；权重待生产观测微调） |
 | Phase 3 单发降级增强 | 保护缓存/粘性路径不钉死劣质代理 | 降级阈值调优需生产观测 | **P1** |
 | Phase 4 探测对齐 | 让探活数据更贴近业务 | 增加探活流量、可能触发目标站限流 | **P2（可选）** |
 | Phase 5 API 暴露 | 运维/仪表盘直接受益 | 无逻辑风险 | **P0** ✅ 已完成 |
@@ -282,7 +323,7 @@ def _single_send_degraded(self, domain, pid, ref_ewma):
 - [x] 为分位数暴露样本数/置信度并在仪表盘累计表加「终身分位」行 + 低样本警示
 - [x] 对 success_rate 使用贝叶斯平滑（Laplace）与 retry_rate 分离统计
 - [ ] 实现 metrics 标签规范并在 /metrics 中限制高基数标签
-- [ ] 设计 Phase 2 的 Cost 函数草案（含归一化/对数变换 & 默认权重）并在小流量 canary 上 A/B 验证
+- [x] 设计并实现 Phase 2 的 Cost 函数（min–max 归一化 + 默认权重，P99 尾部优先）；生产灰度盯 p99/成功率，异常即 `cost_sort_enabled=False` 回滚
 - [ ] 编写单元与集成测试覆盖新采集与排序逻辑
 
 ---
