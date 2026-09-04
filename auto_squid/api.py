@@ -522,7 +522,7 @@ function renderMetricsGlobal(wrap) {
   page = 0;
   // 两表列错开各展所长:窗口表重在 EWMA 趋势与近期计数(代理近况);
   // 累计表重在永久累计与均值(代理历史表现,跨重启可追溯)。
-  let win = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 P50/P95/P99</th><th>源站首字节 P50/P95/P99</th><th>错误分类(近 256)</th></tr></thead><tbody>';
+  let win = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 P50/P95/P99</th><th>源站首字节 P50/P95/P99</th><th>成功率(近)</th><th>成功/总数(近)</th><th>错误分类(近 256)</th></tr></thead><tbody>';
   let cum = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 均值</th><th>源站首字节 均值</th><th>吞吐 累计</th><th>成功率</th><th>成功/总数</th><th>累计字节</th></tr></thead><tbody>';
   for (const pid of pids) {
     const m = qmeta[pid] || {};
@@ -531,6 +531,8 @@ function renderMetricsGlobal(wrap) {
     win += `<tr><td class="default-proxy">${pid}</td>`;
     win += `<td class="metric-cell-num">${pctCell(m.ttfb)}</td>`;
     win += `<td class="metric-cell-num">${pctCell(m.ofb)}</td>`;
+    win += `<td class="metric-cell-num">${fmtPct(m.window_success_rate)}</td>`;
+    win += `<td class="metric-cell-num">${m.window_success_count||0}/${m.window_total||0}</td>`;
     win += `<td class="metric-cell-num err-cell">${errStr(m.errors)}</td></tr>`;
     // 累计行(同列同代理,便于左右对比)
     cum += `<tr><td class="default-proxy">${pid}</td>`;
@@ -564,7 +566,7 @@ function renderMetricsDomain(wrap) {
   const pids = Object.keys(per).sort((a,b) => (per[b].total||0)-(per[a].total||0));
   let banner = `<div class="filter-banner" style="display:flex"><strong>${metricsDomain}</strong>&nbsp;各代理实测指标</div>`;
   // 两表列错开:窗口表 P50/P95/P99 + EWMA 吞吐(近况);累计表 均值 + 永久计数 + 累计字节(历史)。
-  let win = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 P50/P95/P99</th><th>源站首字节 P50/P95/P99</th><th>错误分类(近 256)</th></tr></thead><tbody>';
+  let win = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 P50/P95/P99</th><th>源站首字节 P50/P95/P99</th><th>成功率(近)</th><th>成功/总数(近)</th><th>错误分类(近 256)</th></tr></thead><tbody>';
   let cum = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 均值</th><th>源站首字节 均值</th><th>吞吐 累计</th><th>成功率</th><th>总请求</th><th>累计字节</th></tr></thead><tbody>';
   for (const pid of pids) {
     const m = per[pid] || {};
@@ -576,6 +578,8 @@ function renderMetricsDomain(wrap) {
     win += `<tr><td class="default-proxy">${pid}</td>`;
     win += `<td class="metric-cell-num">${pctCell(per_t.ttfb)}</td>`;
     win += `<td class="metric-cell-num">${pctCell(per_t.ofb)}</td>`;
+    win += `<td class="metric-cell-num">${fmtPct(m.window_success_rate)}</td>`;
+    win += `<td class="metric-cell-num">${m.window_success_count||0}/${m.window_total||0}</td>`;
     win += `<td class="metric-cell-num err-cell">${errStr(m.errors)}</td></tr>`;
     // 累计行(同列同代理,便于左右对比)
     cum += `<tr><td class="default-proxy">${pid}</td>`;

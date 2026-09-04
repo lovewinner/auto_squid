@@ -279,6 +279,7 @@ class ProxySelector:
             scope["success"] += 1
             scope["total"] += 1
             self._append_sample(scope["ttfb_samples"], ttfb)
+            self._append_sample(scope["outcome_samples"], 1)  # 窗口版 success/fail 环形缓冲
             # ── 终身累计(跨重启永久):成功数 + TTFB 累加和/计数(算平均首字节)。
             #   5xx 响应也会走到本分支(record_ttfb 在收到响应头即记),但随后
             #   record_http_error 会把 cum_success 回退并计入 cum_failure_5xx,
@@ -403,6 +404,7 @@ class ProxySelector:
             m["metrics"] = {
                 "ttfb_samples": [],
                 "ofb_samples": [],
+                "outcome_samples": [],  # 窗口版 success/fail 环形缓冲(1=成功 0=失败)
                 "throughput_ewma": None,
                 "success": 0,
                 "total": 0,
@@ -555,6 +557,10 @@ class ProxySelector:
                 scope["cum_failure_5xx"] += 1
                 if scope["cum_success"] > 0:
                     scope["cum_success"] -= 1
+                # 窗口版 outcome_samples:record_ttfb 时已推 1(响应头到达视作成功),
+                # 现 5xx 确认失败,把末尾 1 改为 0,使窗口成功率与累计一致(5xx 算失败)。
+                if scope["outcome_samples"] and scope["outcome_samples"][-1] == 1:
+                    scope["outcome_samples"][-1] = 0
 
     def get_proxy_metrics(self) -> dict:
         """返回全局(跨域名聚合)代理指标快照 {pid: metric_dict},供 /metrics 展示。
@@ -580,6 +586,13 @@ class ProxySelector:
                     "ttfb": ProxySelector._percentiles(mm.get("ttfb_samples", [])),
                     "ofb": ProxySelector._percentiles(mm.get("ofb_samples", [])),
                 }
+                # 窗口版 success/total/rate(近期 _OBS_WINDOW)
+                win_outcomes = mm.get("outcome_samples", [])
+                win_n = len(win_outcomes)
+                win_succ = sum(win_outcomes)
+                out[d][pid]["window_success_count"] = win_succ
+                out[d][pid]["window_total"] = win_n
+                out[d][pid]["window_success_rate"] = (win_succ / win_n) if win_n else None
                 # 终身累计(跨重启永久):与窗口化分位并存,供 --metrics 展示"永久值"。
                 out[d][pid]["cumulative"] = ProxySelector._cumulative_view(mm)
         return out
@@ -593,10 +606,22 @@ class ProxySelector:
         out = {}
         for pid, m in self._proxy_metrics.items():
             mm = m["metrics"]
+            # 窗口版:仅取 outcome_samples 环形缓冲(近 _OBS_WINDOW 次成功/失败)——
+            # 与下面的"终身累计 success_count/total_attempts/success_rate"区分。
+            # 5xx 在 record_http_error 时已把 outcome_samples 末尾 1 改 0,故
+            # 窗口成功率与累计口径一致(5xx 算失败)。
+            win_outcomes = mm.get("outcome_samples", [])
+            win_n = len(win_outcomes)
+            win_succ = sum(win_outcomes)
             per = {
                 "ttfb": ProxySelector._percentiles(mm.get("ttfb_samples", [])),
                 "ofb": ProxySelector._percentiles(mm.get("ofb_samples", [])),
                 "throughput_ewma_mbps": mm.get("throughput_ewma"),
+                # 窗口版(近期 _OBS_WINDOW,内存中重置,跨重启清零):用于仪表盘"近期表现"列
+                "window_success_count": win_succ,
+                "window_total": win_n,
+                "window_success_rate": (win_succ / win_n) if win_n else None,
+                # 终身累计(语义:全部历史,含跨重启)——与上面窗口版并存
                 "success_count": mm.get("success", 0),
                 "total_attempts": mm.get("total", 0),
                 "success_rate": (mm["success"] / mm["total"]) if mm.get("total", 0) else None,
@@ -693,6 +718,10 @@ class ProxySelector:
             # 没有,补空列表,否则热路径 _append_sample 会 KeyError。
             if "ofb_samples" not in m:
                 m["ofb_samples"] = []
+            # outcome_samples 同样为后加字段(窗口版 success/fail 环形缓冲):旧
+            # DB 行没有,补空列表,否则 record_ttfb/record_failure 热路径 KeyError。
+            if "outcome_samples" not in m:
+                m["outcome_samples"] = []
             # 惰性补全终身累计字段(_CUM_FIELDS):旧 DB 行缺这些键时补默认值,使
             # record_ttfb/record_http_error 的 scope[...] 读写不抛 KeyError(09-04
             # 事故:旧行无 cum_* → 热路径 KeyError → 全请求失败 → 熔断全开)。
@@ -723,6 +752,9 @@ class ProxySelector:
                 # 同 set_proxy_metrics:旧 DB 行补 ofb_samples 空列表。
                 if "ofb_samples" not in m:
                     m["ofb_samples"] = []
+                # 同 set_proxy_metrics:旧 DB 行补 outcome_samples 空列表。
+                if "outcome_samples" not in m:
+                    m["outcome_samples"] = []
                 # 惰性补全终身累计字段,同 set_proxy_metrics。
                 for k, v in _CUM_FIELDS.items():
                     if k not in m:
@@ -774,6 +806,7 @@ class ProxySelector:
         for scope in (self._metrics_for(pid, domain), self._metrics_for(pid, None)):
             scope["total"] += 1
             scope["errors"][etype] += 1
+            self._append_sample(scope["outcome_samples"], 0)  # 窗口版 success/fail 环形缓冲
             # 终身累计:传输层失败(连接/超时/TLS/协议/其他),与 cum_failure_5xx
             # 一并构成累计失败总数(见 _cumulative_view)。
             scope["cum_failure_transport"] += 1
