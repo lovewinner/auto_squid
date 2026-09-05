@@ -1640,12 +1640,21 @@ class Router:
         域名缓存复用同一 pid 继续钉)。竞速赢家 _record_win_meta 清除标记。
         写入专用门控集 _immediate_degraded、并同步计入展示集 _degraded_single_send
         (后者仅作 /circuit 展示,非门控)。
+
+        同时喂 record_failure → 累加 consec_fail:让 single_send_degrade_fail
+        通道(默认 2 次单发失败降级)真正在单发路径生效,并在 3 次时触发熔断
+        (早于竞速路径的熔断触发,因为单发失败对代理质量的信号更直接)。
         """
         if pid not in self._immediate_degraded:
             self._immediate_degraded.add(pid)
             self._degraded_single_send.add(pid)
             self.single_send_degrades += 1
             logger.warning("single send degrade(immediate) pid=%s domain=%s", pid, domain)
+        # 累加 consec_fail 使单发路径与竞速路径共用熔断器:2 次单发失败降级,
+        # 3 次熔断。5xx 单发已在 record_http_error 中计入 domain 级指标,此处补
+        # consec_fail 使单发降级门控的 consec_fail 通道真正生效(不区分错误类型,
+        # 单发失败本身已是最强信号)。
+        self.selector.record_failure(pid, ERROR_OTHER, domain)
 
     def _get_fresh_proxy(self, domain: str) -> Optional[str]:
         """返回某域名在 cache_ttl 内的缓存代理 id;过期或无记录返回 None。

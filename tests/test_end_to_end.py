@@ -6786,6 +6786,83 @@ class TestDispatchSingleUnified:
         finally:
             await r.stop()
 
+    @pytest.mark.asyncio
+    async def test_single_send_failure_increments_consec_fail(self):
+        """单发失败即时降级时同时累加 consec_fail:让 single_send_degrade_fail=2 通道
+        在单发路径真正生效(2026-09-05 修复前,单发失败只走 _immediate_degraded 门控,
+        不喂熔断器,导致 consec_fail 通道对单发无效)。
+
+        验证:1 次单发失败后 consec_fail=1,2 次后 consec_fail=2 触发熔断开路。
+        """
+        store = ProxyStore()
+        store.add(ProxyInfo(id='flaky', host=HOST, port=31399))
+        r = Router(store, listen_host=HOST, listen_port=10815,
+                   max_retries=2, enable_http_cache=False, stickiness_enabled=True,
+                   circuit_threshold=3, single_send_degrade_fail=2,
+                   db_path=tempfile.mktemp(suffix='.db'))
+        domain = "fail-count.test"
+        r.sticky._sticky_cache["_test_ip|" + domain] = {"proxy_id": 'flaky', "updated_at": r._now_utc()}
+        r._meta_cache[domain] = {"default_proxy": 'flaky', "updated_at": "2026-01-01T00:00:00+00:00", "_updated_mono": time.monotonic(), "ref_ewma": None}
+
+        async def fail_single(*args, **kwargs):
+            raise RuntimeError('read timed out')
+
+        async def fake_race(*args, **kwargs):
+            return None
+
+        r._forward_single = fail_single
+        r._race = fake_race
+        await r.start()
+        try:
+            # 初始化 circuit state:is_circuit_open 会自动初始化未记录的 pid
+            assert not r.selector.is_circuit_open('flaky')
+            # 直接读 _circuit 内部状态(get_circuit_state 返回快照副本,不更新)。
+            assert r.selector._circuit.get('flaky', {}).get('consec_fail', 0) == 0
+
+            # 第一次单发失败 → consec_fail=1(< fail 阈值 2,降级但未熔断)。
+            r._degrade_send_proxy('flaky', domain)
+            assert r.selector._circuit['flaky']['consec_fail'] == 1
+            assert not r.selector.is_circuit_open('flaky')
+
+            # 第二次单发失败 → consec_fail=2 == fail 阈值,_single_send_degraded
+            # 应返回 True(降级回竞速);circuit_threshold=3 故仍未熔断。
+            r._degrade_send_proxy('flaky', domain)
+            assert r.selector._circuit['flaky']['consec_fail'] == 2
+            assert not r.selector.is_circuit_open('flaky')
+            assert r._single_send_degraded(domain, 'flaky', ref_ewma=None)
+
+            # 第三次单发失败 → consec_fail=3 触发熔断。
+            r._degrade_send_proxy('flaky', domain)
+            assert r.selector.is_circuit_open('flaky')
+        finally:
+            await r.stop()
+
+    @pytest.mark.asyncio
+    async def test_single_send_5xx_increments_consec_fail(self):
+        """5xx 单发失败也累加 consec_fail:_degrade_send_proxy 内部 record_failure
+        覆盖 5xx(已 record_http_error)与建连/超时失败(无 record)两类,统一通路。
+        """
+        store = ProxyStore()
+        store.add(ProxyInfo(id='flaky5x', host=HOST, port=31400))
+        r = Router(store, listen_host=HOST, listen_port=10816,
+                   max_retries=2, enable_http_cache=False, stickiness_enabled=True,
+                   circuit_threshold=3, single_send_degrade_fail=2,
+                   db_path=tempfile.mktemp(suffix='.db'))
+        domain = "5xx-count.test"
+        # 模拟 5xx 失败的 record_http_error + degrade 链路(实际 _forward_single
+        # 5xx 失败会先 record_http_error 再抛 _UpstreamServerError,然后调用方
+        # _degrade_send_proxy)。
+        r.selector._circuit_state('flaky5x')  # 显式初始化 circuit state
+        r.selector.record_http_error('flaky5x', 502, domain=domain)
+        r._degrade_send_proxy('flaky5x', domain)
+        # 5xx 不累加 consec_fail(由 record_http_error 设计决定),degrade 路径
+        # 补一次使其可触发熔断/降级门控。
+        assert r.selector._circuit['flaky5x']['consec_fail'] == 1
+        # 再次单发失败 + degrade → consec_fail=2 == fail 阈值,降级通道生效。
+        r._degrade_send_proxy('flaky5x', domain)
+        assert r.selector._circuit['flaky5x']['consec_fail'] == 2
+        assert r._single_send_degraded(domain, 'flaky5x', ref_ewma=None)
+
     def test_attempt_failure_logs_on_single_send_timeout(self, caplog):
         """per-attempt 失败日志:CONNECT 单发超时 → 记 upstream attempt FAILED,带 pid/err 类型。"""
         import logging
