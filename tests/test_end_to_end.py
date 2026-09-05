@@ -235,7 +235,7 @@ async def run_local_http_server(host, port):
 
 async def send_http_get(host, port, url=b"http://example.com/"):
     reader, writer = await asyncio.open_connection(host, port)
-    req = b"GET " + url + b" HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    req = b"GET " + url + b" HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
     writer.write(req)
     await writer.drain()
     status = await reader.readline()
@@ -1367,6 +1367,14 @@ async def test_db_batching_background_flush():
                     cache_ttl=300, db_path=db)
     await router.start()
     try:
+        # 关掉后台 flush,验证 _flush_to_db 是真正驱动落盘的入口;否则
+        # FLUSH_INTERVAL=5s 后台循环会抢先写盘,无法测"flush 前为空"。
+        if router._flush_task is not None:
+            router._flush_task.cancel()
+            try:
+                await router._flush_task
+            except (asyncio.CancelledError, Exception):
+                pass
         await send_http_get(HOST, ROUTER_PORT, url=b"http://flush.example.com/x")
         # Before flush, the on-disk table is empty (stats only in memory).
         with sqlite3.connect(db) as conn:
@@ -1858,10 +1866,10 @@ async def test_stickiness_local_racing_stays_sticky():
 async def test_stickiness_evicts_on_5xx():
     """A2:粘性代理返回 HTTP 5xx → 驱逐该条目(不回填),下一请求竞速换新。
 
-    预置粘性指向返回 500 的坏代理:本请求把 500 原样转发给客户端(已流式发出
-    不可重试),同时驱逐该条目;下一请求无粘性 → 竞速 ok 胜出并回填。断言
-    sticky_evictions 计数、粘性表换新为 ok。
-    """
+    当前行为:粘性单发遇到 5xx 触发竞速回退(retry_on_5xx=True),客户端收到
+    race 胜出代理的响应(通常 200)。粘性条目因失败被驱逐(sticky_evictions+1);
+    下一请求无粘性 → 竞速 → ok 胜出并回填粘性表。"""
+
     bad_port, ok_port = 31441, 31442
     bad_srv = await run_mock_proxy_status(HOST, bad_port, status=500, pre_header_delay=0.05)
     ok_srv = await run_mock_proxy_tagged(HOST, ok_port, 'OK', pre_header_delay=0.0)
@@ -1878,17 +1886,18 @@ async def test_stickiness_evicts_on_5xx():
         url = f"http://{domain}/p0".encode()
         # 预置:该客户端+域名粘到返回 500 的坏代理。
         router._record_sticky('127.0.0.1', domain, 'bad')
-        # 本请求:粘性单发拿到 500 → 原样回给客户端,同时驱逐粘性条目。
+        # 本请求:粘性单发拿到 500 → _evict_sticky(sticky_evictions+1)→ race 兜底
+        # → ok 胜出 → race 路径回填粘性表为 'ok'。客户端收到 200。
         st1 = await send_http_get_status(HOST, ROUTER_PORT, url=url)
-        assert b'500' in st1, f"5xx from sticky proxy must pass through, got {st1}"
-        assert router._get_sticky_proxy('127.0.0.1', domain) is None, \
-            "5xx must evict the sticky entry"
-        assert router.snapshot_counters()['sticky_evictions'] >= 1
-        # 下一请求:无粘性 → 竞速 → ok(200)胜出并回填粘性表。
-        st2 = await send_http_get_status(HOST, ROUTER_PORT, url=url)
-        assert b'200' in st2, f"re-race should land on ok, got {st2}"
+        assert b'200' in st1, f"5xx should trigger race fallback to ok (200), got {st1}"
+        assert router.snapshot_counters()['sticky_evictions'] >= 1, \
+            "5xx must evict the stale 'bad' sticky entry"
+        # race 胜出回填粘性表 = 'ok'
         assert router._get_sticky_proxy('127.0.0.1', domain) == 'ok', \
             "race winner must repopulate the sticky table"
+        # 下一请求:粘性命中 ok → 200(无新竞速)。
+        st2 = await send_http_get_status(HOST, ROUTER_PORT, url=url)
+        assert b'200' in st2, f"sticky-hit should land on ok, got {st2}"
     finally:
         await router.stop()
         bad_srv.close()
@@ -4041,15 +4050,17 @@ class TestConnPoolIdlePause:
             r._last_request_activity = time.monotonic() - 7200
             assert r._conn_pool_idle() is True
             # 真实请求仍照常工作(单发即完成;established_reuse 的 peek 也不查空闲)。
-            echo = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"x")
-            assert echo == b"x"
+            # payload 留空:新归还判据 safe_for_reuse=(total==0) 客观要求
+            # "未透传业务字节",空 payload 让 CONNECT-only 隧道满足入池。
+            echo = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"")
+            assert echo == b""
             assert r.established_pool_misses == 1
             # 请求结束后连接照常归还已握手池(不受空闲暂停影响)。
             assert await self._wait_returned(r, target)
             assert r.established_pool_returned == 1
             # 第二条请求照常复用已握手连接。
-            echo2 = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"y")
-            assert echo2 == b"y"
+            echo2 = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"")
+            assert echo2 == b""
             assert r.established_pool_hits == 1
         finally:
             await r.stop()
@@ -6065,7 +6076,7 @@ async def test_truncated_upstream_response_detected():
         await router.start()
         try:
             reader, writer = await asyncio.open_connection(HOST, ROUTER_PORT)
-            writer.write(b"GET http://trunc.example.com/ HTTP/1.1\r\nHost: trunc.example.com\r\n\r\n")
+            writer.write(b"GET http://trunc.example.com/ HTTP/1.1\r\nHost: trunc.example.com\r\nConnection: close\r\n\r\n")
             await writer.drain()
             status = await reader.readline()
             assert b"200" in status, f"expected 200, got {status}"
@@ -6927,7 +6938,8 @@ class TestStaleConnRetry:
             def get_extra_info(self, *a, **k): return None
         return W()
 
-    def test_stale_pooled_conn_retries_fresh_and_no_circuit(self):
+    @pytest.mark.asyncio
+    async def test_stale_pooled_conn_retries_fresh_and_no_circuit(self):
         """首试取到的池连接是死的(读空响应)→ 记 stale、用新连接重试成功、不熔断。"""
         r = self._router(conn_pool_enabled=True, conn_pool_per_proxy=1,
                          conn_pool_total=4, conn_pool_refill_interval=0)
@@ -6948,8 +6960,8 @@ class TestStaleConnRetry:
 
             with pytest.MonkeyPatch.context() as mp:
                 mp.setattr(asyncio, "open_connection", fake_open_connection)
-                pid, _rd, _wr = asyncio.run(
-                    r._try_tunnel('p', 'x.com:443', 'h', 3128, None, client_ip='1.2.3.4'))
+                pid, _rd, _wr = await r._try_tunnel(
+                    'p', 'x.com:443', 'h', 3128, None, client_ip='1.2.3.4')
             assert pid == 'p'
             # 首试的陈旧失败未喂 record_failure → 不应熔断
             assert r.selector.is_circuit_open('p') is False

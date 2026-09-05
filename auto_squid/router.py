@@ -113,7 +113,7 @@ _ESTABLISHED_KEY_CAP, _ESTABLISHED_PROBE_TIMEOUT = (
 # 错峰启动(staggered start,RFC 8305 §5)的配置下限。
 # 默认间隔 100ms,下限 100ms(绝对值下限 10ms,防止丢包率高时拥塞崩溃),上限 2s。
 # stagger_interval 由 __init__ 钳制到此区间,配置传 0/负值时落到默认。
-_STAGGER_DEFAULT_MS = 100
+_STAGGER_DEFAULT_MS = 250
 _STAGGER_MIN_MS = 100
 _STAGGER_ABS_MIN_MS = 10
 _STAGGER_MAX_MS = 2000
