@@ -196,6 +196,10 @@ class ProxySelector:
         self.max_in_flight = 0
         # 累计熔断开启次数(供 /metrics /circuit 观察熔断活动)。
         self.circuit_open_count = 0
+        # 池化连接失效触发的重试次数(D 项修复可观测性):来自预热池的连接被上游
+        # 静默关闭,握手即"no response"。这类失败是连接池问题而非代理故障,故只
+        # 计数重试、不喂熔断、不计入成功率。供 /metrics 观察陈旧连接规模。
+        self.stale_conn_retries = 0
 
     def get_quality(self) -> dict[str, dict[str, float]]:
         """返回质量表快照(供 /metrics / 仪表盘展示,读内存无锁)。"""
@@ -960,6 +964,17 @@ class ProxySelector:
             # 终身累计:传输层失败(连接/超时/TLS/协议/其他),与 cum_failure_5xx
             # 一并构成累计失败总数(见 _cumulative_view)。
             scope["cum_failure_transport"] += 1
+
+    def record_stale_conn(self, pid: str, domain: Optional[str] = None):
+        """记录一次池化连接失效(陈旧死连接)触发的重试。
+
+        **不喂熔断、不计入成功率**:这类失败是连接池问题(上游空闲关闭早于本机池
+        idle 超时),与代理质量无关,故绝不累加 consec_fail、不动电路、不动
+        total/success_rate/cum_failure_*。仅作可观测计数,供 /metrics 暴露陈旧连接
+        规模,并佐证"池问题不应误判为代理故障"。调用方(Router._try_tunnel)据此对
+        池连接重试一次全新连接。D 项修复。
+        """
+        self.stale_conn_retries += 1
 
     def record_success(self, pid: str):
         """记录一次上游成功,连续失败计数归零。

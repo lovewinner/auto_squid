@@ -6882,6 +6882,117 @@ class TestDispatchSingleUnified:
             r.stop()
 
 
+class TestStaleConnRetry:
+    """审计 D 项修复回归:池化连接失效(上游已 EOF)时,首试记 stale 观测(不喂熔断),
+    并用一条全新连接重试一次;重试成功则该候选最终成功,且代理不被误熔断。"""
+
+    def _router(self, **kw):
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host='h', port=3128))
+        return Router(store, listen_host=HOST, listen_port=10819,
+                      db_path=tempfile.mktemp(suffix='.db'), **kw)
+
+    @staticmethod
+    def _reader_with(data: bytes):
+        r = asyncio.StreamReader()
+        r.feed_data(data)
+        r.feed_eof()
+        return r
+
+    @staticmethod
+    def _fake_writer():
+        class W:
+            def write(self, *a, **k): pass
+            async def drain(self): pass
+            def close(self): pass
+            async def wait_closed(self): pass
+            def get_extra_info(self, *a, **k): return None
+        return W()
+
+    def test_stale_pooled_conn_retries_fresh_and_no_circuit(self):
+        """首试取到的池连接是死的(读空响应)→ 记 stale、用新连接重试成功、不熔断。"""
+        r = self._router(conn_pool_enabled=True, conn_pool_per_proxy=1,
+                         conn_pool_total=4, conn_pool_refill_interval=0)
+        try:
+            dead_reader = self._reader_with(b"")          # 上游已 EOF:readline → b""
+            dead_writer = self._fake_writer()
+
+            async def fake_open_connection(*a, **k):
+                # 重试用的全新连接:正常返回 200
+                rr = self._reader_with(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                return rr, self._fake_writer()
+
+            peek_calls = {"n": 0}
+            def patched_peek(ph, pp):
+                peek_calls["n"] += 1
+                return (dead_reader, dead_writer) if peek_calls["n"] == 1 else None
+            r.pools._conn_pool_peek = patched_peek
+
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr(asyncio, "open_connection", fake_open_connection)
+                pid, _rd, _wr = asyncio.run(
+                    r._try_tunnel('p', 'x.com:443', 'h', 3128, None, client_ip='1.2.3.4'))
+            assert pid == 'p'
+            # 首试的陈旧失败未喂 record_failure → 不应熔断
+            assert r.selector.is_circuit_open('p') is False
+            # selector 应记过一次 stale 观测
+            assert r.selector.stale_conn_retries == 1
+        finally:
+            r.stop()
+
+    def test_fresh_conn_no_response_is_real_failure(self):
+        """池为空回退到全新连接仍无响应 → 是代理真故障,必须喂熔断(不掩盖)。"""
+        r = self._router(conn_pool_enabled=True, conn_pool_per_proxy=1,
+                         conn_pool_total=4, conn_pool_refill_interval=0)
+        try:
+            async def fake_open_connection(*a, **k):
+                # 全新连接也读空:代理真不响应
+                rr = self._reader_with(b"")
+                return rr, self._fake_writer()
+
+            # 池始终空 → 每次都走新建(非池连接),不触发 stale 重试
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr(asyncio, "open_connection", fake_open_connection)
+                for _ in range(3):
+                    with pytest.raises(RuntimeError):
+                        asyncio.run(
+                            r._try_tunnel('p', 'x.com:443', 'h', 3128, None, client_ip='1.2.3.4'))
+            # 真失败应累计熔断
+            assert r.selector.is_circuit_open('p') is True
+            # 非池连接,不应记 stale
+            assert r.selector.stale_conn_retries == 0
+        finally:
+            r.stop()
+
+    def test_stale_classification_excludes_timeout(self):
+        """握手超时(TimeoutError)不是池陈旧特征,不应触发重试/掩盖真故障。"""
+        assert Router._is_stale_conn_error(asyncio.TimeoutError()) is False
+        assert Router._is_stale_conn_error(RuntimeError('no response from upstream')) is True
+        assert Router._is_stale_conn_error(ConnectionError('connection reset')) is True
+        assert Router._is_stale_conn_error(RuntimeError('upstream returned non-200 for CONNECT: 503')) is False
+        assert Router._is_stale_conn_error(ValueError('bad')) is False
+
+    def test_record_stale_conn_does_not_trip_circuit(self):
+        """record_stale_conn 只计数、不喂熔断/不计入成功率。"""
+        r = self._router()
+        try:
+            r.selector.record_stale_conn('p', 'x.com:443')
+            r.selector.record_stale_conn('p', 'x.com:443')
+            assert r.selector.stale_conn_retries == 2
+            # 未触发任何熔断副作用
+            assert r.selector.is_circuit_open('p') is False
+        finally:
+            r.stop()
+
+    """审计 P2#2 回归:共享缓存对"携带 Cookie/Authorization 的请求"在读、写
+    两侧都按私密头集收敛,防止 A 客户端的个性化响应串给 B 客户端。"""
+
+    def _router(self, **kw):
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host='h', port=3128))
+        return Router(store, listen_host=HOST, listen_port=10809,
+                      db_path=tempfile.mktemp(suffix='.db'), **kw)
+
 class TestHttpCachePrivacy:
     """审计 P2#2 回归:共享缓存对"携带 Cookie/Authorization 的请求"在读、写
     两侧都按私密头集收敛,防止 A 客户端的个性化响应串给 B 客户端。"""

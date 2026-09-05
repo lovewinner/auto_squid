@@ -1350,6 +1350,7 @@ class Router:
             "attempted_counts": dict(self.attempted_counts),
             "proxy_quality": self.selector.get_quality(),
             "proxy_in_flight": self.selector.get_in_flight(),
+            "stale_conn_retries": self.selector.stale_conn_retries,
             "max_in_flight": self.selector.max_in_flight,
             "proxy_concurrency_limits": self.selector.get_concurrency_limits(),
             "concurrency_limit_enabled": self.selector.concurrency_enabled,
@@ -2409,140 +2410,167 @@ class Router:
         # 建立 CONNECT 与读取响应均设超时，避免挂死的上游无限占用竞速 task 与连接。
         connect_timeout = self._local_direct_timeout if relaxed else self._tunnel_timeout_sec
         _perf_t0 = time.perf_counter()  # 失败观测用:记录本次 CONNECT 尝试的发起时刻
-        try:
-            if proxy_host is not None:
-                # CONNECT 预热池(P1)+ 目标半预连接(P2):取用顺序为——
-                # 1) target 半预连接池(按 proxy|target 键,只预连"到上游代理"的
-                #    TCP,未发 CONNECT,可安全复用);2) 第一阶段通用池;3) 新建。
-                # 取用成功即省掉"本机→上游"建连 TTFB。
-                if self.pools.conn_pool_enabled:
-                    up_reader, up_writer = None, None
-                    # 已握手隧道复用:优先取"已发 CONNECT 且收到 200"的连接,命中则
-                    # 跳过下方 CONNECT 握手,直接返回(连接已处于可透传状态)。
-                    if self.pools.conn_pool_established_reuse:
-                        up_reader, up_writer = self.pools._established_pool_peek(proxy_host, proxy_port, target) or (None, None)
-                        if up_reader is not None and not await self.pools._established_alive(up_reader, up_writer):
-                            # 死/脏连接:丢弃(peek 已计 hits),不跳过多余 I/O、不影响下
-                            # 一候选判定——回落后续池/新建。避免一个 tick 赢竞速。
-                            self.pools.established_pool_expired += 1
-                            logger.info("established pool DEAD-ON-PROBE %s via %s:%s",
-                                        target, proxy_host, proxy_port)
-                            _discard_conn(up_writer)
-                            up_reader = up_writer = None
-                    if up_reader is None and self.pools.conn_pool_target_prewarm:
-                        up_reader, up_writer = self.pools._target_pool_peek(proxy_host, proxy_port, target) or (None, None)
-                    if up_reader is None:
-                        pooled = self.pools._conn_pool_peek(proxy_host, proxy_port)
-                        if pooled is not None:
-                            up_reader, up_writer = pooled
-                    if up_reader is None:
-                        self.pools.connect_new_conns += 1  # 观测:池未中需新建
+        # 池化连接失效重试(D 项修复):预热池里的连接可能被上游静默关闭(上游空闲
+        # 超时远短于本机池 idle 超时),取用后发 CONNECT、对端已 EOF,readline 立即
+        # 空响应 → "no response from upstream"。这是连接池问题,不是代理故障。对来自
+        # 池的连接,首次握手遇此类失效(空响应 / 写读阶段被对端 RST / 断管)时,丢弃
+        # 并改用一条全新连接重试一次,且该次失败**不喂 record_failure**(避免把池问题
+        # 记成代理故障→误熔断)。新建连接失败则如实记录(真故障)。最多重试 1 次。
+        for _attempt in (0, 1):
+            up_reader = up_writer = None
+            # 本次取用的连接是否来自预热池(用于区分"池陈旧"vs"代理真故障")。
+            # 仅当池确有吐出连接时才置 True;池空回退新建则为 False(此时失败无权重试)。
+            _used_pooled = False
+            try:
+                if proxy_host is not None:
+                    # CONNECT 预热池(P1)+ 目标半预连接(P2):取用顺序为——
+                    # 1) 已握手隧道池(命中则跳过下方 CONNECT 握手);2) target 半预连接池
+                    #    (按 proxy|target 键,只预连"到上游代理"的 TCP,未发 CONNECT);
+                    # 3) 第一阶段通用池;4) 新建。取用成功即省掉"本机→上游"建连 TTFB。
+                    # 重试(_attempt==1)强制跳过所有池、只用全新连接。
+                    if _attempt == 0 and self.pools.conn_pool_enabled:
+                        up_reader, up_writer = None, None
+                        # 已握手隧道复用:优先取"已发 CONNECT 且收到 200"的连接,命中则
+                        # 跳过下方 CONNECT 握手,直接返回(连接已处于可透传状态)。
+                        if self.pools.conn_pool_established_reuse:
+                            up_reader, up_writer = self.pools._established_pool_peek(proxy_host, proxy_port, target) or (None, None)
+                            if up_reader is not None and not await self.pools._established_alive(up_reader, up_writer):
+                                # 死/脏连接:丢弃(peek 已计 hits),不跳过多余 I/O、不影响下
+                                # 一候选判定——回落后续池/新建。避免一个 tick 赢竞速。
+                                self.pools.established_pool_expired += 1
+                                logger.info("established pool DEAD-ON-PROBE %s via %s:%s",
+                                            target, proxy_host, proxy_port)
+                                _discard_conn(up_writer)
+                                up_reader = up_writer = None
+                            else:
+                                _used_pooled = True  # 命中已握手池且活性探测通过
+                        if up_reader is None and self.pools.conn_pool_target_prewarm:
+                            up_reader, up_writer = self.pools._target_pool_peek(proxy_host, proxy_port, target) or (None, None)
+                            if up_reader is not None:
+                                _used_pooled = True
+                        if up_reader is None:
+                            pooled = self.pools._conn_pool_peek(proxy_host, proxy_port)
+                            if pooled is not None:
+                                up_reader, up_writer = pooled
+                                _used_pooled = True
+                        if up_reader is None:
+                            self.pools.connect_new_conns += 1  # 观测:池未中需新建
+                            up_reader, up_writer = await asyncio.wait_for(
+                                asyncio.open_connection(proxy_host, proxy_port), timeout=connect_timeout)
+                    else:
+                        self.pools.connect_new_conns += 1  # 观测:无池路径/重试路径每次新建
                         up_reader, up_writer = await asyncio.wait_for(
                             asyncio.open_connection(proxy_host, proxy_port), timeout=connect_timeout)
                 else:
-                    self.pools.connect_new_conns += 1  # 观测:无池路径每次新建
+                    host = self._try_tunnel_host(target)
+                    if not host:
+                        raise ValueError(f'Invalid CONNECT target: {target}')
+                    # 端口从 target 解析(host:port);_try_tunnel_host 只回裸 host。
+                    if target.startswith('['):
+                        host_end = target.find(']')
+                        port = int(target[host_end + 2:])
+                    else:
+                        port = int(target.rsplit(':', 1)[1])
                     up_reader, up_writer = await asyncio.wait_for(
-                        asyncio.open_connection(proxy_host, proxy_port), timeout=connect_timeout)
-            else:
-                host = self._try_tunnel_host(target)
-                if not host:
-                    raise ValueError(f'Invalid CONNECT target: {target}')
-                # 端口从 target 解析(host:port);_try_tunnel_host 只回裸 host。
-                if target.startswith('['):
-                    host_end = target.find(']')
-                    port = int(target[host_end + 2:])
-                else:
-                    port = int(target.rsplit(':', 1)[1])
-                up_reader, up_writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, port), timeout=connect_timeout)
-        except (asyncio.TimeoutError, OSError, ConnectionError) as e:
-            # per-attempt 失败观测:建连阶段失败(本机→上游 open_connection 超时/拒绝),
-            # 先记日志再转 RuntimeError,否则该失败从 _try_tunnel 直接逃逸,不会被下方
-            # 2198 except 捕获(两条 except 覆盖不同失败窗口:建连 vs CONNECT 握手)。
-            # record_failure 也在此喂——建连失败返回前不进入 2198 except(handshake
-            # 用),此前的代理建连失败从未计入熔断,同样白白反复竞速同批坏端点。
-            self._log_attempt_failure(client_ip, target, target, pid,
-                                      RuntimeError(f'connect to {proxy_host or target} timed out or failed: {e}'),
-                                      _perf_t0)
-            # Phase 1.3:建连阶段失败 → 归为 connect/timeout 错误分类(带 target 域名)。
-            etype = ERROR_TIMEOUT if isinstance(e, asyncio.TimeoutError) else ERROR_CONNECT
-            self.selector.record_failure(pid, etype, target)
-            raise RuntimeError(f'connect to {proxy_host or target} timed out or failed: {e}') from e
-        except ValueError as e:
-            # 非法 CONNECT target(空 host / 坏端口):同样记 per-attempt 日志与熔断
-            # (真失败),原样重抛(调用方按 ValueError 处理,不转 RuntimeError)。
-            self._log_attempt_failure(client_ip, target, target, pid, e, _perf_t0)
-            self.selector.record_failure(pid, ERROR_OTHER, target)
-            raise
-        # 首字节计时:从 CONNECT 发出到收到 200。用于 EWMA 质量跟踪(竞速排序)。
-        # 复用已握手隧道时无 CONNECT 往返,计时为 0(不做 EWMA 观测)。
-        reused_established = (self.pools.conn_pool_established_reuse
-                              and proxy_host is not None
-                              and up_reader is not None
-                              and getattr(up_writer, '_established_reused', False))
-        t0 = time.perf_counter()
-        # 计入该代理在途数(从 CONNECT 发起到拿到 200/失败/被取消),finally 释放。
-        self.selector._inflight_start(pid)
-        try:
-            if not reused_established:
-                auth_hdr = ""
-                if proxy_auth:
-                    raw = f"{proxy_auth['username']}:{proxy_auth['password']}"
-                    encoded = base64.b64encode(raw.encode()).decode()
-                    auth_hdr = f"Proxy-Authorization: Basic {encoded}\r\n"
-                up_writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: ".encode('latin-1') + _hb(target) + f"\r\n{auth_hdr}\r\n".encode('latin-1'))
-                await up_writer.drain()
-                self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
-                self.upstream_attempts += 1  # 聚合竞速扇出总数(供 /metrics 算放大率)
-                status = await asyncio.wait_for(up_reader.readline(), timeout=connect_timeout)
-                if not status:
-                    raise RuntimeError('no response from upstream')
-                status_text = status.decode('latin-1')
-                # 审计 P3#7:精确解析状态码(HTTP/1.x <code> <reason>),而不是子串
-                # 匹配——"HTTP/1.1 2000" 或原因短语含 "200" 会被旧实现误判为成功。
-                _parts = status_text.split(' ', 2)
-                status_code = _parts[1] if (len(_parts) >= 2 and _parts[0].startswith('HTTP/')) else ''
-                if status_code != '200':
+                        asyncio.open_connection(host, port), timeout=connect_timeout)
+            except (asyncio.TimeoutError, OSError, ConnectionError) as e:
+                # 建连阶段失败(本机→上游 open_connection 超时/拒绝)。仅"首试取的是
+                # 池连接、且这是池失效特征(非超时)"才视为陈旧重试;新建连接超时/拒绝
+                # 是真故障,如实记熔断并转 RuntimeError。
+                if _attempt == 0 and _used_pooled and not isinstance(e, asyncio.TimeoutError):
+                    self.selector.record_stale_conn(pid, target)
+                    logger.info("pooled conn STALE on connect %s via %s:%s (err=%s), retrying fresh",
+                                target, proxy_host, proxy_port, type(e).__name__)
+                    continue
+                self._log_attempt_failure(client_ip, target, target, pid,
+                                          RuntimeError(f'connect to {proxy_host or target} timed out or failed: {e}'),
+                                          _perf_t0)
+                # Phase 1.3:建连阶段失败 → 归为 connect/timeout 错误分类(带 target 域名)。
+                etype = ERROR_TIMEOUT if isinstance(e, asyncio.TimeoutError) else ERROR_CONNECT
+                self.selector.record_failure(pid, etype, target)
+                raise RuntimeError(f'connect to {proxy_host or target} timed out or failed: {e}') from e
+            except ValueError as e:
+                # 非法 CONNECT target(空 host / 坏端口):同样记 per-attempt 日志与熔断
+                # (真失败),原样重抛(调用方按 ValueError 处理,不转 RuntimeError)。
+                self._log_attempt_failure(client_ip, target, target, pid, e, _perf_t0)
+                self.selector.record_failure(pid, ERROR_OTHER, target)
+                raise
+            # 首字节计时:从 CONNECT 发出到收到 200。用于 EWMA 质量跟踪(竞速排序)。
+            # 复用已握手隧道时无 CONNECT 往返,计时为 0(不做 EWMA 观测)。
+            reused_established = (self.pools.conn_pool_established_reuse
+                                  and proxy_host is not None
+                                  and up_reader is not None
+                                  and getattr(up_writer, '_established_reused', False))
+            t0 = time.perf_counter()
+            # 计入该代理在途数(从 CONNECT 发起到拿到 200/失败/被取消),finally 释放。
+            self.selector._inflight_start(pid)
+            try:
+                if not reused_established:
+                    auth_hdr = ""
+                    if proxy_auth:
+                        raw = f"{proxy_auth['username']}:{proxy_auth['password']}"
+                        encoded = base64.b64encode(raw.encode()).decode()
+                        auth_hdr = f"Proxy-Authorization: Basic {encoded}\r\n"
+                    up_writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: ".encode('latin-1') + _hb(target) + f"\r\n{auth_hdr}\r\n".encode('latin-1'))
+                    await up_writer.drain()
+                    self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
+                    self.upstream_attempts += 1  # 聚合竞速扇出总数(供 /metrics 算放大率)
+                    status = await asyncio.wait_for(up_reader.readline(), timeout=connect_timeout)
+                    if not status:
+                        raise RuntimeError('no response from upstream')
+                    status_text = status.decode('latin-1')
+                    # 审计 P3#7:精确解析状态码(HTTP/1.x <code> <reason>),而不是子串
+                    # 匹配——"HTTP/1.1 2000" 或原因短语含 "200" 会被旧实现误判为成功。
+                    _parts = status_text.split(' ', 2)
+                    status_code = _parts[1] if (len(_parts) >= 2 and _parts[0].startswith('HTTP/')) else ''
+                    if status_code != '200':
+                        while True:
+                            h = await up_reader.readline()
+                            if not h or h in (b"\r\n", b"\n"):
+                                break
+                        raise RuntimeError(f'upstream returned non-200 for CONNECT: {status_text.strip()}')
                     while True:
                         h = await up_reader.readline()
                         if not h or h in (b"\r\n", b"\n"):
                             break
-                    raise RuntimeError(f'upstream returned non-200 for CONNECT: {status_text.strip()}')
-                while True:
-                    h = await up_reader.readline()
-                    if not h or h in (b"\r\n", b"\n"):
-                        break
-                self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
-                # CONNECT 域名 key = 原始 target("host:port"),与 _record_attempt /
-                # _get_fresh_proxy(target) / sticky key(client_ip|target)一致。
-                ttfb = time.perf_counter() - t0
-                self.selector.record_ttfb(pid, ttfb, target)
-                self._stash_attempt_ttfb(ttfb)  # 调参器侧信道:胜出点取回(见 _observe_win)
-            # 仅记尝试统计;meta 由 _handle_connect 在确认赢家后调 _record_win_meta。
-            self._record_attempt(target, pid)
-            # CONNECT 拿到 200 即视为一次成功观测(EWMA + 连续失败归零)。
-            self.selector.record_success(pid)
-            return pid, up_reader, up_writer
-        except BaseException as ex:
-            try:
-                up_writer.close()
-                await up_writer.wait_closed()
-            except Exception:
-                pass
-            # 同 _try_http:被竞速取消(CancelledError)不算失败;真失败才累计熔断。
-            # local(本机直连)真失败同样喂熔断——把"死本机端点"(如 colo 防火墙挡住
-            # 的 127.0.0.1:26128/6128)经 is_circuit_open('local') 移出竞速/单发
-            # (4 处 local-add 与 _get_fresh_proxy/sticky 已加门控),消除每请求白烧 3s。
-            if not isinstance(ex, asyncio.CancelledError):
-                # Phase 1.3:CONNECT 握手/建连失败归因。RuntimeError 通常来自上游
-                # 非 200 / 无响应(协议/上游错误),OSError 等为连接层失败。
-                self.selector.record_failure(pid, self._classify_error(ex), target)
-            # per-attempt 失败观测(同 _try_http):每次 CONNECT 尝试失败都记(含取消
-            # 的竞速败者),带 client_ip/异常类型/耗时,可直接 grep 定位事故源。
-            self._log_attempt_failure(client_ip, target, target, pid, ex, _perf_t0)
-            raise
-        finally:
-            self.selector._inflight_finish(pid)
+                    self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
+                    # CONNECT 域名 key = 原始 target("host:port"),与 _record_attempt /
+                    # _get_fresh_proxy(target) / sticky key(client_ip|target)一致。
+                    ttfb = time.perf_counter() - t0
+                    self.selector.record_ttfb(pid, ttfb, target)
+                    self._stash_attempt_ttfb(ttfb)  # 调参器侧信道:胜出点取回(见 _observe_win)
+                # 仅记尝试统计;meta 由 _handle_connect 在确认赢家后调 _record_win_meta。
+                self._record_attempt(target, pid)
+                # CONNECT 拿到 200 即视为一次成功观测(EWMA + 连续失败归零)。
+                self.selector.record_success(pid)
+                return pid, up_reader, up_writer
+            except BaseException as ex:
+                try:
+                    up_writer.close()
+                    await up_writer.wait_closed()
+                except Exception:
+                    pass
+                # 池化连接失效:记 stale 观测(不喂熔断),重试一次新连接。命中条件:
+                # 首试 + 来自池 + 失效特征(空响应 / 写读被 RST,非超时)。
+                if _attempt == 0 and _used_pooled and self._is_stale_conn_error(ex):
+                    self.selector.record_stale_conn(pid, target)
+                    logger.info("pooled conn STALE on handshake %s via %s:%s (err=%s), retrying fresh",
+                                target, proxy_host, proxy_port, type(ex).__name__)
+                    continue
+                # 同 _try_http:被竞速取消(CancelledError)不算失败;真失败才累计熔断。
+                # local(本机直连)真失败同样喂熔断——把"死本机端点"(如 colo 防火墙挡住
+                # 的 127.0.0.1:26128/6128)经 is_circuit_open('local') 移出竞速/单发
+                # (4 处 local-add 与 _get_fresh_proxy/sticky 已加门控),消除每请求白烧 3s。
+                if not isinstance(ex, asyncio.CancelledError):
+                    # Phase 1.3:CONNECT 握手/建连失败归因。RuntimeError 通常来自上游
+                    # 非 200 / 无响应(协议/上游错误),OSError 等为连接层失败。
+                    self.selector.record_failure(pid, self._classify_error(ex), target)
+                # per-attempt 失败观测(同 _try_http):每次 CONNECT 尝试失败都记(含取消
+                # 的竞速败者),带 client_ip/异常类型/耗时,可直接 grep 定位事故源。
+                self._log_attempt_failure(client_ip, target, target, pid, ex, _perf_t0)
+                raise
+            finally:
+                self.selector._inflight_finish(pid)
 
     # ── 客户端入口 ──────────────────────────────────────────────
 
@@ -2905,6 +2933,24 @@ class Router:
         if "Protocol" in tn:
             return "protocol"
         return "other"
+
+    @staticmethod
+    def _is_stale_conn_error(err: BaseException) -> bool:
+        """判断是否为"池化连接失效"特征(应触发陈旧重试而非记代理故障)。
+
+        - RuntimeError('no response from upstream'):上游已 EOF,我们发出 CONNECT、
+          对端已无响应,readline 立即空返回——典型的池连接被上游空闲关闭。
+        - OSError / ConnectionError(写/读阶段被对端 RST / 断管):池连接半途死亡。
+        排除 asyncio.TimeoutError(基类链下常为 TimeoutError→OSError 子类):握手超时
+        是上游真的慢,属代理/网络真故障,应如实记熔断、不应重试掩盖。
+        """
+        if isinstance(err, asyncio.TimeoutError):
+            return False
+        if isinstance(err, RuntimeError) and str(err).startswith("no response from upstream"):
+            return True
+        if isinstance(err, (OSError, ConnectionError)):
+            return True
+        return False
 
     async def _forward_single(self, writer, method: str, url: str, hdrs: dict, body, domain: str,
                              pid: str | None = None, instantiated=None, sticky: bool = False,
