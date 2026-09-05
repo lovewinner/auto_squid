@@ -161,7 +161,13 @@ class HttpCache:
         # Content-Length)。no-cache 在此保守按"不存"处理:本代理不做再校验
         # (发条件请求),存了也只是徒增一次过期清除,不如直接不存。
         # headers 为 list[(name, value)](保留重复头)或 dict,两种都按 (k, v) 迭代。
-        items = headers.items() if isinstance(headers, dict) else headers
+        items = list(headers.items() if isinstance(headers, dict) else headers)
+        # 当前缓存键只含 method:url，无法安全表达响应按请求头变化的表示。
+        # Set-Cookie 也绝不能进入共享缓存，否则会被后续客户端重放。
+        if any(k.lower() == 'set-cookie' for k, _ in items):
+            return
+        if any(k.lower() == 'vary' and v.strip() for k, v in items):
+            return
         cc = next((v for k, v in items if k.lower() == 'cache-control'), '')
         if 'no-store' in cc or 'no-cache' in cc or 'private' in cc:
             return

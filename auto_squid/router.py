@@ -111,9 +111,9 @@ _ESTABLISHED_KEY_CAP, _ESTABLISHED_PROBE_TIMEOUT = (
     _ESTABLISHED_KEY_CAP, _ESTABLISHED_PROBE_TIMEOUT)
 
 # 错峰启动(staggered start,RFC 8305 §5)的配置下限。
-# 默认间隔 250ms,下限 100ms(绝对值下限 10ms,防止丢包率高时拥塞崩溃),上限 2s。
+# 默认间隔 100ms,下限 100ms(绝对值下限 10ms,防止丢包率高时拥塞崩溃),上限 2s。
 # stagger_interval 由 __init__ 钳制到此区间,配置传 0/负值时落到默认。
-_STAGGER_DEFAULT_MS = 250
+_STAGGER_DEFAULT_MS = 100
 _STAGGER_MIN_MS = 100
 _STAGGER_ABS_MIN_MS = 10
 _STAGGER_MAX_MS = 2000
@@ -139,6 +139,10 @@ _HOP_BY_HOP_RESPONSE_HEADERS = frozenset({
     'transfer-encoding', 'content-length', 'connection', 'keep-alive',
     'proxy-connection', 'te', 'trailer', 'upgrade',
 })
+
+
+class _UpstreamServerError(Exception):
+    """单发收到 5xx 时触发重竞速，避免把故障代理继续钉在缓存路径。"""
 
 
 def _hb(v: str) -> bytes:
@@ -1789,7 +1793,7 @@ class Router:
             # staircase p95≈1300ms 长尾的主因。调大 keepalive 与总量,并把
             # 过期延长到 120s,让突发间复用连接、减少隧道重建。
             "limits": httpx.Limits(
-                max_keepalive_connections=50, max_connections=200,
+                max_keepalive_connections=200, max_connections=400,
                 keepalive_expiry=120),
         }
         if proxy_url:
@@ -1846,7 +1850,7 @@ class Router:
         if proxy_host is None:
             return  # 本机直连路径无"上游代理"可预热
         self.pools.target_prewarm_dispatched += 1
-        logger.info("target prewarm SPAWN %s via %s:%s (dispatched=%d)",
+        logger.debug("target prewarm SPAWN %s via %s:%s (dispatched=%d)",
                     target, proxy_host, proxy_port, self.pools.target_prewarm_dispatched)
         task = asyncio.create_task(
             self.pools._target_pool_prewarm(proxy_host, proxy_port, target,
@@ -2226,7 +2230,7 @@ class Router:
         proxy = None if pid == 'local' else self.proxy_store.get(pid)
         if (self.pools.conn_pool_established_reuse and proxy is not None and target):
             await self._maybe_return_established(
-                result[2], result[1], proxy.host, proxy.port, target)
+                result[2], result[1], proxy.host, proxy.port, target, safe_for_reuse=True)
         else:
             up_writer = result[-1]
             try:
@@ -2543,128 +2547,16 @@ class Router:
     # ── 客户端入口 ──────────────────────────────────────────────
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        """客户端连接入口:读首行+请求头,认证,再分流到 HTTP 或 CONNECT 处理。
-
-        这是 HTTP 与 CONNECT 的唯一公共入口,客户端认证在此统一校验(分流前),
-        因此未认证客户端不会触达任何上游。finally 中无论正常返回还是异常,
-        都从 _running_tasks 移除当前 task 并关闭客户端连接。
-        """
+        """客户端连接入口：HTTP/1.1 顺序 keep-alive，CONNECT 接管连接后退出。"""
         task = asyncio.current_task()
         self._running_tasks.add(task)
         peer = writer.get_extra_info('peername')
-        # 会话粘性的客户端键:仅取 IP(不带端口),同一客户端复用;无 peer 时
-        # 退化为空串(粘性关闭时不影响,开启时该请求只走域名缓存/竞速)。
         client_ip = peer[0] if peer else ""
         logger.debug("client connected %s", peer)
         self._set_nodelay(writer)
         try:
-            # 首行与请求头读取设超时(审计 P1#1):慢速/断连客户端不能无限期挂住
-            # 连接与 task。整段头部读取共用一个线性超时预算:每次 readline 都
-            # 用 wait_for 包一层,超时抛 TimeoutError 落到底部 except 关闭连接。
-            line = await asyncio.wait_for(reader.readline(), timeout=_CLIENT_HEADER_TIMEOUT)
-            if not line:
-                return
-            first = line.decode('latin-1').strip()
-            # 客户端请求头有界读:每行受 readline 64KB 限制,但行数无上限——慢速
-            # loris 式攻击发大量小 header 行会让 headers bytearray 无界增长。
-            # 双上限:header 数量(100)与累计总字节(64KB),任何一项超限拒绝并关连接
-            # (拒绝而非容忍慢读——请求不合法,不必然回 431)。字节上限取 64KB,
-            # 单行已被主机背压限制,blocking 客户端最多消耗 64KB×100,有界。
-            headers = bytearray()
-            header_lines = 0
-            while True:
-                h = await asyncio.wait_for(reader.readline(), timeout=_CLIENT_HEADER_TIMEOUT)
-                if not h:
-                    break
-                if h in (b"\r\n", b"\n"):
-                    break
-                headers.extend(h)
-                header_lines += 1
-                if header_lines > _MAX_REQUEST_HEADER_LINES or len(headers) > _MAX_REQUEST_HEADER_BYTES:
-                    logger.warning("rejecting client %s: header limit exceeded (lines=%d bytes=%d)",
-                                   peer, header_lines, len(headers))
-                    raise ConnectionError('request header limit exceeded')
-            logger.debug("first line: %s", first)
-            # 一次性把请求头字节解析成 dict(键小写归一),auth 与 body
-            # 长度判定及下游转发共用此 dict,不再各自重新 decode+split 头部。
-            # HTTP 头字段为 ASCII,latin-1 解码安全;body 不在此解码(见下)。
-            # 键小写归一 + 重复头合并(审计 P2#5):dict 无法表达同名重复头,若
-            # 后者覆盖前者会丢失首个(常为关键)的 Cookie 值;这里把重复键按
-            # 语义拼接——Cookie 用 `; `(RFC 6265),其余用 `, `(RFC 9110 多值),
-            # 保证下游(httpx dict)转发时值不丢失,且头名小写化后转发合规。
-            req_headers = {}
-            for h in headers.decode('latin-1').split('\r\n'):
-                if ':' in h:
-                    k, v = h.split(':', 1)
-                    k = k.strip().lower()
-                    v = v.strip()
-                    if k in req_headers:
-                        req_headers[k] = req_headers[k] + ("; " if k == 'cookie' else ", ") + v
-                    else:
-                        req_headers[k] = v
-            # 客户端认证：在 CONNECT/HTTP 分流前统一校验，未通过则返回 407，
-            # 不进行任何上游连接/竞速/DB 写入。auth_enabled=False 时放行。
-            if self.auth_enabled:
-                ok, reason = check_auth(req_headers, self.auth_enabled, self.auth_username, self.auth_password)
-                if not ok:
-                    logger.info("auth rejected for %s: %s", peer, reason)
-                    await self._write_cached_response(writer, 407, 'Proxy Authentication Required',
-                                               {'Proxy-Authenticate': 'Basic realm="auto_squid"',
-                                                'Content-Type': 'text/plain'},
-                                               _hb(reason or 'Authentication required'))
-                    return
-            # 有效客户端请求(认证通过):刷新 refill 空闲感知的活动时间戳,解除深夜暂停。
-            self.pools._record_request_activity()
-            if first.upper().startswith('CONNECT'):
-                target = first.split(' ')[1]
-                await self._handle_connect(target, reader, writer, client_ip)
-            else:
-                # 首行合法性提前校验(原由 _handle_http_request 做):缺方法/URL
-                # 直接 400,不必再拼包传下去重新解析。
-                parts = first.split(' ')
-                if len(parts) < 3:
-                    writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nBad Request")
-                    await writer.drain()
-                    return
-                method, url = parts[0], parts[1]
-                body = b''
-                cl = None
-                for k, v in req_headers.items():
-                    if k.lower() == 'content-length':
-                        try:
-                            cl = int(v)
-                        except ValueError:
-                            # 审计 P3#8:非数值 Content-Length(如 "abc")原先让 int()
-                            # 抛 ValueError 落到外层 except 静默断连,未回明确 400。
-                            logger.warning("rejecting client %s: invalid content-length %r", peer, v)
-                            writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nBad Request")
-                            await writer.drain()
-                            return
-                        break
-                if cl is not None and cl > 0:
-                    if cl > MAX_BODY:
-                        writer.write(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 15\r\n\r\nPayload Too Large")
-                        await writer.drain()
-                        return
-                    # body 读取设超时(审计 P1#1):慢速上传也能挂住连接,统一设超时。
-                    body = await asyncio.wait_for(reader.readexactly(cl), timeout=_CLIENT_BODY_TIMEOUT)
-                elif cl is None and method.upper() in ('POST', 'PUT', 'PATCH'):
-                    # 无 Content-Length 头：分块读取至上限，避免 read(-1) 阻塞到
-                    # 客户端关闭连接而破坏 HTTP keep-alive。注意 cl is None 与
-                    # cl == 0 不同——后者表示头部存在但 body 为空，应直接用 b''。
-                    body = bytearray()
-                    while len(body) < MAX_BODY:
-                        chunk = await asyncio.wait_for(reader.read(MAX_BODY - len(body)), timeout=_CLIENT_BODY_TIMEOUT)
-                        if not chunk:
-                            break
-                        body.extend(chunk)
-                    if len(body) >= MAX_BODY:
-                        writer.write(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 15\r\n\r\nPayload Too Large")
-                        await writer.drain()
-                        return
-                # 直接传已解析的 method/url/headers/body,不再拼回 request_bytes
-                # 让下游重新 find+decode+split(消除双重解析)。
-                await self._handle_http_request(method, url, req_headers, bytes(body) if isinstance(body, bytearray) else body, writer, client_ip)
+            while await self._handle_one_client_request(reader, writer, peer, client_ip):
+                pass
         except Exception:
             logger.exception("error handling client")
         finally:
@@ -2674,6 +2566,64 @@ class Router:
                 await writer.wait_closed()
             except Exception:
                 pass
+
+    async def _handle_one_client_request(self, reader, writer, peer, client_ip: str) -> bool:
+        """处理一条客户端请求；返回 True 表示可在同一 HTTP/1.1 连接继续读取。"""
+        line = await asyncio.wait_for(reader.readline(), timeout=_CLIENT_HEADER_TIMEOUT)
+        if not line:
+            return False
+        first = line.decode('latin-1').strip()
+        raw_headers = bytearray()
+        while True:
+            h = await asyncio.wait_for(reader.readline(), timeout=_CLIENT_HEADER_TIMEOUT)
+            if not h or h in (b"\r\n", b"\n"):
+                break
+            raw_headers.extend(h)
+            if raw_headers.count(b'\n') > _MAX_REQUEST_HEADER_LINES or len(raw_headers) > _MAX_REQUEST_HEADER_BYTES:
+                raise ConnectionError('request header limit exceeded')
+        req_headers = {}
+        for h in raw_headers.decode('latin-1').splitlines():
+            if ':' in h:
+                k, v = h.split(':', 1)
+                k, v = k.strip().lower(), v.strip()
+                req_headers[k] = req_headers.get(k, '') + (("; " if k == 'cookie' else ", ") if k in req_headers else '') + v
+        if self.auth_enabled:
+            ok, reason = check_auth(req_headers, True, self.auth_username, self.auth_password)
+            if not ok:
+                await self._write_cached_response(writer, 407, 'Proxy Authentication Required',
+                    {'Proxy-Authenticate': 'Basic realm="auto_squid"', 'Content-Type': 'text/plain'},
+                    _hb(reason or 'Authentication required'))
+                return False
+        self.pools._record_request_activity()
+        parts = first.split()
+        if not parts:
+            return False
+        if parts[0].upper() == 'CONNECT':
+            if len(parts) < 2:
+                return False
+            await self._handle_connect(parts[1], reader, writer, client_ip)
+            return False  # CONNECT 接管整个连接，隧道结束后不可复用为 HTTP。
+        if len(parts) != 3:
+            await self._write_cached_response(writer, 400, 'Bad Request', {}, b'Bad Request')
+            return False
+        method, url, version = parts
+        cl = req_headers.get('content-length')
+        try:
+            content_length = int(cl) if cl is not None else 0
+        except ValueError:
+            await self._write_cached_response(writer, 400, 'Bad Request', {}, b'Bad Request')
+            return False
+        if content_length < 0 or content_length > MAX_BODY:
+            await self._write_cached_response(writer, 413, 'Payload Too Large', {}, b'Payload Too Large')
+            return False
+        # 无长度的写请求无法在持久连接上确定消息边界；明确拒绝而不是读到 EOF。
+        if cl is None and method.upper() in _INVALIDATING_METHODS:
+            await self._write_cached_response(writer, 411, 'Length Required', {}, b'Length Required')
+            return False
+        body = await asyncio.wait_for(reader.readexactly(content_length), timeout=_CLIENT_BODY_TIMEOUT) if content_length else b''
+        await self._handle_http_request(method, url, req_headers, body, writer, client_ip)
+        connection = {v.strip().lower() for v in req_headers.get('connection', '').split(',')}
+        return version.upper() == 'HTTP/1.1' and 'close' not in connection
 
     # ── HTTP 请求处理 ──────────────────────────────────────────
 
@@ -2807,7 +2757,9 @@ class Router:
             if existing is not None:
                 try:
                     logger.debug("coalescing %s %s (in-flight)", method, url)
-                    agg_result = await asyncio.wait_for(existing, timeout=_AGG_WAIT_TIMEOUT)
+                    # waiter 超时只能放弃自己的等待，不能取消首请求持有的共享 Future。
+                    agg_result = await asyncio.wait_for(
+                        asyncio.shield(existing), timeout=_AGG_WAIT_TIMEOUT)
                 except asyncio.TimeoutError:
                     logger.debug("coalescing timeout %s %s, fall back to racing", method, url)
                     existing = None
@@ -2956,7 +2908,7 @@ class Router:
 
     async def _forward_single(self, writer, method: str, url: str, hdrs: dict, body, domain: str,
                              pid: str | None = None, instantiated=None, sticky: bool = False,
-                             client_ip: str = ""):
+                             client_ip: str = "", retry_on_5xx: bool = False):
         """流式转发一个已取得胜利的响应并视情写入响应缓存,作为统一收尾。
 
         供域名缓存命中单发、会话粘性命中单发 与 竞速赢家三条路径共用:流式
@@ -2993,6 +2945,11 @@ class Router:
             else:
                 self.domain_cache_hits += 1
         try:
+            # 域名缓存/粘性单发必须与竞速保持同一语义：5xx 不是可用赢家。
+            # 在响应头尚未写给客户端前终止本次尝试，交给调用方失效钉住代理并竞速。
+            if retry_on_5xx and resp.status_code >= 500:
+                self.selector.record_http_error(pid, resp.status_code, domain=domain)
+                raise _UpstreamServerError(f"upstream returned HTTP {resp.status_code}")
             buffered, body_bytes, body_duration = await self._stream_upstream_response(writer, resp, method, url)
             # Phase 1.1:吞吐观测(见 record_complete)。instantiated(竞速赢家)
             # 路径同样在此记录:赢家是最终面向客户端的代理,其中转速率正是用户
@@ -3158,13 +3115,10 @@ class Router:
                     if proto == 'http':
                         status = await self._forward_single(
                             writer, method, url, hdrs, body, domain_key, sticky_pid, sticky=True,
-                            client_ip=client_ip)
-                        if status is not None and status >= 500:
-                            self.sticky._evict_sticky(client_ip, domain_key)
-                        else:
-                            self.sticky._bump_sticky(client_ip, domain_key, sticky_pid)
-                            # 杠杆A:粘性命中后台探路——竞争代理显著更快则驱逐(不阻塞单发)。
-                            self._spawn_sticky_probe(client_ip, domain_key, sticky_pid)
+                            client_ip=client_ip, retry_on_5xx=True)
+                        self.sticky._bump_sticky(client_ip, domain_key, sticky_pid)
+                        # 杠杆A:粘性命中后台探路——竞争代理显著更快则驱逐(不阻塞单发)。
+                        self._spawn_sticky_probe(client_ip, domain_key, sticky_pid)
                         return status
                     # CONNECT:成功账簿 + 200 + 透传。隧道为长连接,须在 _relay_tunnel
                     # 之前记账;helper 成功已观测、失败已观测并抛出。
@@ -3203,7 +3157,7 @@ class Router:
                     if proto == 'http':
                         result = await self._forward_single(
                             writer, method, url, hdrs, body, domain_key, cached_pid,
-                            client_ip=client_ip)
+                            client_ip=client_ip, retry_on_5xx=True)
                         self.sticky._record_sticky(client_ip, domain_key, cached_pid)
                         return result
                     up_reader, up_writer, ph, pp = await self._connect_single_send(
@@ -3216,6 +3170,7 @@ class Router:
                     return None
                 except Exception:
                     logger.debug("cached proxy %s failed for %s", cached_pid, domain_key)
+                    self._degrade_send_proxy(cached_pid, domain_key)
 
         # 3) 竞速:首批并行 max_retries 个代理,全失败且还有剩余则对剩余再竞速。
         #    排序域名级(ordered_for_domain):该 domain 快代理进首批,而非全局
@@ -3381,6 +3336,9 @@ class Router:
         buffering = True
         streamed = 0
         total_streamed = 0  # 无论 chunked 与否都累计原始 body 字节(供 Phase 1.1 吞吐)
+        # 不为每个小 chunk 都 drain：transport 高水位前只入用户态缓冲，减少事件
+        # 循环调度与系统调用；达到阈值立即 drain，仍保留对慢客户端的背压。
+        drain_threshold = 64 * 1024
         _body_t0 = time.perf_counter()
         try:
             async for chunk in resp.aiter_raw():
@@ -3400,11 +3358,16 @@ class Router:
                             client_writer.write(b"\r\n")
                         else:
                             client_writer.write(chunk)
-                        await client_writer.drain()
+                        transport = getattr(client_writer, 'transport', None)
+                        if transport is None or transport.get_write_buffer_size() >= drain_threshold:
+                            await client_writer.drain()
                     except (BrokenPipeError, ConnectionError, OSError):
                         client_disconnected = True
                 if use_chunked is False:
                     streamed += len(chunk)
+            if not client_disconnected:
+                # 小响应可能始终未触发高水位；结束时确保立即提交给客户端。
+                await client_writer.drain()
             if use_chunked and not client_disconnected:
                 try:
                     client_writer.write(b"0\r\n\r\n")
@@ -3544,21 +3507,22 @@ class Router:
                     # 隧道寿命只用于吞吐/累计字节;不再是任何"完整响应耗时"分位
                     # (原 TTLB 维度已移除,见 selector.record_complete)。
                     self.selector.record_complete(pid, total, duration, domain=target)
-            # 统一归还判定:抽到 _maybe_return_established,与竞速败者清理共用。
-            await self._maybe_return_established(up_writer, up_reader, proxy_host, proxy_port, target)
+            # 已转发过客户端字节的 CONNECT 隧道包含完整 TLS/应用会话，不能交给另一
+            # 客户端续用；只有竞速败者等从未透传业务字节的隧道才允许入池。
+            await self._maybe_return_established(
+                up_writer, up_reader, proxy_host, proxy_port, target, safe_for_reuse=False)
 
     async def _maybe_return_established(self, up_writer, up_reader,
-                                        proxy_host, proxy_port, target) -> bool:
-        """隧道/竞速败者结束时的统一"是否归还 _established_pool"判定。
+                                        proxy_host, proxy_port, target,
+                                        safe_for_reuse: bool = False) -> bool:
+        """仅为从未透传业务字节的 CONNECT 隧道判定是否归还库存。
 
-        判定条件(抽取自 _relay_tunnel finally):conn_pool_enabled 且
-        established_reuse 且经上游代理(proxy_host 非 None)且上游连接未关闭
-        且无残留缓冲(_pipe 的 close_writer=False 透传路径和竞速败者都只读过
-        CONNECT 响应头,缓冲天然干净)且预算/单键 cap 未超。归还成功返回 True;
-        否则关闭连接并返回 False。_relay_tunnel 与 _cleanup_tunnel_result 共用,
-        保证"正常隧道结束"与"竞速败者"同一套归还语义。
+        safe_for_reuse 只由竞速败者清理路径传 True：它们仅完成 CONNECT 握手，
+        从未承载客户端 TLS/应用会话。正常隧道即使缓冲为空，也不能复用给另一
+        客户端；此时本函数关闭连接。其余预算、活性和单键 cap 约束保持不变。
         """
-        can_reuse = (self.pools.conn_pool_enabled and self.pools.conn_pool_established_reuse
+        can_reuse = (safe_for_reuse and self.pools.conn_pool_enabled
+                     and self.pools.conn_pool_established_reuse
                      and proxy_host is not None and target is not None
                      and not up_writer.is_closing())
         # 严格验证:上游残留缓冲 → 连接已脏,不归还(宁可不复用也不污染)。
@@ -3822,4 +3786,3 @@ class Router:
             setattr(self.cluster, name, value)
             return
         super().__setattr__(name, value)
-

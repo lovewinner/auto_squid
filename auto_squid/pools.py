@@ -273,7 +273,7 @@ class ConnectionPools:
             else:
                 # 桶不匹配:该桶从未有 cluster 预建(真实请求走的代理不是预测那个)。
                 self.cluster_pool_bucket_miss += 1
-            logger.info("target pool MISS %s via %s:%s (misses=%d)",
+            logger.debug("target pool MISS %s via %s:%s (misses=%d)",
                         target, proxy_host, proxy_port, self.target_pool_misses)
         else:
             self.target_pool_hits += 1
@@ -281,7 +281,7 @@ class ConnectionPools:
             if getattr(writer, '_cluster_prewarmed', False):
                 self.cluster_pool_hits += 1
                 writer._consumed_unexpired = True
-            logger.info("target pool HIT  %s via %s:%s (hits=%d)",
+            logger.debug("target pool HIT  %s via %s:%s (hits=%d)",
                         target, proxy_host, proxy_port, self.target_pool_hits)
         return got
 
@@ -303,7 +303,7 @@ class ConnectionPools:
         # 本方法是同步热路径,关闭用 fire-and-forget 后台任务(不阻塞取用)。
         if reader.at_eof() or (reader._buffer and len(reader._buffer) > 0):
             self.established_pool_expired += 1
-            logger.info("established pool DISCARD %s via %s:%s (dirty buffer)", target, proxy_host, proxy_port)
+            logger.debug("established pool DISCARD %s via %s:%s (dirty buffer)", target, proxy_host, proxy_port)
             _discard_conn(writer)
             return None
         # 标记:该连接已建握手,调用方 _try_tunnel 据此跳过 CONNECT 发送/200 校验。
@@ -313,7 +313,7 @@ class ConnectionPools:
         # 区别于竞速败者/隧道归还(_established_pooled)——算预握手专属命中率。
         if getattr(writer, '_prehandshook', False):
             self.established_pool_prehandshook += 1
-        logger.info("established pool HIT  %s via %s:%s (hits=%d)",
+        logger.debug("established pool HIT  %s via %s:%s (hits=%d)",
                     target, proxy_host, proxy_port, self.established_pool_hits)
         return reader, writer
 

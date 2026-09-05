@@ -44,9 +44,9 @@ router:
   stagger_start: true
   # 错峰首批并发数(>=1,经 max_retries 钳制)。冷启动(无任何 EWMA 历史)时
   # 自动翻倍到 2,避免随机首抽丢快代理。
-  stagger_initial: 1
+  stagger_initial: 2
   # 相邻候选的启动间隔(毫秒),钳制到 [100, 2000]。默认 250。
-  stagger_interval_ms: 250
+  stagger_interval_ms: 100
 
   # 客户端访问代理端口所需的 HTTP Basic 认证,默认关闭(开放代理)
   auth:
