@@ -2589,6 +2589,10 @@ class Router:
             pass  # server shutdown, normal
         except asyncio.TimeoutError:
             logger.info("client %s header timed out after %ds", client_ip, _CLIENT_HEADER_TIMEOUT)
+        except (ConnectionResetError, BrokenPipeError):
+            # 客户端在 router 读到 header 前就 RST / FIN(浏览器关、代理被前端 cancel、
+            # 扫码/扫描器只探活)。健康流量,不该 traceback。
+            logger.debug("client %s disconnected before request", client_ip)
         except Exception:
             logger.exception("error handling client")
         finally:
