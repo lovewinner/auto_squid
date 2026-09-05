@@ -157,7 +157,7 @@ python -m bench.github --rounds 3                 # 每轮全新子进程/SQLite
 python -m bench.github --requests 5000            # 闭环:固定请求总数(覆盖 --duration)
 ```
 
-报告含请求/吞吐/TTFB 分位/状态码分布/缓存命中/竞速放大率/连接池/target 半预连接/服务端 CPU 与 loop-lag,另写 JSON(`--out`)。注意:github 对 `http://host/` 普遍回 301/302,属"代理已成功转发",不算失败。
+报告含请求/吞吐/TTFB 分位/状态码分布/缓存命中/竞速放大率/**上游分布(每个代理的请求与尝试次数)**/连接池/target 半预连接/服务端 CPU 与 loop-lag,另写 JSON(`--out`)。注意:github 对 `http://host/` 普遍回 301/302,属"代理已成功转发",不算失败。
 
 ## 隔离缓存层
 

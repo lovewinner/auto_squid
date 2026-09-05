@@ -30,6 +30,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import httpx  # noqa: E402
+from typing import Optional  # noqa: E402
+
 from bench.stress import (  # noqa: E402
     ScenarioResult, ServerProcess, _percentile,
     do_connect_request, do_http_request, fetch_counters,
@@ -119,6 +122,40 @@ async def _probe(args) -> None:
              if bad and ok == 0 else ""))
 
 
+async def fetch_proxy_snapshot(metrics_base: str) -> Optional[dict]:
+    """拉 /metrics 的 per-pid request/attempt 计数快照,失败返回 None。
+
+    Router 的 `request_counts`/`attempted_counts` 都是 {proxy_id: int}:
+    - request_counts  : 该代理被选定(成功转发)的次数;
+    - attempted_counts: 该代理被尝试的次数(竞速下 ≈ 选定次数 × 竞速放大)。
+    场景首尾各拉一次,`proxy_deltas` 做差即"本次压测各上游代理的分布"。
+    """
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            r = await client.get(f"{metrics_base}/metrics")
+            if r.status_code != 200:
+                return None
+            j = r.json()
+        return {"request_counts": j.get("request_counts") or {},
+                "attempted_counts": j.get("attempted_counts") or {}}
+    except Exception:
+        return None
+
+
+def proxy_deltas(before: Optional[dict], after: Optional[dict]) -> Optional[dict]:
+    """两个 per-proxy 快照做差,得到各上游代理的请求/尝试次数,按请求降序。"""
+    if not before or not after:
+        return None
+    before_req, after_req = before.get("request_counts", {}), after.get("request_counts", {})
+    before_att, after_att = before.get("attempted_counts", {}), after.get("attempted_counts", {})
+    requests = {pid: after_req[pid] - before_req.get(pid, 0)
+                for pid in after_req if after_req[pid] > before_req.get(pid, 0)}
+    attempts = {pid: after_att[pid] - before_att.get(pid, 0)
+                for pid in after_att if after_att[pid] > before_att.get(pid, 0)}
+    return {"requests": dict(sorted(requests.items(), key=lambda kv: -kv[1])),
+            "attempts": attempts}
+
+
 def _server_config(args) -> dict:
     """组装传给 bench.server_proc 的 JSON 配置(real 模式,加载 proxies.yaml)。
 
@@ -161,6 +198,7 @@ async def _run_one_round(args, targets: list) -> tuple:
 
         # 正式负载:counters_before 在预热后拉,差值只含正式段。
         result.counters_before = await fetch_counters(sp.metrics_base) or {}
+        proxy_before = await fetch_proxy_snapshot(sp.metrics_base)
         t0 = time.monotonic()
         if args.requests and args.requests > 0:
             res = await run_concurrent(make, args.requests, args.concurrency,
@@ -183,9 +221,11 @@ async def _run_one_round(args, targets: list) -> tuple:
         result.counters_after = await fetch_counters(sp.metrics_base) or {}
         if not result.counters_after:
             result.counter_fetch_failed = True
+        m = result.metrics()
+        m["proxies"] = proxy_deltas(proxy_before, await fetch_proxy_snapshot(sp.metrics_base))
         stop_evt.set()
         await sampler
-        return result.metrics(), sp
+        return m, sp
     finally:
         try:
             sp.stop()
@@ -229,6 +269,17 @@ def print_row(prefix: str, m: dict) -> None:
     att_s = racing["upstream_attempts"] if racing["upstream_attempts"] is not None else "N/A"
     inv_s = racing["invocations"] if racing["invocations"] is not None else "N/A"
     print(f"  竞速          : 放大率 {amp_s}  (上游尝试 {att_s}, 触发 {inv_s})")
+    proxies = m.get("proxies")
+    if proxies:
+        req = proxies["requests"] or {}
+        att = proxies["attempts"] or {}
+        parts = []
+        for pid, n in req.items():
+            a = att.get(pid)
+            parts.append(f"{pid}: {n} 次" if a is None or a == n else f"{pid}: {n} 次 (尝试 {a})")
+        print(f"  上游分布      : " + (" | ".join(parts) if parts else "(无增量)"))
+    else:
+        print(f"  上游分布      : N/A (per-proxy 计数拉取失败)")
     if conn.get("hits") is not None:
         print(f"  连接池        : hits {conn['hits']}  misses {conn['misses']}  新建 {conn['new_conns']}  "
               f"池末值 {conn['pool_size_end']}")
