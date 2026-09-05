@@ -3561,10 +3561,13 @@ class Router:
                     # 隧道寿命只用于吞吐/累计字节;不再是任何"完整响应耗时"分位
                     # (原 TTLB 维度已移除,见 selector.record_complete)。
                     self.selector.record_complete(pid, total, duration, domain=target)
-            # 已转发过客户端字节的 CONNECT 隧道包含完整 TLS/应用会话，不能交给另一
+            # 已转发过客户端字节的 CONNECT 隧道包含完整 TLS/应用会话,不能交给另一
             # 客户端续用；只有竞速败者等从未透传业务字节的隧道才允许入池。
+            # 安全判据客观化:total==0(客户端只 CONNECT 立即断开,未发业务字节)
+            # → 干净隧道,允许入池,无需调用方主观判断 safe_for_reuse。
             await self._maybe_return_established(
-                up_writer, up_reader, proxy_host, proxy_port, target, safe_for_reuse=False)
+                up_writer, up_reader, proxy_host, proxy_port, target,
+                safe_for_reuse=(total == 0))
 
     async def _maybe_return_established(self, up_writer, up_reader,
                                         proxy_host, proxy_port, target,

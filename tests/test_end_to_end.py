@@ -4435,16 +4435,22 @@ class TestEstablishedTunnelReuse:
 
     @pytest.mark.asyncio
     async def test_tunnel_returned_to_pool(self):
-        """隧道结束后连接归还 _established_pool(而非关闭),returned 计数 +1。"""
+        """已握手隧道复用:客户端仅 CONNECT 不断开业务字节 → 隧道干净,可归还 established 池。
+
+        已透传过客户端业务字节的 CONNECT 隧道含完整 TLS/应用会话,**不能**给另一客户端
+        续用(协议串流污染、隐私隔离失效)。本测试只发 CONNECT 不发 payload,使
+        _relay_tunnel 收到的客户端数据是 0 字节 → 干净 → 入池。
+        """
         up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
         r = self._router()
         await r.start()
         try:
             target = b"reuse-return.example.com:443"
-            echo = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"one")
-            assert echo == b"one"
+            # 只发 CONNECT,读 200 后立即关闭客户端(不发业务 payload)→ 干净隧道。
+            status = await send_connect_status(HOST, ROUTER_PORT, target=target)
+            assert b'200' in status, f"expected 200, got {status}"
             # 客户端断开 → _relay_tunnel 异步归还已握手连接,轮询等待。
-            assert await self._wait_returned(r, target), "连接应归还到已握手池"
+            assert await self._wait_returned(r, target), "干净隧道应归还到已握手池"
             assert r.established_pool_returned == 1
             key = f"{HOST}:31991|reuse-return.example.com:443"
             assert len(r._established_pool[key]) == 1
@@ -4457,7 +4463,8 @@ class TestEstablishedTunnelReuse:
     async def test_reuse_skips_connect(self):
         """第二次同 target 命中已握手池,established_pool_hits +1,不再发 CONNECT。
 
-        用 hit_counter 列表统计 mock 上游收到的 CONNECT 请求数:第二次应不增加。
+        hit_counter 统计 mock 上游收到的 CONNECT 请求数:第二次应不增加。两次
+        客户端都仅 CONNECT 不发 payload,保持隧道干净可入池/可复用。
         """
         hit_counter = []
         up_srv = await run_mock_proxy(HOST, 31991, hit_counter=hit_counter)
@@ -4466,13 +4473,13 @@ class TestEstablishedTunnelReuse:
         try:
             target = b"reuse-skip.example.com:443"
             # 第一次:建隧道 + CONNECT 计数 +1,结束后归还(异步,轮询等待)。
-            echo1 = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"one")
-            assert echo1 == b"one"
+            status1 = await send_connect_status(HOST, ROUTER_PORT, target=target)
+            assert b'200' in status1
             assert len(hit_counter) == 1, f"first CONNECT must hit mock, got {len(hit_counter)}"
             assert await self._wait_returned(r, target)
             # 第二次:命中已握手池,跳过 CONNECT,mock 收到 CONNECT 数不增。
-            echo2 = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"two")
-            assert echo2 == b"two"
+            status2 = await send_connect_status(HOST, ROUTER_PORT, target=target)
+            assert b'200' in status2
             assert len(hit_counter) == 1, f"second CONNECT must be reused, got {len(hit_counter)} CONNECTs"
             # 第一次 peek miss(池空)→ misses=1;第二次命中 → hits=1,misses 不再增。
             assert r.established_pool_hits == 1
@@ -4502,14 +4509,17 @@ class TestEstablishedTunnelReuse:
 
     @pytest.mark.asyncio
     async def test_stop_closes_established_pool(self):
-        """stop() 关闭全部已握手连接,池清空。"""
+        """stop() 关闭全部已握手连接,池清空。
+
+        用仅 CONNECT 不发 payload 的客户端,保留干净隧道入池。
+        """
         up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
         r = self._router()
         await r.start()
         try:
             target = b"reuse-stop.example.com:443"
-            echo = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"x")
-            assert echo == b"x"
+            status = await send_connect_status(HOST, ROUTER_PORT, target=target)
+            assert b'200' in status
             assert await self._wait_returned(r, target)
             assert sum(len(v) for v in r._established_pool.values()) == 1
         finally:
@@ -4626,14 +4636,17 @@ class TestEstablishedTunnelReuse:
 
     @pytest.mark.asyncio
     async def test_pool_keepalive_set_on_return(self):
-        """归还到 established 池的连接设了 SO_KEEPALIVE(OS 兜底判死半开)。"""
+        """归还到 established 池的连接设了 SO_KEEPALIVE(OS 兜底判死半开)。
+
+        用仅 CONNECT 不发 payload 的客户端,保留干净隧道入池。
+        """
         up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
         r = self._router()
         await r.start()
         try:
             target = b"reuse-keepalive.example.com:443"
-            echo = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"k")
-            assert echo == b"k"
+            status = await send_connect_status(HOST, ROUTER_PORT, target=target)
+            assert b'200' in status
             assert await self._wait_returned(r, target)
             key = f"{HOST}:31991|{target.decode()}"
             _reader, writer = r._established_pool[key][0]
@@ -4661,9 +4674,9 @@ class TestEstablishedTunnelReuse:
         await r.start()
         try:
             target = b"reuse-dead.example.com:443"
-            # 第一次:正常隧道 → 归还 established 池。
-            echo1 = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"one")
-            assert echo1 == b"one"
+            # 第一次:仅 CONNECT 不断开业务字节 → 干净隧道 → 归还 established 池。
+            status1 = await send_connect_status(HOST, ROUTER_PORT, target=target)
+            assert b'200' in status1
             assert await self._wait_returned(r, target)
             key = f"{HOST}:31991|{target.decode()}"
             # 手动造一条"已 RST"的候选(模拟对端静默 RST 却又过了 peek 干净检查):
@@ -4749,15 +4762,20 @@ class TestRaceLoserEstablishedReturn:
     @pytest.mark.asyncio
     async def test_e2e_race_pools_both_winner_and_loser(self):
         """E2E 竞速:两个无延迟代理同时完成 CONNECT 200,赢家经 relay 归还、
-        败者经 cleanup 归还 → 两键都入池。"""
+        败者经 cleanup 归还 → 两键都入池。
+
+        胜者:仅 CONNECT 立即关闭客户端(不发业务 payload) → 干净 → 入池。
+        败者:仅 CONNECT 已握手 → safe_for_reuse=True → 入池。
+        """
         up_srv_fast = await run_mock_proxy(HOST, 31991, hit_counter=None)
         up_srv_slow = await run_mock_proxy_delayed_connect(HOST, 31992, connect_delay=0.0)
         r = self._router(stagger_start=False)  # _race 全发,两候选同时完成 200
         await r.start()
         try:
             target = b"loser-e2e.example.com:443"
-            echo = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"one")
-            assert echo == b"one"
+            # 仅 CONNECT 立即关闭(不发业务 payload)→ 干净胜者隧道,可入池。
+            status = await send_connect_status(HOST, ROUTER_PORT, target=target)
+            assert b'200' in status
             # 两键最终都应入池:赢家(客户端断开后 relay 归还)+ 败者(cleanup 归还)。
             for _ in range(int(3.0 / 0.02)):
                 if len(r._established_pool) >= 2:
