@@ -2585,6 +2585,10 @@ class Router:
         try:
             while await self._handle_one_client_request(reader, writer, peer, client_ip):
                 pass
+        except asyncio.CancelledError:
+            pass  # server shutdown, normal
+        except asyncio.TimeoutError:
+            logger.info("client %s header timed out after %ds", client_ip, _CLIENT_HEADER_TIMEOUT)
         except Exception:
             logger.exception("error handling client")
         finally:
