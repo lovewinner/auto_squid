@@ -28,6 +28,7 @@ import json
 import os
 import resource
 import signal
+import socket
 import sys
 import tempfile
 import time
@@ -146,6 +147,19 @@ class ServerStatsSampler:
             pass
 
 
+def _pick_free_port() -> int:
+    """预选一个空闲本地端口(TCP)。bind 后立即关闭,由调用方尽快使用。
+
+    主进程 config 允许 metrics_port=0(让子进程自己挑)。uvicorn 在 port=0 时会
+    随机绑定,但 READY 行只能打印配置值(0),主进程会连到 127.0.0.1:0 拉
+    /metrics 而失败——因此这里先挑一个具体端口,再写进 uvicorn 配置与 READY,
+    避免"随机绑定但主进程不知道端口"的隐身 bug。
+    """
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 def _pct(vals: list[float], p: float) -> float:
     if not vals:
         return 0.0
@@ -252,14 +266,17 @@ async def _serve(config: dict):
         sampler = ServerStatsSampler(mock_counters_fn=mock_fn)
         sampler_task = asyncio.create_task(sampler.run(stop_evt))
 
-        # 4) 管理 API(uvicorn),监听主进程指定的 metrics_port。
+        # 4) 管理 API(uvicorn)。metrics_port=0 → 预选具体端口(见 _pick_free_port),
+        #    并用于 READY 回传,否则主进程拿到的 metrics_base 是 :0,拉 /metrics
+        #    必然失败(cache/racing/资源全 None)。
+        metrics_port = config.get("metrics_port") or _pick_free_port()
         uv_cfg = uvicorn.Config(api_app, host="127.0.0.1",
-                                port=config["metrics_port"], log_level="warning")
+                                port=metrics_port, log_level="warning")
         server = uvicorn.Server(uv_cfg)
         server_task = asyncio.create_task(server.serve())
 
         # 5) 就绪握手:打印 READY 行(主进程据此开始发请求)。
-        print(f"READY {config['router_port']} {config['metrics_port']}", flush=True)
+        print(f"READY {config['router_port']} {metrics_port}", flush=True)
 
         # 阻塞至停止信号。
         await stop_evt.wait()

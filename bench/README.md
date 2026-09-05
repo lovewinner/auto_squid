@@ -7,6 +7,7 @@
 - `mock_upstream.py` — 受控上游代理集群。模拟真实 HTTP/HTTPS 代理(绝对 URL 请求 + CONNECT 回显隧道),延迟/响应大小/chunked/失败率由配置决定,排除真实网络抖动。每实例带命中计数器与**新建连接计数器**(后者供连接复用场景)。
 - `server_proc.py` — **被测方子进程入口**。独立事件循环内启动 Router(+ mock 集群)+ 管理 API(uvicorn,复用 `auto_squid.api:app`),经 stdout 打印 `READY` 握手,捕获 SIGTERM 优雅关闭。进程隔离的核心。
 - `stress.py` — 压测主驱动(纯客户端)。启动 `server_proc` 子进程 → 读 READY 握手 → 按模式跑负载 → 跨进程拉 `/metrics` `/server-stats` → 输出终端表格 + 结构化 JSON。
+- `github.py` — 对 github.com 的专用压测(独立脚本,复用 stress 客户端与 server_proc)。目标锁定 github 家族,负载以 CONNECT 隧道为主,含 `--probe` 探路。详见下文「对 github.com 压测」。
 
 ## 进程隔离(本版核心)
 
@@ -140,6 +141,23 @@ python -m bench.stress --adaptive-ttl --switch-damping --concurrency-limit
 python -m bench.stress --upstream real --mode all --duration 120
 python -m bench.stress --upstream real --real-hosts www.baidu.com,www.qq.com
 ```
+
+## 对 github.com 压测(`bench/github.py`)
+
+独立脚本,目标**锁定**在 github 家族(默认 github.com / api.github.com / www.github.com,`--targets` 覆盖)。与 `stress --upstream real` 同用真实上游代理(需 proxies.yaml 且上游可达 github),但负载以 **CONNECT 隧道为主**——真实访问 github 是 HTTPS,隧道成本正是本代理面向 github 的真实成本。成功语义同 stress real 模式:建隧道即成功 / 收到任何状态码即成功(状态码分布照常记录,用于识别 4xx/429)。
+
+```bash
+python -m bench.github                            # mixed:CONNECT + GET 交替,并发 64×30s
+python -m bench.github --mode tunnel              # 只打 CONNECT host:443
+python -m bench.github --mode http                # 只打 absolute-form GET
+python -m bench.github --probe                    # 快速探路:上游能否访问 github(只发 2 请求/目标)
+python -m bench.github --conn-pool --conn-pool-target-prewarm   # 测预热池对 github 的收益
+python -m bench.github --duration 120 --concurrency 100         # 长时高压
+python -m bench.github --rounds 3                 # 每轮全新子进程/SQLite,均值±stddev 去噪声
+python -m bench.github --requests 5000            # 闭环:固定请求总数(覆盖 --duration)
+```
+
+报告含请求/吞吐/TTFB 分位/状态码分布/缓存命中/竞速放大率/连接池/target 半预连接/服务端 CPU 与 loop-lag,另写 JSON(`--out`)。注意:github 对 `http://host/` 普遍回 301/302,属"代理已成功转发",不算失败。
 
 ## 隔离缓存层
 
