@@ -45,6 +45,43 @@
 - 域名级胜出统计持久化到 SQLite（`auto_squid.db`）
 - 管理 API + 单页 Web 界面
 
+## 请求处理链条
+
+每个客户端连接都走同一条决策链。理解它就能定位请求耗时点与调优参数的作用位置。所有 handler 都在 `auto_squid/router.py` 中。
+
+**1. 连接与认证** — `handle_client`（router.py:2577）接受 HTTP/1.1 keep-alive 连接,读取请求头,并执行 `Proxy-Authorization` 校验（407 在任何上游工作之前返回）。`CONNECT` 交给 `_handle_connect`,普通 HTTP 交给 `_handle_http_request`。
+
+**2. 短路检查** — 在任何路由决策之前,若干检查直接绕过后续流程：
+
+- `local_direct_domains` 白名单 → 网关直连源站,不经任何远端代理
+- In-flight GET coalescing（并发相同 URL 共享一次上游请求）
+
+**3. 分发决策** — `_dispatch_single`（router.py:3141）是 HTTP 与 CONNECT 共用的唯一决策点。优先级顺序：
+
+1. **会话粘性命中**（`_get_sticky_proxy`）：同一 client IP + 域名/target 复用其钉住的代理 → 确定性**单发**（`_forward_single` / `_connect_single_send`）,不竞速
+2. **域名缓存命中**（`_get_fresh_proxy`）：`cache_ttl` 内该域名上次竞速胜出的代理 → 单发
+3. **竞速**（`_race_staggered`,router.py:2054）：无钉住 → 按 Cost 排序（P99-TTFB 尾延迟 + 成功率 + 吞吐,min–max 归一化）的候选集上竞速；最优 1–2 个先发（RFC 8305 §5 错开）,其余按 ~250ms 间隔补发；首个首字节到达即胜出,其余取消
+
+**4. 降级反馈** — 单发失败是危险情形（钉住的代理可能被反复钉死）。两个守卫打断该循环：
+
+- 单发失败时，`_degrade_send_proxy`（router.py:1634）把代理标记进 `_immediate_degraded`，使该域名的**下一次**请求跳过粘性与域名缓存，直接回落竞速。竞速新赢家 `_record_win_meta`（router.py:956）清除该标记
+- 独立地，策略过滤（`_policy_allows_sticky` / `_policy_candidate_pids`,router.py:1517）可在分发决策前按域名排除代理
+
+**5. 失败计数** — 竞速败者按尝试次数 `record_failure`（`_try_tunnel` / `_try_http`），喂给 `selector.py` 的熔断器：`circuit_threshold` 次连续失败后开路，指数退避（8s → 最大 300s）。单发失败**不**累加 circuit counter（仅设即时降级标记）——见 commit `7f34984` 的事故复盘。
+
+**6. 连接复用** — 上述所有路径之下有三层 TCP 池化（`conn_pool` / `target_prewarm` / `cluster_predict`）：「本机 → 上游代理」连接、热点 target 的「上游代理 → target」半预开连接、以及页面加载 burst 的预测 co-target 连接。陈旧池化连接在握手时被检测到并重试新连接，不惩罚熔断器。
+
+### 各配置项作用位置
+
+| 配置项 | 作用于 | 影响 |
+|---|---|---|
+| `cache_ttl` | 域名缓存（步骤 3.2） | 竞速胜出代理被复用多久 |
+| `stickiness_enabled` | 粘性查找（步骤 3.1） | 是否启用 per-client-IP 钉住 |
+| `max_retries` | 竞速（步骤 3.3） | 初始竞速扇出宽度 |
+| `cost_sort_enabled` | 候选排序（步骤 3.3） | 多目标 Cost 排序 vs 纯 EWMA |
+| `circuit_threshold` | 失败计数（步骤 5） | 连续失败几次后开路 |
+| `single_send_degrade_fail` / `_ratio` | 降级门控（步骤 4） | 解除钉住的阈值 |
+
 ## 客户端认证
 
 代理端口（`:10808`）可要求客户端通过 HTTP Basic 认证。**默认关闭**，在 `config.yaml` 中开启：

@@ -45,6 +45,43 @@ Lightweight forward proxy with parallel racing, domain-based caching, an HTTP re
 - Domain-level win statistics persisted to SQLite (`auto_squid.db`)
 - Management API + single-page web UI
 
+## Request pipeline
+
+Every client connection goes through the same decision chain. Understanding it explains where a request spends time and where the tuning knobs act. All handlers live in `auto_squid/router.py`.
+
+**1. Connection & auth** — `handle_client` (router.py:2577) accepts a keep-alive HTTP/1.1 connection, reads the request head, and enforces `Proxy-Authorization` (407 before any upstream work). `CONNECT` is handed to `_handle_connect`, plain HTTP to `_handle_http_request`.
+
+**2. Short-circuit checks** — before any routing decision, a few checks bypass everything else:
+
+- `local_direct_domains` whitelist → the gateway dials the origin directly, no upstream proxy
+- In-flight GET coalescing (concurrent identical URLs share one upstream request)
+
+**3. Dispatch decision** — `_dispatch_single` (router.py:3141) is the single decision point for both HTTP and CONNECT. Priority order:
+
+1. **Session stickiness hit** (`_get_sticky_proxy`): same client IP + domain/target reuses its pinned proxy → deterministic **single-send** (`_forward_single` / `_connect_single_send`), no race
+2. **Domain cache hit** (`_get_fresh_proxy`): the domain's last race winner within `cache_ttl` → single-send on that proxy
+3. **Racing** (`_race_staggered`, router.py:2054): no pin → race across the candidate list sorted by Cost (P99-TTFB-first latency + success rate + throughput, min–max normalized); the best 1–2 launch first (RFC 8305 §5 stagger), the rest refill at ~250ms intervals; first first-byte wins, losers are cancelled
+
+**4. Degradation feedback** — a failing single-send is the dangerous case (a pinned proxy can be re-pinned forever). Two guards interrupt that loop:
+
+- On single-send failure, `_degrade_send_proxy` (router.py:1634) marks the proxy in `_immediate_degraded`, so the *next* request for that domain skips both stickiness and domain cache and falls straight back to racing. `_record_win_meta` (router.py:956) clears the marker when a new race winner is established
+- Independently, policy filters (`_policy_allows_sticky` / `_policy_candidate_pids`, router.py:1517) can exclude proxies per-domain before the dispatch decision is even made
+
+**5. Failure accounting** — racing losers record `record_failure` per attempt (`_try_tunnel` / `_try_http`), which feeds the circuit breaker in `selector.py`: `circuit_threshold` consecutive failures open a circuit with exponential backoff (8s → up to 300s). Single-send failures do **not** increment the circuit counter (they only set the immediate-degrade marker) — see the post-mortem in commit `7f34984`.
+
+**6. Connection reuse** — under all of the above sit three layers of TCP pooling (`conn_pool`, `target_prewarm`, `cluster_predict`): "this host → upstream" connections, half-preopened "to upstream → target" connections for hot targets, and predicted co-targets for a page-load burst. A stale pooled connection is detected on handshake and retried fresh without penalizing the circuit breaker.
+
+### Where each knob acts
+
+| Knob | Acts at | Effect |
+|---|---|---|
+| `cache_ttl` | Domain cache (step 3.2) | How long a race winner is reused without re-racing |
+| `stickiness_enabled` | Sticky lookup (step 3.1) | Enables per-client-IP pinning |
+| `max_retries` | Racing (step 3.3) | Initial race fan-out width |
+| `cost_sort_enabled` | Candidate sort (step 3.3) | Multi-objective ranking vs pure EWMA |
+| `circuit_threshold` | Failure accounting (step 5) | Consecutive failures before a circuit opens |
+| `single_send_degrade_fail` / `_ratio` | Degrade gate (step 4) | Thresholds that unpin a failing single-send proxy |
+
 ## Client authentication
 
 The proxy port (`:10808`) can require HTTP Basic auth from clients. It is **off by default** — enable it in `config.yaml`:
