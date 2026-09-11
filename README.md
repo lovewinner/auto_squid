@@ -368,7 +368,7 @@ router:
   # adaptive_ttl: {enabled: true, min_sec: 60, max_sec: 1800}   # per-domain TTL by stability
   # switch_damping: {enabled: true, min_wins: 2, ratio: 0.8, abs_ms: 30}  # stable egress
   # concurrency_limit: {enabled: true, initial: 16, min: 2, max: 128, add_on_success: 4, mult_on_failure: 0.5, failure_window: 20}
-  # conn_pool: {enabled: true, per_proxy: 4, total: 64, idle_timeout: 30.0, refill_interval: 5.0, refill_target: 2, connect_timeout: 10.0, target_prewarm: true, refill_pause_minutes: 60, refill_pause_activity_window: 120, refill_pause_min_requests: 3, established_reuse: true, cluster_predict: true, cluster_window_sec: 2.0, cluster_predict_topk: 3, cluster_min_support: 2, cluster_graph_ttl_sec: 86400, cluster_graph_max_entries: 100000, cluster_predict_throttle_sec: 30.0}
+  # conn_pool: {enabled: true, per_proxy: 4, total: 64, idle_timeout: 30.0, refill_interval: 5.0, refill_target: 2, connect_timeout: 10.0, target_prewarm: true, refill_pause_minutes: 60, refill_pause_activity_window: 120, refill_pause_min_requests: 3, established_reuse: true, prehandshake: true, prehandshake_throttle_window_sec: 2.0, prehandshake_throttle_max_per_window: 6, cluster_predict: true, cluster_window_sec: 2.0, cluster_predict_topk: 3, cluster_min_support: 2, cluster_graph_ttl_sec: 86400, cluster_graph_max_entries: 100000, cluster_predict_throttle_sec: 30.0}
 logging:
   file: "auto_squid.log"
 ```
@@ -407,7 +407,7 @@ router:
     probe_interval_sec: 30
     probe_canary: "www.baidu.com:443"
     single_send_degrade_fail: 2
-    single_send_degrade_ratio: 3.0
+    single_send_degrade_ratio: 1.5  # tightened 2026-09-05 from 2.0: catch proxy quality degradation faster
     single_send_degrade_slack_ms: 10
 ```
 
@@ -423,7 +423,7 @@ router:
     probe_interval_sec: 20
     lb_bias: 0.5            # stop de-prioritizing the fast proxy too eagerly
     single_send_degrade_fail: 2
-    single_send_degrade_ratio: 3.0
+    single_send_degrade_ratio: 1.5  # tightened 2026-09-05 from 2.0: catch proxy quality degradation faster
     single_send_degrade_slack_ms: 10
 ```
 
@@ -437,8 +437,8 @@ router:
   circuit:
     probe_interval_sec: 30
     lb_bias: 1.0
-    single_send_degrade_fail: 1   # pin faster than the circuit breaker
-    single_send_degrade_ratio: 2.0
+    single_send_degrade_fail: 1   # unpin before the circuit breaker trips
+    single_send_degrade_ratio: 1.5  # tightened 2026-09-05 from 2.0
     single_send_degrade_slack_ms: 10
 ```
 
@@ -455,6 +455,9 @@ Tuning notes:
 - **`conn_pool.refill_pause_minutes`** (default 60): when no client request has arrived for N consecutive minutes (e.g. overnight), the background refill and target-prewarm **pause** so they stop churning "connect → idle-expire → reconnect" with zero traffic. Production measured ~233 wasted connects/hour per 6 proxies during a 6h idle stretch (100% expired). The pool still drains stale connections while paused (prune runs), and any new request immediately resumes refilling. Set `0` to keep the old always-refill behavior.
 - **`conn_pool.refill_pause_activity_window`** (default 120) and **`conn_pool.refill_pause_min_requests`** (default 3): activity is judged as **clustered requests** — real traffic is a cluster (a page load fires CONNECTs to multiple hostnames within seconds, so window counts run 5-30), while background heartbeats (GitHub Desktop's `alive.github.com`, Windows' `client.wns.windows.com`, Edge cloud-messaging — every 3-10 min) are isolated single requests (window count 1, rarely 2). The activity timestamp refreshes only when the count inside the window reaches the threshold, so heartbeats can never defeat the idle pause — while real isolated requests are no longer misclassified (the old `refill_pause_silence_sec` interval cutoff wrongly ignored any request spaced >120s, and refill never resumed during the day). Set the window to `0` or threshold ≤ 1 to keep the old refresh-on-any-request behavior. Note: **idle pause only suspends background prewarm (refill / target-prewarm), never the request path** — a real request always takes/creates/reuses connections normally even while paused.
 - **`conn_pool.established_reuse`** (default false): reuses *already-CONNECT-handshaked* tunnels. When a tunnel ends cleanly (no residual buffered data on the upstream side), the connection is returned to `_established_pool` instead of closed; the next request for the same `(proxy, target)` reuses it directly, skipping the CONNECT send + 200 check — saving a full round-trip over slow lines (e.g. github). Strict verification discards dirty connections rather than risk data pollution. The pool is bounded by the global `conn_pool.total` budget (counted alongside the other two pools) plus a per-key cap of 2; before reuse, a 50ms liveness probe (`read(1)`) drops connections whose peer closed (FIN/RST) and falls back to a fresh CONNECT — a dead tunnel can never win a race on zero I/O. Returned connections get `SO_KEEPALIVE` so the OS clears half-open peers while pooled. Watch `/metrics` `established_pool_hits` vs `established_pool_misses` to confirm reuse. Requires `conn_pool.enabled`.
+- **`conn_pool.prehandshake`** (default false, requires `conn_pool.enabled` + `target_prewarm` + `established_reuse`): when a CONNECT wins (sticky hit, domain cache hit, or race win), the router proactively opens an *additional* TCP connection and runs a full CONNECT handshake to the origin, queuing the completed tunnel in `_established_pool`. This converts "only bare TCP" prewarming into "completed-handshake-in-pool", so the next request for the same `(proxy, target)` reuses it directly without any CONNECT round-trip — saving a full round-trip latency on every hit. Without it, prewarm only delivers raw TCP; the next request still pays the CONNECT cost. **Production incident (2026-09-01)**: without the throttle knobs below, a page first-load floods dozens of sticky-hit targets across multiple proxies, spawning 20+ completed handshakes in 3 seconds → upstream overload → full circuit breaker cascade. Always configure `prehandshake_throttle_window_sec > 0` and `prehandshake_throttle_max_per_window > 0` together before enabling. Watch `/metrics` `prehandshake_pool_hits` vs `prehandshake_pool_misses` and `prehandshake_throttled_skips`.
+- **`conn_pool.prehandshake_throttle_window_sec`** (default 0 = off): sliding-window throttle (seconds); at most `prehandshake_throttle_max_per_window` prehandshake launches allowed per window. Set > 0 with `prehandshake_throttle_max_per_window` to prevent flood.
+- **`conn_pool.prehandshake_throttle_max_per_window`** (default 0 = off): max prehandshake launches per `throttle_window_sec`. Only effective when both window_sec > 0 and this value > 0.
 - **`conn_pool.cluster_predict`** (default false, requires `conn_pool.enabled` **and** `conn_pool.target_prewarm`): learns, from each client's page-load window (default 2s group of CONNECT targets), which targets co-occur globally (a cross-client co-occurrence graph) and, at the *next* window's **opening request** — the HTML request while its js/css/CDN burst is still to come — pre-warms bare "local → upstream proxy" TCP for the top-K predicted co-targets (never sending a CONNECT to the origin). It is *predictive* pre-warm, complementing the *reactive* `target_prewarm`: the co-targets' TCP is already connected by the time the subresources arrive, and `_target_pool` hands it out on the take-ladder. A wrong prediction costs one idle TCP that the 30s idle-expiry reaps, and all predictions share the `conn_pool.total` fd budget. `cluster_window_sec` groups targets into clusters; `cluster_predict_topk` caps predicted co-targets per opening; `cluster_min_support` (minimum co-occurrence windows) filters out one-off co-occurrence; `cluster_graph_max_entries` + `cluster_graph_ttl_sec` bound the graph; `cluster_predict_throttle_sec` stops a reload from re-predicting the same pair too often. Watch `/metrics` `cluster_windows_learned` / `cluster_predictions` / `cluster_prewarm_spawned` downstream of `cluster_predict`.
 
 ## Container deployment (Docker / docker compose)
@@ -478,11 +481,11 @@ curl -x http://127.0.0.1:10808 http://www.baidu.com
 .venv/bin/python -m pytest -q
 ```
 
-The suite (328 tests) covers HTTP/CONNECT forwarding, the HTTP response cache (incl. LRU/eviction and in-flight coalescing), the domain cache, racing/aggregation timeouts, client auth, circuit breaker / probing / EWMA selection / in-flight weighting, session stickiness (incl. quality-driven single-send degrade **and slow single-send sampling logs**), per-domain stats + SQLite persistence, UTF-8 header safety, binary-safe request body handling, connection warm pools + established-handshake reuse + idle pause (with the "pause never blocks the request path" guarantee), robustness (request-header limits, truncated-response detection), the config layer (`extra="forbid"` rejects typos, cross-field validation, exit code 2), and the module-split regressions (router_cfg= vs kwarg equivalence and pool/cache/sticky forwarding identity).
+The suite (346 tests) covers HTTP/CONNECT forwarding, the HTTP response cache (incl. LRU/eviction and in-flight coalescing), the domain cache, racing/aggregation timeouts, client auth, circuit breaker / probing / EWMA selection / in-flight weighting, session stickiness (incl. quality-driven single-send degrade **and slow single-send sampling logs**), per-domain stats + SQLite persistence, UTF-8 header safety, binary-safe request body handling, connection warm pools + established-handshake reuse + idle pause (with the "pause never blocks the request path" guarantee), robustness (request-header limits, truncated-response detection), the config layer (`extra="forbid"` rejects typos, cross-field validation, exit code 2), and the module-split regressions (router_cfg= vs kwarg equivalence and pool/cache/sticky forwarding identity).
 
 The Phase-2+ metric/ranking layer has its own focused suites: `tests/test_phase_metrics.py` (t-digest bounds/roundtrip/accuracy, protocol-version stats, dual-scope double-count regression, Phase-3 demote gating, Phase-4 GET probing, Phase-2 Cost ordering incl. EWMA-equivalence and rollback equivalence, cost breakdown) and `tests/test_tuner.py` (adopt/reject/rollback decisions, SR guard, perturbation rotation + bounds, the win-TTFB task side-channel, baseline persistence/recovery, and the `/cost` + `/tuner` hot-reload endpoints).
 
-CI runs the suite on **Python 3.10, 3.11 and 3.12** via GitHub Actions (`.github/workflows/test.yml`), with a per-test timeout (`pytest --timeout=60`) so a hanging test fails fast instead of blocking the job.
+CI runs the suite on **Python 3.10, 3.11 and 3.12** via GitHub Actions (`.github/workflows/test.yml`), with a per-test timeout (`pytest --timeout=60`) so a hanging test fails fast instead of blocking the job. The suite currently has **346 passing tests**.
 
 > **Python 3.12 compatibility note**: `StreamWriter.wait_closed()` and `Server.wait_closed()` became stricter in 3.12 — they wait for the peer FIN / active handler coroutines. Prewarm pool connections are "half-open" (TCP established, no data sent), so their peers never close; the router now bounds these with a short timeout, and the mock upstreams in the test suite close idle connections after 5s (mirroring a real upstream's idle timeout). This only surfaced under CI's 3.12 matrix — 3.11 passes without it.
 

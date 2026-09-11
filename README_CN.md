@@ -32,6 +32,7 @@
 - 慢单发采样日志（`router.circuit.single_send_slow_log_ms`）：粘性/域名缓存命中的单发（跳过竞速的路径）"发起到首字节"耗时超阈值即记一条**带客户端 IP** 的日志——成功路径不打 IP 日志,这是按 IP 归因"打不开/要反复刷新"的唯一锚点
 - CONNECT 上游 TCP 预热池（第一阶段，`router.conn_pool`）：为每上游维护少量空闲 TCP，CONNECT 跳过"本机→上游代理"建连；目标半预连接（第二阶段，`conn_pool.target_prewarm`）：命中域名缓存/粘性**或竞速胜出**的高频 CONNECT target 后台预建"到上游"的 TCP（每条 target 补 2 条、取走仍留 1 条备用），与第一阶段共享 fd 预算与空闲超时
 - 请求簇预测预热（第三阶段，`conn_pool.cluster_predict`）：学习客户端页面加载窗口内 CONNECT target 的共现规律,下次窗口开口即预测同簇 co-target 并预建"到上游代理"的裸 TCP(不 CONNECT 源站),把子资源突发期的建连 TTFB 省掉
+- 被动预建升级（`conn_pool.prehandshake`，默认关闭，需与 `target_prewarm` + `established_reuse` 同时开启）：命中粘性/域缓存/竞速胜出的 CONNECT 在"只建 TCP"预建之外额外自建一条 TCP 并发 CONNECT 预握手,200 直接进已建握手池——提升库存产生率(等同 target 请求到来时复用跳过握手)。**生产事故(2026-09-01)**：页面首载瞬间粘性命中几十个 target 疯狂预握手,3 秒内 PREHANDSHAKE 落池 20+,把上游代理压到过载→全量熔断风暴。必须同时配置 `prehandshake_throttle_window_sec > 0` + `prehandshake_throttle_max_per_window > 0` 节流
 - 内存级 HTTP `GET` 响应缓存，遵循 `Cache-Control`
 - 在途 GET 去重聚合：同 URL 并发 GET 命中未命中缓存时，等待在途的上游请求结果，不再重复打上游（有界等待，超时回落竞速）
 - 写方法缓存失效：`POST`/`PUT`/`DELETE`/`PATCH` 转发前清空该域名下所有已缓存 `GET` 响应，后续 `GET` 不会返回过期内容
@@ -399,7 +400,7 @@ router:
     probe_interval_sec: 30
     probe_canary: "www.baidu.com:443"
     single_send_degrade_fail: 2
-    single_send_degrade_ratio: 3.0
+    single_send_degrade_ratio: 1.5  # 2026-09-05 由 2.0 收紧:更快捕获代理质量退化
     single_send_degrade_slack_ms: 10
 ```
 
@@ -415,7 +416,7 @@ router:
     probe_interval_sec: 20
     lb_bias: 0.5            # 不要过度避让最快代理
     single_send_degrade_fail: 2
-    single_send_degrade_ratio: 3.0
+    single_send_degrade_ratio: 1.5  # 2026-09-05 由 2.0 收紧:更快捕获代理质量退化
     single_send_degrade_slack_ms: 10
 ```
 
@@ -430,7 +431,7 @@ router:
     probe_interval_sec: 30
     lb_bias: 1.0
     single_send_degrade_fail: 1   # 比熔断更早脱离钉住
-    single_send_degrade_ratio: 2.0
+    single_send_degrade_ratio: 1.5  # 2026-09-05 由 2.0 收紧
     single_send_degrade_slack_ms: 10
 ```
 
@@ -447,6 +448,9 @@ router:
 - **`conn_pool.refill_pause_minutes`**(默认 60):连续 N 分钟无客户端请求时(如深夜),后台 refill/目标预热**挂起**,停止"建连→空闲过期→重建"的零流量空转。生产实测:6 代理深夜 6h 空转白建 ~1400 条连接(100% 超时被清,约 233 条/小时)。暂停期间过期连接照常清理(池渐空),任一新请求到来立即恢复补充。设 `0` 保持旧行为(始终 refill)。
 - **`conn_pool.refill_pause_activity_window`**(默认 120)与 **`conn_pool.refill_pause_min_requests`**(默认 3):活动判定改为**簇度计数**——真实流量是簇(一次页面加载数秒内对多个 hostname 并发 CONNECT,窗口内计数 5-30),后台心跳(GitHub Desktop 的 `alive.github.com` / Windows 的 `client.wns.windows.com` / Edge 云消息,间隔 3-10 分钟)是孤例(窗口内计数 1,极少 2)。窗口内请求数 ≥ 阈值才刷新活动时间戳——心跳无法阻止空闲暂停,同时**真实孤立请求不再被误伤**(旧 `refill_pause_silence_sec` 的"间隔一刀切"会把任何间隔 >120s 的真实请求当心跳忽略,导致 refill 白天从不恢复)。窗口设 `0` 或阈值 ≤1 保持旧行为(任意请求都刷新)。注意:**空闲暂停只挂起后台预建(refill/目标预热),永不卡请求路径**——暂停期间真实请求照常取池/新建/复用已握手连接。
 - **`conn_pool.established_reuse`**(默认 false):复用**已建 CONNECT 握手**的隧道。隧道结束若上游连接干净(无残留缓冲数据)则归还 `_established_pool` 而非关闭;下次同 `(proxy, target)` 请求直接复用,跳过 CONNECT 发送+200 校验——省掉慢线路上的一次完整往返(如 github)。严格验证:有残留即丢弃不复用,宁可不复用也不污染。池受全局 `conn_pool.total` 预算约束(与另两池同口径)且单键上限 2 条;复用前做 50ms 活性探测(`read(1)`),对端已关(FIN/RST)即丢弃并回落新建——死隧道不可能靠零 I/O 赢竞速。归还连接设 `SO_KEEPALIVE`,由 OS 在驻池期间清掉半开对端。看 `/metrics` 的 `established_pool_hits` vs `established_pool_misses` 确认复用。需 `conn_pool.enabled` 为 true。
+- **`conn_pool.prehandshake`**(默认 false,需 `conn_pool.enabled` + `target_prewarm` + `established_reuse` 同时开启):当 CONNECT 胜出时(粘性命中/域名缓存命中/竞速胜出局),路由器**额外**新建一条 TCP 并完成完整 CONNECT 握手到源站,把建好的隧道放进 `_established_pool`——把"只有裸 TCP"的预热升级为"已建握手入池",下一次同 `(proxy, target)` 请求直接复用,完全省掉 CONNECT 往返。**生产事故(2026-09-01)**:页面首载瞬间粘性命中几十个 target、多个代理疯狂预握手,3 秒内 PREHANDSHAKE 落池 20+ → 上游过载 → 全量熔断风暴。启用时必须同时配置 `prehandshake_throttle_window_sec > 0` 和 `prehandshake_throttle_max_per_window > 0`。看 `/metrics` 的 `prehandshake_pool_hits` / `prehandshake_pool_misses` / `prehandshake_throttled_skips`。
+- **`conn_pool.prehandshake_throttle_window_sec`**(默认 0=关闭):滑动窗口节流(秒);每 `throttle_window_sec` 窗口内最多发射 `prehandshake_throttle_max_per_window` 条预握手。设 > 0 与 `prehandshake_throttle_max_per_window` 配合防洪。
+- **`conn_pool.prehandshake_throttle_max_per_window`**(默认 0=关闭):每窗口最大预握手发射条数。仅当 `window_sec > 0` 且本值 > 0 时空流生效。
 - **`conn_pool.cluster_predict`**(默认 false,需 `conn_pool.enabled` **且** `conn_pool.target_prewarm`):学习每个客户端页面加载窗口(默认 2s 内的一组 CONNECT target)跨客户端形成的**全局共现图**,在**下一次窗口开口**(HTML 请求刚到达、js/css/CDN 子资源突发还没来)就为预测出的 top-K co-target **提前预建"本机→上游代理"的裸 TCP**(不 CONNECT 到源站)。它是**预测**预热,与 `target_prewarm` 的**被动**预热互补:子资源真实到达时 TCP 已就绪,取用阶梯在 target 池直接取走。错预测的代价只是一条 30s 空闲后被淘汰的 TCP,且所有预建共享 `conn_pool.total` fd 预算。`cluster_window_sec` 决定目标分组簇宽;`cluster_predict_topk` 每次开口最多预测的 co-target 数;`cluster_min_support` 最低共现窗口数(免疫单次偶然共现);`cluster_graph_max_entries` + `cluster_graph_ttl_sec` 约束图体积;`cluster_predict_throttle_sec` 防止 reload 对同对反复预建。看 `/metrics` 的 `cluster_windows_learned` / `cluster_predictions` / `cluster_prewarm_spawned` 三个 cluster 计数器随 `cluster_predict` 开启后变化。
 
 ## 容器化部署（Docker / docker compose）
@@ -471,7 +475,7 @@ curl -x http://127.0.0.1:10808 http://www.baidu.com
 .venv/bin/python -m pytest -q
 ```
 
-测试套件（**328** 个用例）覆盖 HTTP/CONNECT 转发、HTTP 响应缓存（含 LRU/淘汰与在途去重聚合）、域名缓存、竞速/聚合超时、客户端认证、熔断/探活/EWMA 选路/在途加权、会话粘性（含质量感知单发降级**与慢单发采样日志**）、域名统计 + SQLite 持久化、UTF-8 头安全、二进制安全的请求体处理、连接预热（通用池 + target 半预连接 + 已建握手隧道复用）+ 空闲暂停（含"暂停不卡请求路径"回归）、健壮性（请求头行数/字节上限、截断响应检测）、配置层（`extra="forbid"` 拒绝拼错键、跨字段校验、退出码 2），以及模块拆分回归（`router_cfg=` vs kwarg 等价、池/缓存/粘性转发同一性）。
+测试套件（**346** 个用例）覆盖 HTTP/CONNECT 转发、HTTP 响应缓存（含 LRU/淘汰与在途去重聚合）、域名缓存、竞速/聚合超时、客户端认证、熔断/探活/EWMA 选路/在途加权、会话粘性（含质量感知单发降级**与慢单发采样日志**）、域名统计 + SQLite 持久化、UTF-8 头安全、二进制安全的请求体处理、连接预热（通用池 + target 半预连接 + 已建握手隧道复用）+ 空闲暂停（含"暂停不卡请求路径"回归）、健壮性（请求头行数/字节上限、截断响应检测）、配置层（`extra="forbid"` 拒绝拼错键、跨字段校验、退出码 2），以及模块拆分回归（`router_cfg=` vs kwarg 等价、池/缓存/粘性转发同一性）。
 
 Phase 2+ 的指标/排序层有专属测试文件：`tests/test_phase_metrics.py`（t-digest 上界/往返/精度、协议版本统计、双作用域双计数回归、Phase 3 降级门控、Phase 4 GET 探测、Phase 2 Cost 排序含 EWMA 等价与回滚等价、Cost 分解）与 `tests/test_tuner.py`（采纳/拒绝/回滚判定、成功率守卫、扰动轮转与边界、赢家 TTFB task 侧信道、基线持久化/恢复、`/cost` + `/tuner` 热更新端点）。
 
