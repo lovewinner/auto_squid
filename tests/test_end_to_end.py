@@ -6474,6 +6474,68 @@ async def test_local_direct_http_circuit_recovers_after_backoff():
         await local_srv.wait_closed()
 
 
+# ── P0(内网目标识别):CONNECT 目标是上游代理自身 IP → 强制本机直连 ─────
+
+@pytest.mark.asyncio
+async def test_internal_proxy_host_target_direct_connect():
+    """客户端 CONNECT 目标是某上游代理自身的 IP 时走本地直连,不绕行竞速。
+
+    复现生产 `211.82.239.101:443`:客户端访问代理侧内网服务,远端代理(socket
+    打不回该内网)绕行 transport 96% 失败。改判:目标 host == enabled 代理的
+    host → _is_internal_target 命中 → _local_direct_connect(本地 mock CONNECT
+    服务回 200 echo),不再经上游竞速 mock(proxy_srv)转一圈。
+    """
+    # local 侧"内网目标服务":一个监听 LOCAL_HTTP_PORT 的 mock CONNECT(回 200+echo)
+    local_tunnel_srv = await run_mock_proxy(HOST, LOCAL_HTTP_PORT)
+    # 上游竞速 mock:若误入竞速路径会走它(记录命中证明未走)。
+    proxy_hits = []
+    proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=proxy_hits)
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='inexternal', host=HOST, port=PROXY_PORT))  # host==HOST
+    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                    enable_http_cache=False, db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        # 目标是 HOST(== 代理自身的 host),应直连 local_tunnel_srv(200),不碰 proxy_srv。
+        echo = await send_connect(HOST, ROUTER_PORT,
+                                  target=f"{HOST}:{LOCAL_HTTP_PORT}".encode())
+        assert echo == b"hello", f"expected relayed echo, got {echo!r}"
+        counters = router.snapshot_counters()
+        assert counters['local_direct_hits'] >= 1, f"expected a local-direct hit, got {counters}"
+        assert proxy_hits == [], f"internal target should not race upstream, got {proxy_hits}"
+    finally:
+        await router.stop()
+        local_tunnel_srv.close()
+        await local_tunnel_srv.wait_closed()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_internal_proxy_host_http_direct():
+    """HTTP 目标 host == 上游代理自身 IP → 本地直连(同样不走上游竞速)。"""
+    local_srv = await run_local_http_server(HOST, LOCAL_HTTP_PORT)
+    hit = []
+    proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=hit)
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='ptarget', host=HOST, port=PROXY_PORT))  # host==HOST
+    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                    enable_http_cache=False, db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        url = f"http://{HOST}:{LOCAL_HTTP_PORT}/".encode()
+        body = await send_http_get(HOST, ROUTER_PORT, url=url)
+        assert b'local-response' in body, f"expected local body, got {body!r}"
+        # 走上游 mock 代理的录入 0(本地直连不经它)。
+        assert router.request_counts.get('ptarget', 0) == 0, "internal target should not race upstream"
+    finally:
+        await router.stop()
+        local_srv.close()
+        await local_srv.wait_closed()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
+
 @pytest.mark.asyncio
 async def test_local_direct_http_cache_still_works():
     """白名单请求仍走 HTTP 响应缓存:第二次命中缓存,local 只打一次。"""

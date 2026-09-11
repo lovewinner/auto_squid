@@ -845,6 +845,29 @@ class Router:
             return False
         return self._norm_host(host) in self._local_direct_domains
 
+    def _proxy_hosts_idx(self) -> frozenset:
+        """构建 enabled 上游代理的 host 集合(用于内网目标识别)。
+
+        代理表在运行时基本静态(静态 proxies.yaml/极少热更),每次现建即可:
+        7 个代理的 frozenset 开销可忽略,且天然跟随代理启停变化(免 dirty 同步)。
+        空代理表返回空集合(不误伤任何目标——无代理则无内网目标可判)。
+        """
+        return frozenset(self._norm_host(p.host) for p in self.proxy_store.list() if p.enabled)
+
+    def _is_internal_target(self, host: str) -> bool:
+        """目标 host 是否是某上游代理自身的 host/IP(内网目标判定)。
+
+        客户端 CONNECT 目标命中某 enabled 代理自身的 IP/域名 → 属"代理侧内网
+        服务"。此时经任何远端代理绕行大多连不上(远端 socket 打不回该内网,
+        transport 失败),本机直连(能直接到代理 IP,说明本机可达该内网)通常
+        更强。当前实现:精确匹配代理 host(与 local_direct_domains 白名单互补;
+        走 _local_direct_connect 复用统一直连/熔断/失败回退)。local 无 host 跳过。
+        """
+        if not host:
+            return False
+        h = self._norm_host(host)
+        return h in self._proxy_hosts_idx()
+
     def _record_attempt(self, domain: str, pid: str):
         """记录一次"代理 pid 对域名 domain 的尝试"(竞速扇出统计)。
 
@@ -2771,9 +2794,12 @@ class Router:
         #      502 不绕远端(用户决策)。位置在缓存检查之后、在途聚合注册之前:
         #      (a) 白名单请求仍可命中直连写入的缓存; (b) 白名单请求不注册在途
         #      聚合,waiter 也不会落入 _dispatch_single 的远端竞速(跨路径坑)。
-        if self._host_in_local_direct(domain):
+        #      同时命中上游代理自身 IP/域名的 HTTP 目标(P0)也判为内网直连:
+        #      远端代理绕行打不回该内网,本机直连更能成功(与 CONNECT 同规则)。
+        if self._host_in_local_direct(domain) or self._is_internal_target(domain):
             self.local_direct_hits += 1
-            logger.debug("local-direct HTTP %s %s", method, url)
+            logger.debug("local-direct HTTP %s %s (internal=%s)", method, url,
+                         self._is_internal_target(domain))
             await self._forward_local_direct_http(writer, method, url, hdrs, body, domain, client_ip)
             return
 
@@ -3674,10 +3700,13 @@ class Router:
         失败回 502 不绕远端——用户决策)。认证已在 handle_client 完成。
         """
         # 0) 本地白名单强制直连(CONNECT 无在途聚合,位置无跨路径约束)。
+        #    再加 P0:命中上游代理自身 IP/域名的内网目标也强制直连——远端代理
+        #    绕行打不回内网(transport 96% 失败实测),本机直连更能连上。
         host = self._try_tunnel_host(target)
-        if self._host_in_local_direct(host):
+        if self._host_in_local_direct(host) or self._is_internal_target(host):
             self.local_direct_hits += 1
-            logger.debug("local-direct CONNECT %s", target)
+            logger.debug("local-direct CONNECT %s (internal=%s)",
+                         target, self._is_internal_target(host))
             await self._local_direct_connect(target, client_reader, client_writer, client_ip)
             return
         await self._dispatch_single(
