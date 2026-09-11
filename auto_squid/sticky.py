@@ -112,14 +112,21 @@ class StickyCache:
             if not proxy or not proxy.enabled:
                 self._evict_sticky_key(key)
                 return None
-        try:
-            dt = datetime.fromisoformat(entry["updated_at"])
-            if (datetime.now(timezone.utc) - dt).total_seconds() >= self.stickiness_ttl:
+        # TTL 用单调钟判定(避免每次 fromisoformat 解析 datetime + 时钟跳变敏感)。
+        # _updated_mono 由 _record_sticky/_bump_sticky 写入;缺省时退回 fromisoformat。
+        if "_updated_mono" in entry:
+            if (time.monotonic() - entry["_updated_mono"]) >= self.stickiness_ttl:
                 self._evict_sticky_key(key)
                 return None
-        except Exception:
-            self._evict_sticky_key(key)
-            return None
+        else:
+            try:
+                dt = datetime.fromisoformat(entry["updated_at"])
+                if (datetime.now(timezone.utc) - dt).total_seconds() >= self.stickiness_ttl:
+                    self._evict_sticky_key(key)
+                    return None
+            except Exception:
+                self._evict_sticky_key(key)
+                return None
         # 熔断中的代理不作粘性单发:直接驱逐(退回竞速找健康代理),避免对
         # 已确认故障的代理持续单发。local 不经 selector,跳过该检查(A1)。
         if pid != 'local' and self.router.selector.is_circuit_open(pid):
@@ -164,6 +171,9 @@ class StickyCache:
         try:
             if int(entry.get("hits", 0)) < self.stickiness_recheck_hits:
                 return False
+            # 用单调钟判 TTL(与 get_sticky 一致);缺省时退回 fromisoformat。
+            if "_updated_mono" in entry:
+                return (time.monotonic() - entry["_updated_mono"]) < self.stickiness_ttl
             dt = datetime.fromisoformat(entry["updated_at"])
             return (datetime.now(timezone.utc) - dt).total_seconds() < self.stickiness_ttl
         except Exception:
@@ -256,6 +266,7 @@ class StickyCache:
         self._sticky_cache[key] = {
             "proxy_id": pid,
             "updated_at": self.router._now_utc(),
+            "_updated_mono": time.monotonic(),
             "hits": 0,
             # Goal #6:钉住时刻的 EWMA 基线,供 _sticky_degrade_due 判定"相对钉住
             # 时是否恶化"。粘性命中(_bump_sticky)只滑动 TTL,不刷新基线。
@@ -275,6 +286,7 @@ class StickyCache:
             return
         entry["proxy_id"] = pid
         entry["updated_at"] = self.router._now_utc()
+        entry["_updated_mono"] = time.monotonic()
         entry["hits"] = int(entry.get("hits", 0)) + 1
 
     def _evict_sticky(self, client_ip: str, domain: str):
@@ -313,7 +325,7 @@ class StickyCache:
 
         if not self._sticky_cache:
             return
-        now = datetime.now(timezone.utc)
+        now_mono = time.monotonic()
         stale = []
         for key, entry in self._sticky_cache.items():
             pid = entry["proxy_id"]
@@ -326,9 +338,14 @@ class StickyCache:
                 stale.append(key)
                 continue
             try:
-                dt = datetime.fromisoformat(entry["updated_at"])
-                if (now - dt).total_seconds() >= self.stickiness_ttl:
-                    stale.append(key)
+                # 用单调钟判 TTL(避免每次 fromisoformat 解析);缺省时退回 datetime。
+                if "_updated_mono" in entry:
+                    if (now_mono - entry["_updated_mono"]) >= self.stickiness_ttl:
+                        stale.append(key)
+                else:
+                    dt = datetime.fromisoformat(entry["updated_at"])
+                    if (datetime.now(timezone.utc) - dt).total_seconds() >= self.stickiness_ttl:
+                        stale.append(key)
             except Exception:
                 stale.append(key)
         for key in stale:

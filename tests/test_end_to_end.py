@@ -1630,7 +1630,11 @@ async def test_stickiness_unit_hit_and_eviction():
         assert router._get_sticky_proxy('1.2.3.4', 'other.com') is None
         assert '1.2.3.4|example.com' in router.get_sticky_cache()
         # TTL 过期 → 未命中并驱逐条目。
+        # 新实现用单调钟 _updated_mono 判 TTL,手工把 updated_at 置旧不足以触发
+        # 过期(单调钟仍是最近);须同时把 _updated_mono 置到早期以模拟滑动过期。
         router._sticky_cache['1.2.3.4|example.com']['updated_at'] = '2000-01-01T00:00:00+00:00'
+        router._sticky_cache['1.2.3.4|example.com']['_updated_mono'] = \
+            time.monotonic() - 2000
         assert router._get_sticky_proxy('1.2.3.4', 'example.com') is None
         assert '1.2.3.4|example.com' not in router._sticky_cache
         # 指向不存在代理的条目 → 取用即失效并驱逐。
