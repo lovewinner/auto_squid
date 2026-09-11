@@ -54,6 +54,9 @@ router:
     single_send_degrade_fail: 2
     single_send_degrade_ratio: 2.0
     single_send_degrade_slack_ms: 10
+    # HTTP 单发读首字节超时(秒):_upstream_timeout.read。显式配置便于灰度调参。
+    # 与 connect_tunnel_timeout_sec(5s,HTTPS CONNECT)协同覆盖 HTTP/HTTPS 两条路径。
+    http_read_timeout_sec: 3
 
   # 代理端口(面向客户端的 HTTP/CONNECT 代理端口)客户端认证。生产已开启。
   auth:
