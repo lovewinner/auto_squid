@@ -379,3 +379,48 @@ def _single_send_degraded(self, domain, pid, ref_ewma):
 
 - **Phase 2 权重调参**：没有 1-2 周观测数据与 Cost 分解视图之前，任何权重改动都是盲调。
 - **回溯改写 DB 历史计数**：无法从膨胀值反推真实混合比例，收益低风险高；让偏差自然衰减即可。
+
+---
+
+## 九、当前状态与后续策略（2026-09-11 复核）
+
+> 本节为统一复核本计划与 [`CODE_REVIEW_PERFORMANCE_REPORT_2026-09-05.md`](CODE_REVIEW_PERFORMANCE_REPORT_2026-09-05.md) 时新增，反映最新落地状态。**本文件保留为历史审计记录**，状态标记随代码实际行为运维更新；执行任何改动前以代码为准。
+
+### 各 Phase / 建议项最终状态
+
+| 项 | 状态 | 说明 |
+|----|------|------|
+| Phase 1 指标采集 | ✅ 已完成 | P50/P95/P99 + t-digest 终身分位 + 成功率 + 7 类错误分类 + 吞吐 + OFB；连接复用/TLS 会话恢复架构上不可观测，不伪造 |
+| Phase 2 多目标 Cost 排序 | ✅ 已完成 | P99 尾部优先 + 成功率 + 吞吐（min–max 归一化），`cost_sort_enabled` 一键回滚 |
+| Phase 3 单发降级门控 | ✅ 已完成 | 连续失败 / EWMA 恶化 / 域名级成功率 / P99 / 吞吐 五信号（阈值默认关=零行为变化） |
+| Phase 4 探测对齐 | ✅ 已完成 | `probe_with_get` 默认关 + 白名单 + (代理,目标) 限速；失败只计观测不熔断 |
+| Phase 5 可观测性/API | ✅ 已完成 | `/quality/meta`、`/metrics/per-destination`、Cost 分解、仪表盘窗口/累计双表（`7ccb4ae`/`7958c68`） |
+| Cost 热更新 + 自动调参器 | ✅ 已完成 | `/cost`、`/tuner`、`AutoTuner` 保守爬山、基线持久化 SQLite |
+| `domain=None` 双重计数修复 | ✅ 已完成 | 4 处双作用域循环改为去重写法 |
+| 代码审查 P0-1 GET 聚合 shield | ✅ 已完成 | `asyncio.shield`（router.py:2798） |
+| 代码审查 P0-2 隧道复用约束 | ✅ 已完成 | `safe_for_reuse` 客观字节判据（`4844c7b`） |
+| 代码审查 P1-3 单发 5xx 回退 | ✅ 已完成 | `retry_on_5xx`（router.py:2965） |
+| 代码审查 P2 keep-alive | ✅ 已完成 | HTTP/1.1 顺序 keep-alive（router.py:2586），不支持 pipelining |
+| 代码审查 **P1-4 `Vary` 缓存键** | ⚠️ 部分实现 | 跳过 `Set-Cookie`/任意非空 `Vary` 响应（http_cache.py:166-170）；**支持 Vary 字段规范入缓存键未做** |
+| 代码审查优化 2 错峰 start | ⚠️ 部分 | 参数已配置化；生产保持 `stagger_initial:1`（低扇出，回避 09-01 熔断事故） |
+| 代码审查优化 3 热路径日志 | ✅ 已完成 | 池命中/未中/归还改计数器经 `/metrics` 暴露 |
+| 代码审查优化 4 drain 合并 | ⚠️ 跳评 | 仅在需保序点 drain；未做显式双缓冲合并 |
+| 代码审查优化 5 httpx 上限 | ✅ 已完成 | 每代理 `Limits(max_keepalive=200, max_connections=400)`；外部配置化/HTTP2 A/B 未做 |
+| 可行增强 2 生产观测 | ⚠️ 部分 | 生产已持续观测（github/baike 等域名实数据）；未做形式化的「信号×用户感知」A/B 分析 |
+| 审计项：§六.1 去极值 | ⚠️ 未做 | 现以 P99/尾部优先容忍异常长请求（Cost 用分位天然抗个别异常点） |
+| 审计项：§六.3 Cost 分解输出 | ✅ 已完成 | `cost_breakdown` 每代理输出 |
+| 审计项：§六.7 /api 鉴权 | ✅ 已完成 | `api.auth` HTTP Basic，除 `/health` 外全端点上锁 |
+| P2 预置告警 | ⚠️ 未做 | 待接入 Prometheus/规模化部署时再补 |
+| P2 采集开销性能测试 | 📋 待做 | t-digest/Cost/调参均在热路径；当前功能测试已覆盖正确性，压力开销未系统测 |
+| P3 不确定性折扣/探索策略 | 📋 不做 | 候选集规模小；引入随机探索可能造成出口抖动 |
+| P3 path-level / CDN 识别 | 📋 不做 | 前向代理难见完整 URL；CDN 识别需 IP/geo 依赖，易误判 |
+| metrics 标签规范 / Prometheus 改造 | 📋 不做 | 当前 `/metrics`+仪表盘已满足运维；接入 Prometheus 时再做 |
+| 日志噪音：`Future exception was never retrieved` | 📋 P2 待做 | DNS 解析取消的 asyncio GC 警告，功能性无影响；可加全局 `exception_handler` 过滤 |
+
+### 后续执行策略
+
+1. **先观测再优化**：生产已稳定（熔断风暴已根除），Phase 2+ 权重已按实测调整（`ratio` 2.0→1.5）并部署；继续以 `/quality/meta`、`/metrics/per-destination`、`/circuit` 观测数据为准，**不做无数据支撑的盲调**。
+2. **只补正确性缺口**：唯一明确的缺口是 `Vary` 缓存键规范化（当前「带 `Vary` 一律不缓存」牺牲命中率换正确性）——如该场景有真实用户感知，再补。
+3. **性能收益明确才落地**：`stagger_initial:2` 需实测扇出-延迟收益才能说服生产变更；`drain` 合并风险大于收益。
+4. **保留为历史记录**：两文档的 Phase 1-5 主体已全部实现，不代表当前仍需全部重读；后续改动直接以代码/测试/配置为准。
+5. **不再机械补齐 `[ ]` 项**：探索/折扣/path-level/Prometheus 等只在「接入规模变大或引入新依赖」时触发。
