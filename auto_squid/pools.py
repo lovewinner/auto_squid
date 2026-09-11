@@ -67,7 +67,10 @@ def _discard_conn(writer: asyncio.StreamWriter):
 # 堆太多条全双工 socket(见 #15 拆池前的 #2 修复)。
 _ESTABLISHED_KEY_CAP = 2
 # 复用前活性探测超时(秒):read(1) 阻塞等这一时长的数据/EOF。
-_ESTABLISHED_PROBE_TIMEOUT = 0.05
+# 0.01s 足以区分"连接已死(立即 FIN/RST)"和"连接存活(需等数据)":
+# 死连接 read(1) 在 10ms 内必返回 0 字节或异常;活连接 10ms 内大概率无
+# 数据到达(正常 HTTP 响应体尚未下发),read 超时返回空 → 视为存活。
+_ESTABLISHED_PROBE_TIMEOUT = 0.01
 
 
 class ConnectionPools:
