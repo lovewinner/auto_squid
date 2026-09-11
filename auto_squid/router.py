@@ -1050,7 +1050,7 @@ class Router:
                 self._db.execute(
                     "INSERT INTO proxy_metrics (proxy_id, metrics_json, updated_at)"
                     " VALUES (?, ?, ?)",
-                    (pid, json.dumps(m), now))
+                    (pid, json.dumps(m, default=list), now))
             # 监控指标:域名 × 代理 实测指标
             self._db.execute("DELETE FROM domain_metrics")
             for d, per_pid in self.selector.get_domain_metrics().items():
@@ -1058,7 +1058,7 @@ class Router:
                     self._db.execute(
                         "INSERT INTO domain_metrics (domain, proxy_id, metrics_json, updated_at)"
                         " VALUES (?, ?, ?, ?)",
-                        (d, pid, json.dumps(mm), now))
+                        (d, pid, json.dumps(mm, default=list), now))
             self._db.commit()
 
     async def _flush_loop(self):

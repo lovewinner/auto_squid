@@ -17,6 +17,7 @@
 import logging
 import random
 import time
+from collections import deque
 from typing import List, Optional
 
 from .digest import TDigest
@@ -443,9 +444,9 @@ class ProxySelector:
         """
         if "metrics" not in m:
             m["metrics"] = {
-                "ttfb_samples": [],
-                "ofb_samples": [],
-                "outcome_samples": [],  # 窗口版 success/fail 环形缓冲(1=成功 0=失败)
+                "ttfb_samples": deque([], maxlen=_OBS_WINDOW),
+                "ofb_samples": deque([], maxlen=_OBS_WINDOW),
+                "outcome_samples": deque([], maxlen=_OBS_WINDOW),  # 窗口版 success/fail 环形缓冲(1=成功 0=失败)
                 "throughput_ewma": None,
                 "success": 0,
                 "total": 0,
@@ -469,11 +470,9 @@ class ProxySelector:
         return self._ensure_metrics(self._proxy_metrics.setdefault(pid, {}))
 
     @staticmethod
-    def _append_sample(samples: list, value: float):
-        """向有界样本列表追加一个值,超出 _OBS_WINDOW 丢弃最旧(环形截断)。"""
+    def _append_sample(samples, value: float):
+        """向有界样本容器追加一个值;超出 _OBS_WINDOW 自动丢弃最旧(deque maxlen)。"""
         samples.append(value)
-        if len(samples) > _OBS_WINDOW:
-            del samples[0]
 
     @staticmethod
     def _percentile(samples: list, p: float) -> Optional[float]:
@@ -847,13 +846,19 @@ class ProxySelector:
                 logger.debug("proxy_metrics %s 缺少字段,跳过: %s", pid, set(m.keys()))
                 continue
             # ofb_samples 为后加字段(TTLB 移除后新增的源站首字节窗口):旧 DB 行
-            # 没有,补空列表,否则热路径 _append_sample 会 KeyError。
+            # 没有,补空 deque,否则热路径 _append_sample 会 KeyError。
             if "ofb_samples" not in m:
-                m["ofb_samples"] = []
+                m["ofb_samples"] = deque([], maxlen=_OBS_WINDOW)
             # outcome_samples 同样为后加字段(窗口版 success/fail 环形缓冲):旧
-            # DB 行没有,补空列表,否则 record_ttfb/record_failure 热路径 KeyError。
+            # DB 行没有,补空 deque,否则 record_ttfb/record_failure 热路径 KeyError。
             if "outcome_samples" not in m:
-                m["outcome_samples"] = []
+                m["outcome_samples"] = deque([], maxlen=_OBS_WINDOW)
+            # DB json.loads 后 samples 是普通 list,转为 deque 使 _append_sample 走
+            # O(1) maxlen 自动截断,避免 O(n) del[0] 移位。
+            for k in ("ttfb_samples", "ofb_samples", "outcome_samples"):
+                v = m[k]
+                if not isinstance(v, deque):
+                    m[k] = deque(v, maxlen=_OBS_WINDOW)
             # http_versions 为后加字段(Phase 1.4 协议版本计数):旧 DB 行没有,补空
             # 字典,否则 record_protocol 热路径 scope["http_versions"] KeyError。
             if "http_versions" not in m:
@@ -891,12 +896,16 @@ class ProxySelector:
                 if not needed.issubset(m):
                     logger.debug("domain_metrics %s %s 缺少字段,跳过", d, pid)
                     continue
-                # 同 set_proxy_metrics:旧 DB 行补 ofb_samples 空列表。
+                # 同 set_proxy_metrics:旧 DB 行补 ofb_samples 空 deque。
                 if "ofb_samples" not in m:
-                    m["ofb_samples"] = []
-                # 同 set_proxy_metrics:旧 DB 行补 outcome_samples 空列表。
+                    m["ofb_samples"] = deque([], maxlen=_OBS_WINDOW)
+                # 同 set_proxy_metrics:旧 DB 行补 outcome_samples 空 deque。
                 if "outcome_samples" not in m:
-                    m["outcome_samples"] = []
+                    m["outcome_samples"] = deque([], maxlen=_OBS_WINDOW)
+                for k in ("ttfb_samples", "ofb_samples", "outcome_samples"):
+                    v = m[k]
+                    if not isinstance(v, deque):
+                        m[k] = deque(v, maxlen=_OBS_WINDOW)
                 # 同 set_proxy_metrics:旧 DB 行补 http_versions 空字典。
                 if "http_versions" not in m:
                     m["http_versions"] = {}
