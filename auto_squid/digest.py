@@ -42,6 +42,9 @@ class TDigest(dict):
         self.setdefault("n", 0.0)
         self.setdefault("mn", None)
         self.setdefault("mx", None)
+        # 分位数结果缓存:(n, result)。t-digest 是增量采样,n 变化才失效(见
+        # percentiles)。非 dict 键(实例 attr),不会被 json.dumps 序列化污染持久化。
+        self._pct_cache: Optional[tuple] = None
 
     # ── 写入 ──────────────────────────────────────────────
     def add(self, value: float, weight: float = 1.0) -> None:
@@ -162,15 +165,25 @@ class TDigest(dict):
 
         mean 是质心加权的近似均值（非精确算术平均），仅供量级参考；
         samples 为累计权重（真实样本总数，精确）。
+
+        缓存：t-digest 是**增量采样**，从上次算分位数到下次之间只有 `add` 会
+        改变数据（n 递增）；`_compress` 只重排质心、n 不变、分位数在同一边界
+        内近似不变。故以 `n` 做缓存键：n 未变则直接用上次结果，省掉每请求
+        (竞速 `_cost_raw_inputs` 对每代理) 重复遍历质心算分位数的开销。
+        空结果(无样本)不缓存——返回 {} 时 n 可能为 0,缓存到有数据前没有任何
+        价值,且 n=0 时下次有样本身 d 才失效,留空缓存无意义。
         """
+        cached = self._pct_cache
+        n = self["n"]
+        if cached is not None and cached[0] == n:
+            return cached[1]
         self._compress()
         c = self["c"]
-        n = self["n"]
         if not c or n <= 0:
             return {}
         total_w = sum(w for _, w in c)
         mean = (sum(m * w for m, w in c) / total_w) if total_w > 0 else None
-        return {
+        res = {
             "p50": self.quantile(0.50),
             "p95": self.quantile(0.95),
             "p99": self.quantile(0.99),
@@ -179,3 +192,5 @@ class TDigest(dict):
             "mean": mean,
             "samples": int(n),
         }
+        self._pct_cache = (n, res)
+        return res
