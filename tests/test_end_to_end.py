@@ -1063,7 +1063,12 @@ class TestApiAuth:
                 r = client.get(path)
                 assert r.status_code == 401, f"{path} 应要求认证"
             assert client.get("/").status_code == 401  # 无凭据访问仪表盘页面
-            assert client.get("/", headers=self._auth()).status_code == 200
+            # 拆页后:根路径 307 → /panel/domains;三面板页 / 共享 JS 需凭据可访问
+            r = client.get("/", headers=self._auth(), follow_redirects=False)
+            assert r.status_code == 307 and r.headers.get("location") == "/panel/domains"
+            for path in ["/panel/domains", "/panel/stickiness", "/panel/metrics", "/static/panel.js"]:
+                assert client.get(path, headers=self._auth()).status_code == 200, f"{path} 应可访问"
+            assert client.get("/panel/unknown", headers=self._auth()).status_code == 404
         finally:
             mount(None, None)
 
