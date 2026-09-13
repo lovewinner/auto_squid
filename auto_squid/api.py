@@ -954,14 +954,8 @@ async function renderMetrics() {
   // 域名明细:timer 内已有缓存则直接用;否则按需拉单域名
   if (window._metricFetchT.need(metricsDomain)) {
     await fetchDomain(metricsDomain);
+    // 拉取后 perDest 已更新,但被覆盖的这套采用最新
   }
-  renderMetricsDomain(wrap);
-}
-
-function renderMetrics() {
-  const wrap = document.getElementById('table-wrap');
-  document.getElementById('pager').innerHTML = '';
-  if (metricsSub === 'global') { renderMetricsGlobal(wrap); return; }
   renderMetricsDomain(wrap);
 }
 
