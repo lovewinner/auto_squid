@@ -369,10 +369,14 @@ async def metrics_per_destination():
     评估"特定 URL(如 https://github.com 的 domain key github.com:443)实测速度":
     返回 {domain: {pid: {ttfb/ofb 分位数, 成功率, 错误分类, 吞吐}}}。见
     selector.get_domain_metrics()。
+
+    走版本化快照缓存(use_cache=True):面板 30s 轮询,无新样本时直接复用上次
+    算好的快照,避免每次请求逐域名逐代理重算分位数(实测单次 1.3s/6.7MB)。
+    数据有变更才会重算,故展示始终新鲜。落盘路径(router._flush_to_db)不用缓存。
     """
     if not _router:
         return {}
-    return _router.selector.get_domain_metrics()
+    return _router.selector.get_domain_metrics(use_cache=True)
 
 
 @app.get("/server-stats")
@@ -498,20 +502,19 @@ async def domains():
 
 @app.get("/domains/meta")
 async def domains_meta():
-    """返回域名缓存元数据（当前默认代理、更新时间；自适应 TTL 开启时含
-    ttl/expires_at/switch_count）。
+    """返回域名缓存元数据(当前默认代理、更新时间;自适应 TTL 开启时含
+    ttl/expires_at/switch_count)。
 
-    Phase 1 增强:每个域名追加 proxy_metrics = {pid: {ttfb/ofb 分位数, 成功率,
-    错误分类, 吞吐}}——用于评估"特定 URL(如 github.com:443)在各代理上的实测
-    速度差异"(握手+源站首字节双维度)。见 selector.get_domain_metrics()。
+    注意:不再附加 `proxy_metrics`。旧版给每个域名算并返回逐域名逐代理的
+    `get_domain_metrics()` 分位快照(实测 ~6.7MB / ~1.3s 的 CPU 重算),但
+    域名面板 JS 只读 `default_proxy` + `updated_at`,`proxy_metrics` 完全未被
+    前端使用。为消除这部分死重(域名分位明细如需,请走
+    `/metrics/per-destination` 或 `/quality/meta`),这里只返回纯元数据。
+    见 Phase 1 IMPROVEMENT_PLAN 的评估目标,现改由独占端点承担。
     """
     if not _router:
         return {}
-    out = _router.get_domain_meta_enriched()
-    per_dest = _router.selector.get_domain_metrics()
-    for d, per_pid in per_dest.items():
-        out.setdefault(d, {})["proxy_metrics"] = per_pid
-    return out
+    return _router.get_domain_meta_enriched()
 
 
 @app.get("/stickiness")

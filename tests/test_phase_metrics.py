@@ -506,3 +506,41 @@ def test_cost_breakdown_excludes_non_candidates():
     assert v2["fast"]["cost_breakdown"] is not None
     assert v2["slow"]["cost_breakdown"] is None
     assert v2["slow"]["cumulative"] is not None  # 指标本身仍可见
+
+
+# ── get_domain_metrics 版本化快照缓存 ─────────────────────
+def test_domain_metrics_version_cache():
+    """use_cache=True 时版本未变直接复用快照,数据变更才重算,落盘路径不吃缓存。
+
+    回归/验证:面板 30s 轮询 /metrics/per-destination 无新样本时不重复重算
+    分位数(修复前单次 1.3s/6.7MB);而 _flush_to_db 落盘路径(use_cache=False)
+    永远实时,不被缓存污染。
+    """
+    sel = _selector()
+    # 两个域名 × 各一个代理,造两轮样本
+    sel.record_ttfb("p1", 0.10, domain="a:443")
+    sel.record_ttfb("p1", 0.20, domain="a:443")
+    sel.record_ttfb("p1", 0.05, domain="b:443")
+
+    v0 = sel._metrics_version
+    snap_a = sel.get_domain_metrics(use_cache=True)
+    # 缓存已存:(v0, snap)
+    assert sel._domain_snapshot_cache[0] == v0
+    # 版本未变 → 命中,返回同一对象
+    snap_b = sel.get_domain_metrics(use_cache=True)
+    assert snap_b is snap_a
+    assert snap_b["a:443"]["p1"]["window_total"] == 2
+    assert snap_b["b:443"]["p1"]["window_total"] == 1
+
+    # 无新样本时多次调用命中缓存(不新增重算)——返回引用相同即可证明未重建
+    # 落盘路径(十二 use_cache=False)永远实时,且不更新缓存
+    live = sel.get_domain_metrics(use_cache=False)
+    assert live is not snap_a            # 实时新建,注意 be 引用
+    assert sel._domain_snapshot_cache[0] == v0  # 未污染缓存
+
+    # 新观测 → 版本递增 → 缓存失效,重建
+    sel.record_ttfb("p1", 0.15, domain="a:443")
+    assert sel._metrics_version > v0
+    snap_c = sel.get_domain_metrics(use_cache=True)
+    assert snap_c is not snap_a
+    assert snap_c["a:443"]["p1"]["window_total"] == 3

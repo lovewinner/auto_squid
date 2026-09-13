@@ -186,6 +186,13 @@ class ProxySelector:
         # metric_dict 字段见 _ensure_metrics 注释。
         self._proxy_metrics: dict[str, dict] = {}
         self._domain_metrics: dict[str, dict[str, dict]] = {}
+        # 域名×代理指标内容版本号 + 快照缓存:任何改变 _domain_metrics 内容的写入
+        # (_metrics_for 进样 / set_domain_metrics 批量替换)都让 _metrics_version+1。
+        # get_domain_metrics(use_cache=True) 以它为缓存键——版本未变直接返回上次
+        # 算好的快照,避免面板每 30s 轮询、无新样本时仍逐域名逐代理重算分位数
+        # (实测单次 1.3s/6.7MB)。落盘路径(use_cache=False)永远实时,不吃缓存。
+        self._metrics_version: int = 0
+        self._domain_snapshot_cache: tuple = (None, None)  # (version|None, result|None)
         # 每代理熔断/慢启动状态(与 _quality 分开维护,含未观测过的新代理):
         #   {pid: {"consec_fail": int, "open_until": float(monotonic 秒), "backoff": float}}
         self._circuit: dict[str, dict[str, float]] = {}
@@ -466,8 +473,18 @@ class ProxySelector:
         """取 (自适应 domain 存在时) 域名级或全局级 metric_dict,带惰性初始化。"""
         if domain is not None:
             per = self._domain_metrics.setdefault(domain, {})
+            self._domain_metrics_dirty(per)
             return self._ensure_metrics(per.setdefault(pid, {}))
         return self._ensure_metrics(self._proxy_metrics.setdefault(pid, {}))
+
+    def _domain_metrics_dirty(self, _scope: dict) -> None:
+        """标记域名指标内容已变更:使 get_domain_metrics 缓存失效。
+
+        所有写入 _domain_metrics 的热路径都经 _metrics_for,此处递增基础设施级
+        版本号(每次新观测一次),get_domain_metrics(use_cache=True) 据此判断缓存
+        是否仍新鲜。调用方(record_* / probe 等)不直接读该值,仅为失效信号。
+        """
+        self._metrics_version += 1
 
     @staticmethod
     def _append_sample(samples, value: float):
@@ -678,12 +695,22 @@ class ProxySelector:
         import copy
         return {pid: copy.deepcopy(m["metrics"]) for pid, m in self._proxy_metrics.items()}
 
-    def get_domain_metrics(self) -> dict:
-        """返回域名级代理指标快照 {domain: {pid: metric_dict}},供 /domains/meta。
+    def get_domain_metrics(self, use_cache: bool = False) -> dict:
+        """返回域名级代理指标快照 {domain: {pid: metric_dict}}。
 
         增加 per-pid 的 P50/P95/P99 汇总(分位数从该域名样本窗口算)。
         返回拷贝,调用方改不动内部。
+
+        缓存:面板(监控页 /metrics/per-destination)每 30s 轮询,而窗口样本只随
+        新观测(外)变更。use_cache=True 时以 _metrics_version 为缓存键,版本未变
+        直接返回上次算好的深拷贝快照,避免多次轮询间无新样本仍逐域名逐代理重算
+        分位数(实测单次 1.3s/6.7MB)。默认 False ≡ 旧行为,供落盘路径
+        (router._flush_to_db)永远取实时值,不被缓存污染。
         """
+        if use_cache:
+            ver, cached = self._domain_snapshot_cache
+            if ver == self._metrics_version and cached is not None:
+                return cached
         out = {}
         for d, per_pid in self._domain_metrics.items():
             for pid, m in per_pid.items():
@@ -702,6 +729,8 @@ class ProxySelector:
                 out[d][pid]["window_success_rate"] = ProxySelector._smooth_rate(win_succ, win_n)
                 # 终身累计(跨重启永久):与窗口化分位并存,供 --metrics 展示"永久值"。
                 out[d][pid]["cumulative"] = ProxySelector._cumulative_view(mm)
+        if use_cache:
+            self._domain_snapshot_cache = (self._metrics_version, out)
         return out
 
     def get_pid_quality_v2(self) -> dict:
@@ -773,12 +802,14 @@ class ProxySelector:
         """
         if max_entries <= 0:
             self._domain_metrics.clear()
+            self._metrics_version += 1  # 全清,缓存失效
             return
         total = sum(len(per_pid) for per_pid in self._domain_metrics.values())
         if total <= max_entries:
             return
         # 均匀地删:按域名遍历砍掉多余条目(简单、无偏的容量保护)。
         to_free = total - max_entries
+        pruned = False
         for d, per_pid in list(self._domain_metrics.items()):
             if to_free <= 0:
                 break
@@ -787,9 +818,12 @@ class ProxySelector:
                 per_pid.pop(pid, None)
                 self._domain_quality.get(d, {}).pop(pid, None)
             to_free -= drop
+            pruned = True
             if not per_pid:
                 self._domain_metrics.pop(d, None)
                 self._domain_quality.pop(d, None)
+        if pruned:
+            self._metrics_version += 1  # 删除了域名指标条目,缓存失效
 
     def prune_domain_quality(self, max_entries: int = 10_000):
         """域名级质量表容量保护:条目超上限时按最近观测 ts 淘汰最旧条目。
@@ -829,6 +863,8 @@ class ProxySelector:
         self._conc.clear()
         self._proxy_metrics.clear()
         self._domain_metrics.clear()
+        self._metrics_version += 1  # 清空域名指标,使 get_domain_metrics 缓存失效
+        self._domain_snapshot_cache = (None, None)
 
     def set_proxy_metrics(self, data: dict):
         """从 DB 恢复 proxy 级全局指标。
@@ -918,6 +954,9 @@ class ProxySelector:
                     if k not in m:
                         m[k] = v
                 self._domain_metrics.setdefault(d, {})[pid] = {"metrics": m}
+        # 批量替换 _domain_metrics 完成,使 get_domain_metrics 缓存失效。
+        if data:
+            self._metrics_version += 1
 
     def reset_circuits(self):
         """手动解除全部代理的熔断并清空连续失败计数(运维介入后调用)。
