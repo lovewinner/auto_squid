@@ -544,3 +544,35 @@ def test_domain_metrics_version_cache():
     snap_c = sel.get_domain_metrics(use_cache=True)
     assert snap_c is not snap_a
     assert snap_c["a:443"]["p1"]["window_total"] == 3
+
+
+# ── get_domain_metrics 单域名 + 面板口径剔除样本 ─────────
+def test_domain_metrics_single_and_prune():
+    """domain= 只算单域名;use_cache=True 面板口径剔样本,落盘口径保留样本。"""
+    sel = _selector()
+    sel.record_ttfb("p1", 0.10, domain="a:443")
+    sel.record_ttfb("p1", 0.20, domain="a:443")
+    sel.record_ttfb("p1", 0.05, domain="b:443")
+
+    # 单域名:只返回该域名
+    only = sel.get_domain_metrics(use_cache=True, domain="a:443")
+    assert set(only.keys()) == {"a:443"}
+    assert only["a:443"]["p1"]["window_total"] == 2
+    # 面板口径剔样本
+    m = list(only["a:443"].values())[0]
+    for k in ("ttfb_samples", "ofb_samples", "outcome_samples", "cum_ttfb_digest", "cum_ofb_digest"):
+        assert k not in m, f"面板口径不应含 {k}"
+    assert "cumulative" in m and "percentiles" in m  # 派生字段保留
+
+    # 落盘口径(use_cache=False)保留完整样本
+    flush = sel.get_domain_metrics(use_cache=False, domain="a:443")
+    mf = list(flush["a:443"].values())[0]
+    assert "ttfb_samples" in mf and "outcome_samples" in mf and "cum_ttfb_digest" in mf
+
+    # 无该域名 → 空
+    assert sel.get_domain_metrics(use_cache=True, domain="nope:443") == {}
+
+    # 单域名查询不污染全量缓存
+    all1 = sel.get_domain_metrics(use_cache=True)
+    sel.get_domain_metrics(use_cache=True, domain="a:443")
+    assert sel.get_domain_metrics(use_cache=True) is all1

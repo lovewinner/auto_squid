@@ -695,28 +695,57 @@ class ProxySelector:
         import copy
         return {pid: copy.deepcopy(m["metrics"]) for pid, m in self._proxy_metrics.items()}
 
-    def get_domain_metrics(self, use_cache: bool = False) -> dict:
+    @staticmethod
+    def _panel_metric(mm: dict) -> dict:
+        """面板口径的 metric 拷贝:剔除原始样本数组与 TDigest 质心列表。
+
+        明细渲染(前端)只需派生字段(percentiles 已算好 / cumulative / window_* /
+        errors / http_versions / total),原始窗口样本(deque≤256 条)与终身 digest
+        质心对展示无用。面板消费方(use_cache=True)用它构造输出,让载荷从几十
+        KB 降到底部 KB 且不随窗口大小膨胀;落盘(use_cache=False)保留完整 mm。
+        仅浅拷贝(dict 字面量),不复制样本内容。
+        """
+        return {k: v for k, v in mm.items()
+                if k not in ("ttfb_samples", "ofb_samples", "outcome_samples",
+                             "cum_ttfb_digest", "cum_ofb_digest")}
+
+    def get_domain_metrics(self, use_cache: bool = False,
+                           domain: Optional[str] = None) -> dict:
         """返回域名级代理指标快照 {domain: {pid: metric_dict}}。
 
         增加 per-pid 的 P50/P95/P99 汇总(分位数从该域名样本窗口算)。
         返回拷贝,调用方改不动内部。
 
-        缓存:面板(监控页 /metrics/per-destination)每 30s 轮询,而窗口样本只随
-        新观测(外)变更。use_cache=True 时以 _metrics_version 为缓存键,版本未变
-        直接返回上次算好的深拷贝快照,避免多次轮询间无新样本仍逐域名逐代理重算
-        分位数(实测单次 1.3s/6.7MB)。默认 False ≡ 旧行为,供落盘路径
-        (router._flush_to_db)永远取实时值,不被缓存污染。
+        参数:
+          use_cache: 面板(监控页 /metrics/per-destination)每 30s 轮询,而窗口样本
+            只随新观测(外)变更。True 时以 _metrics_version 为缓存键,版本未变
+            直接返回上次算好的深拷贝快照,避免多次轮询间无新样本仍逐域名逐代理
+            重算分位数(实测单次 1.3s/6.7MB)。默认 False ≡ 旧行为,供落盘路径
+            (router._flush_to_db) 永远取实时值,不被缓存污染。
+          domain: 非 None 只计算该域名的 {pid: ...}(监控页明细按需拉单域名,
+            避开全量 1175 域名网格的序列化/传输);None 计算全部。
+
+        面板口径减载:use_cache=True(面板消费方)时,输出剔除原始样本数组
+          ttfb_samples/ofb_samples/outcome_samples 与 TDigest 质心列表——前端
+          明细渲染只用派生字段(percentiles 已算好 / cumulative / window_* /
+          errors / http_versions / total),不需要原始样本;去掉它们让单域名
+          明细从几十 KB 降到底部 KB,且不随窗口大小膨胀。use_cache=False
+          (落盘 _flush_to_db) 保留完整 mm(含样本/质心)以正确序列化持久化。
         """
+        cache_ok = False
         if use_cache:
             ver, cached = self._domain_snapshot_cache
-            if ver == self._metrics_version and cached is not None:
+            if domain is None and ver == self._metrics_version and cached is not None:
                 return cached
         out = {}
         for d, per_pid in self._domain_metrics.items():
+            if domain is not None and d != domain:
+                continue
             for pid, m in per_pid.items():
                 mm = m["metrics"]
-                out.setdefault(d, {})[pid] = dict(mm)
-                out[d][pid]["percentiles"] = {
+                o = dict(mm) if not use_cache else ProxySelector._panel_metric(mm)
+                out.setdefault(d, {})[pid] = o
+                o["percentiles"] = {
                     "ttfb": ProxySelector._percentiles(mm.get("ttfb_samples", [])),
                     "ofb": ProxySelector._percentiles(mm.get("ofb_samples", [])),
                 }
@@ -724,12 +753,12 @@ class ProxySelector:
                 win_outcomes = mm.get("outcome_samples", [])
                 win_n = len(win_outcomes)
                 win_succ = sum(win_outcomes)
-                out[d][pid]["window_success_count"] = win_succ
-                out[d][pid]["window_total"] = win_n
-                out[d][pid]["window_success_rate"] = ProxySelector._smooth_rate(win_succ, win_n)
+                o["window_success_count"] = win_succ
+                o["window_total"] = win_n
+                o["window_success_rate"] = ProxySelector._smooth_rate(win_succ, win_n)
                 # 终身累计(跨重启永久):与窗口化分位并存,供 --metrics 展示"永久值"。
-                out[d][pid]["cumulative"] = ProxySelector._cumulative_view(mm)
-        if use_cache:
+                o["cumulative"] = ProxySelector._cumulative_view(mm)
+        if use_cache and domain is None:
             self._domain_snapshot_cache = (self._metrics_version, out)
         return out
 

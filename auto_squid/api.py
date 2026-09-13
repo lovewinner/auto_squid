@@ -363,20 +363,22 @@ async def metrics():
 
 
 @app.get("/metrics/per-destination")
-async def metrics_per_destination():
+async def metrics_per_destination(domain: str | None = None):
     """每分钟度(域名,代理)的增强指标(Phase 1,IMPROVEMENT_PLAN.md)。
 
     评估"特定 URL(如 https://github.com 的 domain key github.com:443)实测速度":
     返回 {domain: {pid: {ttfb/ofb 分位数, 成功率, 错误分类, 吞吐}}}。见
     selector.get_domain_metrics()。
 
-    走版本化快照缓存(use_cache=True):面板 30s 轮询,无新样本时直接复用上次
-    算好的快照,避免每次请求逐域名逐代理重算分位数(实测单次 1.3s/6.7MB)。
-    数据有变更才会重算,故展示始终新鲜。落盘路径(router._flush_to_db)不用缓存。
+    domain 可选:非 None 只返回该域名的 {pid: ...}(监控页明细按需拉单域名,
+    避开全量 1175 域名网格的序列化/传输);缺省返回全部。走版本化快照缓存
+    (use_cache=True):面板 30s 轮询无新样本时直接复用快照,避免重复重算分位
+    (近式单次 1.3s/6.7MB);面板口径剔除原始样本数组,载荷大幅缩减。
+    落盘路径(router._flush_to_db)用 use_cache=False 不全缓存/不减样本。
     """
     if not _router:
         return {}
-    return _router.selector.get_domain_metrics(use_cache=True)
+    return _router.selector.get_domain_metrics(use_cache=True, domain=domain)
 
 
 @app.get("/server-stats")
@@ -909,18 +911,51 @@ let qmeta = {}, perDest = {};
 
 function doRefresh() { fetchMetrics(); }
 
+// 全局概览:只需 /quality/meta(每代理增强指标,轻量)。域名下拉的 keys 来自
+// /domains(域名统计,60KB),不拉全量 /metrics/per-destination(1175 域名 6.7MB)。
+// 域名明细在切到域名 tab / 选中域名时才按需 /metrics/per-destination?domain=X 拉单域名。
 async function fetchMetrics() {
-  const [r1, r2] = await Promise.all([fetch('/quality/meta'), fetch('/metrics/per-destination')]);
+  const [r1, r2] = await Promise.all([fetch('/quality/meta'), fetch('/domains')]);
   qmeta = await r1.json();
-  perDest = await r2.json();
+  const stamp = Object.keys((await r2.json()) || {});
   const sel = document.getElementById('metrics-domain');
-  const keys = Object.keys(perDest).sort();
+  const keys = stamp.sort();
   if (sel.options.length !== keys.length) {
     sel.innerHTML = keys.map(k => `<option value="${k.replace(/"/g,'&quot;')}">${k}</option>`).join('');
     sel.value = (metricsDomain && keys.includes(metricsDomain)) ? metricsDomain : '';
     metricsDomain = sel.value;
   }
   renderMetrics();
+}
+
+class _metric_tracker {
+  constructor() { this.last = {}; }
+  need(domain) {
+    const key = domain || '';
+    const t = performance.now();
+    // 30s 内不重复拉同一域名明细;强刷(Refresh)会换对象强制重拉
+    if (this.last[key] && t - this.last[key] < 30000) return false;
+    this.last[key] = t; return true;
+  }
+  reset() { this.last = {}; }
+}
+window._metricFetchT = new _metric_tracker();
+
+async function fetchDomain(domain) {
+  const rp = await fetch('/metrics/per-destination?domain=' + encodeURIComponent(domain));
+  const d = await rp.json();
+  perDest = d[domain] || {};
+}
+
+async function renderMetrics() {
+  const wrap = document.getElementById('table-wrap');
+  document.getElementById('pager').innerHTML = '';
+  if (metricsSub === 'global') { renderMetricsGlobal(wrap); return; }
+  // 域名明细:timer 内已有缓存则直接用;否则按需拉单域名
+  if (window._metricFetchT.need(metricsDomain)) {
+    await fetchDomain(metricsDomain);
+  }
+  renderMetricsDomain(wrap);
 }
 
 function renderMetrics() {
@@ -975,15 +1010,14 @@ function renderMetricsGlobal(wrap) {
 }
 
 function renderMetricsDomain(wrap) {
-  if (!metricsDomain || !perDest[metricsDomain]) {
-    const keys = Object.keys(perDest);
-    if (!keys.length) { wrap.innerHTML = '<div class="no-data">No per-domain metrics</div>'; document.getElementById('pager').innerHTML=''; document.getElementById('footer').textContent=''; return; }
+  if (!metricsDomain) {
     wrap.innerHTML = '<div class="no-data">请在上方选择域名</div>';
     document.getElementById('pager').innerHTML=''; document.getElementById('footer').textContent='';
     return;
   }
-  const per = perDest[metricsDomain];
+  const per = perDest;  // perDest 已是选中域名的 {pid: ...}(fetchDomain 按需拉取)
   const pids = Object.keys(per).sort((a,b) => (per[b].total||0)-(per[a].total||0));
+  if (!pids.length) { wrap.innerHTML = '<div class="no-data">该域名暂无代理指标</div>'; document.getElementById('pager').innerHTML=''; document.getElementById('footer').textContent=''; return; }
   let banner = `<div class="filter-banner" style="display:flex"><strong>${metricsDomain}</strong>&nbsp;各代理实测指标</div>`;
   let win = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 P50/P95/P99</th><th>源站首字节 P50/P95/P99</th><th>成功率(近)</th><th>成功/总数(近)</th><th>错误分类(近 256)</th></tr></thead><tbody>';
   let cum = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 均值</th><th>源站首字节 均值</th><th>吞吐 累计</th><th>成功率</th><th>总请求</th><th>累计字节</th><th>协议(累计)</th></tr></thead><tbody>';
