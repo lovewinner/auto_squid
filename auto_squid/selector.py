@@ -84,12 +84,14 @@ _CUM_FIELDS = {
 ERROR_TIMEOUT = "timeout"
 ERROR_CONNECT = "connect"
 ERROR_HTTP_5XX = "http_5xx"
+ERROR_HTTP_STATUS = "http_status"  # CONNECT 上游返回非 200(业务拒绝),不计熔断
 ERROR_TLS = "tls"
 ERROR_PROTOCOL = "protocol"
 ERROR_CANCELLED = "cancelled"
 ERROR_OTHER = "other"
 _ERROR_KEYS = (ERROR_TIMEOUT, ERROR_CONNECT, ERROR_HTTP_5XX,
-               ERROR_TLS, ERROR_PROTOCOL, ERROR_CANCELLED, ERROR_OTHER)
+               ERROR_HTTP_STATUS, ERROR_TLS, ERROR_PROTOCOL,
+               ERROR_CANCELLED, ERROR_OTHER)
 
 
 class ProxySelector:
@@ -1016,19 +1018,28 @@ class ProxySelector:
         域名级与全局级指标的错误分类与 total。注意**被竞速取消的败者
         (CancelledError)不应喂 record_failure**(由调用方跳过),故此处不再引入
         error_type='cancelled' 入口——取消在调用方(_try_http/_try_tunnel)判断。
+
+        **业务拒绝类别('http_status')不熔断**:CONNECT 上游返回非 200(如
+        localhost.weixin 的 403/502/503)是目标端在拒绝连接,不是该代理"不可用"
+        的质量信号。把它计入 consec_fail 会导致单个业务拒绝的重复请求把 6 个
+        外部代理全部熔断(backoff 300s),造成"全代理失败/全站瘫痪"(09-15 事故)。
+        此处对 error_type='http_status' 跳过 consec_fail 累加与熔断,但仍计
+        total/errors/outcome/cum_failure_transport 以维持成功率口径一致。
         """
-        self._conc_observe_failure(pid)  # 自适应并发:失败 → 乘性降低上限(P3)
-        s = self._circuit_state(pid)
-        s["consec_fail"] = int(s.get("consec_fail", 0)) + 1
-        if s["consec_fail"] >= self.circuit_threshold:
-            backoff = (float(s.get("backoff", 0.0)) or 1.0) * self._CIRCUIT_BACKOFF_MULT
-            s["backoff"] = min(self.circuit_max_backoff, backoff)
-            s["open_until"] = time.monotonic() + s["backoff"]
-            s["consec_fail"] = 0  # 熔断后计数清零,恢复后的失败重新累计
-            self.circuit_open_count += 1
-            logger.warning("circuit opened for proxy %s, backoff=%.1fs", pid, s["backoff"])
-        # ── 可观测性增强(Phase 1):错误分类 + total ──
         etype = error_type if error_type in _ERROR_KEYS else ERROR_OTHER
+        bypass_circuit = (etype == ERROR_HTTP_STATUS)
+        self._conc_observe_failure(pid)  # 自适应并发:失败 → 乘性降低上限(P3)
+        if not bypass_circuit:
+            s = self._circuit_state(pid)
+            s["consec_fail"] = int(s.get("consec_fail", 0)) + 1
+            if s["consec_fail"] >= self.circuit_threshold:
+                backoff = (float(s.get("backoff", 0.0)) or 1.0) * self._CIRCUIT_BACKOFF_MULT
+                s["backoff"] = min(self.circuit_max_backoff, backoff)
+                s["open_until"] = time.monotonic() + s["backoff"]
+                s["consec_fail"] = 0  # 熔断后计数清零,恢复后的失败重新累计
+                self.circuit_open_count += 1
+                logger.warning("circuit opened for proxy %s, backoff=%.1fs", pid, s["backoff"])
+        # ── 可观测性增强(Phase 1):错误分类 + total ──
         # 同 record_ttfb:domain=None 时两个桶是同一对象,去重只写一次
         # (否则非域名失败的 total/错误分类/cum_failure_transport 被双计,
         #  使全局成功率向非域名流量倾斜)。

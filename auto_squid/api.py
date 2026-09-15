@@ -100,7 +100,7 @@ let pageSize = 20;
 let cfg = {};
 
 // ── 错误分类标签(监控页 errStr 复用)──
-const ERR_LABELS = {timeout:'超时', connect:'连接', http_5xx:'5xx', tls:'TLS', protocol:'协议', cancelled:'取消', other:'其他'};
+const ERR_LABELS = {timeout:'超时', connect:'连接', http_5xx:'5xx', http_status:'HTTP状态', tls:'TLS', protocol:'协议', cancelled:'取消', other:'其他'};
 
 // ── 格式化工具(纯函数,所有页共用)──
 function fmtPct(p) { return p == null ? '—' : (p * 100).toFixed(1) + '%'; }

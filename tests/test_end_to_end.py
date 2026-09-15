@@ -2437,6 +2437,88 @@ class TestCircuitBreaker:
             await r.stop()
 
     @pytest.mark.asyncio
+    async def test_http_status_failure_does_not_trip_circuit(self):
+        """P0 修复:业务拒绝(http_status,如 CONNECT 被 403/502/503)不累加 consec_fail。
+
+        上游返回非 200 是目标端在拒绝连接,不是代理"不可用"质量信号。把它计入
+        consec_fail 会让单个业务拒绝的重复请求把代理熔断(09-15 全站瘫痪事故)。
+        此处连续 http_status 失败多次,熔断器不应开启,但错误分类计数器仍在涨。
+        """
+        ps, r = await self._circuit_router()
+        try:
+            sel = r.selector
+            # 超过 circuit_threshold(3) 次的 http_status 失败:不熔断。
+            for _ in range(5):
+                sel.record_failure('down', 'http_status')
+            assert sel.is_circuit_open('down') is False
+            assert sel.circuit_open_count == 0
+            # 错误分类计数照常(成功率口径一致)。
+            mm = sel._metrics_for('down', None)
+            assert mm['errors']['http_status'] >= 5
+            assert mm['total'] >= 5
+            sel.record_success('down')
+            assert sel.circuit_open_count == 0
+        finally:
+            await r.stop()
+
+    @pytest.mark.asyncio
+    async def test_escape_local_when_all_proxies_circuit_open(self):
+        """P0 逃生走廊:全外部代理熔断时,fail-open 强制尝试本机直连。
+
+        模拟:2 个代理全部熔断 → ordered_for_domain 为空 → _dispatch_single 注入
+        ['local'](escape=True)→ 即使 local 也熔断,仍被 builder 放入候选。
+        """
+        import asyncio
+        local_srv = await run_local_http_server(HOST, LOCAL_HTTP_PORT)
+        ps = ProxyStore()
+        # 两个端口都无人监听 → 会被熔断
+        ps.add(ProxyInfo(id='down1', host=HOST, port=31990))
+        ps.add(ProxyInfo(id='down2', host=HOST, port=31991))
+        r = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                   enable_local_racing=True, enable_http_cache=False,
+                   circuit_threshold=1, circuit_max_backoff=10.0,
+                   local_direct_domains=[],  # 不拦截本机 HTTP 测试目标
+                   db_path=tempfile.mktemp(suffix='.db'))
+        await r.start()
+        try:
+            # 熔断两个外部代理。
+            r.selector.record_failure('down1')
+            r.selector.record_failure('down2')
+            assert r.selector.is_circuit_open('down1')
+            assert r.selector.is_circuit_open('down2')
+            # 竞速候选应为空(全熔断)。
+            assert r.selector.ordered_for_domain('localhost') == []
+            # 请求能经逃生走廊 local 回到本地服务器,而不是 502。
+            url = f"http://{HOST}:{LOCAL_HTTP_PORT}/".encode()
+            body = await send_http_get(HOST, ROUTER_PORT, url=url)
+            assert b'local-response' in body, \
+                f"escape local should serve local server, got: {body[:60]}"
+        finally:
+            await r.stop()
+            local_srv.close()
+            await local_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_escape_local_respects_policy_deny(self):
+        """P0 逃生走廊:策略禁止 local 时,全熔断仍 502(不绕过策略)。"""
+        pol = PolicyConfig(match={'domain_suffix': ['deny.local']},
+                           proxies={'ids': {'p1'}})
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='p1', host=HOST, port=31990))
+        r = Router(ps, listen_host=HOST, listen_port=10829,
+                   max_retries=2, enable_http_cache=False,
+                   probe_interval_sec=0.0, circuit_threshold=1,
+                   policies=[pol], db_path=tempfile.mktemp(suffix='.db'))
+        try:
+            # 熔断 p1(唯一外部代理)。
+            r.selector.record_failure('p1', error_type='timeout')
+            assert r.selector.is_circuit_open('p1')
+            # 该策略下 local 不在 ids 子集内 → 逃生走廊被策略挡住,仍 502。
+            assert not r._policy_allows_sticky('deny.local', 'local')
+        finally:
+            await r.stop()
+
+    @pytest.mark.asyncio
     async def test_success_clears_failure_count(self):
         """一次成功清零连续失败计数(健康后不会熔断)。"""
         _, r = await self._circuit_router()

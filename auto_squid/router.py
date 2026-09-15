@@ -2686,19 +2686,23 @@ class Router:
 
     # ── HTTP 请求处理 ──────────────────────────────────────────
 
-    def _build_racing_tasks_http(self, proxies: List[str], host: str = "") -> set:
+    def _build_racing_tasks_http(self, proxies: List[str], host: str = "", escape: bool = False) -> set:
         """为 HTTP 竞速产出候选占位集合(前 max_retries 个 pid + 本机 local)。
 
         N 由 max_retries 限制(本批只竞速前 N 个)。返回的 set 交给 _race(真 task)
         或 _race_staggered(惰性占位,补发时才创建)。占位为 pid 字符串,
         _make_race_task 据此建 _try_http task。host 给策略路由:命中策略时
         proxies 已由调用方按策略收窄;local 仅当策略放行时加入。
+        escape=True 为 P0 逃生走廊:绕开 is_circuit_open('local') 过滤(理由见
+        _prep_http)。
         """
         places = {pid for pid in proxies[:self.max_retries] if self.proxy_store.get(pid)}
         # local 仅当 enable_local_racing + 策略放行 + 未熔断(死本机端点/连续真失败被
         # is_circuit_open 标记)时参与竞速——熔断后 local 不再白烧 3s。
-        if self.enable_local_racing and self._policy_allows_sticky(host, 'local') \
-                and not self.selector.is_circuit_open('local'):
+        # escape 逃生走廊例外:全熔断时强制尝试本机直连。
+        local_ok = self._policy_allows_sticky(host, 'local') and (
+            escape or not self.selector.is_circuit_open('local'))
+        if (escape or self.enable_local_racing) and local_ok:
             places.add('local')
         return places
 
@@ -2719,20 +2723,23 @@ class Router:
             return min(self.max_retries, max(2, self.stagger_initial))
         return self.stagger_initial
 
-    def _prep_http(self, proxies: List[str], host: str = "") -> tuple:
+    def _prep_http(self, proxies: List[str], host: str = "", escape: bool = False) -> tuple:
         """HTTP 竞速的启动参数:首批/补发按 stagger 配置取占位,返回 (initial_places, remaining)。
 
         供 _dispatch_single 拼接 _race_staggered 的调用。`initial_places` 是
         首批要同时发出的**有序**占位列表(最优先发出,保持 proxies 的 EWMA 排序);
         `remaining` 是待定时补发的**有序**占位列表。本机竞速开启时 local 优先
         (直连,常最快)。占位为 pid 字符串,_make_race_task 据此建 _try_http task。
-        host 给策略路由:local 仅当策略放行时参与。
+        host 给策略路由:local 仅当策略放行时参与。escape=True 为 P0 逃生走廊:
+        全外部代理熔断时由 _dispatch_single 注入 ['local'],此时**绕过 local 的
+        is_circuit_open 过滤**(local 熔断常由探测不可达目标触发,不代表对真实
+        业务目标本机不可用)。
         """
         n_initial = self._stagger_initial()
         initial_pids = proxies[:n_initial]
-        if self.enable_local_racing and 'local' not in initial_pids \
-                and self._policy_allows_sticky(host, 'local') \
-                and not self.selector.is_circuit_open('local'):
+        local_ok = self._policy_allows_sticky(host, 'local') and (
+            escape or not self.selector.is_circuit_open('local'))
+        if (escape or self.enable_local_racing) and 'local' not in initial_pids and local_ok:
             initial_pids = ['local'] + initial_pids
         initial_places = [pid for pid in initial_pids
                           if pid == 'local' or self.proxy_store.get(pid)]
@@ -2956,7 +2963,13 @@ class Router:
         if isinstance(err, (OSError, ConnectionError)):
             return "connect"
         if isinstance(err, RuntimeError):
-            # 上游返回非 200 / 无响应 由本模块 raise RuntimeError 标记协议层失败
+            # 上游返回非 200(CONNECT 被目标端 4xx/5xx 拒绝)由本模块 raise
+            # RuntimeError('upstream returned non-200 for CONNECT: ...') 标记。
+            # 归为 http_status(业务拒绝,**不计熔断**——见 selector.record_failure);
+            # 其余 RuntimeError(如"no response from upstream")才是真正协议层失败。
+            emsg = str(err)
+            if "upstream returned non-200" in emsg:
+                return "http_status"
             return "protocol"
         if "Timeout" in full or "TimeoutError" in full:
             return "timeout"
@@ -3260,10 +3273,25 @@ class Router:
         #    cleanup(HTTP 流式 vs CONNECT 隧道归还)、错峰 kwargs(HTTP 带方法参数
         #    建 _try_http task;CONNECT 无需但 _race_staggered 默认 "" 亦可)、
         #    胜者收尾。统一后用 proto 分派选择,消除 duplicates。
+        # 逃生走廊标记:全外部代理熔断时经 fail-open 强制尝试本机直连(local),
+        # 即使 local 也在熔断期(传 escape=True 让 builder 绕过 is_circuit_open 过滤)。
+        escape = False
         proxies = self.selector.ordered_for_domain(domain_key)
         if self._policies:
             proxies = self._policy_candidate_pids(domain_key, proxies)
-        if not proxies and not self.enable_local_racing:
+        if not proxies:
+            # P0 逃生走廊(全熔断 fail-open):没有任何可用外部代理时,不再直接
+            # 502 瘫痪,而是强制尝试本机直连(local)——即使 local 也在熔断期。
+            # 依据:local 熔断通常由探测不可达目标(workbuddy-pc / localhost.weixin)
+            # 触发,不代表对真实业务目标(如 cn.bing.com)本机也连不上。此时
+            # local_direct_domains 白名单目标已在 _handle_connect 前置拦截,不会
+            # 走到这里;策略禁止 local 时 _policy_allows_sticky 返回 False,仍 502。
+            if self._policy_allows_sticky(domain_key, 'local'):
+                proxies = ['local']
+                escape = True
+            else:
+                proxies = []
+        if not proxies:
             await self._write_cached_response(writer, 502, 'Bad Gateway', {'Content-Type': 'text/plain'}, b'Bad Gateway')
             return None
 
@@ -3275,13 +3303,13 @@ class Router:
 
         if proto == 'http':
             if self.stagger_start:
-                initial_places, remaining = self._prep_http(proxies, domain_key)
+                initial_places, remaining = self._prep_http(proxies, domain_key, escape=escape)
                 winner = await self._race_staggered(
                     initial_places + remaining, cleanup=self._cleanup_http_result,
                     initial=len(initial_places), interval=self.stagger_interval,
                     method=method, url=url, headers=hdrs, body=body, domain=domain_key)
             else:
-                places = self._build_racing_tasks_http(proxies, domain_key)
+                places = self._build_racing_tasks_http(proxies, domain_key, escape=escape)
                 tasks = {self._make_race_task(p, method, url, hdrs, body, domain_key)
                          for p in places}
                 winner = await self._race(tasks, cleanup=self._cleanup_http_result)
@@ -3296,12 +3324,12 @@ class Router:
         else:  # CONNECT
             race_cleanup = functools.partial(self._cleanup_tunnel_result, target=target)
             if self.stagger_start:
-                initial_places, remaining = self._prep_connect(proxies, target)
+                initial_places, remaining = self._prep_connect(proxies, target, escape=escape)
                 winner = await self._race_staggered(
                     initial_places + remaining, cleanup=race_cleanup,
                     initial=len(initial_places), interval=self.stagger_interval)
             else:
-                places = self._build_racing_tasks_connect(proxies, target)
+                places = self._build_racing_tasks_connect(proxies, target, escape=escape)
                 tasks = {self._make_race_task(p, '', '', None, None) for p in places}
                 winner = await self._race(tasks, cleanup=race_cleanup)
                 # 首批全失败且代理数超过 max_retries:对剩余代理再竞速兜底。
@@ -3478,35 +3506,39 @@ class Router:
 
     # ── CONNECT 处理 ──────────────────────────────────────────
 
-    def _build_racing_tasks_connect(self, proxies: List[str], target: str) -> set:
+    def _build_racing_tasks_connect(self, proxies: List[str], target: str, escape: bool = False) -> set:
         """为 CONNECT 竞速产出候选占位集合(前 max_retries 个上游 + 本机 local)。
 
         占位为 (pid, target) 元组,交由 _race(真 task)/ _race_staggered(惰性占位,
         补发时才创建)执行;本机竞速时追加 (local, target) 直连占位。target 给
         策略路由:proxies 已由调用方收窄,local 仅当策略放行时参与。
+        escape=True 为 P0 逃生走廊:绕开 is_circuit_open('local') 过滤(理由见
+        _prep_http)。
         """
         places = set()
         for pid in proxies[:self.max_retries]:
             if self.proxy_store.get(pid):
                 places.add((pid, target))
-        if self.enable_local_racing and self._policy_allows_sticky(target, 'local') \
-                and not self.selector.is_circuit_open('local'):
+        local_ok = self._policy_allows_sticky(target, 'local') and (
+            escape or not self.selector.is_circuit_open('local'))
+        if (escape or self.enable_local_racing) and local_ok:
             places.add(('local', target))
         return places
 
-    def _prep_connect(self, proxies: List[str], target: str) -> tuple:
+    def _prep_connect(self, proxies: List[str], target: str, escape: bool = False) -> tuple:
         """CONNECT 竞速的启动参数:首批/补发按 stagger 配置取占位,返回 (initial_places, remaining)。
 
         与 _prep_http 同构:首批取前 stagger_initial 个最优代理,本机竞速时 local
         优先(直连,常最快)。占位为 (pid, target) 元组,_make_race_task 据此建
         _try_tunnel task。返回的两个列表均保持 proxies 的 EWMA 排序(最优在前)。
-        target 给策略路由:local 仅当策略放行时参与。
+        target 给策略路由:local 仅当策略放行时参与。escape=True 为 P0 逃生走廊:
+        绕开 is_circuit_open('local') 过滤(理由见 _prep_http)。
         """
         n_initial = self._stagger_initial()
         initial_pids = proxies[:n_initial]
-        if self.enable_local_racing and 'local' not in initial_pids \
-                and self._policy_allows_sticky(target, 'local') \
-                and not self.selector.is_circuit_open('local'):
+        local_ok = self._policy_allows_sticky(target, 'local') and (
+            escape or not self.selector.is_circuit_open('local'))
+        if (escape or self.enable_local_racing) and 'local' not in initial_pids and local_ok:
             initial_pids = ['local'] + initial_pids
         initial_places = [(pid, target) for pid in initial_pids
                           if pid == 'local' or self.proxy_store.get(pid)]
