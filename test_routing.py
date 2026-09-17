@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
 from auto_squid.proxy_store import ProxyStore
-from auto_squid.router import Router
+from auto_squid.router import Router, make_router
 from auto_squid.config_schema import Config, RouterConfig
 from auto_squid.api import mount
 import yaml
@@ -999,7 +999,7 @@ async def main():
 
         # Create router with minimal config for analysis
         # We don't start the server, just use the router object for inspection
-        router = Router(
+        router = make_router(
             proxy_store,
             listen_host=cfg.listen.host,
             listen_port=cfg.listen.port,

@@ -525,3 +525,172 @@ class Config(ConfigBase):
 # APIConfig.auth 是字符串前向引用("AuthConfig"),在模块底部解析一次,
 # 使 pydantic 能构建正确类型。AuthConfig 定义于本文件下方。
 APIConfig.model_rebuild()
+
+
+
+# ── 兼容层:历史散装 Router(**kwargs) 参数名 → 嵌套 RouterConfig ──────────────
+# Router.__init__ 重构前接受 ~99 个散装关键字(如 conn_pool_per_proxy=4),与
+# router_cfg 配置对象两条路径并存。重构后 Router 只接受 router_cfg,散装词汇表
+# 下沉到本函数,仅供测试/压测/工具迁移使用 —— 不再是 Router 的公开接口。
+#
+# 映射方向:散装名 → RouterConfig 点分路径。与 Router.__init__ 里那段"逐字段
+# 从 router_cfg 取回局部变量"的重绑定表严格一一对应(同一份字段清单)。
+_FLAT_TO_CONFIG_PATH: dict[str, str] = {
+    "adaptive_ttl": "adaptive_ttl.enabled",
+    "adaptive_ttl_max": "adaptive_ttl.max_sec",
+    "adaptive_ttl_min": "adaptive_ttl.min_sec",
+    "auth_enabled": "auth.enabled",
+    "auth_password": "auth.password",
+    "auth_username": "auth.username",
+    "auto_tune": "auto_tune",
+    "cache_ttl": "cache_ttl",
+    "circuit_max_backoff": "circuit.circuit_max_backoff",
+    "circuit_threshold": "circuit.circuit_threshold",
+    "cluster_graph_max_entries": "conn_pool.cluster_graph_max_entries",
+    "cluster_graph_ttl_sec": "conn_pool.cluster_graph_ttl_sec",
+    "cluster_min_support": "conn_pool.cluster_min_support",
+    "cluster_pool_idle_timeout": "conn_pool.cluster_pool_idle_timeout",
+    "cluster_predict": "conn_pool.cluster_predict",
+    "cluster_predict_throttle_sec": "conn_pool.cluster_predict_throttle_sec",
+    "cluster_predict_topk": "conn_pool.cluster_predict_topk",
+    "cluster_probe_decay_sec": "conn_pool.cluster_probe_decay_sec",
+    "cluster_proxy_fanout": "conn_pool.cluster_proxy_fanout",
+    "cluster_window_sec": "conn_pool.cluster_window_sec",
+    "concurrency_add_on_success": "concurrency_limit.add_on_success",
+    "concurrency_failure_window": "concurrency_limit.failure_window",
+    "concurrency_limit_enabled": "concurrency_limit.enabled",
+    "concurrency_limit_initial": "concurrency_limit.initial",
+    "concurrency_limit_max": "concurrency_limit.max",
+    "concurrency_limit_min": "concurrency_limit.min",
+    "concurrency_mult_on_failure": "concurrency_limit.mult_on_failure",
+    "conn_pool_connect_timeout": "conn_pool.connect_timeout",
+    "conn_pool_enabled": "conn_pool.enabled",
+    "conn_pool_established_idle_timeout": "conn_pool.established_idle_timeout",
+    "conn_pool_established_reuse": "conn_pool.established_reuse",
+    "conn_pool_idle_timeout": "conn_pool.idle_timeout",
+    "conn_pool_per_proxy": "conn_pool.per_proxy",
+    "conn_pool_prehandshake": "conn_pool.prehandshake",
+    "conn_pool_prehandshake_throttle_max_per_window": "conn_pool.prehandshake_throttle_max_per_window",
+    "conn_pool_prehandshake_throttle_window_sec": "conn_pool.prehandshake_throttle_window_sec",
+    "conn_pool_refill_interval": "conn_pool.refill_interval",
+    "conn_pool_refill_pause_activity_window": "conn_pool.refill_pause_activity_window",
+    "conn_pool_refill_pause_min_requests": "conn_pool.refill_pause_min_requests",
+    "conn_pool_refill_pause_minutes": "conn_pool.refill_pause_minutes",
+    "conn_pool_refill_pause_silence_sec": "conn_pool.refill_pause_silence_sec",
+    "conn_pool_refill_target": "conn_pool.refill_target",
+    "conn_pool_target_prewarm": "conn_pool.target_prewarm",
+    "conn_pool_total": "conn_pool.total",
+    "connect_tunnel_timeout_sec": "circuit.connect_tunnel_timeout_sec",
+    "cost_latency_metric": "circuit.cost_latency_metric",
+    "cost_latency_min_samples": "circuit.cost_latency_min_samples",
+    "cost_sort_enabled": "circuit.cost_sort_enabled",
+    "cost_throughput_min_bytes": "circuit.cost_throughput_min_bytes",
+    "cost_weight_latency": "circuit.cost_weight_latency",
+    "cost_weight_success_rate": "circuit.cost_weight_success_rate",
+    "cost_weight_throughput": "circuit.cost_weight_throughput",
+    "enable_http_cache": "http_cache.enabled",
+    "enable_local_racing": "enable_local_racing",
+    "fail_penalty_weight": "circuit.fail_penalty_weight",
+    "http_cache_max_bytes": "http_cache.max_bytes",
+    "http_cache_max_entries": "http_cache.max_entries",
+    "http_cache_stream_limit": "http_cache.stream_cache_limit",
+    "http_cache_ttl": "http_cache.ttl",
+    "http_read_timeout_sec": "circuit.http_read_timeout_sec",
+    "lb_bias": "circuit.lb_bias",
+    "local_direct_domains": "local_direct_domains",
+    "local_direct_timeout_sec": "circuit.local_direct_timeout_sec",
+    "max_retries": "max_retries",
+    "policies": "policies",
+    "probe_canaries": "circuit.probe_canaries",
+    "probe_canary": "circuit.probe_canary",
+    "probe_get_interval_sec": "circuit.probe_get_interval_sec",
+    "probe_get_max_bytes": "circuit.probe_get_max_bytes",
+    "probe_get_targets": "circuit.probe_get_targets",
+    "probe_get_timeout_sec": "circuit.probe_get_timeout_sec",
+    "probe_interval_sec": "circuit.probe_interval_sec",
+    "probe_with_get": "circuit.probe_with_get",
+    "single_send_degrade_fail": "circuit.single_send_degrade_fail",
+    "single_send_degrade_min_throughput": "circuit.single_send_degrade_min_throughput",
+    "single_send_degrade_p99_ms": "circuit.single_send_degrade_p99_ms",
+    "single_send_degrade_ratio": "circuit.single_send_degrade_ratio",
+    "single_send_degrade_slack_ms": "circuit.single_send_degrade_slack_ms",
+    "single_send_degrade_success_rate": "circuit.single_send_degrade_success_rate",
+    "single_send_slow_log_ms": "circuit.single_send_slow_log_ms",
+    "slow_start_success": "circuit.slow_start_success",
+    "slow_start_window": "circuit.slow_start_window",
+    "stagger_initial": "stagger_initial",
+    "stagger_interval_ms": "stagger_interval_ms",
+    "stagger_start": "stagger_start",
+    "stickiness_enabled": "stickiness.enabled",
+    "stickiness_max_entries": "stickiness.max_entries",
+    "stickiness_recheck_hits": "stickiness.recheck_hits",
+    "stickiness_ttl": "stickiness.ttl",
+    "sticky_probe_fanout": "stickiness.probe_fanout",
+    "sticky_probe_interval_sec": "stickiness.probe_interval_sec",
+    "switch_damping": "switch_damping.enabled",
+    "switch_damping_abs_ms": "switch_damping.abs_ms",
+    "switch_damping_min_wins": "switch_damping.min_wins",
+    "switch_damping_ratio": "switch_damping.ratio",
+}
+
+# 这 4 个字段在 Router body 里会被 list() / 逐元素 .model_dump() 直接消费,故传入
+# None 时必须回落到模型默认空列表(散装路径原本用 `(x or [])` 处理 None)。
+_LIST_FIELDS = frozenset({
+    "local_direct_domains", "policies",
+    "circuit.probe_canaries", "circuit.probe_get_targets",
+})
+
+
+def router_config_from_flat(**overrides) -> RouterConfig:
+    """[兼容层] 把散装 Router(**kwargs) 参数名映射成嵌套 RouterConfig。
+
+    仅供测试/压测等历史调用点迁移使用;生产路径(cli.py)直接构造 RouterConfig。
+
+    宽松语义:统一用 ``model_construct`` 构造,**跳过 #12 的跨字段硬校验**。散装
+    路径原本就不校验——非法组合在 Router body 内被钳制或静默降级(例如
+    ``stagger_initial > max_retries`` 会被 ``min()`` 钳到 max_retries,
+    ``cluster_predict=True`` 而未开 ``conn_pool.enabled`` 会静默降级为不启用)。
+    若这里改成带校验的构造,依赖这些钳制/降级行为的现有调用会直接抛错,属行为变更。
+
+    参数:
+        **overrides: 散装参数名 → 值(名字清单见 ``_FLAT_TO_CONFIG_PATH``)。
+
+    返回:
+        未经校验的 ``RouterConfig``;未提供的字段取模型默认值。
+
+    异常:
+        TypeError: 出现未知参数名(与散装签名一致:不认识的键即报错)。
+    """
+    defaults = RouterConfig.model_construct()
+    top: dict = {}
+    sections: dict[str, dict] = {}
+
+    for name, value in overrides.items():
+        path = _FLAT_TO_CONFIG_PATH.get(name)
+        if path is None:
+            raise TypeError(
+                f"router_config_from_flat() got an unexpected keyword argument {name!r}")
+        if value is None and path in _LIST_FIELDS:
+            continue                      # 等价散装路径的 `(x or [])`
+        if "." in path:
+            section, field = path.split(".", 1)
+            sections.setdefault(section, {})[field] = value
+        else:
+            top[path] = value
+
+    # probe_canaries:散装路径收 dict 列表,配置对象存模型列表;Router 会逐元素
+    # 调 .model_dump(),故这里必须转成 ProbeCanaryConfig。
+    if "probe_canaries" in sections.get("circuit", {}):
+        raw = sections["circuit"]["probe_canaries"]
+        sections["circuit"]["probe_canaries"] = [
+            c if isinstance(c, ProbeCanaryConfig) else ProbeCanaryConfig(**c)
+            for c in (raw or [])
+        ]
+
+    # 各子配置:模型默认 + 覆盖,整体走 model_construct(不校验)
+    for section, fields in sections.items():
+        default = getattr(defaults, section)
+        merged = {**{k: getattr(default, k) for k in type(default).model_fields}, **fields}
+        top[section] = type(default).model_construct(**merged)
+
+    return RouterConfig.model_construct(**top)

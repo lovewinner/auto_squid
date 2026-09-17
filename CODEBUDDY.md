@@ -80,6 +80,7 @@ Both are written in the same scope loop inside `record_ttfb` / `record_failure` 
 ## Conventions worth knowing
 
 - Comments are in Chinese and dense (they explain *why*, not *what*). Preserve this style; match it for new code.
+- **`Router` takes a single config object**: `Router(proxy_store, *, listen_host, listen_port, db_path, router_cfg=None)`. All ~100 tuning knobs live in `config_schema.RouterConfig` (nested sub-configs). Tests/bench keep the legacy *flat* keyword vocabulary via `make_router(...)` (in `router.py`) / `config_schema.router_config_from_flat(...)` — that compat layer uses `model_construct` to stay **lenient** (the flat path never validated; `#12`'s cross-field hard checks apply only when a `RouterConfig` is constructed normally, e.g. from YAML). `tests/test_end_to_end.py::TestRouterConfigPassThrough::test_every_router_cfg_field_propagates` is a fence: it mutates every `RouterConfig` leaf and asserts Router state changes, so a newly added field that is not read in `__init__` fails CI.
 - `MAX_BODY = 10 MiB` (413 on overflow), `STREAM_CACHE_LIMIT = 1 MiB`, `FLUSH_INTERVAL = 5.0s` are module constants in `router.py`.
 - The management API is **open by default**; protect with `api.auth` in `config.yaml`. Proxy port auth is `router.auth` (also off by default).
 - `bench/` is a load-test harness, deliberately excluded from the packaged `auto_squid` distribution (`pyproject.toml` `packages.find` is scoped to `auto_squid*`).

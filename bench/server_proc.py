@@ -42,7 +42,7 @@ from auto_squid.api import app as api_app, mount as mount_api
 from auto_squid import api as api_mod
 from auto_squid.config_schema import ProxyInfo
 from auto_squid.proxy_store import ProxyStore
-from auto_squid.router import Router
+from auto_squid.router import Router, make_router
 
 from bench.mock_upstream import UpstreamCluster, ResponseProfile
 
@@ -212,7 +212,7 @@ async def _serve(config: dict):
 
         # 2) Router(被测方)。错峰参数可经 config 注入(默认启用;压测对比错峰
         #    on/off 时传 stagger_start=False)。
-        router = Router(ps, listen_host="127.0.0.1", listen_port=config["router_port"],
+        router = make_router(ps, listen_host="127.0.0.1", listen_port=config["router_port"],
                         max_retries=config["max_retries"], cache_ttl=config["cache_ttl"],
                         enable_http_cache=config["enable_http_cache"],
                         stagger_start=config.get("stagger_start", True),

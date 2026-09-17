@@ -21,7 +21,7 @@ from auto_squid.api import app
 import auto_squid.api as api_module
 from auto_squid.config_schema import AutoTuneConfig
 from auto_squid.proxy_store import ProxyStore
-from auto_squid.router import Router
+from auto_squid.router import Router, make_router
 from auto_squid.tuner import AutoTuner, _WEIGHT_BOUNDS, _WEIGHT_KEYS
 
 
@@ -220,7 +220,7 @@ def _router(**kw):
     """构造带真实 DB 与默认(关闭)调参器的 Router(不监听)。"""
     ps = ProxyStore()
     db_path = kw.pop("db_path", None) or tempfile.mktemp(suffix=".db")
-    return Router(ps, listen_host="127.0.0.1", listen_port=10909,
+    return make_router(ps, listen_host="127.0.0.1", listen_port=10909,
                   db_path=db_path, probe_interval_sec=0.0, **kw)
 
 

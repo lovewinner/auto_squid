@@ -47,7 +47,8 @@ import httpx
 
 from .proxy_store import ProxyStore
 from .auth import check_auth
-from .config_schema import PolicyConfig, RouterConfig, AutoTuneConfig
+from .config_schema import (PolicyConfig, RouterConfig, AutoTuneConfig,
+                            router_config_from_flat)
 from .tuner import AutoTuner
 from .pools import ConnectionPools, _discard_conn, _ESTABLISHED_KEY_CAP, _ESTABLISHED_PROBE_TIMEOUT
 from .selector import (ProxySelector, _CIRCUIT_THRESHOLD, _CIRCUIT_MAX_BACKOFF,
@@ -180,6 +181,35 @@ def _hb(v: str) -> bytes:
 
 # ProxySelector 已随 #14 拆分搬入 auto_squid/selector.py(顶部 re-import);
 # Router 构造在此经 self.selector = ProxySelector(...) 持有其协作对象。
+def make_router(proxy_store: ProxyStore, *, listen_host: str = "0.0.0.0",
+                listen_port: int = 10808, db_path: str = "auto_squid.db",
+                router_cfg: Optional[RouterConfig] = None,
+                **flat_overrides) -> "Router":
+    """[兼容层] 用历史散装关键字构造 Router(测试/压测/工具迁移用)。
+
+    Router 重构后只接受 ``router_cfg``;本函数把散装关键字经
+    ``config_schema.router_config_from_flat`` 折成 RouterConfig,使既有调用点
+    保持简洁(如 ``make_router(ps, circuit_threshold=3, conn_pool_enabled=True)``)。
+
+    - ``router_cfg`` 显式给出时**优先**,散装 ``flat_overrides`` 被忽略 —— 与重构前
+      Router 的既有优先级一致(router_cfg 覆盖同名散装参数)。
+    - 两者都不给时,等价于 ``Router(proxy_store, ...)``,配置取 RouterConfig 模型默认值。
+
+    参数:
+        proxy_store:      上游代理注册表。
+        listen_host/port: 代理监听地址/端口。
+        db_path:          SQLite 文件路径。
+        router_cfg:       显式路由配置(优先)。
+        **flat_overrides: 历史散装配置项(见 _FLAT_TO_CONFIG_PATH)。
+    返回:
+        构造好的 Router 实例。
+    """
+    if router_cfg is None:
+        router_cfg = router_config_from_flat(**flat_overrides)
+    return Router(proxy_store, listen_host=listen_host, listen_port=listen_port,
+                  db_path=db_path, router_cfg=router_cfg)
+
+
 class Router:
     """代理路由器:监听端口、处理客户端连接、竞速转发、维护统计与缓存。
 
@@ -190,333 +220,116 @@ class Router:
         self,
         proxy_store: ProxyStore,
         *,
-        # ── 监听 / 持久化 / 竞速基础 ──
+        # ── 监听 / 持久化 ──
         listen_host: str = "0.0.0.0",
         listen_port: int = 10808,
-        max_retries: int = 3,
         db_path: str = "auto_squid.db",
-        cache_ttl: int = 600,
-        enable_local_racing: bool = False,
-        # ── 客户端认证(HTTP Basic) ──
-        auth_enabled: bool = False,
-        auth_username: str = "",
-        auth_password: str = "",
-        # ── HTTP 响应缓存 ──
-        enable_http_cache: bool = True,
-        http_cache_ttl: int = 60,
-        http_cache_max_entries: int = 10_000,
-        http_cache_max_bytes: int = 256 * 1024 * 1024,
-        http_cache_stream_limit: int = 1 * 1024 * 1024,
-        # ── 会话粘性 ──
-        stickiness_enabled: bool = False,
-        stickiness_ttl: int = 1800,
-        stickiness_recheck_hits: int = 100,
-        stickiness_max_entries: int = 100_000,
-        sticky_probe_interval_sec: float = 0.0,
-        sticky_probe_fanout: int = 2,
-        # ── 错峰启动(RFC 8305 §5) ──
-        stagger_start: bool = True,
-        stagger_initial: int = 1,
-        stagger_interval_ms: int = _STAGGER_DEFAULT_MS,
-        # ── 后台探活 / 多 canary ──
-        probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT,
-        probe_canary: str = _PROBE_CANARY_DEFAULT,
-        probe_canaries: Optional[List[Dict[str, Any]]] = None,
-        probe_with_get: bool = False,
-        probe_get_targets: Optional[List[str]] = None,
-        probe_get_interval_sec: float = 60.0,
-        probe_get_timeout_sec: float = 5.0,
-        probe_get_max_bytes: int = 65536,
-        # ── 熔断 / slow-start / 失败惩罚 ──
-        circuit_threshold: int = _CIRCUIT_THRESHOLD,
-        circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF,
-        slow_start_window: float = _SLOW_START_WINDOW,
-        slow_start_success: int = _SLOW_START_SUCCESS,
-        lb_bias: float = _LB_BIAS_DEFAULT,
-        fail_penalty_weight: float = _FAIL_PENALTY_DEFAULT,
-        # ── 单发降级 / 慢单发采样 ──
-        single_send_degrade_fail: int = 0,
-        single_send_degrade_ratio: float = 0.0,
-        single_send_degrade_slack_ms: float = 0.0,
-        single_send_degrade_success_rate: float = 0.0,
-        single_send_degrade_p99_ms: float = 0.0,
-        single_send_degrade_min_throughput: float = 0.0,
-        single_send_slow_log_ms: float = 0.0,
-        # ── Cost 多目标排序 / 自动调参 ──
-        cost_sort_enabled: bool = True,
-        cost_latency_metric: str = "p99",
-        cost_weight_latency: float = 1.0,
-        cost_weight_success_rate: float = 0.6,
-        cost_weight_throughput: float = 0.1,
-        cost_latency_min_samples: int = 1,
-        cost_throughput_min_bytes: int = 1_000_000,
-        auto_tune: Optional[AutoTuneConfig] = None,
-        # ── 请求路径超时 ──
-        connect_tunnel_timeout_sec: float = 3.0,
-        http_read_timeout_sec: float = 3.0,
-        # ── 本地域名强制直连白名单 ──
-        local_direct_domains: Optional[List[str]] = None,
-        local_direct_timeout_sec: float = 10.0,
-        # ── 策略路由 ──
-        policies: Optional[List[PolicyConfig]] = None,
-        # ── 自适应域名缓存 TTL ──
-        adaptive_ttl: bool = False,
-        adaptive_ttl_min: float = 60.0,
-        adaptive_ttl_max: float = 1800.0,
-        # ── 域名赢家切换阻尼 ──
-        switch_damping: bool = False,
-        switch_damping_min_wins: int = 2,
-        switch_damping_ratio: float = 0.8,
-        switch_damping_abs_ms: float = 30.0,
-        # ── 自适应并发限制 ──
-        concurrency_limit_enabled: bool = False,
-        concurrency_limit_initial: int = 16,
-        concurrency_limit_min: int = 2,
-        concurrency_limit_max: int = 128,
-        concurrency_add_on_success: int = 4,
-        concurrency_mult_on_failure: float = 0.5,
-        concurrency_failure_window: int = 20,
-        # ── CONNECT 连接池 / 请求簇预测 ──
-        conn_pool_enabled: bool = False,
-        conn_pool_per_proxy: int = 4,
-        conn_pool_total: int = 64,
-        conn_pool_idle_timeout: float = 30.0,
-        conn_pool_refill_interval: float = 5.0,
-        conn_pool_refill_target: int = 2,
-        conn_pool_connect_timeout: float = 10.0,
-        conn_pool_target_prewarm: bool = False,
-        conn_pool_refill_pause_minutes: float = 60.0,
-        conn_pool_refill_pause_silence_sec: float = 120.0,
-        conn_pool_refill_pause_activity_window: Optional[float] = None,
-        conn_pool_refill_pause_min_requests: int = 3,
-        conn_pool_established_reuse: bool = False,
-        conn_pool_established_idle_timeout: Optional[float] = None,
-        conn_pool_prehandshake: bool = False,
-        conn_pool_prehandshake_throttle_window_sec: float = 0.0,
-        conn_pool_prehandshake_throttle_max_per_window: int = 0,
-        cluster_predict: bool = False,
-        cluster_window_sec: float = 2.0,
-        cluster_predict_topk: int = 3,
-        cluster_min_support: int = 2,
-        cluster_graph_ttl_sec: int = 86400,
-        cluster_graph_max_entries: int = 100_000,
-        cluster_predict_throttle_sec: float = 30.0,
-        cluster_proxy_fanout: int = 2,
-        cluster_probe_decay_sec: float = 3600.0,
-        cluster_pool_idle_timeout: float = 600.0,
-        # ── 配置整体入口 ──
+        # ── 路由配置整体入口(RouterConfig;None 时取模型默认)──
         router_cfg: Optional[RouterConfig] = None,
     ):
         """构造路由器。
 
         参数:
-            proxy_store:         上游代理注册表。
-            listen_host/port:    代理监听地址/端口(面向客户端)。
-            max_retries:         竞速首批并行的代理数量;失败后对剩余代理再竞速。
-            db_path:             SQLite 文件路径(域名统计/元数据持久化)。
-            cache_ttl:           域名缓存有效期(秒)。
-            enable_local_racing: 让本机作为代理节点直接参与竞速。
-            auth_enabled:        是否要求客户端 HTTP Basic 认证。
-            auth_username/password: 客户端认证的预期凭据。
-            stickiness_enabled:  是否启用会话粘性(同客户端+域名复用同一代理)。
-            stickiness_ttl:      会话粘性有效期(秒),粘性命中成功滑动刷新。
-            stickiness_recheck_hits: 粘性命中 N 次后触发探路重竞速(0=关闭)。
-            stickiness_max_entries: 粘性表最大条目数,超出驱逐最旧(内存保护)。
-            stagger_start:       是否启用错峰启动(RFC 8305 §5)。竞速首批不再同时全发,
-                                 先发最优 stagger_initial 个,间隔 stagger_interval_ms
-                                 补发下一个;首个首字节成功即取消其余。显著减少 CONNECT
-                                 隧道扇出与 HTTP 双写流量。默认 True(启用错峰)。
-            stagger_initial:     错峰首批并发数(必须 >= 1;经 max_retries 钳制)。
-                                 有历史 RTT 时可设 2 同时赌两个最优者(RFC 8305 §5 允许)。
-            stagger_interval_ms: 相邻候选的启动间隔(毫秒),钳制到 [100, 2000]
-                                 (RFC 8305 §5 下限 100ms/绝对值 10ms、上限 2s)。
-            probe_interval_sec: 后台探活周期(秒)。每周期对 enabled 代理做轻量
-                                CONNECT 到 probe_canary + 关闭,计延迟/成败 →
-                                更新 EWMA 与熔断计数。0=关闭主动探活(仅真实请求
-                                驱动熔断)。默认 30。
-            probe_canary:       探活目标 "host:port"。轻量 CONNECT 只验证上游可达
-                                与建连延迟,域名级最终仍由竞速决定。
-            circuit_threshold:  连续失败多少次触发熔断(默认 3)。真实请求失败与
-                                探活失败共享计数。
-            circuit_max_backoff: 熔断退避上限(秒,默认 300)。退避指数增长:1s → 2s
-                                → 4s → ... 直到此上限。
-            slow_start_window:  slow-start 爬升窗口(秒,默认 60)。熔断退避到期后
-                                该代理在此窗口内低权重垫底。
-            slow_start_success: slow-start 恢复期内累计成功多少次后恢复完整权重
-                                (默认 3)。
-            lb_bias:            加权 least-request 的在途惩罚指数(默认 1.0)。竞速
-                                排序权重 = ewma × (1 + active)^bias,在途积压多的
-                                代理即使延迟历史最快也被压低排序,保护慢代理不被打爆
-                                (Envoy LeastRequest / Dubbo LeastActive)。bias=0
-                                退化为纯 EWMA 排序。
-            single_send_degrade_fail: 单发降级:连续失败阈值(默认 0=关闭)。域名缓存/
-                                粘性命中的代理连续失败达该值,即使未到熔断阈值也
-                                视作"不稳定",单发路径主动降级回竞速。
-            single_send_degrade_ratio: 单发降级:EWMA 恶化阈值(默认 0=关闭)。被钉住
-                                代理的当前 EWMA 相对钉住时基线的比值超过该值(如 3.0
-                                = 延迟恶化 3 倍)即降级回竞速。0=只按连续失败降级。
-            single_send_degrade_slack_ms: EWMA 降级的绝对下限(毫秒)。基线与当前值
-                                都极小时(如 0.2ms→0.9ms,比值 4.5 但绝对差距 <1ms)
-                                用纯比值会误判剧烈恶化——绝对差值低于该 slack 时
-                                即使比值超阈值也不降级(默认 10)。
-            policies:           策略路由:按目标域名(后缀/精确/正则)命中第一条
-                                策略,把候选代理集收窄到该策略允许的 tags/ids 子集
-                                (作用于竞速、域名缓存、粘性,三者一致)。
-            http_cache_ttl:     HTTP 响应缓存条目有效期(秒),命中滑动刷新。
-            http_cache_max_entries: 缓存条目数硬上限,超限按 LRU 淘汰最久未访问。
-            http_cache_max_bytes:   缓存总字节(body)上限,超限按 LRU 淘汰。
-            http_cache_stream_limit: 单条响应 body 缓冲上限(字节),超过放弃缓存。
-            adaptive_ttl:       启用自适应域名缓存 TTL(默认关闭)。开启后每域名
-                                TTL 按稳定度升降:连续同代理胜出 → TTL 上浮
-                                (上限 adaptive_ttl_max);单发降级/换赢家/熔断类
-                                故障 → TTL 回落(下限 adaptive_ttl_min)。
-            adaptive_ttl_min:   自适应 TTL 下限(秒,默认 60)。
-            adaptive_ttl_max:   自适应 TTL 上限(秒,默认 1800)。
-            switch_damping:     启用域名赢家切换阻尼(默认关闭)。新赢家不能因单次
-                                竞速抖动就替换稳定域名赢家,需连续胜出
-                                switch_damping_min_wins 次,或 EWMA 显著优于旧赢家
-                                (switch_damping_ratio 比例 / switch_damping_abs_ms
-                                绝对毫秒)才立即替换。降低出口 IP 抖动。
-            switch_damping_min_wins: 新赢家需连续胜出次数(默认 2)。
-            switch_damping_ratio: 新赢家 EWMA ≤ 旧×该比例即立即切换(默认 0.8)。
-            switch_damping_abs_ms: 新赢家快 ≥ 该毫秒即立即切换(默认 30)。
-            concurrency_limit_enabled: 启用自适应并发限制(默认关闭)。每代理
-                                并发上限成功加性增/失败乘性降,在途达上限的代理
-                                不参与竞速候选,防慢代理被请求堆死。
-            concurrency_limit_initial/min/max: 每代理并发上限的初始/下限/上限。
-            concurrency_add_on_success: 成功且稳定时加性提升上限(默认 +4)。
-            concurrency_mult_on_failure: 失败时乘性降低上限(默认 0.5)。
-            concurrency_failure_window: 成功观测窗口(达标才提升上限)。
-            conn_pool_enabled:   启用 CONNECT 上游 TCP 预热池(默认关闭)。为每
-                                上游维护少量空闲 TCP,CONNECT 到来优先取池中
-                                socket 再发 CONNECT target,省"本机→上游"建连。
-            conn_pool_per_proxy: 每代理预热连接数上限。
-            conn_pool_total:     全局预热连接数上限(fd 预算)。
-            conn_pool_idle_timeout: 空闲连接超时(秒),超时未取用则关闭。
-            conn_pool_refill_interval: 后台补充周期(秒),0=只取不补。
-            conn_pool_refill_target: 每代理保持的空闲连接数目标。
-            conn_pool_connect_timeout: 预热/取用建连超时(秒)。
-            conn_pool_target_prewarm: 第二阶段(CONNECT 目标半预连接)。命中域名
-                                缓存/粘性的高频 CONNECT target 在后台提前建立
-                                "到上游代理"的 TCP(不提前 CONNECT 到目标),按
-                                (proxy, target) 键区分,下次命中直接复用该 TCP
-                                发 CONNECT,进一步压低 HTTPS 短连接 TTFB。与
-                                第一阶段共享 per-proxy/全局 fd 预算/空闲超时。
-            conn_pool_refill_pause_minutes: 空闲暂停(分钟,默认 60)。连续 N 分钟
-                                无客户端请求时,挂起后台 refill/目标预热,避免
-                                深夜空闲期"建了又过期"的空转浪费(生产实测:6 代理
-                                深夜 6h 白建 ~1400 条连接,100% 超时被清)。新请求
-                                到来立即恢复补充。
-            conn_pool_refill_pause_silence_sec: [已弃用,仅兼容] 旧版"间隔一刀切"
-                                活动判定(默认 120),误伤真实孤立请求。已由窗口计数
-                                取代,本参数仅对旧配置兼容。
-            conn_pool_refill_pause_activity_window: 活动判定窗口(秒,默认 None=
-                                旧 silence_sec 换算或 120s)。窗口内请求数 ≥
-                                min_requests 才算"密集活动"并刷新时间戳;真实流量
-                                是簇(一次页面加载多 hostname 并发,计数高),后台
-                                心跳是孤例(窗口内计数低)——据此区分,既不误伤真实
-                                孤立请求,又免疫心跳。0=不启用窗口计数(任意请求都刷新)。
-            conn_pool_refill_pause_min_requests: 活动判定窗口阈值(默认 3)。
-                                窗口内请求数 ≥ 此值才刷新活动时间戳;≤1 时退化为
-                                "任意请求都刷新"。
-            conn_pool_established_reuse: 已建握手隧道复用(默认关闭)。隧道结束
-                                时若连接干净(无残留数据),归还 _established_pool
-                                而非关闭;下次同 (proxy, target) 请求直接复用已
-                                CONNECT 握手的连接,跳过 CONNECT 发送+200 校验,
-                                省掉重建。仅当 conn_pool_enabled 时生效。
-            router_cfg:       #15 配置整体入口(RouterConfig)。给出时用它解析出与
-                                上述 kwarg 同名的局部变量,后续 __init__ body 原样
-                                消费;未给出时局部变量即各 kwarg 默认值(测试/bench
-                                的 Router(**kwargs) 构造不受影响)。两者都给时
-                                router_cfg 优先。
+            proxy_store:     上游代理注册表(ProxyStore)。
+            listen_host/port: 代理监听地址/端口(面向客户端)。
+            db_path:         SQLite 文件路径(域名统计/元数据/监控指标持久化)。
+            router_cfg:      路由配置整体入口(RouterConfig)。None 时取
+                             RouterConfig() 的模型默认值。竞速/熔断/缓存/
+                             粘性/连接池/集群等全部可调参数都在这里(见
+                             config_schema.RouterConfig 及各子配置类)。
+
+        注:重构前本函数接受约 100 个散装关键字(如 conn_pool_per_proxy=4)。散装
+        词汇表已下沉为 config_schema.router_config_from_flat(),仅供测试/压测等
+        历史调用点迁移;生产路径(cli.py)直接传 RouterConfig。
         """
         # #15:配置整体入口。给出 router_cfg 时覆盖同名 kwarg 局部变量,后续 body
         # (selector/stagger/circuit/http_cache/conn_pool 构造)原样消费,无重排。
-        if router_cfg is not None:
-            c, cc, auth, stick = router_cfg, router_cfg.circuit, router_cfg.auth, router_cfg.stickiness
-            hc, at, sd, cl, pc = (router_cfg.http_cache, router_cfg.adaptive_ttl,
-                                  router_cfg.switch_damping, router_cfg.concurrency_limit,
-                                  router_cfg.conn_pool)
-            max_retries = c.max_retries
-            cache_ttl = c.cache_ttl
-            enable_local_racing = c.enable_local_racing
-            local_direct_domains = list(c.local_direct_domains)
-            local_direct_timeout_sec = cc.local_direct_timeout_sec
-            stagger_start, stagger_initial, stagger_interval_ms = c.stagger_start, c.stagger_initial, c.stagger_interval_ms
-            probe_interval_sec = cc.probe_interval_sec
-            probe_canary = cc.probe_canary
-            probe_canaries = [x.model_dump() for x in cc.probe_canaries]
-            probe_with_get = cc.probe_with_get
-            probe_get_targets = list(cc.probe_get_targets)
-            probe_get_interval_sec = cc.probe_get_interval_sec
-            probe_get_timeout_sec = cc.probe_get_timeout_sec
-            probe_get_max_bytes = cc.probe_get_max_bytes
-            circuit_threshold, circuit_max_backoff = cc.circuit_threshold, cc.circuit_max_backoff
-            slow_start_window, slow_start_success = cc.slow_start_window, cc.slow_start_success
-            lb_bias = cc.lb_bias
-            fail_penalty_weight = cc.fail_penalty_weight
-            single_send_degrade_fail, single_send_degrade_ratio, single_send_degrade_slack_ms = (
-                cc.single_send_degrade_fail, cc.single_send_degrade_ratio, cc.single_send_degrade_slack_ms)
-            single_send_degrade_success_rate = cc.single_send_degrade_success_rate
-            single_send_degrade_p99_ms = cc.single_send_degrade_p99_ms
-            single_send_degrade_min_throughput = cc.single_send_degrade_min_throughput
-            single_send_slow_log_ms = cc.single_send_slow_log_ms
-            # ── Phase 2: 多目标 Cost 排序 ──
-            cost_sort_enabled = cc.cost_sort_enabled
-            cost_latency_metric = cc.cost_latency_metric
-            cost_weight_latency = cc.cost_weight_latency
-            cost_weight_success_rate = cc.cost_weight_success_rate
-            cost_weight_throughput = cc.cost_weight_throughput
-            cost_latency_min_samples = cc.cost_latency_min_samples
-            cost_throughput_min_bytes = cc.cost_throughput_min_bytes
-            auto_tune = c.auto_tune
-            connect_tunnel_timeout_sec, http_read_timeout_sec = cc.connect_tunnel_timeout_sec, cc.http_read_timeout_sec
-            auth_enabled, auth_username, auth_password = auth.enabled, auth.username, auth.password
-            enable_http_cache, http_cache_ttl = hc.enabled, hc.ttl
-            http_cache_max_entries, http_cache_max_bytes, http_cache_stream_limit = (
-                hc.max_entries, hc.max_bytes, hc.stream_cache_limit)
-            stickiness_enabled, stickiness_ttl = stick.enabled, stick.ttl
-            stickiness_recheck_hits, stickiness_max_entries = stick.recheck_hits, stick.max_entries
-            sticky_probe_interval_sec, sticky_probe_fanout = stick.probe_interval_sec, stick.probe_fanout
-            adaptive_ttl, adaptive_ttl_min, adaptive_ttl_max = at.enabled, at.min_sec, at.max_sec
-            switch_damping, switch_damping_min_wins = sd.enabled, sd.min_wins
-            switch_damping_ratio, switch_damping_abs_ms = sd.ratio, sd.abs_ms
-            concurrency_limit_enabled, concurrency_limit_initial = cl.enabled, cl.initial
-            concurrency_limit_min, concurrency_limit_max = cl.min, cl.max
-            concurrency_add_on_success, concurrency_mult_on_failure = cl.add_on_success, cl.mult_on_failure
-            concurrency_failure_window = cl.failure_window
-            # ── Phase 2: 多目标 Cost 排序 ──
-            cost_sort_enabled = cc.cost_sort_enabled
-            cost_latency_metric = cc.cost_latency_metric
-            cost_weight_latency = cc.cost_weight_latency
-            cost_weight_success_rate = cc.cost_weight_success_rate
-            cost_weight_throughput = cc.cost_weight_throughput
-            cost_latency_min_samples = cc.cost_latency_min_samples
-            cost_throughput_min_bytes = cc.cost_throughput_min_bytes
-            conn_pool_enabled, conn_pool_per_proxy = pc.enabled, pc.per_proxy
-            conn_pool_total, conn_pool_idle_timeout = pc.total, pc.idle_timeout
-            conn_pool_refill_interval, conn_pool_refill_target = pc.refill_interval, pc.refill_target
-            conn_pool_connect_timeout, conn_pool_target_prewarm = pc.connect_timeout, pc.target_prewarm
-            conn_pool_refill_pause_minutes = pc.refill_pause_minutes
-            conn_pool_refill_pause_silence_sec = pc.refill_pause_silence_sec
-            conn_pool_refill_pause_activity_window = pc.refill_pause_activity_window
-            conn_pool_refill_pause_min_requests = pc.refill_pause_min_requests
-            conn_pool_established_reuse = pc.established_reuse
-            conn_pool_established_idle_timeout = pc.established_idle_timeout
-            conn_pool_prehandshake = pc.prehandshake
-            conn_pool_prehandshake_throttle_window_sec = pc.prehandshake_throttle_window_sec
-            conn_pool_prehandshake_throttle_max_per_window = pc.prehandshake_throttle_max_per_window
-            cluster_predict = pc.cluster_predict
-            cluster_window_sec = pc.cluster_window_sec
-            cluster_predict_topk = pc.cluster_predict_topk
-            cluster_min_support = pc.cluster_min_support
-            cluster_graph_ttl_sec = pc.cluster_graph_ttl_sec
-            cluster_graph_max_entries = pc.cluster_graph_max_entries
-            cluster_predict_throttle_sec = pc.cluster_predict_throttle_sec
-            cluster_proxy_fanout = pc.cluster_proxy_fanout
-            cluster_probe_decay_sec = pc.cluster_probe_decay_sec
-            cluster_pool_idle_timeout = pc.cluster_pool_idle_timeout
-            policies = list(c.policies)
+        if router_cfg is None:
+            router_cfg = RouterConfig()
+        c, cc, auth, stick = router_cfg, router_cfg.circuit, router_cfg.auth, router_cfg.stickiness
+        hc, at, sd, cl, pc = (router_cfg.http_cache, router_cfg.adaptive_ttl,
+                              router_cfg.switch_damping, router_cfg.concurrency_limit,
+                              router_cfg.conn_pool)
+        max_retries = c.max_retries
+        cache_ttl = c.cache_ttl
+        enable_local_racing = c.enable_local_racing
+        local_direct_domains = list(c.local_direct_domains)
+        local_direct_timeout_sec = cc.local_direct_timeout_sec
+        stagger_start, stagger_initial, stagger_interval_ms = c.stagger_start, c.stagger_initial, c.stagger_interval_ms
+        probe_interval_sec = cc.probe_interval_sec
+        probe_canary = cc.probe_canary
+        probe_canaries = [x.model_dump() for x in cc.probe_canaries]
+        probe_with_get = cc.probe_with_get
+        probe_get_targets = list(cc.probe_get_targets)
+        probe_get_interval_sec = cc.probe_get_interval_sec
+        probe_get_timeout_sec = cc.probe_get_timeout_sec
+        probe_get_max_bytes = cc.probe_get_max_bytes
+        circuit_threshold, circuit_max_backoff = cc.circuit_threshold, cc.circuit_max_backoff
+        slow_start_window, slow_start_success = cc.slow_start_window, cc.slow_start_success
+        lb_bias = cc.lb_bias
+        fail_penalty_weight = cc.fail_penalty_weight
+        single_send_degrade_fail, single_send_degrade_ratio, single_send_degrade_slack_ms = (
+            cc.single_send_degrade_fail, cc.single_send_degrade_ratio, cc.single_send_degrade_slack_ms)
+        single_send_degrade_success_rate = cc.single_send_degrade_success_rate
+        single_send_degrade_p99_ms = cc.single_send_degrade_p99_ms
+        single_send_degrade_min_throughput = cc.single_send_degrade_min_throughput
+        single_send_slow_log_ms = cc.single_send_slow_log_ms
+        # ── Phase 2: 多目标 Cost 排序 ──
+        cost_sort_enabled = cc.cost_sort_enabled
+        cost_latency_metric = cc.cost_latency_metric
+        cost_weight_latency = cc.cost_weight_latency
+        cost_weight_success_rate = cc.cost_weight_success_rate
+        cost_weight_throughput = cc.cost_weight_throughput
+        cost_latency_min_samples = cc.cost_latency_min_samples
+        cost_throughput_min_bytes = cc.cost_throughput_min_bytes
+        auto_tune = c.auto_tune
+        connect_tunnel_timeout_sec, http_read_timeout_sec = cc.connect_tunnel_timeout_sec, cc.http_read_timeout_sec
+        auth_enabled, auth_username, auth_password = auth.enabled, auth.username, auth.password
+        enable_http_cache, http_cache_ttl = hc.enabled, hc.ttl
+        http_cache_max_entries, http_cache_max_bytes, http_cache_stream_limit = (
+            hc.max_entries, hc.max_bytes, hc.stream_cache_limit)
+        stickiness_enabled, stickiness_ttl = stick.enabled, stick.ttl
+        stickiness_recheck_hits, stickiness_max_entries = stick.recheck_hits, stick.max_entries
+        sticky_probe_interval_sec, sticky_probe_fanout = stick.probe_interval_sec, stick.probe_fanout
+        adaptive_ttl, adaptive_ttl_min, adaptive_ttl_max = at.enabled, at.min_sec, at.max_sec
+        switch_damping, switch_damping_min_wins = sd.enabled, sd.min_wins
+        switch_damping_ratio, switch_damping_abs_ms = sd.ratio, sd.abs_ms
+        concurrency_limit_enabled, concurrency_limit_initial = cl.enabled, cl.initial
+        concurrency_limit_min, concurrency_limit_max = cl.min, cl.max
+        concurrency_add_on_success, concurrency_mult_on_failure = cl.add_on_success, cl.mult_on_failure
+        concurrency_failure_window = cl.failure_window
+        # ── Phase 2: 多目标 Cost 排序 ──
+        cost_sort_enabled = cc.cost_sort_enabled
+        cost_latency_metric = cc.cost_latency_metric
+        cost_weight_latency = cc.cost_weight_latency
+        cost_weight_success_rate = cc.cost_weight_success_rate
+        cost_weight_throughput = cc.cost_weight_throughput
+        cost_latency_min_samples = cc.cost_latency_min_samples
+        cost_throughput_min_bytes = cc.cost_throughput_min_bytes
+        conn_pool_enabled, conn_pool_per_proxy = pc.enabled, pc.per_proxy
+        conn_pool_total, conn_pool_idle_timeout = pc.total, pc.idle_timeout
+        conn_pool_refill_interval, conn_pool_refill_target = pc.refill_interval, pc.refill_target
+        conn_pool_connect_timeout, conn_pool_target_prewarm = pc.connect_timeout, pc.target_prewarm
+        conn_pool_refill_pause_minutes = pc.refill_pause_minutes
+        conn_pool_refill_pause_silence_sec = pc.refill_pause_silence_sec
+        conn_pool_refill_pause_activity_window = pc.refill_pause_activity_window
+        conn_pool_refill_pause_min_requests = pc.refill_pause_min_requests
+        conn_pool_established_reuse = pc.established_reuse
+        conn_pool_established_idle_timeout = pc.established_idle_timeout
+        conn_pool_prehandshake = pc.prehandshake
+        conn_pool_prehandshake_throttle_window_sec = pc.prehandshake_throttle_window_sec
+        conn_pool_prehandshake_throttle_max_per_window = pc.prehandshake_throttle_max_per_window
+        cluster_predict = pc.cluster_predict
+        cluster_window_sec = pc.cluster_window_sec
+        cluster_predict_topk = pc.cluster_predict_topk
+        cluster_min_support = pc.cluster_min_support
+        cluster_graph_ttl_sec = pc.cluster_graph_ttl_sec
+        cluster_graph_max_entries = pc.cluster_graph_max_entries
+        cluster_predict_throttle_sec = pc.cluster_predict_throttle_sec
+        cluster_proxy_fanout = pc.cluster_proxy_fanout
+        cluster_probe_decay_sec = pc.cluster_probe_decay_sec
+        cluster_pool_idle_timeout = pc.cluster_pool_idle_timeout
+        policies = list(c.policies)
         self.proxy_store = proxy_store
         self._init_selector(
             proxy_store,

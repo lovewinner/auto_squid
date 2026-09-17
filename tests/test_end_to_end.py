@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 from auto_squid.proxy_store import ProxyStore
 from auto_squid.router import (
-    Router, ProxySelector, _hb,
+    Router, ProxySelector, _hb, make_router,
     _MAX_REQUEST_HEADER_LINES, _MAX_REQUEST_HEADER_BYTES,
     _AGG_WAIT_TIMEOUT,
 )
@@ -150,7 +150,7 @@ async def test_end_to_end_http_forwarding_utf8_header():
     proxy_srv = await run_mock_proxy_utf8_header(HOST, PROXY_PORT)
     proxy_store = ProxyStore()
     proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT, db_path=tempfile.mktemp(suffix='.db'))
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT, db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
     try:
         reader, writer = await asyncio.open_connection(HOST, ROUTER_PORT)
@@ -412,7 +412,7 @@ async def test_end_to_end_http_forwarding():
     proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=hit)
     proxy_store = ProxyStore()
     proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT, db_path=tempfile.mktemp(suffix='.db'))
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT, db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
     try:
         body = await send_http_get(HOST, ROUTER_PORT)
@@ -429,7 +429,7 @@ async def test_end_to_end_connect_forwarding():
     proxy_srv = await run_mock_proxy(HOST, PROXY_PORT)
     proxy_store = ProxyStore()
     proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT, db_path=tempfile.mktemp(suffix='.db'))
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT, db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
     try:
         echo = await send_connect(HOST, ROUTER_PORT, payload=b"conn-echo-test")
@@ -446,7 +446,7 @@ async def test_http_cache():
     proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=hit)
     proxy_store = ProxyStore()
     proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT, db_path=tempfile.mktemp(suffix='.db'))
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT, db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
     try:
         body1 = await send_http_get(HOST, ROUTER_PORT, url=b"http://cachetest.example.com/")
@@ -517,7 +517,7 @@ async def test_meta_cache_holds_winner_pid():
     proxy_store = ProxyStore()
     proxy_store.add(ProxyInfo(id='fast', host=HOST, port=fast_port))
     proxy_store.add(ProxyInfo(id='slow', host=HOST, port=slow_port))
-    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
                     max_retries=2, enable_http_cache=False,
                     db_path=tempfile.mktemp(suffix='.db'))
 
@@ -563,7 +563,7 @@ async def test_domain_cache():
     proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=hit)
     proxy_store = ProxyStore()
     proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT, cache_ttl=300, db_path=tempfile.mktemp(suffix='.db'))
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT, cache_ttl=300, db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
     try:
         body1 = await send_http_get(HOST, ROUTER_PORT, url=b"http://domaincache.example.com/path1")
@@ -588,7 +588,7 @@ async def test_domain_cache():
 async def test_local_racing_http():
     local_srv = await run_local_http_server(HOST, LOCAL_HTTP_PORT)
     proxy_store = ProxyStore()
-    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT, enable_local_racing=True, db_path=tempfile.mktemp(suffix='.db'))
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT, enable_local_racing=True, db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
     try:
         body = await send_http_get(HOST, ROUTER_PORT, url=f"http://{HOST}:{LOCAL_HTTP_PORT}/".encode())
@@ -606,7 +606,7 @@ def _authed_router(user='user', pw='pass'):
     """A Router with client auth enabled, backed by the mock proxy."""
     ps = ProxyStore()
     ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    return Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+    return make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
                   db_path=tempfile.mktemp(suffix='.db'),
                   auth_enabled=True, auth_username=user, auth_password=pw)
 
@@ -685,7 +685,7 @@ async def test_auth_disabled_allows_all():
     proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=hit)
     ps = ProxyStore()
     ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT, db_path=tempfile.mktemp(suffix='.db'))
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT, db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
     try:
         status = await send_http_get_status(HOST, ROUTER_PORT)  # no creds
@@ -741,7 +741,7 @@ async def test_hop_by_hop_request_headers_not_forwarded():
     proxy_srv = await run_header_echo_proxy(HOST, PROXY_PORT)
     ps = ProxyStore()
     ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
                     auth_enabled=True, auth_username='asuser', auth_password='s3cretRRxc68a',
                     db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
@@ -887,7 +887,7 @@ async def test_binary_body_preserved():
     echo_srv = await run_echo_proxy(HOST, PROXY_PORT)
     proxy_store = ProxyStore()
     proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT, db_path=tempfile.mktemp(suffix='.db'))
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT, db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
     try:
         for payload in (bytes(range(256)), b'part1\r\n\r\npart2', b'', b'\r\n', b'X' * 4096):
@@ -948,7 +948,7 @@ class TestAPI:
 
     def test_stats_with_mounted_router(self):
         proxy_store = ProxyStore()
-        router = Router(proxy_store, db_path=tempfile.mktemp(suffix='.db'))
+        router = make_router(proxy_store, db_path=tempfile.mktemp(suffix='.db'))
         mount(proxy_store, router)
         client = TestClient(api_app)
         r = client.get("/stats")
@@ -1131,7 +1131,7 @@ async def test_stream_chunked_upstream():
     proxy_srv = await run_chunked_proxy(HOST, PROXY_PORT)
     proxy_store = ProxyStore()
     proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
                     db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
     try:
@@ -1206,7 +1206,7 @@ async def test_stream_large_response_with_content_length():
     srv = await asyncio.start_server(handle, host=HOST, port=PROXY_PORT)
     proxy_store = ProxyStore()
     proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
                     db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
     try:
@@ -1267,7 +1267,7 @@ async def test_upstream_client_pool_reused():
     srv = await asyncio.start_server(handle, host=HOST, port=PROXY_PORT)
     proxy_store = ProxyStore()
     proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
                     db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
     try:
@@ -1290,7 +1290,7 @@ async def test_try_http_send_failure_does_not_mask_error():
     `await resp.aclose()`) and leave the pooled client intact for reuse."""
     proxy_store = ProxyStore()
     proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
                     db_path=tempfile.mktemp(suffix='.db'))
 
     class _Boom(Exception):
@@ -1332,7 +1332,7 @@ async def test_db_batching_durability_across_restart():
     proxy_srv = await run_mock_proxy(HOST, PROXY_PORT)
     proxy_store = ProxyStore()
     proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
                     cache_ttl=300, db_path=db)
     await router.start()
     try:
@@ -1348,7 +1348,7 @@ async def test_db_batching_durability_across_restart():
     # New Router on the same DB must reload the persisted stats.
     proxy_store2 = ProxyStore()
     proxy_store2.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router2 = Router(proxy_store2, listen_host=HOST, listen_port=ROUTER_PORT,
+    router2 = make_router(proxy_store2, listen_host=HOST, listen_port=ROUTER_PORT,
                      cache_ttl=300, db_path=db)
     try:
         stats2 = router2.get_domain_stats_from_db()
@@ -1369,7 +1369,7 @@ async def test_db_batching_background_flush():
     proxy_srv = await run_mock_proxy(HOST, PROXY_PORT)
     proxy_store = ProxyStore()
     proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
                     cache_ttl=300, db_path=db)
     await router.start()
     try:
@@ -1409,7 +1409,7 @@ async def test_http_cache_counters_hit_and_miss():
     proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=hit)
     proxy_store = ProxyStore()
     proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
                     db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
     try:
@@ -1440,7 +1440,7 @@ async def test_upstream_attempts_and_racing_counters():
     proxy_srv = await run_mock_proxy(HOST, PROXY_PORT)
     proxy_store = ProxyStore()
     proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
                     max_retries=1, enable_http_cache=False,
                     db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
@@ -1468,7 +1468,7 @@ async def test_domain_cache_hit_counter():
     proxy_srv = await run_mock_proxy(HOST, PROXY_PORT)
     proxy_store = ProxyStore()
     proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
                     cache_ttl=300, max_retries=1, enable_http_cache=False,
                     db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
@@ -1499,7 +1499,7 @@ async def test_http_cache_invalidated_by_write_method():
     proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=hit)
     proxy_store = ProxyStore()
     proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
                     db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
     try:
@@ -1549,7 +1549,7 @@ async def test_thundering_herd_avoided():
     proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=hit)
     proxy_store = ProxyStore()
     proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
                     db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
     try:
@@ -1587,7 +1587,7 @@ async def test_coalescing_timeout_falls_back():
                                             pre_header_delay=0.5)
     proxy_store = ProxyStore()
     proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
                     db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
     try:
@@ -1622,7 +1622,7 @@ async def test_stickiness_unit_hit_and_eviction():
     """
     ps = ProxyStore()
     ps.add(ProxyInfo(id='p1', host=HOST, port=PROXY_PORT))
-    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
                     stickiness_enabled=True, stickiness_ttl=1800,
                     db_path=tempfile.mktemp(suffix='.db'))
     try:
@@ -1660,7 +1660,7 @@ async def test_stickiness_disabled_ignores_records():
     """stickiness_enabled=False 时:记录为空操作,查询恒 None(默认行为不变)。"""
     ps = ProxyStore()
     ps.add(ProxyInfo(id='p1', host=HOST, port=PROXY_PORT))
-    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
                     stickiness_enabled=False, stickiness_ttl=1800,
                     db_path=tempfile.mktemp(suffix='.db'))
     try:
@@ -1685,7 +1685,7 @@ async def test_session_stickiness_reuses_proxy():
     ps = ProxyStore()
     ps.add(ProxyInfo(id='fast', host=HOST, port=fast_port))
     ps.add(ProxyInfo(id='slow', host=HOST, port=slow_port))
-    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
                     max_retries=2, enable_http_cache=False,
                     stickiness_enabled=True, stickiness_ttl=1800,
                     db_path=tempfile.mktemp(suffix='.db'))
@@ -1727,7 +1727,7 @@ async def test_stickiness_redispatch_on_proxy_failure():
     ps = ProxyStore()
     ps.add(ProxyInfo(id='fast', host=HOST, port=fast_port))
     ps.add(ProxyInfo(id='slow', host=HOST, port=slow_port))
-    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
                     max_retries=2, enable_http_cache=False,
                     stickiness_enabled=True, stickiness_ttl=1800,
                     db_path=tempfile.mktemp(suffix='.db'))
@@ -1765,7 +1765,7 @@ async def test_stickiness_connect_reuses_proxy():
     ps = ProxyStore()
     ps.add(ProxyInfo(id='fast', host=HOST, port=fast_port))
     ps.add(ProxyInfo(id='slow', host=HOST, port=slow_port))
-    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
                     max_retries=2, enable_http_cache=False,
                     stickiness_enabled=True, stickiness_ttl=1800,
                     db_path=tempfile.mktemp(suffix='.db'))
@@ -1807,7 +1807,7 @@ async def test_stickiness_repopulated_from_domain_cache():
     ps = ProxyStore()
     ps.add(ProxyInfo(id='fast', host=HOST, port=fast_port))
     ps.add(ProxyInfo(id='slow', host=HOST, port=slow_port))
-    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
                     max_retries=2, enable_http_cache=False,
                     stickiness_enabled=True, stickiness_ttl=1800,
                     db_path=tempfile.mktemp(suffix='.db'))
@@ -1847,7 +1847,7 @@ async def test_stickiness_local_racing_stays_sticky():
     """
     local_srv = await run_local_http_server(HOST, LOCAL_HTTP_PORT)
     ps = ProxyStore()
-    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
                     enable_local_racing=True, enable_http_cache=False,
                     stickiness_enabled=True, stickiness_ttl=1800,
                     db_path=tempfile.mktemp(suffix='.db'))
@@ -1886,7 +1886,7 @@ async def test_stickiness_evicts_on_5xx():
     ps = ProxyStore()
     ps.add(ProxyInfo(id='bad', host=HOST, port=bad_port))
     ps.add(ProxyInfo(id='ok', host=HOST, port=ok_port))
-    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
                     max_retries=2, enable_http_cache=False,
                     stickiness_enabled=True, stickiness_ttl=1800,
                     db_path=tempfile.mktemp(suffix='.db'))
@@ -1925,7 +1925,7 @@ async def test_stickiness_capacity_limit_evicts_oldest():
     """
     ps = ProxyStore()
     ps.add(ProxyInfo(id='p1', host=HOST, port=PROXY_PORT))
-    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
                     stickiness_enabled=True, stickiness_ttl=1800,
                     stickiness_max_entries=3,
                     db_path=tempfile.mktemp(suffix='.db'))
@@ -1963,7 +1963,7 @@ async def test_stickiness_recheck_reraces_after_hits():
     ps = ProxyStore()
     ps.add(ProxyInfo(id='fast', host=HOST, port=fast_port))
     ps.add(ProxyInfo(id='slow', host=HOST, port=slow_port))
-    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
                     max_retries=2, enable_http_cache=False,
                     stickiness_enabled=True, stickiness_ttl=1800,
                     stickiness_recheck_hits=1,
@@ -2076,7 +2076,7 @@ async def test_multiple_setcookie_headers_preserved():
     proxy_srv = await run_multi_setcookie_proxy(HOST, PROXY_PORT)
     proxy_store = ProxyStore()
     proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
                     db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
     try:
@@ -2261,18 +2261,18 @@ class TestOrderedForDomain:
     def test_stagger_initial_domain_agnostic(self):
         """冷启动判定保持全局:域名无观测时 ordered_for_domain 回退全局排序(可信),
         不翻倍;只有全局质量全空才翻倍。"""
-        from auto_squid.router import Router
+        from auto_squid.router import Router, make_router
         ps = ProxyStore()
         ps.add(ProxyInfo(id='fast', host='h1', port=3128))
         ps.add(ProxyInfo(id='slow', host='h2', port=3128))
-        r = Router(ps, listen_host='127.0.0.1', listen_port=10809,
+        r = make_router(ps, listen_host='127.0.0.1', listen_port=10809,
                    db_path=tempfile.mktemp(suffix='.db'),
                    max_retries=3, stagger_initial=1, enable_http_cache=False)
         # 全局有观测 → 不翻倍(即使某域名无观测,排序回退全局仍可信)。
         r.selector.record_ttfb('fast', 0.01, 'example.com')
         assert r._stagger_initial() == 1
         # 全局无观测(冷启动)→ 翻倍。
-        r2 = Router(ps, listen_host='127.0.0.1', listen_port=10809,
+        r2 = make_router(ps, listen_host='127.0.0.1', listen_port=10809,
                     db_path=tempfile.mktemp(suffix='.db'),
                     max_retries=3, stagger_initial=1, enable_http_cache=False)
         assert r2._stagger_initial() == min(3, max(2, 1)) == 2
@@ -2292,7 +2292,7 @@ class TestStagger:
         ps.add(ProxyInfo(id='p1', host='127.0.0.1', port=31301))
         ps.add(ProxyInfo(id='p2', host='127.0.0.1', port=31302))
         ps.add(ProxyInfo(id='p3', host='127.0.0.1', port=31303))
-        r = Router(ps, listen_host='127.0.0.1', listen_port=10819,
+        r = make_router(ps, listen_host='127.0.0.1', listen_port=10819,
                    max_retries=3, enable_http_cache=False, stagger_start=True,
                    db_path=tempfile.mktemp(suffix='.db'))
         # 直接驱动:initial=1 + 一个立即成功的占位 → 只发 1 个,赢家即返回。
@@ -2316,7 +2316,7 @@ class TestStagger:
         ps = ProxyStore()
         ps.add(ProxyInfo(id='bad', host=HOST, port=bad_port))
         ps.add(ProxyInfo(id='ok', host=HOST, port=ok_port))
-        r = Router(ps, listen_host=HOST, listen_port=10819,
+        r = make_router(ps, listen_host=HOST, listen_port=10819,
                    max_retries=2, enable_http_cache=False, stagger_start=True,
                    db_path=tempfile.mktemp(suffix='.db'))
         await r.start()
@@ -2335,25 +2335,25 @@ class TestStagger:
     def test_stagger_interval_clamped(self):
         """interval 钳制到 RFC 8305 区间 [100ms, 2000ms];0/负值回默认 250ms。"""
         ps = ProxyStore()
-        r = Router(ps, listen_host='127.0.0.1', listen_port=10819,
+        r = make_router(ps, listen_host='127.0.0.1', listen_port=10819,
                    max_retries=2, stagger_interval_ms=0)
         assert r.stagger_interval == 0.25
-        r2 = Router(ps, listen_host='127.0.0.1', listen_port=10819,
+        r2 = make_router(ps, listen_host='127.0.0.1', listen_port=10819,
                     max_retries=2, stagger_interval_ms=5000)
         assert r2.stagger_interval == 2.0
-        r3 = Router(ps, listen_host='127.0.0.1', listen_port=10819,
+        r3 = make_router(ps, listen_host='127.0.0.1', listen_port=10819,
                     max_retries=2, stagger_interval_ms=20)
         assert r3.stagger_interval == 0.1
 
     def test_stagger_initial_clamped_to_max_retries(self):
         """stagger_initial 钳制到 max_retries;冷启动(无 EWMA)时翻倍到 2。"""
         ps = ProxyStore()
-        r = Router(ps, listen_host='127.0.0.1', listen_port=10819,
+        r = make_router(ps, listen_host='127.0.0.1', listen_port=10819,
                    max_retries=1, stagger_initial=5, stagger_start=True)
         assert r.stagger_initial == 1
         # 冷启动:无质量观测 → 首批翻倍(最多 max_retries)。
         assert r._stagger_initial() == 1  # min(max_retries=1, max(2,1))=1
-        r2 = Router(ps, listen_host='127.0.0.1', listen_port=10819,
+        r2 = make_router(ps, listen_host='127.0.0.1', listen_port=10819,
                     max_retries=3, stagger_initial=1, stagger_start=True)
         assert r2._stagger_initial() == 2  # 冷启动翻倍到 2(<=3)
         # 学到质量后回落 stagger_initial=1。
@@ -2369,9 +2369,11 @@ class TestStagger:
         ps = ProxyStore()
         ps.add(ProxyInfo(id='fast', host=HOST, port=fast_port))
         ps.add(ProxyInfo(id='slow', host=HOST, port=slow_port))
-        r = Router(ps, listen_host=HOST, listen_port=10819,
-                   max_retries=2, enable_http_cache=False, stagger_start=True,
-                   db_path=tempfile.mktemp(suffix='.db'))
+        # 显式指定 stagger_initial=1:本用例断言"首批只发 1 个",必须把该前提写出来,
+        # 不能依赖签名默认值(方案 C 后默认值已收敛为配置默认 2)。
+        r = make_router(ps, listen_host=HOST, listen_port=10819,
+                        max_retries=2, enable_http_cache=False, stagger_start=True,
+                        stagger_initial=1, db_path=tempfile.mktemp(suffix='.db'))
         # 预置质量:fast 远快于 slow → 排序 fast 在前。
         r.selector.record_ttfb('fast', 0.01)
         r.selector.record_ttfb('slow', 0.30)
@@ -2404,7 +2406,7 @@ class TestCircuitBreaker:
         ps = ProxyStore()
         ps.add(ProxyInfo(id='down', host=HOST, port=31990))   # 端口无人监听 → 连接失败
         ps.add(ProxyInfo(id='up', host=HOST, port=31991))
-        r = Router(ps, listen_host=HOST, listen_port=10829,
+        r = make_router(ps, listen_host=HOST, listen_port=10829,
                    max_retries=2, enable_http_cache=False,
                    probe_interval_sec=0.0,
                    circuit_threshold=3, circuit_max_backoff=10.0,
@@ -2475,7 +2477,7 @@ class TestCircuitBreaker:
         # 两个端口都无人监听 → 会被熔断
         ps.add(ProxyInfo(id='down1', host=HOST, port=31990))
         ps.add(ProxyInfo(id='down2', host=HOST, port=31991))
-        r = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+        r = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
                    enable_local_racing=True, enable_http_cache=False,
                    circuit_threshold=1, circuit_max_backoff=10.0,
                    local_direct_domains=[],  # 不拦截本机 HTTP 测试目标
@@ -2506,7 +2508,7 @@ class TestCircuitBreaker:
                            proxies={'ids': {'p1'}})
         ps = ProxyStore()
         ps.add(ProxyInfo(id='p1', host=HOST, port=31990))
-        r = Router(ps, listen_host=HOST, listen_port=10829,
+        r = make_router(ps, listen_host=HOST, listen_port=10829,
                    max_retries=2, enable_http_cache=False,
                    probe_interval_sec=0.0, circuit_threshold=1,
                    policies=[pol], db_path=tempfile.mktemp(suffix='.db'))
@@ -2541,7 +2543,7 @@ class TestCircuitBreaker:
         ps.add(ProxyInfo(id='p1', host='h1', port=1))
         ps.add(ProxyInfo(id='p2', host='h2', port=2))
         ps.add(ProxyInfo(id='p3', host='h3', port=3))
-        r = Router(ps, listen_host=HOST, listen_port=10829, max_retries=2,
+        r = make_router(ps, listen_host=HOST, listen_port=10829, max_retries=2,
                    probe_interval_sec=0.0, circuit_threshold=1,
                    circuit_max_backoff=100.0, slow_start_window=60.0,
                    slow_start_success=2, db_path=tempfile.mktemp(suffix='.db'),
@@ -2588,7 +2590,7 @@ class TestCircuitBreaker:
         ps = ProxyStore()
         ps.add(ProxyInfo(id='down', host=HOST, port=31990))
         ps.add(ProxyInfo(id='up', host=HOST, port=31991))
-        r = Router(ps, listen_host=HOST, listen_port=10829,
+        r = make_router(ps, listen_host=HOST, listen_port=10829,
                    max_retries=2, enable_http_cache=False,
                    probe_interval_sec=0.0, circuit_threshold=1,
                    circuit_max_backoff=100.0,
@@ -2620,7 +2622,7 @@ class TestCircuitBreaker:
         ps = ProxyStore()
         ps.add(ProxyInfo(id='up', host=HOST, port=31991))
         ps.add(ProxyInfo(id='down', host=HOST, port=31990))  # 无人监听 → 失败
-        r = Router(ps, listen_host=HOST, listen_port=10829,
+        r = make_router(ps, listen_host=HOST, listen_port=10829,
                    max_retries=2, enable_http_cache=False,
                    probe_interval_sec=0.0, probe_canary=f"{HOST}:31991",  # 本机可达
                    circuit_threshold=2, circuit_max_backoff=100.0,
@@ -2657,7 +2659,7 @@ class TestCircuitBreaker:
         ps = ProxyStore()
         ps.add(ProxyInfo(id='up', host=HOST, port=31991))
         ps.add(ProxyInfo(id='down', host=HOST, port=31990))  # 无人监听 → 失败
-        r = Router(ps, listen_host=HOST, listen_port=10829,
+        r = make_router(ps, listen_host=HOST, listen_port=10829,
                    max_retries=2, enable_http_cache=False,
                    probe_interval_sec=0.0, probe_canary=f"127.0.0.1:1",
                    circuit_threshold=2, circuit_max_backoff=100.0,
@@ -2688,7 +2690,7 @@ class TestCircuitBreaker:
         ps.add(ProxyInfo(id='cn', host='h', port=3128, tags={'region': 'cn'}))
         ps.add(ProxyInfo(id='hk', host='h', port=3128, tags={'region': 'hk'}))
         ps.add(ProxyInfo(id='plain', host='h', port=3128))
-        r = Router(ps, listen_host='127.0.0.1', listen_port=10809,
+        r = make_router(ps, listen_host='127.0.0.1', listen_port=10809,
                    db_path=tempfile.mktemp(suffix='.db'),
                    probe_canary="fallback:443",
                    probe_canaries=[
@@ -2704,11 +2706,11 @@ class TestCircuitBreaker:
         """未配置多 canary 或全未命中 → 回退单 canary(probe_canary)。"""
         ps = ProxyStore()
         ps.add(ProxyInfo(id='p', host='h', port=3128, tags={'region': 'cn'}))
-        r = Router(ps, listen_host='127.0.0.1', listen_port=10809,
+        r = make_router(ps, listen_host='127.0.0.1', listen_port=10809,
                    db_path=tempfile.mktemp(suffix='.db'), probe_canary="1.1.1.1:443")
         assert r._canary_for_proxy(ps.get('p')) == "1.1.1.1:443"
         # 多 canary 全带 tags 且全不匹配 → 回退全局。
-        r2 = Router(ps, listen_host='127.0.0.1', listen_port=10809,
+        r2 = make_router(ps, listen_host='127.0.0.1', listen_port=10809,
                     db_path=tempfile.mktemp(suffix='.db'),
                     probe_canary="fallback:443",
                     probe_canaries=[{"name": "hk", "target": "hk.com:443",
@@ -2722,7 +2724,7 @@ class TestCircuitBreaker:
         ps = ProxyStore()
         ps.add(ProxyInfo(id='down', host=HOST, port=31990))  # 无人监听
         ps.add(ProxyInfo(id='ok', host=HOST, port=31991))
-        r = Router(ps, listen_host=HOST, listen_port=10829,
+        r = make_router(ps, listen_host=HOST, listen_port=10829,
                    max_retries=2, enable_http_cache=False,
                    probe_interval_sec=0.0, circuit_threshold=2,
                    circuit_max_backoff=100.0, stagger_start=False,
@@ -2919,7 +2921,7 @@ class TestInFlightSelection:
         proxy_srv = await run_mock_proxy(HOST, PROXY_PORT)
         proxy_store = ProxyStore()
         proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-        router = Router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+        router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
                         db_path=tempfile.mktemp(suffix='.db'))
         await router.start()
         try:
@@ -2943,7 +2945,7 @@ class TestWinnerBackfillQualityGate:
         store = ProxyStore()
         store.add(ProxyInfo(id='fast', host='h1', port=3128))
         store.add(ProxyInfo(id='slow', host='h2', port=3128))
-        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+        return make_router(store, listen_host='127.0.0.1', listen_port=10809,
                       db_path=tempfile.mktemp(suffix='.db'),
                       stickiness_enabled=True, stickiness_ttl=1800,
                       single_send_degrade_ratio=2.0, single_send_degrade_slack_ms=10.0,
@@ -3026,7 +3028,7 @@ class TestSingleSendDegrade:
     def _router(self, **kw):
         store = ProxyStore()
         store.add(ProxyInfo(id='p', host='h', port=3128))
-        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+        return make_router(store, listen_host='127.0.0.1', listen_port=10809,
                       db_path=tempfile.mktemp(suffix='.db'),
                       stickiness_enabled=True, stickiness_ttl=1800, **kw)
 
@@ -3213,7 +3215,7 @@ class TestDomainLevelDegrade:
         store = ProxyStore()
         store.add(ProxyInfo(id='x', host='h', port=3128))
         store.add(ProxyInfo(id='y', host='h2', port=3128))
-        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+        return make_router(store, listen_host='127.0.0.1', listen_port=10809,
                       db_path=tempfile.mktemp(suffix='.db'),
                       stickiness_enabled=True, stickiness_ttl=1800,
                       single_send_degrade_ratio=2.0, single_send_degrade_slack_ms=5.0,
@@ -3311,7 +3313,7 @@ class TestStickySlowProbe:
         store = ProxyStore()
         for i, pid in enumerate(proxies):
             store.add(ProxyInfo(id=pid, host=f'h{i}', port=3128))
-        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+        return make_router(store, listen_host='127.0.0.1', listen_port=10809,
                       db_path=tempfile.mktemp(suffix='.db'),
                       stickiness_enabled=True, stickiness_ttl=1800,
                       single_send_degrade_ratio=3.0,
@@ -3382,7 +3384,7 @@ class TestPolicyRouting:
         store.add(self._proxy('cn-1', tags={'region': 'cn'}))
         store.add(self._proxy('hk-1', tags={'region': 'hk'}))
         store.add(self._proxy('plain'))
-        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+        return make_router(store, listen_host='127.0.0.1', listen_port=10809,
                       db_path=tempfile.mktemp(suffix='.db'),
                       policies=policies, **kw)
 
@@ -3494,7 +3496,7 @@ class TestHttpCacheLRU:
     def _router(self, **kw):
         store = ProxyStore()
         store.add(ProxyInfo(id='p', host='h', port=3128))
-        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+        return make_router(store, listen_host='127.0.0.1', listen_port=10809,
                       db_path=tempfile.mktemp(suffix='.db'), **kw)
 
     def test_lru_evicts_least_recently_used_by_entries(self):
@@ -3593,7 +3595,7 @@ class TestAdaptiveTTL:
         store = ProxyStore()
         store.add(ProxyInfo(id='p', host='h', port=3128))
         store.add(ProxyInfo(id='q', host='h', port=3129))
-        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+        return make_router(store, listen_host='127.0.0.1', listen_port=10809,
                       db_path=tempfile.mktemp(suffix='.db'),
                       adaptive_ttl=True, adaptive_ttl_min=60.0,
                       adaptive_ttl_max=1800.0, **kw)
@@ -3650,7 +3652,7 @@ class TestAdaptiveTTL:
         assert 'expires_at' in meta['d.example.com']
         assert meta['d.example.com']['switch_count'] == 0
         # 关闭时与旧结构一致(无附加字段)。
-        r2 = Router(ProxyStore(), listen_host='127.0.0.1', listen_port=10809,
+        r2 = make_router(ProxyStore(), listen_host='127.0.0.1', listen_port=10809,
                     db_path=tempfile.mktemp(suffix='.db'))
         r2.selector.record_ttfb('p', 0.01)
         r2._record_win_meta('d.example.com', 'p')
@@ -3730,7 +3732,7 @@ class TestSwitchDamping:
         store = ProxyStore()
         store.add(ProxyInfo(id='p', host='h', port=3128))
         store.add(ProxyInfo(id='q', host='h', port=3129))
-        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+        return make_router(store, listen_host='127.0.0.1', listen_port=10809,
                       db_path=tempfile.mktemp(suffix='.db'),
                       switch_damping=True, switch_damping_min_wins=2, **kw)
 
@@ -3814,7 +3816,7 @@ class TestAdaptiveConcurrencyLimit:
         kw.setdefault('concurrency_add_on_success', 2)
         kw.setdefault('concurrency_mult_on_failure', 0.5)
         kw.setdefault('concurrency_failure_window', 3)
-        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+        return make_router(store, listen_host='127.0.0.1', listen_port=10809,
                       db_path=tempfile.mktemp(suffix='.db'), **kw)
 
     def test_at_limit_filtered_from_candidates(self):
@@ -3874,7 +3876,7 @@ class TestConnPool:
         kw.setdefault('conn_pool_per_proxy', 2)
         kw.setdefault('conn_pool_total', 8)
         kw.setdefault('conn_pool_refill_interval', 0.0)  # 只取不补(测试手动补)
-        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+        return make_router(store, listen_host='127.0.0.1', listen_port=10809,
                       db_path=tempfile.mktemp(suffix='.db'), **kw)
 
     @pytest.mark.asyncio
@@ -3938,7 +3940,7 @@ class TestConnPool:
         ps.add(ProxyInfo(id='p1', host=HOST, port=31991))
         ps.add(ProxyInfo(id='p2', host=HOST, port=31992))
         up_srv2 = await run_mock_proxy(HOST, 31992, hit_counter=None)
-        r = Router(ps, listen_host='127.0.0.1', listen_port=10809,
+        r = make_router(ps, listen_host='127.0.0.1', listen_port=10809,
                    db_path=tempfile.mktemp(suffix='.db'),
                    conn_pool_enabled=True, conn_pool_per_proxy=5,
                    conn_pool_total=2, conn_pool_refill_target=5,
@@ -3985,7 +3987,7 @@ class TestConnPoolIdlePause:
         kw.setdefault('conn_pool_per_proxy', 2)
         kw.setdefault('conn_pool_total', 8)
         kw.setdefault('conn_pool_refill_interval', 0.0)  # 只取不补(测试手动补)
-        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+        return make_router(store, listen_host='127.0.0.1', listen_port=10809,
                       db_path=tempfile.mktemp(suffix='.db'), **kw)
 
     @pytest.mark.asyncio
@@ -4183,7 +4185,7 @@ class TestTargetPrewarm:
         kw.setdefault('conn_pool_per_proxy', 4)
         kw.setdefault('conn_pool_total', 8)
         kw.setdefault('conn_pool_refill_interval', 0.0)  # 只取不补(测试手动补)
-        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+        return make_router(store, listen_host='127.0.0.1', listen_port=10809,
                       db_path=tempfile.mktemp(suffix='.db'), **kw)
 
     @pytest.mark.asyncio
@@ -4473,7 +4475,7 @@ class TestTargetPrewarm:
         store = ProxyStore()
         store.add(ProxyInfo(id='p1', host=HOST, port=31991))
         store.add(ProxyInfo(id='p2', host=HOST, port=31992))
-        r = Router(store, listen_host='127.0.0.1', listen_port=10809,
+        r = make_router(store, listen_host='127.0.0.1', listen_port=10809,
                    db_path=tempfile.mktemp(suffix='.db'),
                    conn_pool_enabled=True, conn_pool_target_prewarm=True,
                    conn_pool_per_proxy=4, conn_pool_total=8,
@@ -4524,7 +4526,7 @@ class TestEstablishedTunnelReuse:
         kw.setdefault('conn_pool_total', 8)
         kw.setdefault('conn_pool_refill_interval', 0.0)  # 只取不补(测试手动)
         kw.setdefault('conn_pool_idle_timeout', 100.0)   # 长超时,防测试中途过期
-        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+        return make_router(store, listen_host='127.0.0.1', listen_port=10809,
                       db_path=tempfile.mktemp(suffix='.db'), **kw)
 
     async def _wait_returned(self, r, target, timeout=2.0):
@@ -4820,7 +4822,7 @@ class TestRaceLoserEstablishedReturn:
         kw.setdefault('max_retries', 2)
         kw.setdefault('stickiness_enabled', False)
         kw.setdefault('enable_local_racing', False)       # 排除 local 直连,确保胜者是上游
-        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+        return make_router(store, listen_host='127.0.0.1', listen_port=10809,
                       db_path=tempfile.mktemp(suffix='.db'), **kw)
 
     @staticmethod
@@ -4941,7 +4943,7 @@ class TestPrehandshake:
         kw.setdefault('conn_pool_idle_timeout', 100.0)   # 长超时,防测试中途过期
         kw.setdefault('stickiness_enabled', True)
         kw.setdefault('stickiness_ttl', 1800.0)
-        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+        return make_router(store, listen_host='127.0.0.1', listen_port=10809,
                       db_path=tempfile.mktemp(suffix='.db'), **kw)
 
     async def _wait_prehandshake(self, r, target, timeout=2.0):
@@ -5133,7 +5135,7 @@ class TestStickyProbeEviction:
         kw.setdefault('single_send_degrade_slack_ms', 10.0)
         kw.setdefault('sticky_probe_interval_sec', 1.0)
         kw.setdefault('sticky_probe_fanout', 2)
-        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+        return make_router(store, listen_host='127.0.0.1', listen_port=10809,
                       db_path=tempfile.mktemp(suffix='.db'), **kw)
 
     def test_probe_due_respects_cooldown(self):
@@ -5587,7 +5589,7 @@ class TestClusterPredictor:
         store = ProxyStore()
         store.add(ProxyInfo(id='p', host=HOST, port=31991))
         store.add(ProxyInfo(id='q', host=HOST, port=31992))
-        r = Router(store, listen_host='127.0.0.1', listen_port=ROUTER_PORT,
+        r = make_router(store, listen_host='127.0.0.1', listen_port=ROUTER_PORT,
                    db_path=tempfile.mktemp(suffix='.db'),
                    conn_pool_enabled=True, conn_pool_target_prewarm=True,
                    cluster_predict=True, cluster_min_support=2,
@@ -5793,7 +5795,7 @@ class TestClusterPredictor:
         kw.setdefault('conn_pool_per_proxy', 4)
         kw.setdefault('conn_pool_total', 8)
         kw.setdefault('conn_pool_refill_interval', 0.0)  # 只取不补(测试手动触发)
-        return Router(store, listen_host='127.0.0.1', listen_port=ROUTER_PORT,
+        return make_router(store, listen_host='127.0.0.1', listen_port=ROUTER_PORT,
                       db_path=tempfile.mktemp(suffix='.db'), **kw)
 
 
@@ -5898,7 +5900,7 @@ class TestRouterConfigPassThrough:
     def _router(self, **kw) -> Router:
         store = ProxyStore()
         store.add(ProxyInfo(id='p', host=HOST, port=31991))
-        return Router(store, listen_host='127.0.0.1', listen_port=10809,
+        return make_router(store, listen_host='127.0.0.1', listen_port=10809,
                       db_path=tempfile.mktemp(suffix='.db'), **kw)
 
     def test_router_cfg_equals_kwargs(self):
@@ -5906,9 +5908,9 @@ class TestRouterConfigPassThrough:
         cfg = self._make_cfg()
         store = ProxyStore()
         store.add(ProxyInfo(id='p', host=HOST, port=31991))
-        r_cfg = Router(store, listen_host='127.0.0.1', listen_port=10809,
+        r_cfg = make_router(store, listen_host='127.0.0.1', listen_port=10809,
                        db_path=tempfile.mktemp(suffix='.db'), router_cfg=cfg)
-        r_kw = Router(store, listen_host='127.0.0.1', listen_port=10809,
+        r_kw = make_router(store, listen_host='127.0.0.1', listen_port=10809,
                       db_path=tempfile.mktemp(suffix='.db'), **self._cfg_kwargs(cfg))
         try:
             assert r_cfg.snapshot_counters() == r_kw.snapshot_counters(), \
@@ -6092,7 +6094,7 @@ class TestRouterConfigPassThrough:
         store.add(ProxyInfo(id='p', host=HOST, port=31991))
 
         def build(cfg: RouterConfig) -> Router:
-            return Router(store, listen_host='127.0.0.1', listen_port=10809,
+            return make_router(store, listen_host='127.0.0.1', listen_port=10809,
                           db_path=':memory:', router_cfg=cfg)
 
         leaves = self._leaf_paths(self._rich_cfg())
@@ -6123,7 +6125,7 @@ class TestRaceStaggeredCleanupOnAllFail:
         ps = ProxyStore()
         ps.add(ProxyInfo(id='p1', host='127.0.0.1', port=31341))
         ps.add(ProxyInfo(id='p2', host='127.0.0.1', port=31342))
-        r = Router(ps, listen_host='127.0.0.1', listen_port=10819,
+        r = make_router(ps, listen_host='127.0.0.1', listen_port=10819,
                    max_retries=2, enable_http_cache=False, stagger_start=True,
                    db_path=tempfile.mktemp(suffix='.db'))
         rented = []
@@ -6174,7 +6176,7 @@ class TestRaceStaggeredCleanupOnAllFail:
         ps = ProxyStore()
         ps.add(ProxyInfo(id='ok', host='127.0.0.1', port=31343))
         ps.add(ProxyInfo(id='dead', host='127.0.0.1', port=31344))
-        r = Router(ps, listen_host='127.0.0.1', listen_port=10819,
+        r = make_router(ps, listen_host='127.0.0.1', listen_port=10819,
                    max_retries=2, enable_http_cache=False, stagger_start=True,
                    db_path=tempfile.mktemp(suffix='.db'))
         rented = []
@@ -6205,7 +6207,7 @@ class TestForwardSingleAcloseFinally:
     async def test_stream_raise_still_aclose(self):
         """_stream_upstream_response 抛异常(BaseException 语义)→ resp.aclose() 仍被调。"""
         ps = ProxyStore()
-        r = Router(ps, listen_host='127.0.0.1', listen_port=10819,
+        r = make_router(ps, listen_host='127.0.0.1', listen_port=10819,
                    enable_http_cache=False, db_path=tempfile.mktemp(suffix='.db'))
 
         class FakeResp:
@@ -6263,7 +6265,7 @@ async def test_request_header_line_count_limited():
     回归:慢速 loris 式攻击发大量小 header 行曾让 headers bytearray 无界增长。
     现在超过 100 行(默认)直接拒连,客户端看到 EOF 而非挂住。
     """
-    router = Router(ProxyStore(), listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(ProxyStore(), listen_host=HOST, listen_port=ROUTER_PORT,
                     db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
     try:
@@ -6281,7 +6283,7 @@ async def test_request_header_byte_limit():
 
     >64KB 的请求头被拒连。字节限在行数限之前触发(44 行 × 1.5KB ≈ 66KB)。
     """
-    router = Router(ProxyStore(), listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(ProxyStore(), listen_host=HOST, listen_port=ROUTER_PORT,
                     db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
     try:
@@ -6317,7 +6319,7 @@ async def test_truncated_upstream_response_detected():
         proxy_srv = await run_mock_proxy_truncated(HOST, PROXY_PORT, declared=1000, sent=5)
         ps = ProxyStore()
         ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-        router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+        router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
                         enable_http_cache=False, db_path=tempfile.mktemp(suffix='.db'))
         await router.start()
         try:
@@ -6554,7 +6556,7 @@ def _local_direct_router(**kw):
     kw.setdefault('local_direct_domains', [HOST])
     kw.setdefault('db_path', tempfile.mktemp(suffix='.db'))
     kw.setdefault('enable_http_cache', False)
-    return Router(ps, listen_host=HOST, listen_port=ROUTER_PORT, **kw)
+    return make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT, **kw)
 
 
 @pytest.mark.asyncio
@@ -6588,7 +6590,7 @@ async def test_local_direct_http_non_whitelist_uses_upstream():
     proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=hit)
     ps = ProxyStore()
     ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
                     local_direct_domains=[HOST], enable_http_cache=False,
                     db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
@@ -6734,7 +6736,7 @@ async def test_internal_proxy_host_target_direct_connect():
     proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=proxy_hits)
     ps = ProxyStore()
     ps.add(ProxyInfo(id='inexternal', host=HOST, port=PROXY_PORT))  # host==HOST
-    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
                     enable_http_cache=False, db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
     try:
@@ -6761,7 +6763,7 @@ async def test_internal_proxy_host_http_direct():
     proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=hit)
     ps = ProxyStore()
     ps.add(ProxyInfo(id='ptarget', host=HOST, port=PROXY_PORT))  # host==HOST
-    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
                     enable_http_cache=False, db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
     try:
@@ -6952,7 +6954,7 @@ class TestDispatchSingleUnified:
         fast_srv = await run_mock_proxy_tagged(HOST, 31391, 'FAST')
         store = ProxyStore()
         store.add(ProxyInfo(id='fast', host=HOST, port=31391))
-        r = Router(store, listen_host=HOST, listen_port=10809,
+        r = make_router(store, listen_host=HOST, listen_port=10809,
                    max_retries=2, enable_http_cache=False,
                    db_path=tempfile.mktemp(suffix='.db'))
         win_meta_calls, sticky_calls = [], []
@@ -6976,7 +6978,7 @@ class TestDispatchSingleUnified:
         fast_srv = await run_mock_proxy(HOST, 31392)
         store = ProxyStore()
         store.add(ProxyInfo(id='fast', host=HOST, port=31392))
-        r = Router(store, listen_host=HOST, listen_port=10810,
+        r = make_router(store, listen_host=HOST, listen_port=10810,
                    max_retries=2, enable_http_cache=False,
                    db_path=tempfile.mktemp(suffix='.db'))
         win_meta_calls, sticky_calls = [], []
@@ -7003,7 +7005,7 @@ class TestDispatchSingleUnified:
         """
         store = ProxyStore()
         store.add(ProxyInfo(id='slow', host=HOST, port=31395))
-        r = Router(store, listen_host=HOST, listen_port=10811,
+        r = make_router(store, listen_host=HOST, listen_port=10811,
                    max_retries=2, enable_http_cache=False, stickiness_enabled=True,
                    db_path=tempfile.mktemp(suffix='.db'))
         target = "immediate-degrade.connect:443"
@@ -7052,7 +7054,7 @@ class TestDispatchSingleUnified:
         """_get_fresh_proxy 对「即时降级」标记的代理直接 miss,回落到竞速。"""
         store = ProxyStore()
         store.add(ProxyInfo(id='slow', host=HOST, port=31396))
-        r = Router(store, listen_host=HOST, listen_port=10812,
+        r = make_router(store, listen_host=HOST, listen_port=10812,
                    max_retries=2, enable_http_cache=False,
                    db_path=tempfile.mktemp(suffix='.db'))
         r._immediate_degraded.add('slow')
@@ -7064,7 +7066,7 @@ class TestDispatchSingleUnified:
         """HTTP 粘性单发失败同样即时降级(与 CONNECT 对称,覆盖 _forward_single 异常)。"""
         store = ProxyStore()
         store.add(ProxyInfo(id='slow', host=HOST, port=31397))
-        r = Router(store, listen_host=HOST, listen_port=10813,
+        r = make_router(store, listen_host=HOST, listen_port=10813,
                    max_retries=2, enable_http_cache=False, stickiness_enabled=True,
                    db_path=tempfile.mktemp(suffix='.db'))
         domain = "x.test"
@@ -7100,7 +7102,7 @@ class TestDispatchSingleUnified:
         import logging
         store = ProxyStore()
         store.add(ProxyInfo(id='slow', host=HOST, port=31398))
-        r = Router(store, listen_host=HOST, listen_port=10814,
+        r = make_router(store, listen_host=HOST, listen_port=10814,
                    max_retries=2, enable_http_cache=False,
                    db_path=tempfile.mktemp(suffix='.db'))
         with caplog.at_level(logging.INFO, logger='auto_squid.router'):
@@ -7124,7 +7126,7 @@ class TestDispatchSingleUnified:
         import logging
         store = ProxyStore()
         store.add(ProxyInfo(id='slow', host=HOST, port=31399))
-        r = Router(store, listen_host=HOST, listen_port=10815,
+        r = make_router(store, listen_host=HOST, listen_port=10815,
                    max_retries=2, enable_http_cache=False,
                    db_path=tempfile.mktemp(suffix='.db'))
         # 本机直连路径(proxy_host=None)对空 target 抛 ValueError,真实走 except。
@@ -7148,7 +7150,7 @@ class TestDispatchSingleUnified:
         is_circuit_open('local') 为真。
         """
         store = ProxyStore()
-        r = Router(store, listen_host=HOST, listen_port=10816,
+        r = make_router(store, listen_host=HOST, listen_port=10816,
                    max_retries=2, enable_http_cache=False,
                    enable_local_racing=True,
                    db_path=tempfile.mktemp(suffix='.db'))
@@ -7168,7 +7170,7 @@ class TestDispatchSingleUnified:
         local 候选消失,不再每次白烧 3s。
         """
         store = ProxyStore()
-        r = Router(store, listen_host=HOST, listen_port=10817,
+        r = make_router(store, listen_host=HOST, listen_port=10817,
                    max_retries=2, enable_http_cache=False,
                    enable_local_racing=True,
                    db_path=tempfile.mktemp(suffix='.db'))
@@ -7200,7 +7202,7 @@ class TestDispatchSingleUnified:
         record_failure('local'),使 consec_fail 增长;连续 3 次后熔断。
         """
         store = ProxyStore()
-        r = Router(store, listen_host=HOST, listen_port=10818,
+        r = make_router(store, listen_host=HOST, listen_port=10818,
                    max_retries=2, enable_http_cache=False,
                    enable_local_racing=True,
                    db_path=tempfile.mktemp(suffix='.db'))
@@ -7227,7 +7229,7 @@ class TestStaleConnRetry:
     def _router(self, **kw):
         store = ProxyStore()
         store.add(ProxyInfo(id='p', host='h', port=3128))
-        return Router(store, listen_host=HOST, listen_port=10819,
+        return make_router(store, listen_host=HOST, listen_port=10819,
                       db_path=tempfile.mktemp(suffix='.db'), **kw)
 
     @staticmethod
@@ -7329,7 +7331,7 @@ class TestStaleConnRetry:
     def _router(self, **kw):
         store = ProxyStore()
         store.add(ProxyInfo(id='p', host='h', port=3128))
-        return Router(store, listen_host=HOST, listen_port=10809,
+        return make_router(store, listen_host=HOST, listen_port=10809,
                       db_path=tempfile.mktemp(suffix='.db'), **kw)
 
 class TestHttpCachePrivacy:
@@ -7339,7 +7341,7 @@ class TestHttpCachePrivacy:
     def _router(self, **kw):
         store = ProxyStore()
         store.add(ProxyInfo(id='p', host='h', port=3128))
-        return Router(store, listen_host=HOST, listen_port=10809,
+        return make_router(store, listen_host=HOST, listen_port=10809,
                       db_path=tempfile.mktemp(suffix='.db'), **kw)
 
     def test_get_with_cookie_header_is_miss(self):
@@ -7381,7 +7383,7 @@ class TestStickyProbePrune:
     def _router(self, **kw):
         store = ProxyStore()
         store.add(ProxyInfo(id='p', host='h', port=3128))
-        return Router(store, listen_host=HOST, listen_port=10809,
+        return make_router(store, listen_host=HOST, listen_port=10809,
                       db_path=tempfile.mktemp(suffix='.db'), **kw)
 
     def test_probe_pruning_removes_stale_entries_with_empty_sticky_cache(self):
@@ -7425,7 +7427,7 @@ async def test_duplicate_request_headers_forwarded_to_upstream():
     proxy_srv = await run_header_echo_proxy(HOST, PROXY_PORT)
     ps = ProxyStore()
     ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
                     db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
     try:
@@ -7466,7 +7468,7 @@ async def test_auth_accepts_lowercase_proxy_authorization():
     proxy_srv = await run_header_echo_proxy(HOST, PROXY_PORT)
     ps = ProxyStore()
     ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
                     auth_enabled=True, auth_username='asuser', auth_password='s3cretRRxc68a',
                     db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
@@ -7538,7 +7540,7 @@ async def test_connect_status_code_requires_exact_200():
     up_srv = await run_mock_proxy_bogus_connect(HOST, PROXY_PORT)
     ps = ProxyStore()
     ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
                     max_retries=1, db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
     try:
@@ -7562,7 +7564,7 @@ async def test_invalid_content_length_returns_400():
     proxy_srv = await run_mock_proxy(HOST, PROXY_PORT)
     ps = ProxyStore()
     ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
                     db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
     try:
@@ -7590,7 +7592,7 @@ async def test_slow_client_header_timeout_closes_connection():
     proxy_srv = await run_mock_proxy(HOST, PROXY_PORT)
     ps = ProxyStore()
     ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
-    router = Router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
                     db_path=tempfile.mktemp(suffix='.db'))
     orig = router_mod._CLIENT_HEADER_TIMEOUT
     router_mod._CLIENT_HEADER_TIMEOUT = 0.3  # 缩短等待窗口,测试可快速通过
