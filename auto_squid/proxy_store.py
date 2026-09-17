@@ -27,6 +27,8 @@ class ProxyStore:
         # URL 构造含 urlquote(逐字节扫描),缓存消除每次单发/竞速的重复 quote。
         # 在 add/remove/load 处失效——这三个入口是仅有的变更点。
         self._url_cache: Dict[str, Optional[str]] = {}
+        # 节点表版本号:增删代理节点时递增,供 Router 等协作方做 O(1) 缓存失效判断。
+        self.version: int = 0
         self.path = Path(path) if path else None
         if self.path and self.path.exists():
             self.load(self.path)
@@ -35,11 +37,15 @@ class ProxyStore:
         """添加/覆盖一个代理节点(以 id 为键)。"""
         self._proxies[proxy.id] = proxy
         self._url_cache.pop(proxy.id, None)
+        self.version += 1
 
     def remove(self, proxy_id: str) -> Optional[ProxyInfo]:
         """按 id 移除节点,返回被移除的 ProxyInfo(不存在则返回 None)。"""
         self._url_cache.pop(proxy_id, None)
-        return self._proxies.pop(proxy_id, None)
+        p = self._proxies.pop(proxy_id, None)
+        if p is not None:
+            self.version += 1
+        return p
 
     def list(self) -> List[ProxyInfo]:
         """返回所有代理节点的列表(快照副本)。"""

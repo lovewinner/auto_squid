@@ -59,6 +59,22 @@ from .http_cache import HttpCache, CACHEABLE_STATUS, _INVALIDATING_METHODS
 from .sticky import StickyCache
 from .cluster import ClusterGraph
 import json
+import ssl
+
+# 预导入 httpcore 及 httpx 默认传输模块并缓存共享 SSLContext:
+# 消除首次创建 httpx.AsyncClient 时懒加载模块(~300ms)和多次重读磁盘 CA 证书(~200ms)
+# 带来的 500ms 冷启动延迟。既提升首个用户请求的响应速度，又避免错峰竞速 (stagger)
+# 在首请求冷启动时因 client 构建耗时超出 stagger_interval 而误触发后序候选扇出。
+try:
+    _SHARED_SSL_CONTEXT: Optional[ssl.SSLContext] = ssl.create_default_context()
+except Exception:
+    _SHARED_SSL_CONTEXT = None
+
+try:
+    import httpcore
+    import httpx._transports.default
+except Exception:
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -529,6 +545,8 @@ class Router:
         self.local_direct_hits = 0        # 白名单命中(强制本机直连)次数
         self.local_direct_failures = 0    # 白名单直连失败(回 502)次数
         self.local_direct_circuit_short = 0  # 白名单命中但 local 熔断短路次数
+        # 缓存已启用的代理 host 集合及其对应的 proxy_store 版本,避免每请求重复创建 frozenset
+        self._proxy_hosts_cache: tuple[int, frozenset] = (-1, frozenset())
         # "降级中"代理集合(可观测,非门控):被单发降级判定命中的代理记录于此。
         # 注意真正的门控是每次选择时实时重估 _single_send_degraded(代理恢复后立即
         # 重新可单发,无需冷却),此集合只供 /metrics /circuit 展示"当前被判定降级的
@@ -846,13 +864,17 @@ class Router:
         return self._norm_host(host) in self._local_direct_domains
 
     def _proxy_hosts_idx(self) -> frozenset:
-        """构建 enabled 上游代理的 host 集合(用于内网目标识别)。
+        """构建 enabled 上游代理的 host 集合(用于内网目标识别)。带版本缓存。
 
-        代理表在运行时基本静态(静态 proxies.yaml/极少热更),每次现建即可:
-        7 个代理的 frozenset 开销可忽略,且天然跟随代理启停变化(免 dirty 同步)。
-        空代理表返回空集合(不误伤任何目标——无代理则无内网目标可判)。
+        代理表在运行时基本静态(静态 proxies.yaml/极少热更),以 proxy_store.version
+        做 O(1) 缓存失效判断,避免每个请求重建 frozenset。
         """
-        return frozenset(self._norm_host(p.host) for p in self.proxy_store.list() if p.enabled)
+        store_ver = getattr(self.proxy_store, 'version', 0)
+        if self._proxy_hosts_cache[0] == store_ver:
+            return self._proxy_hosts_cache[1]
+        hosts = frozenset(self._norm_host(p.host) for p in self.proxy_store.list() if p.enabled)
+        self._proxy_hosts_cache = (store_ver, hosts)
+        return hosts
 
     def _is_internal_target(self, host: str) -> bool:
         """目标 host 是否是某上游代理自身的 host/IP(内网目标判定)。
@@ -1822,6 +1844,8 @@ class Router:
         }
         if proxy_url:
             kw['proxy'] = proxy_url
+        if _SHARED_SSL_CONTEXT is not None:
+            kw['verify'] = _SHARED_SSL_CONTEXT
         client = httpx.AsyncClient(**kw)
         self._client_pool[key] = client
         return client
@@ -2633,19 +2657,28 @@ class Router:
             return False
         first = line.decode('latin-1').strip()
         raw_headers = bytearray()
+        header_lines_count = 0
         while True:
             h = await asyncio.wait_for(reader.readline(), timeout=_CLIENT_HEADER_TIMEOUT)
             if not h or h in (b"\r\n", b"\n"):
                 break
             raw_headers.extend(h)
-            if raw_headers.count(b'\n') > _MAX_REQUEST_HEADER_LINES or len(raw_headers) > _MAX_REQUEST_HEADER_BYTES:
+            header_lines_count += 1
+            # 性能优化:以整型自增计数器代替每次对 bytearray 做 O(n) 全文 count(b'\n'),
+            # 消除多行请求头场景下的 O(n²) 线性重复扫描;字节长度检查 len() 仍为 O(1)。
+            if header_lines_count > _MAX_REQUEST_HEADER_LINES or len(raw_headers) > _MAX_REQUEST_HEADER_BYTES:
                 raise ConnectionError('request header limit exceeded')
         req_headers = {}
         for h in raw_headers.decode('latin-1').splitlines():
             if ':' in h:
                 k, v = h.split(':', 1)
                 k, v = k.strip().lower(), v.strip()
-                req_headers[k] = req_headers.get(k, '') + (("; " if k == 'cookie' else ", ") if k in req_headers else '') + v
+                # 针对非重复单次头直接赋值,避免多余的 get() 与空串拼接分配
+                if k in req_headers:
+                    sep = "; " if k == 'cookie' else ", "
+                    req_headers[k] = f"{req_headers[k]}{sep}{v}"
+                else:
+                    req_headers[k] = v
         if self.auth_enabled:
             ok, reason = check_auth(req_headers, True, self.auth_username, self.auth_password)
             if not ok:
@@ -3874,33 +3907,32 @@ class Router:
         '_active_windows', '_cooccur', '_last_predict',
         'observe', 'maybe_predict', 'prune', 'reset', 'graph_size', 'get_cluster_cache'})
 
+    # 统一单表转发映射(属性名 -> 协作者字段名):将 4 张白名单集合合并为 1 张映射字典。
+    # 消除 __getattr__ 每次连续 4 次 in set 判断,以及 __setattr__ 每次属性赋值
+    # (含 Router 自身的普通属性如 self.upstream_attempts += 1)的最多 4 次 set 和 4 次 __dict__ 查询。
+    _FORWARD_TARGETS: dict[str, str] = {
+        **{k: 'pools' for k in _POOL_FORWARD},
+        **{k: 'httpcache' for k in _CACHE_FORWARD},
+        **{k: 'sticky' for k in _STICKY_FORWARD},
+        **{k: 'cluster' for k in _CLUSTER_FORWARD},
+    }
+
     def __getattr__(self, name):
-        # 仅在实例属性/类属性都未命中时被调用(正常查找失败);白名单成员转发到
-        # 对应协作类(pools/httpcache/sticky/cluster)。
-        if name in Router._POOL_FORWARD:
-            return getattr(self.pools, name)
-        if name in Router._CACHE_FORWARD:
-            return getattr(self.httpcache, name)
-        if name in Router._STICKY_FORWARD:
-            return getattr(self.sticky, name)
-        if name in Router._CLUSTER_FORWARD:
-            return getattr(self.cluster, name)
+        # 仅在实例属性/类属性都未命中时被调用(正常查找失败);经单表 O(1) 快速分发
+        target = Router._FORWARD_TARGETS.get(name)
+        if target is not None:
+            return getattr(getattr(self, target), name)
         raise AttributeError(f"{type(self).__name__} has no attribute {name!r}")
 
     def __setattr__(self, name, value):
         # 构造期协作类(self.pools/self.httpcache/self.sticky/self.cluster)尚未存在时
         # 走正常赋值;建好后白名单成员 set 到对应协作类(如 sticky_cache_hits += 1
         # 读转发 get + set 转发到 sticky,不重绑 Router 上的名字)。
-        if name in Router._POOL_FORWARD and 'pools' in self.__dict__:
-            setattr(self.pools, name, value)
-            return
-        if name in Router._CACHE_FORWARD and 'httpcache' in self.__dict__:
-            setattr(self.httpcache, name, value)
-            return
-        if name in Router._STICKY_FORWARD and 'sticky' in self.__dict__:
-            setattr(self.sticky, name, value)
-            return
-        if name in Router._CLUSTER_FORWARD and 'cluster' in self.__dict__:
-            setattr(self.cluster, name, value)
-            return
+        # 对于非转发的自身属性(绝大部分写入)，通过单次 get 为 None 直接落入 super().__setattr__。
+        target = Router._FORWARD_TARGETS.get(name)
+        if target is not None:
+            target_obj = self.__dict__.get(target)
+            if target_obj is not None:
+                setattr(target_obj, name, value)
+                return
         super().__setattr__(name, value)

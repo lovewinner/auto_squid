@@ -211,6 +211,16 @@ class ProxySelector:
         # 计数重试、不喂熔断、不计入成功率。供 /metrics 观察陈旧连接规模。
         self.stale_conn_retries = 0
 
+        # ── Cost 排序与候选评分缓存 ────────────────────────────
+        # 1) _cost_raw_cache: 针对每个 domain 缓存 _cost_raw_inputs(三维原始指标值),
+        #    以 _metrics_version 为版本号。只要没有新观测数据进入,直接复用已提取的
+        #    (lat, sr_fail, tp),消除每请求重算 TDigest 分位数与深层字典遍历开销。
+        self._cost_raw_cache: dict[Optional[str], tuple[int, dict]] = {}
+        # 2) 状态版本号:追踪在途数与熔断状态变更,用于 _cost_scores 归一化总分缓存
+        self._inflight_version: int = 0
+        self._circuit_version: int = 0
+        self._cost_scores_cache: dict[tuple, tuple[tuple, dict]] = {}
+
     def get_quality(self) -> dict[str, dict[str, float]]:
         """返回质量表快照(供 /metrics / 仪表盘展示,读内存无锁)。"""
         return {pid: dict(q) for pid, q in self._quality.items()}
@@ -229,6 +239,7 @@ class ProxySelector:
         """发起一次上游尝试:在途数 +1,并推进高水位。热路径,O(1),无锁。"""
         n = self._in_flight.get(pid, 0) + 1
         self._in_flight[pid] = n
+        self._inflight_version += 1
         if n > self.max_in_flight:
             self.max_in_flight = n
 
@@ -238,6 +249,7 @@ class ProxySelector:
         由 _try_http/_try_tunnel 的 finally 调用,保证竞速取消也释放计数。
         只在确有发起(started)时递减;防御性下限 0,防止并发异常路径下计数漂移。
         """
+        self._inflight_version += 1
         n = max(0, self._in_flight.get(pid, 0) - 1)
         if n == 0:
             self._in_flight.pop(pid, None)
@@ -896,6 +908,10 @@ class ProxySelector:
         self._domain_metrics.clear()
         self._metrics_version += 1  # 清空域名指标,使 get_domain_metrics 缓存失效
         self._domain_snapshot_cache = (None, None)
+        self._circuit_version += 1
+        self._inflight_version += 1
+        self._cost_raw_cache.clear()
+        self._cost_scores_cache.clear()
 
     def set_proxy_metrics(self, data: dict):
         """从 DB 恢复 proxy 级全局指标。
@@ -995,6 +1011,8 @@ class ProxySelector:
         与 reset_quality 的区别:不动 EWMA(延迟历史仍有效),只清熔断状态。
         """
         self._circuit.clear()
+        self._circuit_version += 1
+        self._cost_scores_cache.clear()
 
     # ── 熔断器 / slow-start ────────────────────────────────────
 
@@ -1028,6 +1046,7 @@ class ProxySelector:
         """
         etype = error_type if error_type in _ERROR_KEYS else ERROR_OTHER
         bypass_circuit = (etype == ERROR_HTTP_STATUS)
+        self._circuit_version += 1
         self._conc_observe_failure(pid)  # 自适应并发:失败 → 乘性降低上限(P3)
         if not bypass_circuit:
             s = self._circuit_state(pid)
@@ -1074,6 +1093,7 @@ class ProxySelector:
         if s is None:
             return
         s["consec_fail"] = 0
+        self._circuit_version += 1
         if self._in_slow_start(pid, s):
             s["slow_start_ok"] = int(s.get("slow_start_ok", 0)) + 1
 
@@ -1104,6 +1124,7 @@ class ProxySelector:
         s["started_at"] = time.monotonic()
         s["slow_start_ok"] = 0
         s["consec_fail"] = 0
+        self._circuit_version += 1
 
     def is_circuit_open(self, pid: str) -> bool:
         """该代理是否处于熔断退避期(open_until 未到)。已过期自动解除。
@@ -1261,16 +1282,53 @@ class ProxySelector:
                     break
         return (lat, sr_fail, tp)
 
-    def _cost_scores(self, candidates: List[str], domain: Optional[str]) -> dict:
+    def __setattr__(self, name, value):
+        # 当修改 cost 相关的配置参数时,自动使 Cost 评分缓存失效
+        if name.startswith("cost_") and hasattr(self, "_cost_scores_cache"):
+            self._cost_scores_cache.clear()
+            self._cost_raw_cache.clear()
+        super().__setattr__(name, value)
+
+    def _cost_raw_inputs_for_candidates(self, candidates: List[str], domain: Optional[str], use_cache: bool = False) -> dict:
+        """取候选集在 Cost 函数三维度上的原始值,当 use_cache=True 时按 _metrics_version 缓存。"""
+        if use_cache:
+            cached = self._cost_raw_cache.get(domain)
+            if cached is not None and cached[0] == self._metrics_version:
+                cached_dict = cached[1]
+                if all(pid in cached_dict for pid in candidates):
+                    return {pid: cached_dict[pid] for pid in candidates}
+        raw = {pid: self._cost_raw_inputs(pid, domain) for pid in candidates}
+        if use_cache:
+            if len(self._cost_raw_cache) > 2000:
+                self._cost_raw_cache.clear()
+            self._cost_raw_cache[domain] = (self._metrics_version, raw)
+        return raw
+
+    def _cost_scores(self, candidates: List[str], domain: Optional[str], use_cache: bool = False) -> dict:
         """计算候选集中每个代理的 Cost(越小越优),候选集内做 min-max 归一化。
 
         归一化使各维度权重直接可比、与量纲无关:低优指标 norm=(x-min)/(max-min),
         高优(吞吐)用 (max-x)/(max-min);max==min 该项贡献 0;缺数据项中性 0.5。
         最终负载因子折进延迟值再归一化(见 _cost_details)。返回 {pid: cost}。
-        """
-        return {pid: d["cost"] for pid, d in self._cost_details(candidates, domain).items()}
 
-    def _cost_details(self, candidates: List[str], domain: Optional[str]) -> dict:
+        参数 use_cache: 热路径(ordered_for_domain/ordered_proxies)设为 True,
+        在 _metrics_version、_inflight_version、_circuit_version 均未改变时复用评分;
+        白盒单元测试和落盘取实时值(默认 False)。
+        """
+        if use_cache:
+            cache_key = (domain, tuple(sorted(candidates)))
+            state_key = (self._metrics_version, self._inflight_version, self._circuit_version)
+            cached = self._cost_scores_cache.get(cache_key)
+            if cached is not None and cached[0] == state_key:
+                return cached[1]
+        res = {pid: d["cost"] for pid, d in self._cost_details(candidates, domain, use_cache=use_cache).items()}
+        if use_cache:
+            if len(self._cost_scores_cache) > 2000:
+                self._cost_scores_cache.clear()
+            self._cost_scores_cache[cache_key] = (state_key, res)
+        return res
+
+    def _cost_details(self, candidates: List[str], domain: Optional[str], use_cache: bool = False) -> dict:
         """同 _cost_scores,但保留**分解**(P1 观测/调参用):每 pid 各分量的
         原始值、归一化值、加权贡献、折进延迟的负载因子与总 cost。
 
@@ -1284,7 +1342,7 @@ class ProxySelector:
         返回 {pid: {cost, load_mult, latency:{raw,effective,norm,contrib},
         success_rate:{failure,norm,contrib}, throughput:{mbps,norm,contrib}}}。
         """
-        raw = {pid: self._cost_raw_inputs(pid, domain) for pid in candidates}
+        raw = self._cost_raw_inputs_for_candidates(candidates, domain, use_cache=use_cache)
 
         def _bounds(idx):
             vals = [r[idx] for r in raw.values() if r[idx] is not None]
@@ -1349,16 +1407,16 @@ class ProxySelector:
         """竞速候选过滤(ordered_proxies / ordered_for_domain / cost_breakdown
         三处共用):enabled → 非熔断 → 未达自适应并发上限。
 
-        不 shuffle(同权重随机打乱是排序方的职责);is_circuit_open 有副作用
-        (退避到期在此解熔断并置 slow-start),与既有语义一致。
+        单次遍历过滤,避免产生多轮中间列表。不 shuffle(同权重随机打乱是排序方的职责);
+        is_circuit_open 有副作用(退避到期在此解熔断并置 slow-start),与既有语义一致。
         """
-        enabled = [p for p in self.proxy_store.list() if p.enabled]
-        # 过滤熔断中的代理(is_circuit_open 同时处理退避到期解熔断)。
-        enabled = [p for p in enabled if not self.is_circuit_open(p.id)]
-        # 自适应并发限制(P3):在途已达上限的代理不参与候选(防慢代理被堆死)。
-        if self.concurrency_enabled:
-            enabled = [p for p in enabled if not self._at_concurrency_limit(p.id)]
-        return enabled
+        conc_enabled = self.concurrency_enabled
+        return [
+            p for p in self.proxy_store.list()
+            if p.enabled
+            and not self.is_circuit_open(p.id)
+            and (not conc_enabled or not self._at_concurrency_limit(p.id))
+        ]
 
     def cost_breakdown(self) -> dict:
         """当前竞速候选集的 Cost 分解(P1 观测/调参用,非热路径)。
@@ -1402,7 +1460,7 @@ class ProxySelector:
         enabled = self._filtered_candidates()
         random.shuffle(enabled)
         if self.cost_sort_enabled:
-            scores = self._cost_scores([p.id for p in enabled], None)
+            scores = self._cost_scores([p.id for p in enabled], None, use_cache=True)
             enabled.sort(key=lambda p: (self._slow_start_rank(p.id),
                                         self._quality_rank(p.id)[0],  # 未知质量垫底
                                         scores[p.id]))
@@ -1471,7 +1529,7 @@ class ProxySelector:
         enabled = self._filtered_candidates()
         random.shuffle(enabled)
         if self.cost_sort_enabled:
-            scores = self._cost_scores([p.id for p in enabled], domain)
+            scores = self._cost_scores([p.id for p in enabled], domain, use_cache=True)
             enabled.sort(key=lambda p: (self._slow_start_rank(p.id),
                                         self._domain_quality_rank(domain_obs, p.id)[0],
                                         scores[p.id]))
