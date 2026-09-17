@@ -32,8 +32,22 @@ auto-squid = "auto_squid.cli:app"
 dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=0.23",
+    "pytest-cov>=7.1.0",
     "pytest-timeout>=2.4.0",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+
+[tool.coverage.run]
+# 只统计主包:bench/ 是压测工具、test_routing.py 是运维诊断脚本,都不纳入覆盖率分母。
+source = ["auto_squid"]
+# 分支覆盖:本项目条件分支密集(竞速/熔断/降级),仅行覆盖会显著高估。
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+]

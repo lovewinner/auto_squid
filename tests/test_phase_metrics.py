@@ -576,3 +576,74 @@ def test_domain_metrics_single_and_prune():
     all1 = sel.get_domain_metrics(use_cache=True)
     sel.get_domain_metrics(use_cache=True, domain="a:443")
     assert sel.get_domain_metrics(use_cache=True) is all1
+
+
+# ── 域名指标表容量保护(selector.prune_domain_metrics)──────────────
+# 该方法是"独立清理入口"(当前无生产调用方,由 _flush_loop 走
+# prune_domain_quality);这里钉死它的容量语义与副作用(_domain_quality 同步、
+# _metrics_version 只在真正删除时递增)。
+def _fill_domains(sel, domains, pids=("p1",)):
+    """给每个域名各写入若干 (域名, 代理) 观测条目。"""
+    for d in domains:
+        for pid in pids:
+            sel.record_ttfb(pid, 0.01, domain=d)
+
+
+def test_prune_domain_metrics_clears_all_when_max_entries_non_positive():
+    """max_entries <= 0 → 清空整表并使缓存失效(_metrics_version +1)。
+
+    注意与"淘汰"路径的差异:这里是整表 clear(),**只清 _domain_metrics**,
+    不触碰 _domain_quality(后者由 prune_domain_quality 独立治理)。这条差异是
+    有意的(两个容量阈值各自独立),在此钉死防止被"顺手改统一"。
+    """
+    sel = _selector()
+    _fill_domains(sel, ("a", "b"))
+    ver = sel._metrics_version
+    sel.prune_domain_metrics(0)
+    assert sel._domain_metrics == {}
+    assert set(sel._domain_quality) == {"a", "b"}     # 质量表未被这条路径触碰
+    assert sel._metrics_version == ver + 1
+
+
+def test_prune_domain_metrics_noop_when_within_capacity():
+    """总量未超上限 → 完全不动。
+
+    关键:no-op 路径**不得**递增 _metrics_version —— 否则每次周期清理都会把
+    get_domain_metrics 的缓存无谓刷掉(该版本号是缓存新鲜度的唯一依据)。
+    """
+    sel = _selector()
+    _fill_domains(sel, ("a", "b"))
+    ver = sel._metrics_version
+    sel.prune_domain_metrics(10)
+    assert set(sel._domain_metrics) == {"a", "b"}
+    assert sel._metrics_version == ver
+
+
+def test_prune_domain_metrics_partial_drop_keeps_domain():
+    """单域名内部分淘汰:砍掉前 N 个 pid,域名本身保留,且 _domain_quality 同步。"""
+    sel = _selector()
+    _fill_domains(sel, ("a",), pids=("p1", "p2", "p3"))
+    ver = sel._metrics_version
+    sel.prune_domain_metrics(1)                       # 3 条 → 上限 1,需砍 2
+    assert set(sel._domain_metrics["a"]) == {"p3"}    # dict 插入序,砍前 2 个
+    assert set(sel._domain_quality["a"]) == {"p3"}    # 质量表同步剔除
+    assert sel._metrics_version == ver + 1
+
+
+def test_prune_domain_metrics_drops_emptied_domain_from_both_tables():
+    """域名被砍空 → 从 _domain_metrics 与 _domain_quality 双双移除。"""
+    sel = _selector()
+    _fill_domains(sel, ("a", "b"))
+    sel.prune_domain_metrics(1)                       # 2 条 → 上限 1,砍空首个域名
+    assert set(sel._domain_metrics) == {"b"}
+    assert set(sel._domain_quality) == {"b"}
+
+
+def test_prune_domain_metrics_spans_multiple_domains():
+    """需淘汰量跨多个域名:按域名顺序依次砍空,补足差额即停。"""
+    sel = _selector()
+    _fill_domains(sel, ("a", "b", "c"))
+    sel.prune_domain_metrics(1)                       # 3 → 1,砍掉 a、b
+    assert set(sel._domain_metrics) == {"c"}
+    assert set(sel._domain_quality) == {"c"}
+    assert sel._metrics_version > 0                   # 确有删除 → 缓存失效

@@ -20,6 +20,7 @@ from auto_squid.cluster import ClusterGraph
 from auto_squid.config_schema import (
     ProxyInfo, PolicyConfig, Config, RouterConfig, ConnPoolConfig, LoggingConfig,
     ConfigBase, PolicyMatchConfig, ProbeCanaryConfig,
+    router_config_from_flat, _FLAT_TO_CONFIG_PATH,
 )
 from auto_squid.auth import check_auth
 from auto_squid.api import app as api_app, mount
@@ -6110,6 +6111,85 @@ class TestRouterConfigPassThrough:
         assert not leaked, (
             f"以下 {len(leaked)} 个 RouterConfig 字段改动后 Router 状态无任何变化,"
             f"疑似 __init__ 漏绑定(生产路径会静默忽略): {leaked}")
+
+
+class TestRouterConfigFromFlat:
+    """兼容层 config_schema.router_config_from_flat 的契约。
+
+    方案 C 后 Router 只接受 RouterConfig,历史散装词汇表下沉为这个兼容函数(测试/
+    压测依赖它)。这里钉死三件事:①未知键报错;②散装名落到正确的嵌套字段;③保持
+    散装路径原有的宽松语义(不校验)与 None 处理。
+    """
+
+    def test_unknown_kwarg_rejected(self):
+        """未知散装名 → TypeError(与重构前散装签名"不认识的键即报错"一致)。"""
+        with pytest.raises(TypeError, match="unexpected keyword argument"):
+            router_config_from_flat(not_a_real_option=1)
+
+    def test_mapping_paths_all_resolve(self):
+        """映射表每条路径都能在 RouterConfig 上解析(防映射表笔误导致静默丢失)。"""
+        cfg = RouterConfig()
+        for flat_name, dotted in _FLAT_TO_CONFIG_PATH.items():
+            obj = cfg
+            for part in dotted.split(".")[:-1]:
+                obj = getattr(obj, part)
+            assert hasattr(obj, dotted.split(".")[-1]), \
+                f"映射 {flat_name} -> {dotted} 在 RouterConfig 上不存在"
+
+    def test_flattened_names_land_in_nested_sections(self):
+        """散装名落到正确的子配置字段(每个子配置抽样一个)。"""
+        cfg = router_config_from_flat(
+            max_retries=4, cache_ttl=999,
+            circuit_threshold=7, stickiness_ttl=123, http_cache_ttl=7,
+            auth_username="u", adaptive_ttl_min=5.0, adaptive_ttl_max=60.0,
+            switch_damping_ratio=0.5, concurrency_limit_max=64,
+            conn_pool_enabled=True, conn_pool_target_prewarm=True,
+            conn_pool_per_proxy=9, cluster_predict=True)
+        assert cfg.max_retries == 4 and cfg.cache_ttl == 999
+        assert cfg.circuit.circuit_threshold == 7
+        assert cfg.stickiness.ttl == 123
+        assert cfg.http_cache.ttl == 7
+        assert cfg.auth.username == "u"
+        assert cfg.adaptive_ttl.min_sec == 5.0 and cfg.adaptive_ttl.max_sec == 60.0
+        assert cfg.switch_damping.ratio == 0.5
+        assert cfg.concurrency_limit.max == 64
+        assert cfg.conn_pool.per_proxy == 9
+        assert cfg.conn_pool.cluster_predict is True
+
+    def test_none_list_fields_fall_back_to_default(self):
+        """list 字段传 None → 回落模型默认空列表(等价散装路径的 `(x or [])`)。
+
+        不回落的话,Router body 里对这些字段的 list() / 逐元素 .model_dump() 会在
+        None 上抛错。
+        """
+        cfg = router_config_from_flat(
+            local_direct_domains=None, policies=None,
+            probe_get_targets=None, probe_canaries=None)
+        assert cfg.local_direct_domains == [] and cfg.policies == []
+        assert cfg.circuit.probe_get_targets == [] and cfg.circuit.probe_canaries == []
+
+    def test_probe_canaries_dicts_become_models(self):
+        """probe_canaries 收 dict 列表 → 转成 ProbeCanaryConfig(Router 会调 model_dump)。"""
+        cfg = router_config_from_flat(
+            probe_canaries=[{"name": "n", "target": "t.example:443"}])
+        assert all(isinstance(c, ProbeCanaryConfig) for c in cfg.circuit.probe_canaries)
+        assert cfg.circuit.probe_canaries[0].target == "t.example:443"
+
+    def test_lenient_skips_cross_field_validation(self):
+        """保持宽松:违反 #12 跨字段规则的组合不得在兼容层抛错。
+
+        这些非法组合原本由 Router body 钳制/静默降级(见 _mutate_leaf 与
+        Router.__init__ 的 max()/min() 链),兼容层若加校验会变成构造即报错,属行为变更。
+        """
+        # stagger_initial(99) > max_retries(1):原样保留,由 Router 钳到 1
+        assert router_config_from_flat(max_retries=1, stagger_initial=99).stagger_initial == 99
+        # adaptive_ttl min > max:原样保留
+        assert router_config_from_flat(
+            adaptive_ttl=True, adaptive_ttl_min=900.0,
+            adaptive_ttl_max=60.0).adaptive_ttl.min_sec == 900.0
+        # cluster_predict 未开 conn_pool.enabled:原样保留(由 Router 内部按 AND 降级)
+        assert router_config_from_flat(
+            conn_pool_enabled=False, cluster_predict=True).conn_pool.cluster_predict is True
 
 
 class TestRaceStaggeredCleanupOnAllFail:
