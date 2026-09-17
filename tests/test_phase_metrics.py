@@ -18,7 +18,7 @@ from auto_squid.config_schema import CircuitConfig, RouterConfig
 from auto_squid.digest import TDigest
 from auto_squid.proxy_store import ProxyInfo, ProxyStore
 from auto_squid.router import Router
-from auto_squid.selector import ProxySelector
+from auto_squid.selector import ProxySelector, _OBS_WINDOW
 
 
 # ── t-digest ────────────────────────────────────────────
@@ -647,3 +647,69 @@ def test_prune_domain_metrics_spans_multiple_domains():
     assert set(sel._domain_metrics) == {"c"}
     assert set(sel._domain_quality) == {"c"}
     assert sel._metrics_version > 0                   # 确有删除 → 缓存失效
+
+
+# ── 全局窗口成功率(selector.global_window_success)──────────────
+# 供 AutoTuner 的成功率守卫使用(tuner.py:188: sr = succ/total, total=0 时 sr=None)。
+# 数据源是各代理「全局桶」的 outcome_samples 环形缓冲,口径与窗口成功率一致:
+#   record_ttfb 推 1(响应头到达即视作成功);record_failure 推 0;
+#   5xx 由 record_http_error 把末位 1 改写成 0。
+def test_global_window_success_empty_selector():
+    """无任何观测 → (0, 0);tuner 据此得 sr=None,不参与成功率守卫。"""
+    assert _selector().global_window_success() == (0, 0)
+
+
+def test_global_window_success_counts_successes():
+    """全成功 → succ == total == 观测次数(且 domain=None 不重复计数)。"""
+    sel = _selector()
+    for _ in range(3):
+        sel.record_ttfb("p1", 0.01)
+    assert sel.global_window_success() == (3, 3)
+
+
+def test_global_window_success_sums_across_proxies():
+    """多代理求和:跨代理桶累加,互不覆盖;失败也计入分母。"""
+    sel = _selector()
+    sel.record_ttfb("p1", 0.01)
+    sel.record_ttfb("p1", 0.01)
+    sel.record_failure("p1", "timeout")
+    sel.record_ttfb("p2", 0.01)
+    assert sel.global_window_success() == (3, 4)      # 3 成功 / 4 总数
+
+
+def test_global_window_success_counts_5xx_as_failure():
+    """5xx 算失败:record_ttfb 已推的 1 被 record_http_error 改写成 0。"""
+    sel = _selector()
+    sel.record_ttfb("p1", 0.01)
+    sel.record_http_error("p1", 500)
+    assert sel.global_window_success() == (0, 1)
+
+
+def test_global_window_success_excludes_domain_buckets():
+    """只读全局桶:域名级观测不得被二次计入(否则分母翻倍、成功率被稀释)。"""
+    sel = _selector()
+    sel.record_ttfb("p1", 0.01, domain="a:443")
+    # 这一次观测同时写了全局桶与域名桶;聚合只应看到 1 条。
+    assert sel.global_window_success() == (1, 1)
+    assert len(sel._domain_metrics["a:443"]["p1"]["metrics"]["outcome_samples"]) == 1
+
+
+def test_global_window_success_is_window_bounded():
+    """测量的是「窗口」而非终身累计:每代理最多 _OBS_WINDOW 条(环形缓冲上限)。"""
+    sel = _selector()
+    for _ in range(_OBS_WINDOW + 50):
+        sel.record_ttfb("p1", 0.01)
+    assert sel.global_window_success() == (_OBS_WINDOW, _OBS_WINDOW)
+
+
+def test_global_window_success_tolerates_entries_without_metrics():
+    """健壮性:桶缺 metrics 键、或 outcome_samples 为空时跳过,不得抛错。
+
+    读取路径用 m.get("metrics", {}).get("outcome_samples") 兜底 —— 旧 DB 行或
+    异常构造的桶都可能没有这些键(restore 时会补,但聚合不应依赖它)。
+    """
+    sel = _selector()
+    sel.record_ttfb("p1", 0.01)
+    sel._proxy_metrics["ghost"] = {}                  # 无 "metrics" 键
+    sel._proxy_metrics["empty"] = {"metrics": {}}     # 有 metrics 但无 outcome_samples
+    assert sel.global_window_success() == (1, 1)
