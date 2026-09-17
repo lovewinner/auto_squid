@@ -186,7 +186,109 @@ class Router:
     生命周期:start() 开始监听 → handle_client 处理每个连接 → stop() 优雅关闭。
     """
 
-    def __init__(self, proxy_store: ProxyStore, listen_host: str = "0.0.0.0", listen_port: int = 10808, max_retries: int = 3, db_path: str = "auto_squid.db", cache_ttl: int = 600, enable_local_racing: bool = False, auth_enabled: bool = False, auth_username: str = "", auth_password: str = "", enable_http_cache: bool = True, http_cache_ttl: int = 60, http_cache_max_entries: int = 10_000, http_cache_max_bytes: int = 256 * 1024 * 1024, http_cache_stream_limit: int = 1 * 1024 * 1024, stickiness_enabled: bool = False, stickiness_ttl: int = 1800, stickiness_recheck_hits: int = 100, stickiness_max_entries: int = 100_000, sticky_probe_interval_sec: float = 0.0, sticky_probe_fanout: int = 2, stagger_start: bool = True, stagger_initial: int = 1, stagger_interval_ms: int = _STAGGER_DEFAULT_MS, probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT, probe_canary: str = _PROBE_CANARY_DEFAULT, probe_canaries: Optional[List[Dict[str, Any]]] = None, probe_with_get: bool = False, probe_get_targets: Optional[List[str]] = None, probe_get_interval_sec: float = 60.0, probe_get_timeout_sec: float = 5.0, probe_get_max_bytes: int = 65536, circuit_threshold: int = _CIRCUIT_THRESHOLD, circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF, slow_start_window: float = _SLOW_START_WINDOW, slow_start_success: int = _SLOW_START_SUCCESS, lb_bias: float = _LB_BIAS_DEFAULT, fail_penalty_weight: float = _FAIL_PENALTY_DEFAULT, single_send_degrade_fail: int = 0, single_send_degrade_ratio: float = 0.0, single_send_degrade_slack_ms: float = 0.0, single_send_degrade_success_rate: float = 0.0, single_send_degrade_p99_ms: float = 0.0, single_send_degrade_min_throughput: float = 0.0, single_send_slow_log_ms: float = 0.0, cost_sort_enabled: bool = True, cost_latency_metric: str = "p99", cost_weight_latency: float = 1.0, cost_weight_success_rate: float = 0.6, cost_weight_throughput: float = 0.1, cost_latency_min_samples: int = 1, cost_throughput_min_bytes: int = 1_000_000, auto_tune: Optional[AutoTuneConfig] = None, connect_tunnel_timeout_sec: float = 3.0, http_read_timeout_sec: float = 3.0, local_direct_domains: Optional[List[str]] = None, local_direct_timeout_sec: float = 10.0, policies: Optional[List[PolicyConfig]] = None, adaptive_ttl: bool = False, adaptive_ttl_min: float = 60.0, adaptive_ttl_max: float = 1800.0, switch_damping: bool = False, switch_damping_min_wins: int = 2, switch_damping_ratio: float = 0.8, switch_damping_abs_ms: float = 30.0, concurrency_limit_enabled: bool = False, concurrency_limit_initial: int = 16, concurrency_limit_min: int = 2, concurrency_limit_max: int = 128, concurrency_add_on_success: int = 4, concurrency_mult_on_failure: float = 0.5, concurrency_failure_window: int = 20, conn_pool_enabled: bool = False, conn_pool_per_proxy: int = 4, conn_pool_total: int = 64, conn_pool_idle_timeout: float = 30.0, conn_pool_refill_interval: float = 5.0, conn_pool_refill_target: int = 2, conn_pool_connect_timeout: float = 10.0, conn_pool_target_prewarm: bool = False, conn_pool_refill_pause_minutes: float = 60.0, conn_pool_refill_pause_silence_sec: float = 120.0, conn_pool_refill_pause_activity_window: Optional[float] = None, conn_pool_refill_pause_min_requests: int = 3, conn_pool_established_reuse: bool = False, conn_pool_established_idle_timeout: Optional[float] = None, conn_pool_prehandshake: bool = False, conn_pool_prehandshake_throttle_window_sec: float = 0.0, conn_pool_prehandshake_throttle_max_per_window: int = 0, cluster_predict: bool = False, cluster_window_sec: float = 2.0, cluster_predict_topk: int = 3, cluster_min_support: int = 2, cluster_graph_ttl_sec: int = 86400, cluster_graph_max_entries: int = 100_000, cluster_predict_throttle_sec: float = 30.0, cluster_proxy_fanout: int = 2, cluster_probe_decay_sec: float = 3600.0, cluster_pool_idle_timeout: float = 600.0, router_cfg: Optional[RouterConfig] = None):
+    def __init__(
+        self,
+        proxy_store: ProxyStore,
+        listen_host: str = "0.0.0.0",
+        listen_port: int = 10808,
+        max_retries: int = 3,
+        db_path: str = "auto_squid.db",
+        cache_ttl: int = 600,
+        enable_local_racing: bool = False,
+        auth_enabled: bool = False,
+        auth_username: str = "",
+        auth_password: str = "",
+        enable_http_cache: bool = True,
+        http_cache_ttl: int = 60,
+        http_cache_max_entries: int = 10_000,
+        http_cache_max_bytes: int = 256 * 1024 * 1024,
+        http_cache_stream_limit: int = 1 * 1024 * 1024,
+        stickiness_enabled: bool = False,
+        stickiness_ttl: int = 1800,
+        stickiness_recheck_hits: int = 100,
+        stickiness_max_entries: int = 100_000,
+        sticky_probe_interval_sec: float = 0.0,
+        sticky_probe_fanout: int = 2,
+        stagger_start: bool = True,
+        stagger_initial: int = 1,
+        stagger_interval_ms: int = _STAGGER_DEFAULT_MS,
+        probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT,
+        probe_canary: str = _PROBE_CANARY_DEFAULT,
+        probe_canaries: Optional[List[Dict[str, Any]]] = None,
+        probe_with_get: bool = False,
+        probe_get_targets: Optional[List[str]] = None,
+        probe_get_interval_sec: float = 60.0,
+        probe_get_timeout_sec: float = 5.0,
+        probe_get_max_bytes: int = 65536,
+        circuit_threshold: int = _CIRCUIT_THRESHOLD,
+        circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF,
+        slow_start_window: float = _SLOW_START_WINDOW,
+        slow_start_success: int = _SLOW_START_SUCCESS,
+        lb_bias: float = _LB_BIAS_DEFAULT,
+        fail_penalty_weight: float = _FAIL_PENALTY_DEFAULT,
+        single_send_degrade_fail: int = 0,
+        single_send_degrade_ratio: float = 0.0,
+        single_send_degrade_slack_ms: float = 0.0,
+        single_send_degrade_success_rate: float = 0.0,
+        single_send_degrade_p99_ms: float = 0.0,
+        single_send_degrade_min_throughput: float = 0.0,
+        single_send_slow_log_ms: float = 0.0,
+        cost_sort_enabled: bool = True,
+        cost_latency_metric: str = "p99",
+        cost_weight_latency: float = 1.0,
+        cost_weight_success_rate: float = 0.6,
+        cost_weight_throughput: float = 0.1,
+        cost_latency_min_samples: int = 1,
+        cost_throughput_min_bytes: int = 1_000_000,
+        auto_tune: Optional[AutoTuneConfig] = None,
+        connect_tunnel_timeout_sec: float = 3.0,
+        http_read_timeout_sec: float = 3.0,
+        local_direct_domains: Optional[List[str]] = None,
+        local_direct_timeout_sec: float = 10.0,
+        policies: Optional[List[PolicyConfig]] = None,
+        adaptive_ttl: bool = False,
+        adaptive_ttl_min: float = 60.0,
+        adaptive_ttl_max: float = 1800.0,
+        switch_damping: bool = False,
+        switch_damping_min_wins: int = 2,
+        switch_damping_ratio: float = 0.8,
+        switch_damping_abs_ms: float = 30.0,
+        concurrency_limit_enabled: bool = False,
+        concurrency_limit_initial: int = 16,
+        concurrency_limit_min: int = 2,
+        concurrency_limit_max: int = 128,
+        concurrency_add_on_success: int = 4,
+        concurrency_mult_on_failure: float = 0.5,
+        concurrency_failure_window: int = 20,
+        conn_pool_enabled: bool = False,
+        conn_pool_per_proxy: int = 4,
+        conn_pool_total: int = 64,
+        conn_pool_idle_timeout: float = 30.0,
+        conn_pool_refill_interval: float = 5.0,
+        conn_pool_refill_target: int = 2,
+        conn_pool_connect_timeout: float = 10.0,
+        conn_pool_target_prewarm: bool = False,
+        conn_pool_refill_pause_minutes: float = 60.0,
+        conn_pool_refill_pause_silence_sec: float = 120.0,
+        conn_pool_refill_pause_activity_window: Optional[float] = None,
+        conn_pool_refill_pause_min_requests: int = 3,
+        conn_pool_established_reuse: bool = False,
+        conn_pool_established_idle_timeout: Optional[float] = None,
+        conn_pool_prehandshake: bool = False,
+        conn_pool_prehandshake_throttle_window_sec: float = 0.0,
+        conn_pool_prehandshake_throttle_max_per_window: int = 0,
+        cluster_predict: bool = False,
+        cluster_window_sec: float = 2.0,
+        cluster_predict_topk: int = 3,
+        cluster_min_support: int = 2,
+        cluster_graph_ttl_sec: int = 86400,
+        cluster_graph_max_entries: int = 100_000,
+        cluster_predict_throttle_sec: float = 30.0,
+        cluster_proxy_fanout: int = 2,
+        cluster_probe_decay_sec: float = 3600.0,
+        cluster_pool_idle_timeout: float = 600.0,
+        router_cfg: Optional[RouterConfig] = None,
+    ):
         """构造路由器。
 
         参数:
@@ -398,7 +500,7 @@ class Router:
             cluster_pool_idle_timeout = pc.cluster_pool_idle_timeout
             policies = list(c.policies)
         self.proxy_store = proxy_store
-        self.selector = ProxySelector(
+        self._init_selector(
             proxy_store,
             circuit_threshold=circuit_threshold,
             circuit_max_backoff=circuit_max_backoff,
@@ -565,15 +667,14 @@ class Router:
         # 稳定;粘性代理失败则驱逐并回落竞速(redispatch)。仿 _meta_cache 模式,
         # 但不落盘(粘性是瞬态,重启即清)。决策链成员经 sticky 背引用(router)
         # 读取;self._degraded_single_send 以引用共享给 sticky 的降级判定。
-        self.sticky = StickyCache(
-            self,
+        self._init_sticky(
             enable_local_racing=enable_local_racing,
-            enabled=stickiness_enabled,
-            ttl=stickiness_ttl,
-            recheck_hits=stickiness_recheck_hits,
-            max_entries=stickiness_max_entries,
-            probe_interval_sec=sticky_probe_interval_sec,
-            probe_fanout=sticky_probe_fanout)
+            stickiness_enabled=stickiness_enabled,
+            stickiness_ttl=stickiness_ttl,
+            stickiness_recheck_hits=stickiness_recheck_hits,
+            stickiness_max_entries=stickiness_max_entries,
+            sticky_probe_interval_sec=sticky_probe_interval_sec,
+            sticky_probe_fanout=sticky_probe_fanout)
         # ── 策略路由(P1)───────────────────────────────────────
         # 按目标域名收窄候选代理集。不配置(policies 为空)→ 对所有 enabled
         # 代理统一竞速,等价旧行为。预编译正则避免每请求重编译;条目为
@@ -618,20 +719,26 @@ class Router:
         # 空闲超时 + 空闲暂停(refill_pause)。Router 对本对象做白名单转发
         # (__getattr__/__setattr__),使本构造函数 deleted 区域之外的
         # self._conn_pool / self.conn_pool_creates 等原样解析到 pools。
-        self.pools = ConnectionPools(
+        self._init_pools(
             proxy_store,
-            enabled=conn_pool_enabled, per_proxy=conn_pool_per_proxy, total=conn_pool_total,
-            idle_timeout=conn_pool_idle_timeout, refill_interval=conn_pool_refill_interval,
-            refill_target=conn_pool_refill_target, connect_timeout=conn_pool_connect_timeout,
-            target_prewarm=conn_pool_target_prewarm, established_reuse=conn_pool_established_reuse,
-            prehandshake=conn_pool_prehandshake,
-            pause_minutes=conn_pool_refill_pause_minutes, pause_silence_sec=conn_pool_refill_pause_silence_sec,
-            pause_activity_window=conn_pool_refill_pause_activity_window,
-            pause_min_requests=conn_pool_refill_pause_min_requests,
-            idle_timeout_cluster=cluster_pool_idle_timeout,
-            idle_timeout_established=conn_pool_established_idle_timeout,
-            prehandshake_throttle_window_sec=conn_pool_prehandshake_throttle_window_sec,
-            prehandshake_throttle_max_per_window=conn_pool_prehandshake_throttle_max_per_window)
+            conn_pool_enabled=conn_pool_enabled,
+            conn_pool_per_proxy=conn_pool_per_proxy,
+            conn_pool_total=conn_pool_total,
+            conn_pool_idle_timeout=conn_pool_idle_timeout,
+            conn_pool_refill_interval=conn_pool_refill_interval,
+            conn_pool_refill_target=conn_pool_refill_target,
+            conn_pool_connect_timeout=conn_pool_connect_timeout,
+            conn_pool_target_prewarm=conn_pool_target_prewarm,
+            conn_pool_established_reuse=conn_pool_established_reuse,
+            conn_pool_prehandshake=conn_pool_prehandshake,
+            conn_pool_refill_pause_minutes=conn_pool_refill_pause_minutes,
+            conn_pool_refill_pause_silence_sec=conn_pool_refill_pause_silence_sec,
+            conn_pool_refill_pause_activity_window=conn_pool_refill_pause_activity_window,
+            conn_pool_refill_pause_min_requests=conn_pool_refill_pause_min_requests,
+            cluster_pool_idle_timeout=cluster_pool_idle_timeout,
+            conn_pool_established_idle_timeout=conn_pool_established_idle_timeout,
+            conn_pool_prehandshake_throttle_window_sec=conn_pool_prehandshake_throttle_window_sec,
+            conn_pool_prehandshake_throttle_max_per_window=conn_pool_prehandshake_throttle_max_per_window)
 
         # ── 请求簇预测预热(ClusterGraph,#新增:观察见 _cluster_observe)──────
         # 全局共现图 + 客户端瞬态窗口(不超过 window_sec)。总闸 = conn_pool 第二
@@ -640,23 +747,81 @@ class Router:
         # 预测只走既有预建通道,受 conn_pool 门/fd 预算/空闲暂停约束,错预建 30s
         # 自动回收;并用 source='cluster' 给预测预建打上专属归因标签(被动预建
         # 调用的裸 _spawn_target_prewarm 走默认 source='passive',见其签名)。
-        self.cluster = ClusterGraph(
+        self._init_cluster(
             proxy_store,
-            enabled=(cluster_predict and conn_pool_enabled and conn_pool_target_prewarm),
-            window_sec=cluster_window_sec,
-            predict_topk=cluster_predict_topk,
-            min_support=cluster_min_support,
-            ttl_sec=cluster_graph_ttl_sec,
-            max_entries=cluster_graph_max_entries,
-            throttle_sec=cluster_predict_throttle_sec,
-            proxy_fanout=cluster_proxy_fanout,
-            probe_decay_sec=cluster_probe_decay_sec,
-            prewarm_spawn=lambda h, p, t: self._spawn_target_prewarm(h, p, t, source='cluster'),
-            # 熔断感知:摊桶跳过熔断退避期内的代理(退避期内连不上,预建白建 → bucket_miss)。
-            # 与竞速路径同一判定(is_circuit_open),保持"预测桶=竞速可用桶"一致。
-            is_circuit_open=self.selector.is_circuit_open)
+            cluster_predict=cluster_predict,
+            conn_pool_enabled=conn_pool_enabled,
+            conn_pool_target_prewarm=conn_pool_target_prewarm,
+            cluster_window_sec=cluster_window_sec,
+            cluster_predict_topk=cluster_predict_topk,
+            cluster_min_support=cluster_min_support,
+            cluster_graph_ttl_sec=cluster_graph_ttl_sec,
+            cluster_graph_max_entries=cluster_graph_max_entries,
+            cluster_predict_throttle_sec=cluster_predict_throttle_sec,
+            cluster_proxy_fanout=cluster_proxy_fanout,
+            cluster_probe_decay_sec=cluster_probe_decay_sec)
 
         # ── 数据持久化 ──────────────────────────────────────────
+        self._init_persistence(db_path, auto_tune)
+
+        # 内存镜像:热路径(每请求查域名缓存)只读这两份内存,不经 DB/锁。
+        # _meta_cache: {domain: {'default_proxy': pid, 'updated_at': ts}}
+        # _stats_cache: {domain: {pid: wins}}(内存累加,后台 flush 落盘)
+        self._meta_cache: dict[str, dict[str, str]] = {}
+        self._stats_cache: dict[str, dict[str, int]] = {}
+        # ── 自适应域名缓存 TTL(P2)──────────────────────────────
+        # 每域名独立 TTL,按稳定度升降(见 _domain_ttl)。状态与 _meta_cache
+        # 并列维护:meta 负责"当前赢家/时间",这里负责"该域名缓存多久过期"。
+        # 稳定域名 TTL 上浮(减少竞速),抖动域名 TTL 下调(更快换路)。
+        self._domain_ttl_cache: dict[str, float] = {}      # domain -> 当前 TTL(秒)
+        self._domain_switch_count: dict[str, int] = {}     # domain -> 切换赢家次数
+        self._domain_last_pid: dict[str, str] = {}         # domain -> 上次赢家 pid
+        self.domain_ttl_grows = 0       # TTL 上调次数(可观测)
+        self.domain_ttl_resets = 0      # TTL 下调/重置次数(可观测)
+        self._load_caches_from_db()
+        # _stats_dirty / _meta_dirty 标记自上次 flush 后是否有变更。
+        self._stats_dirty = False
+        self._meta_dirty = False
+        self._flush_task: Optional[asyncio.Task] = None
+        # 竞速中"败者清理"(aclose 流式 resp / 关上游裸连接)被下放到后台 task,
+        # 不阻塞赢家首字节(见 _race / _drain_losers)。stop() 收尾时排空,防泄漏。
+        self._pending_cleanups: set = set()
+
+        # ── HTTP 响应缓存(HttpCache,#14)────────────────────────
+        # 缓存(_http_cache/配置/二级索引/LRU/在途聚合)已随 #14 拆分搬入
+        # HttpCache(self.httpcache),经类尾 _CACHE_FORWARD 白名单 __getattr__/
+        # __setattr__ 转发。http_cache_hits/misses 计数留在 Router(在上方初始化,
+        # flow 直接自增,snapshot_counters 直读)。enable_http_cache 门随类单源。
+        self._init_http_cache(
+            enable_http_cache=enable_http_cache,
+            http_cache_ttl=http_cache_ttl,
+            http_cache_max_entries=http_cache_max_entries,
+            http_cache_max_bytes=http_cache_max_bytes,
+            http_cache_stream_limit=http_cache_stream_limit)
+
+    def _init_http_cache(self, enable_http_cache: bool, http_cache_ttl: int,
+                         http_cache_max_entries: int, http_cache_max_bytes: int,
+                         http_cache_stream_limit: int) -> None:
+        """构造 HTTP 响应缓存协作对象 self.httpcache(HttpCache)。
+
+        入参即 __init__ 中同名的 http_cache.* 配置项,未经钳制直接透传
+        (钳制逻辑在 HttpCache 内部,与拆分前一致)。
+        """
+        self.httpcache = HttpCache(
+            enable_http_cache=enable_http_cache,
+            ttl=http_cache_ttl,
+            max_entries=http_cache_max_entries,
+            max_bytes=http_cache_max_bytes,
+            stream_limit=http_cache_stream_limit)
+
+    def _init_persistence(self, db_path: str, auto_tune) -> None:
+        """打开 SQLite(建表+迁移)、建 DB 写锁,并构造自动调参器 self.tuner。
+
+        - db_path:  持久化文件路径,原样透传给 sqlite3.connect(不钳制)。
+        - auto_tune: AutoTuneConfig;None 时取默认 AutoTuneConfig()。
+        顺序敏感:AutoTuner 依赖 self.selector(此前已构造)、self._db 与
+        self._db_lock(本方法内创建),故必须在建表之后执行。
+        """
         self._db_path = db_path
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         # WAL 模式 + synchronous=NORMAL:热路径已不 commit,后台 flush 是低频
@@ -670,6 +835,24 @@ class Router:
         # 热路径(转发)只读写下方内存缓存,不经此锁。
         self._db_lock = threading.Lock()
         self._metrics_dirty = False
+        self._init_schema()
+
+        # ── Cost 权重自动调参器(P1,默认关闭) ──────────────────────
+        # 需 db/_db_lock(持久化基线)与 selector(读写权重),故在两者就绪后构造。
+        # 注意:enabled 时 _restore 可能已把持久化的基线权重写回 selector
+        # (覆盖 config 里的 cost_weight_*);start() 才真正启动后台调参循环。
+        if auto_tune is None:
+            auto_tune = AutoTuneConfig()
+        self.tuner = AutoTuner(self.selector, self._db, self._db_lock, auto_tune)
+
+    def _init_schema(self) -> None:
+        """建表(domain_stats/domain_meta/proxy_metrics/domain_metrics/tuner_state)。
+
+        另含一次性列迁移:老库 domain_meta 缺 ref_ewma 列(GOAL #6 之前),
+        CREATE TABLE IF NOT EXISTS 不给既有表补列,故用 PRAGMA 检查后 ALTER,
+        保证既有部署升级后启动不崩(老行 ref_ewma 为 NULL,按"无基线"处理)。
+        需 self._db 已就绪。
+        """
         # 热路径(转发)只读写下方内存缓存,不经此锁。
         self._db.execute("""
             CREATE TABLE IF NOT EXISTS domain_stats (
@@ -722,48 +905,141 @@ class Router:
             self._db.execute("ALTER TABLE domain_meta ADD COLUMN ref_ewma REAL")
         self._db.commit()
 
-        # ── Cost 权重自动调参器(P1,默认关闭) ──────────────────────
-        # 需 db/_db_lock(持久化基线)与 selector(读写权重),故在两者就绪后构造。
-        # 注意:enabled 时 _restore 可能已把持久化的基线权重写回 selector
-        # (覆盖 config 里的 cost_weight_*);start() 才真正启动后台调参循环。
-        if auto_tune is None:
-            auto_tune = AutoTuneConfig()
-        self.tuner = AutoTuner(self.selector, self._db, self._db_lock, auto_tune)
+    def _init_cluster(self, proxy_store: ProxyStore, *, cluster_predict: bool,
+                      conn_pool_enabled: bool, conn_pool_target_prewarm: bool,
+                      cluster_window_sec: float, cluster_predict_topk: int,
+                      cluster_min_support: int, cluster_graph_ttl_sec: float,
+                      cluster_graph_max_entries: int, cluster_predict_throttle_sec: float,
+                      cluster_proxy_fanout: int, cluster_probe_decay_sec: float) -> None:
+        """构造请求簇预测预热对象 self.cluster(ClusterGraph)。
 
-        # 内存镜像:热路径(每请求查域名缓存)只读这两份内存,不经 DB/锁。
-        # _meta_cache: {domain: {'default_proxy': pid, 'updated_at': ts}}
-        # _stats_cache: {domain: {pid: wins}}(内存累加,后台 flush 落盘)
-        self._meta_cache: dict[str, dict[str, str]] = {}
-        self._stats_cache: dict[str, dict[str, int]] = {}
-        # ── 自适应域名缓存 TTL(P2)──────────────────────────────
-        # 每域名独立 TTL,按稳定度升降(见 _domain_ttl)。状态与 _meta_cache
-        # 并列维护:meta 负责"当前赢家/时间",这里负责"该域名缓存多久过期"。
-        # 稳定域名 TTL 上浮(减少竞速),抖动域名 TTL 下调(更快换路)。
-        self._domain_ttl_cache: dict[str, float] = {}      # domain -> 当前 TTL(秒)
-        self._domain_switch_count: dict[str, int] = {}     # domain -> 切换赢家次数
-        self._domain_last_pid: dict[str, str] = {}         # domain -> 上次赢家 pid
-        self.domain_ttl_grows = 0       # TTL 上调次数(可观测)
-        self.domain_ttl_resets = 0      # TTL 下调/重置次数(可观测)
-        self._load_caches_from_db()
-        # _stats_dirty / _meta_dirty 标记自上次 flush 后是否有变更。
-        self._stats_dirty = False
-        self._meta_dirty = False
-        self._flush_task: Optional[asyncio.Task] = None
-        # 竞速中"败者清理"(aclose 流式 resp / 关上游裸连接)被下放到后台 task,
-        # 不阻塞赢家首字节(见 _race / _drain_losers)。stop() 收尾时排空,防泄漏。
-        self._pending_cleanups: set = set()
+        - 总闸 enabled = cluster_predict 且 conn_pool 已启用且开启目标预连接三者同时成立
+          (任一不满足则该图 observe 近乎空操作,不产生状态)。
+        - prewarm_spawn 绑定到 Router._spawn_target_prewarm 并标 source='cluster',
+          使预测预建走既有通道、受 fd 预算与空闲暂停约束。
+        - is_circuit_open 复用 self.selector 的判定,保证"预测桶 = 竞速可用桶"。
 
-        # ── HTTP 响应缓存(HttpCache,#14)────────────────────────
-        # 缓存(_http_cache/配置/二级索引/LRU/在途聚合)已随 #14 拆分搬入
-        # HttpCache(self.httpcache),经类尾 _CACHE_FORWARD 白名单 __getattr__/
-        # __setattr__ 转发。http_cache_hits/misses 计数留在 Router(在上方初始化,
-        # flow 直接自增,snapshot_counters 直读)。enable_http_cache 门随类单源。
-        self.httpcache = HttpCache(
-            enable_http_cache=enable_http_cache,
-            ttl=http_cache_ttl,
-            max_entries=http_cache_max_entries,
-            max_bytes=http_cache_max_bytes,
-            stream_limit=http_cache_stream_limit)
+        顺序敏感:依赖 self.selector(此前已构造)与 self._spawn_target_prewarm。
+        """
+        self.cluster = ClusterGraph(
+            proxy_store,
+            enabled=(cluster_predict and conn_pool_enabled and conn_pool_target_prewarm),
+            window_sec=cluster_window_sec,
+            predict_topk=cluster_predict_topk,
+            min_support=cluster_min_support,
+            ttl_sec=cluster_graph_ttl_sec,
+            max_entries=cluster_graph_max_entries,
+            throttle_sec=cluster_predict_throttle_sec,
+            proxy_fanout=cluster_proxy_fanout,
+            probe_decay_sec=cluster_probe_decay_sec,
+            prewarm_spawn=lambda h, p, t: self._spawn_target_prewarm(h, p, t, source='cluster'),
+            # 熔断感知:摊桶跳过熔断退避期内的代理(退避期内连不上,预建白建 → bucket_miss)。
+            # 与竞速路径同一判定(is_circuit_open),保持"预测桶=竞速可用桶"一致。
+            is_circuit_open=self.selector.is_circuit_open)
+
+    def _init_selector(self, proxy_store: ProxyStore, *, circuit_threshold: int,
+                       circuit_max_backoff: float, slow_start_window: float,
+                       slow_start_success: int, lb_bias: float,
+                       fail_penalty_weight: float, concurrency_limit_enabled: bool,
+                       concurrency_limit_initial: int, concurrency_limit_min: int,
+                       concurrency_limit_max: int, concurrency_add_on_success: int,
+                       concurrency_mult_on_failure: float, concurrency_failure_window: int,
+                       cost_sort_enabled: bool, cost_latency_metric: str,
+                       cost_weight_latency: float, cost_weight_success_rate: float,
+                       cost_weight_throughput: float, cost_latency_min_samples: int,
+                       cost_throughput_min_bytes: int) -> None:
+        """构造代理选择器协作对象 self.selector(ProxySelector)。
+
+        职责:熔断器参数、slow-start 恢复参数、加权 least-request 的 lb_bias /
+        失败惩罚,以及可选的自适应并发上限与多目标 Cost 排序权重。它是竞速排序
+        的唯一数据源,也是后续 ConnectionPools / ClusterGraph / AutoTuner 的依赖。
+
+        入参即 __init__ 中同名的 circuit.* / concurrency_limit.* / cost_* 配置项,
+        未经钳制直接透传(钳制在 ProxySelector 内部)。
+        """
+        self.selector = ProxySelector(
+            proxy_store,
+            circuit_threshold=circuit_threshold,
+            circuit_max_backoff=circuit_max_backoff,
+            slow_start_window=slow_start_window,
+            slow_start_success=slow_start_success,
+            lb_bias=lb_bias,
+            fail_penalty_weight=fail_penalty_weight,
+            concurrency_limit_enabled=concurrency_limit_enabled,
+            concurrency_limit_initial=concurrency_limit_initial,
+            concurrency_limit_min=concurrency_limit_min,
+            concurrency_limit_max=concurrency_limit_max,
+            concurrency_add_on_success=concurrency_add_on_success,
+            concurrency_mult_on_failure=concurrency_mult_on_failure,
+            concurrency_failure_window=concurrency_failure_window,
+            cost_sort_enabled=cost_sort_enabled,
+            cost_latency_metric=cost_latency_metric,
+            cost_weight_latency=cost_weight_latency,
+            cost_weight_success_rate=cost_weight_success_rate,
+            cost_weight_throughput=cost_weight_throughput,
+            cost_latency_min_samples=cost_latency_min_samples,
+            cost_throughput_min_bytes=cost_throughput_min_bytes)
+
+    def _init_sticky(self, *, enable_local_racing: bool, stickiness_enabled: bool,
+                     stickiness_ttl: int, stickiness_recheck_hits: int,
+                     stickiness_max_entries: int, sticky_probe_interval_sec: float,
+                     sticky_probe_fanout: int) -> None:
+        """构造会话粘性协作对象 self.sticky(StickyCache)。
+
+        以 self(Router)为背引用,使粘性决策链可回调 Router 的降级判定;共享
+        self._degraded_single_send 集合(在调用点之前已初始化)。粘性表纯内存、
+        滑动 TTL,不落盘(重启即清)。
+
+        入参即 __init__ 中同名的 stickiness.* / sticky_probe_* 配置项。
+        """
+        self.sticky = StickyCache(
+            self,
+            enable_local_racing=enable_local_racing,
+            enabled=stickiness_enabled,
+            ttl=stickiness_ttl,
+            recheck_hits=stickiness_recheck_hits,
+            max_entries=stickiness_max_entries,
+            probe_interval_sec=sticky_probe_interval_sec,
+            probe_fanout=sticky_probe_fanout)
+
+    def _init_pools(self, proxy_store: ProxyStore, *, conn_pool_enabled: bool,
+                    conn_pool_per_proxy: int, conn_pool_total: int,
+                    conn_pool_idle_timeout: float, conn_pool_refill_interval: float,
+                    conn_pool_refill_target: int, conn_pool_connect_timeout: float,
+                    conn_pool_target_prewarm: bool, conn_pool_established_reuse: bool,
+                    conn_pool_prehandshake: bool, conn_pool_refill_pause_minutes: float,
+                    conn_pool_refill_pause_silence_sec: float,
+                    conn_pool_refill_pause_activity_window: Optional[float],
+                    conn_pool_refill_pause_min_requests: int,
+                    cluster_pool_idle_timeout: float,
+                    conn_pool_established_idle_timeout: Optional[float],
+                    conn_pool_prehandshake_throttle_window_sec: float,
+                    conn_pool_prehandshake_throttle_max_per_window: int) -> None:
+        """构造 CONNECT 上游连接池协作对象 self.pools(ConnectionPools)。
+
+        统一承载三个池:通用预热池、目标半预连接池、已建握手复用池,共享全局 fd
+        预算 / 空闲超时 / 空闲暂停(refill_pause)。Router 之后对该对象的成员做
+        白名单转发(__getattr__/__setattr__),故 self.pools 必须在任何 _POOL_FORWARD
+        名被赋值之前就位。
+
+        入参即 __init__ 中同名的 conn_pool.* / cluster_pool_idle_timeout 配置项,
+        未经钳制直接透传(钳制在 ConnectionPools 内部)。
+        """
+        self.pools = ConnectionPools(
+            proxy_store,
+            enabled=conn_pool_enabled, per_proxy=conn_pool_per_proxy, total=conn_pool_total,
+            idle_timeout=conn_pool_idle_timeout, refill_interval=conn_pool_refill_interval,
+            refill_target=conn_pool_refill_target, connect_timeout=conn_pool_connect_timeout,
+            target_prewarm=conn_pool_target_prewarm, established_reuse=conn_pool_established_reuse,
+            prehandshake=conn_pool_prehandshake,
+            pause_minutes=conn_pool_refill_pause_minutes,
+            pause_silence_sec=conn_pool_refill_pause_silence_sec,
+            pause_activity_window=conn_pool_refill_pause_activity_window,
+            pause_min_requests=conn_pool_refill_pause_min_requests,
+            idle_timeout_cluster=cluster_pool_idle_timeout,
+            idle_timeout_established=conn_pool_established_idle_timeout,
+            prehandshake_throttle_window_sec=conn_pool_prehandshake_throttle_window_sec,
+            prehandshake_throttle_max_per_window=conn_pool_prehandshake_throttle_max_per_window)
 
     # ── DB helpers ──────────────────────────────────────────────
 
