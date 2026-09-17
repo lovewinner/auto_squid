@@ -189,29 +189,36 @@ class Router:
     def __init__(
         self,
         proxy_store: ProxyStore,
+        *,
+        # ── 监听 / 持久化 / 竞速基础 ──
         listen_host: str = "0.0.0.0",
         listen_port: int = 10808,
         max_retries: int = 3,
         db_path: str = "auto_squid.db",
         cache_ttl: int = 600,
         enable_local_racing: bool = False,
+        # ── 客户端认证(HTTP Basic) ──
         auth_enabled: bool = False,
         auth_username: str = "",
         auth_password: str = "",
+        # ── HTTP 响应缓存 ──
         enable_http_cache: bool = True,
         http_cache_ttl: int = 60,
         http_cache_max_entries: int = 10_000,
         http_cache_max_bytes: int = 256 * 1024 * 1024,
         http_cache_stream_limit: int = 1 * 1024 * 1024,
+        # ── 会话粘性 ──
         stickiness_enabled: bool = False,
         stickiness_ttl: int = 1800,
         stickiness_recheck_hits: int = 100,
         stickiness_max_entries: int = 100_000,
         sticky_probe_interval_sec: float = 0.0,
         sticky_probe_fanout: int = 2,
+        # ── 错峰启动(RFC 8305 §5) ──
         stagger_start: bool = True,
         stagger_initial: int = 1,
         stagger_interval_ms: int = _STAGGER_DEFAULT_MS,
+        # ── 后台探活 / 多 canary ──
         probe_interval_sec: float = _PROBE_INTERVAL_DEFAULT,
         probe_canary: str = _PROBE_CANARY_DEFAULT,
         probe_canaries: Optional[List[Dict[str, Any]]] = None,
@@ -220,12 +227,14 @@ class Router:
         probe_get_interval_sec: float = 60.0,
         probe_get_timeout_sec: float = 5.0,
         probe_get_max_bytes: int = 65536,
+        # ── 熔断 / slow-start / 失败惩罚 ──
         circuit_threshold: int = _CIRCUIT_THRESHOLD,
         circuit_max_backoff: float = _CIRCUIT_MAX_BACKOFF,
         slow_start_window: float = _SLOW_START_WINDOW,
         slow_start_success: int = _SLOW_START_SUCCESS,
         lb_bias: float = _LB_BIAS_DEFAULT,
         fail_penalty_weight: float = _FAIL_PENALTY_DEFAULT,
+        # ── 单发降级 / 慢单发采样 ──
         single_send_degrade_fail: int = 0,
         single_send_degrade_ratio: float = 0.0,
         single_send_degrade_slack_ms: float = 0.0,
@@ -233,6 +242,7 @@ class Router:
         single_send_degrade_p99_ms: float = 0.0,
         single_send_degrade_min_throughput: float = 0.0,
         single_send_slow_log_ms: float = 0.0,
+        # ── Cost 多目标排序 / 自动调参 ──
         cost_sort_enabled: bool = True,
         cost_latency_metric: str = "p99",
         cost_weight_latency: float = 1.0,
@@ -241,18 +251,24 @@ class Router:
         cost_latency_min_samples: int = 1,
         cost_throughput_min_bytes: int = 1_000_000,
         auto_tune: Optional[AutoTuneConfig] = None,
+        # ── 请求路径超时 ──
         connect_tunnel_timeout_sec: float = 3.0,
         http_read_timeout_sec: float = 3.0,
+        # ── 本地域名强制直连白名单 ──
         local_direct_domains: Optional[List[str]] = None,
         local_direct_timeout_sec: float = 10.0,
+        # ── 策略路由 ──
         policies: Optional[List[PolicyConfig]] = None,
+        # ── 自适应域名缓存 TTL ──
         adaptive_ttl: bool = False,
         adaptive_ttl_min: float = 60.0,
         adaptive_ttl_max: float = 1800.0,
+        # ── 域名赢家切换阻尼 ──
         switch_damping: bool = False,
         switch_damping_min_wins: int = 2,
         switch_damping_ratio: float = 0.8,
         switch_damping_abs_ms: float = 30.0,
+        # ── 自适应并发限制 ──
         concurrency_limit_enabled: bool = False,
         concurrency_limit_initial: int = 16,
         concurrency_limit_min: int = 2,
@@ -260,6 +276,7 @@ class Router:
         concurrency_add_on_success: int = 4,
         concurrency_mult_on_failure: float = 0.5,
         concurrency_failure_window: int = 20,
+        # ── CONNECT 连接池 / 请求簇预测 ──
         conn_pool_enabled: bool = False,
         conn_pool_per_proxy: int = 4,
         conn_pool_total: int = 64,
@@ -287,6 +304,7 @@ class Router:
         cluster_proxy_fanout: int = 2,
         cluster_probe_decay_sec: float = 3600.0,
         cluster_pool_idle_timeout: float = 600.0,
+        # ── 配置整体入口 ──
         router_cfg: Optional[RouterConfig] = None,
     ):
         """构造路由器。

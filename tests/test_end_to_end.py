@@ -19,6 +19,7 @@ from auto_squid.router import (
 from auto_squid.cluster import ClusterGraph
 from auto_squid.config_schema import (
     ProxyInfo, PolicyConfig, Config, RouterConfig, ConnPoolConfig, LoggingConfig,
+    ConfigBase, PolicyMatchConfig, ProbeCanaryConfig,
 )
 from auto_squid.auth import check_auth
 from auto_squid.api import app as api_app, mount
@@ -5953,6 +5954,160 @@ class TestRouterConfigPassThrough:
             assert r.pools.conn_pool_creates == 7 and r.conn_pool_creates == 7
         finally:
             r._db.close()
+
+    # ── 传播完整性栅栏(方案 B-1)────────────────────────────────────
+    # RouterConfig 的字段清单实际写在两处:① __init__ 签名默认值;② `if router_cfg
+    # is not None:` 的逐字段重绑定。新增字段若漏了 ②,生产路径(cli.py 传 router_cfg)
+    # 会静默忽略该字段,而测试路径(散装 kwargs)却正常生效 —— 这种"只漏一边"的失效
+    # 靠下面这个测试钉死:逐个叶子字段改值,断言 Router 状态必然发生变化。
+
+    # 指纹比对时忽略的不稳定键(单调时钟)与不可比对象(连接/锁/task)
+    _FP_IGNORE_KEYS = frozenset({"_last_request_activity", "_updated_mono", "_db"})
+    _FP_OPAQUE_TYPES = frozenset({
+        "AsyncClient", "Connection", "Lock", "Task", "AbstractServer",
+        "Selector", "DefaultSelector", "EpollSelector", "TextIOWrapper",
+        "module", "Logger", "RLock", "Condition", "Semaphore"})
+
+    @classmethod
+    def _fingerprint(cls, obj, depth=0, seen=None):
+        """把 Router 状态递归归一化成可比较结构(跳过单调时钟与不可比对象)。"""
+        if seen is None:
+            seen = set()
+        if depth > 6 or obj is None or isinstance(obj, (bool, int, float, str)):
+            return obj
+        if isinstance(obj, (bytes, bytearray)):
+            return f"<bytes:{len(obj)}>"
+        if id(obj) in seen:
+            return "<cycle>"
+        type_name = type(obj).__name__
+        if type_name in cls._FP_OPAQUE_TYPES:
+            return f"<opaque:{type_name}>"
+        if isinstance(obj, dict):
+            seen = seen | {id(obj)}
+            return {str(k): cls._fingerprint(v, depth + 1, seen)
+                    for k, v in sorted(obj.items(), key=lambda kv: str(kv[0]))}
+        if isinstance(obj, (list, tuple)):
+            seen = seen | {id(obj)}
+            return [cls._fingerprint(v, depth + 1, seen) for v in obj]
+        if isinstance(obj, (set, frozenset)):
+            return ["<set>"] + sorted(str(x) for x in obj)
+        if hasattr(obj, "__dict__"):
+            seen = seen | {id(obj)}
+            return {"__type__": type_name,
+                    **{k: cls._fingerprint(v, depth + 1, seen)
+                       for k, v in sorted(vars(obj).items())
+                       if k not in cls._FP_IGNORE_KEYS}}
+        return f"<{type_name}>"
+
+    @staticmethod
+    def _rich_cfg() -> RouterConfig:
+        """所有功能闸门都打开、且彼此一致的基座配置。
+
+        闸门(batch/总开关)关着时,某些字段(如 conn_pool.cluster_predict)无法在
+        派生状态里体现,会被误判为"未传播"。基座全部打开即可让每个字段可观测。
+        """
+        c = RouterConfig()
+        c.max_retries = 10
+        c.stagger_initial = 2
+        c.enable_local_racing = True
+        c.circuit.probe_with_get = True
+        c.circuit.cost_sort_enabled = True
+        c.auth.enabled = True
+        c.stickiness.enabled = True
+        c.http_cache.enabled = True
+        c.adaptive_ttl.enabled = True
+        c.adaptive_ttl.min_sec, c.adaptive_ttl.max_sec = 10.0, 900.0
+        c.switch_damping.enabled = True
+        c.concurrency_limit.enabled = True
+        c.concurrency_limit.min, c.concurrency_limit.initial, c.concurrency_limit.max = 1, 16, 128
+        c.conn_pool.enabled = True
+        c.conn_pool.target_prewarm = True
+        c.conn_pool.cluster_predict = True
+        c.conn_pool.established_reuse = True
+        c.conn_pool.prehandshake = True
+        c.auto_tune.enabled = True
+        return c
+
+    @classmethod
+    def _leaf_paths(cls, cfg, prefix=""):
+        """枚举 RouterConfig 的全部叶子字段,返回 [(点分路径, 当前值), ...]。"""
+        out = []
+        for name in type(cfg).model_fields:
+            val = getattr(cfg, name)
+            path = f"{prefix}{name}"
+            if isinstance(val, ConfigBase):
+                out.extend(cls._leaf_paths(val, path + "."))
+            else:
+                out.append((path, val))
+        return out
+
+    @staticmethod
+    def _mutate_leaf(cfg, path: str, val) -> None:
+        """把某个叶子字段改成"必然不同于当前默认"的值。
+
+        直接属性赋值(不经构造)以绕过 #12 的跨字段硬校验 —— 本测试只验证"字段是否
+        传播",不验证"取值是否合法",故不能让校验拦截这些刻意的扰动值。
+        """
+        obj = cfg
+        for part in path.split(".")[:-1]:
+            obj = getattr(obj, part)
+        leaf = path.split(".")[-1]
+        if path == "circuit.cost_latency_metric":
+            # 枚举字段:切到另一个合法值(非法串会被 selector 兜底回默认 → 观测不到变化)
+            new = "ewma" if val == "p99" else "p99"
+        elif isinstance(val, bool):
+            new = not val
+        elif isinstance(val, int):
+            new = val + 7
+        elif isinstance(val, float):
+            new = val + 3.5
+        elif isinstance(val, str):
+            new = (val + "_sent") if val else "sent"
+        elif val is None:
+            new = 7.5
+        elif path == "local_direct_domains":
+            new = val + ["sentinel.example"]
+        elif path == "circuit.probe_get_targets":
+            new = val + ["https://sentinel.example/"]
+        elif path == "circuit.probe_canaries":
+            new = val + [ProbeCanaryConfig(target="sentinel.example:443")]
+        elif path == "policies":
+            new = val + [PolicyConfig(match=PolicyMatchConfig(domain_exact=["sentinel.example"]))]
+        else:
+            raise AssertionError(
+                f"未覆盖的叶子字段类型: {path} = {val!r} ({type(val).__name__})")
+        setattr(obj, leaf, new)
+
+    def test_every_router_cfg_field_propagates(self):
+        """RouterConfig 每个叶子字段都必须真实传播到 Router 状态(漏绑定栅栏)。
+
+        覆盖现有 test_router_cfg_equals_kwargs 的盲区:后者只手工比对约 20 个属性,
+        其余字段漏绑定不会被发现。
+
+        作用域:本测试证明"该字段确实影响了 Router 状态",不证明"影响落到了正确的
+        属性上"(目的地正确性由 test_router_cfg_equals_kwargs 的显式属性比对覆盖)。
+        两者互补:前者防"漏绑定",后者防"绑错地方"。
+        """
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host=HOST, port=31991))
+
+        def build(cfg: RouterConfig) -> Router:
+            return Router(store, listen_host='127.0.0.1', listen_port=10809,
+                          db_path=':memory:', router_cfg=cfg)
+
+        leaves = self._leaf_paths(self._rich_cfg())
+        assert leaves, "RouterConfig 未枚举到任何叶子字段,测试自身失效"
+
+        base = self._fingerprint(build(self._rich_cfg()))
+        leaked = []
+        for path, val in leaves:
+            cfg = self._rich_cfg()
+            self._mutate_leaf(cfg, path, val)
+            if self._fingerprint(build(cfg)) == base:
+                leaked.append(path)
+        assert not leaked, (
+            f"以下 {len(leaked)} 个 RouterConfig 字段改动后 Router 状态无任何变化,"
+            f"疑似 __init__ 漏绑定(生产路径会静默忽略): {leaked}")
 
 
 class TestRaceStaggeredCleanupOnAllFail:
