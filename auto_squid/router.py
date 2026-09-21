@@ -2448,6 +2448,25 @@ class Router:
         except (BrokenPipeError, ConnectionError, OSError):
             pass
 
+    @staticmethod
+    async def _write_connect_502(client_writer) -> None:
+        """给 CONNECT 客户端回 502 裸响应并关闭连接。
+
+        必须传 **client_writer**:CONNECT 路径下 `_dispatch_single` 的 `writer`
+        参数恒为 None(见 _handle_connect 的调用点),误传会在 None 上 write。
+        写失败/关闭失败都静默——客户端可能已断开,不应因此再抛错。
+        """
+        try:
+            client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n\r\nBad Gateway")
+            await client_writer.drain()
+        except Exception:
+            pass
+        try:
+            client_writer.close()
+            await client_writer.wait_closed()
+        except Exception:
+            pass
+
     # ── HTTP 请求 ──────────────────────────────────────────────
 
     async def _try_http(self, pid: str, proxy_url: Optional[str], method: str, url: str, headers: dict, body: Optional[bytes], domain: Optional[str] = None, relaxed: bool = False, client_ip: str = ""):
@@ -3432,7 +3451,15 @@ class Router:
             else:
                 proxies = []
         if not proxies:
-            await self._write_cached_response(writer, 502, 'Bad Gateway', {'Content-Type': 'text/plain'}, b'Bad Gateway')
+            # proto 分派:HTTP 用 writer 走缓存式回写;CONNECT 的 writer 恒为 None
+            # (见 _handle_connect 调用点),必须走 client_writer —— 否则 None.write
+            # 抛 AttributeError,把"没有可用代理"变成服务端崩溃 + 客户端连接重置
+            # (2026-09-17 生产日志:全代理熔断 + 策略未允许 local 时触发)。
+            if proto == 'http':
+                await self._write_cached_response(writer, 502, 'Bad Gateway',
+                                                  {'Content-Type': 'text/plain'}, b'Bad Gateway')
+            else:
+                await self._write_connect_502(client_writer)
             return None
 
         # 计数:进入竞速(首批)。兜底批单独再 +1,故 invocations 可能 > 请求数。
@@ -3524,16 +3551,7 @@ class Router:
         if proto == 'http':
             await self._write_cached_response(writer, 502, 'Bad Gateway', {'Content-Type': 'text/plain'}, b'Bad Gateway')
         else:
-            try:
-                client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n\r\nBad Gateway")
-                await client_writer.drain()
-            except Exception:
-                pass
-            try:
-                client_writer.close()
-                await client_writer.wait_closed()
-            except Exception:
-                pass
+            await self._write_connect_502(client_writer)
         return None
 
     async def _stream_upstream_response(self, client_writer, resp, method: str, url: str) -> Optional[bytes]:

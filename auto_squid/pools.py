@@ -502,9 +502,13 @@ class ConnectionPools:
             made += 1
             total_idle += 1
         if made:
-            logger.info("target prewarm CREATED %d conn(s) for %s via %s:%s (creates=%d, size=%d)",
-                        made, target, proxy_host, proxy_port,
-                        self.target_pool_creates, len(self._target_pool.get(key, [])))
+            # DEBUG:预建是"每次命中/胜出都会发生"的常规后台事件,不是异常。实测
+            # 生产 10 天日志里这一类占全部日志约 30%(单条最高),把真信号(失败/
+            # STALE/熔断)淹没。池的常规命中/未命中本就在 DEBUG(_pool_peek 处),
+            # 此处对齐;异常路径(CONNECT-FAIL / FAILED)保持 INFO。
+            logger.debug("target prewarm CREATED %d conn(s) for %s via %s:%s (creates=%d, size=%d)",
+                         made, target, proxy_host, proxy_port,
+                         self.target_pool_creates, len(self._target_pool.get(key, [])))
         return made
 
     async def _target_pool_prewarm(self, proxy_host: str, proxy_port: int, target: str,
@@ -628,8 +632,9 @@ class ConnectionPools:
         writer._prehandshook = True
         self._established_pool.setdefault(key, []).append((reader, writer))
         self.established_pool_returned += 1
-        logger.info("established pool PREHANDSHAKE %s via %s:%s (returned=%d)",
-                    target, proxy_host, proxy_port, self.established_pool_returned)
+        # DEBUG:同上——归还进池是常规生命周期事件(实测占全部日志约 15%)。
+        logger.debug("established pool PREHANDSHAKE %s via %s:%s (returned=%d)",
+                     target, proxy_host, proxy_port, self.established_pool_returned)
         return True
 
     # ── 清理 / 生命周期 ─────────────────────────────────────────
@@ -679,11 +684,14 @@ class ConnectionPools:
                     pool[key] = alive
                 else:
                     if expired_counter == 'target_pool_expired':
-                        logger.info("target prewarm EXPIRED %s (%s conn(s))",
-                                    key, len(stack))
+                        # DEBUG:过期淘汰是常规生命周期(实测占全部日志约 17%),
+                        # 与 target pool MISS/HIT 同属高频诊断,非异常。
+                        logger.debug("target prewarm EXPIRED %s (%s conn(s))",
+                                     key, len(stack))
                     elif expired_counter == 'established_pool_expired':
-                        logger.info("established pool EXPIRED %s (%s conn(s))",
-                                    key, len(stack))
+                        # DEBUG:同上,常规生命周期事件(实测占全部日志约 8%)。
+                        logger.debug("established pool EXPIRED %s (%s conn(s))",
+                                     key, len(stack))
                     pool.pop(key, None)
         for w in stale:
             try:

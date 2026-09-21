@@ -19,7 +19,7 @@ from auto_squid.router import (
 from auto_squid.cluster import ClusterGraph
 from auto_squid.config_schema import (
     ProxyInfo, PolicyConfig, Config, RouterConfig, ConnPoolConfig, LoggingConfig,
-    ConfigBase, PolicyMatchConfig, ProbeCanaryConfig,
+    ConfigBase, PolicyMatchConfig, PolicyProxiesConfig, ProbeCanaryConfig,
     router_config_from_flat, _FLAT_TO_CONFIG_PATH,
 )
 from auto_squid.auth import check_auth
@@ -3934,6 +3934,47 @@ class TestConnPool:
             await up_srv.wait_closed()
 
     @pytest.mark.asyncio
+    async def test_lifecycle_logs_are_debug_not_info(self, caplog):
+        """回归栅栏:池生命周期日志必须是 DEBUG,不得退回 INFO。
+
+        实测生产 10 天日志(13.3 万行)中这四类合计 93,675 行 = 70.2%:
+          target prewarm CREATED 40,468 / EXPIRED 22,872 /
+          established pool PREHANDSHAKE 19,911 / EXPIRED 10,424
+        它们都是「每次命中或胜出都会发生」的常规事件,留在 INFO 会把失败 /
+        STALE / 熔断等真信号淹没(池的 MISS/HIT 本就在 DEBUG,此处对齐)。
+        异常路径(target prewarm CONNECT-FAIL / FAILED)刻意保留 INFO。
+
+        本测试驱动 CREATED 与 EXPIRED 两条(合计 47.4%);另两条按同一策略处理。
+        """
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router(conn_pool_idle_timeout=1.0)
+        try:
+            with caplog.at_level(logging.DEBUG, logger="auto_squid.pools"):
+                made = await r.pools._target_pool_refill(HOST, 31991, "log.example:443", cap=1)
+                assert made >= 1, "预建未发生,测试前提不成立"
+                # 伪造创建时间在很久以前 → prune 触发空闲超时(EXPIRED)。
+                for stack in r._target_pool.values():
+                    for _, w in stack:
+                        w._conn_pool_created = time.monotonic() - 100
+                await r._pool_prune()
+
+            lifecycle = [rec for rec in caplog.records
+                         if any(s in rec.getMessage() for s in
+                                ("target prewarm CREATED", "target prewarm EXPIRED"))]
+            assert lifecycle, "未捕获到池生命周期日志,测试前提不成立"
+            levels = {rec.levelno for rec in lifecycle}
+            assert levels == {logging.DEBUG}, \
+                "池生命周期日志必须全为 DEBUG,实际: " \
+                f"{[(rec.levelname, rec.getMessage()[:36]) for rec in lifecycle]}"
+            seen = " ".join(rec.getMessage() for rec in lifecycle)
+            assert "target prewarm CREATED" in seen and "target prewarm EXPIRED" in seen, \
+                f"应覆盖 CREATED 与 EXPIRED 两类,实际: {seen[:120]}"
+        finally:
+            await r._conn_pool_close_all()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
     async def test_global_budget_respected(self):
         """refill 受全局 conn_pool_total 钳制。"""
         up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
@@ -7300,6 +7341,71 @@ class TestDispatchSingleUnified:
                 "3 次真失败应熔断 local"
         finally:
             r.stop()
+
+
+class _FakeConnectWriter:
+    """CONNECT 客户端 writer 的最小替身:记录写入字节,可断言是否 close。"""
+
+    def __init__(self):
+        self.buf = bytearray()
+        self.closed = False
+
+    def write(self, data):
+        self.buf += data
+
+    async def drain(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+    async def wait_closed(self):
+        pass
+
+
+class _FakeConnectReader:
+    async def read(self, n=-1):
+        return b""
+
+
+class TestConnectNoCandidates502:
+    """回归:`_dispatch_single` 无候选代理时,CONNECT 必须回 502 而不是崩溃。
+
+    生产 2026-09-17 日志(全代理失败 → 熔断开启 → 下一个 CONNECT):
+        router.py:3884 _handle_connect → _dispatch_single
+        router.py:3435 _write_cached_response(writer, 502, ...)
+        AttributeError: 'NoneType' object has no attribute 'write'
+
+    根因:CONNECT 路径给 `_dispatch_single` 传的 `writer` **恒为 None**(CONNECT 的
+    响应走 `client_writer`),而"无候选代理"分支无条件用 `writer` 回 502 —— 与同函数
+    内"全失败"分支(那里正确按 proto 分派)不一致。触发条件:目标命中某策略且该策略
+    未允许 `local`(local 直连逃生走廊被关闭),同时所有代理都不可用。
+    """
+
+    @pytest.mark.asyncio
+    async def test_connect_without_candidates_writes_502_to_client(self):
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p1', host='127.0.0.1', port=31991, enabled=False))
+        router = make_router(
+            store, listen_host='127.0.0.1', listen_port=10809, db_path=':memory:',
+            # 策略命中 example.com,但只允许 p1 → local 被排除(_policy_allows_proxy
+            # 对 proxy=None 且策略有 ids 限制时返回 False),逃生走廊关闭。
+            policies=[PolicyConfig(
+                match=PolicyMatchConfig(domain_exact=['example.com']),
+                proxies=PolicyProxiesConfig(ids=['p1']))])
+        client_writer = _FakeConnectWriter()
+
+        # writer 传 None —— 与 _handle_connect 的真实调用形状完全一致。
+        await router._dispatch_single(
+            None, '', '', None, None, 'example.com:443',
+            proto='tunnel', target='example.com:443',
+            client_reader=_FakeConnectReader(), client_writer=client_writer)
+
+        assert bytes(client_writer.buf).startswith(b"HTTP/1.1 502"), \
+            f"CONNECT 应收到 502,实际: {bytes(client_writer.buf)[:80]!r}"
+        assert b"Content-Length: 11" in client_writer.buf
+        assert b"Bad Gateway" in client_writer.buf
+        assert client_writer.closed, "回 502 后应关闭客户端连接"
 
 
 class TestStaleConnRetry:
