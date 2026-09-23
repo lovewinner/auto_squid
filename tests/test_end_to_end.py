@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from auto_squid.proxy_store import ProxyStore
+from auto_squid.selector import _ERROR_KEYS, ERROR_HTTP_STATUS
 from auto_squid.router import (
     Router, ProxySelector, _hb, make_router,
     _MAX_REQUEST_HEADER_LINES, _MAX_REQUEST_HEADER_BYTES,
@@ -2204,6 +2205,40 @@ class TestProxySelectorEWMA:
         assert m['cum_ttfb_n'] == 2
         dm = sel._domain_metrics['example.com']['p']['metrics']
         assert dm['cum_success'] == 1
+
+    def test_legacy_metrics_restore_without_http_status_no_keyerror(self):
+        """回归:旧 DB 行的 errors 字典缺 http_status 键时,record_failure 不能
+        抛 KeyError。生产实测(09-19、09-22 日志):
+            _try_tunnel → record_failure(pid, 'http_status', target)
+            selector.py:1069 scope["errors"][etype] += 1
+            KeyError: 'http_status'
+        fe6c54f 新增 ERROR_HTTP_STATUS 后,_ERROR_KEYS 变 8 键,但旧行只有 7 键
+        (errors 内层键从不随 _ERROR_KEYS 增长而 backfill)。与 09-04 的 cum_* 事故
+        同源:热路径 KeyError 逃出 record_failure,该次失败观测丢失。
+        """
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host='h', port=3128))
+        sel = ProxySelector(store)
+
+        def _legacy_metric() -> dict:
+            """旧格式:errors 只有新增 http_status 之前的 7 个键。"""
+            return {
+                "ttfb_samples": [], "ttlb_samples": [], "ttlb_ewma": None,
+                "throughput_ewma": None, "success": 1, "total": 1,
+                "errors": {k: 0 for k in _ERROR_KEYS if k != ERROR_HTTP_STATUS},
+                "total_bytes": 0.0, "transfer_time": 0.0,
+            }
+
+        sel.set_proxy_metrics({"p": _legacy_metric()})
+        sel.set_domain_metrics({"example.com": {"p": _legacy_metric()}})
+        # 恢复后 record_failure 不再抛 KeyError;errors 已补全全部键。
+        sel.record_failure('p', 'http_status')               # 全局 scope
+        sel.record_failure('p', 'http_status', 'example.com')  # 域名 scope
+        m = sel._proxy_metrics['p']['metrics']
+        assert m['errors'].keys() >= set(_ERROR_KEYS)
+        assert m['errors'][ERROR_HTTP_STATUS] == 2  # 无 domain +1,有 domain 再 +1
+        dm = sel._domain_metrics['example.com']['p']['metrics']
+        assert dm['errors'][ERROR_HTTP_STATUS] == 1
 
 
 class TestOrderedForDomain:

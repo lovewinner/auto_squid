@@ -946,6 +946,15 @@ class ProxySelector:
             # 字典,否则 record_protocol 热路径 scope["http_versions"] KeyError。
             if "http_versions" not in m:
                 m["http_versions"] = {}
+            # errors 内层缺键补全:新增错误分类(如 http_status,fe6c54f)后,旧行
+            # 的 errors 字典不含该键,record_failure 热路径 scope["errors"][etype]
+            # 会 KeyError(且异常逃出 record_failure,使该次失败观测丢失)。与
+            # _CUM_FIELDS 同理,按 _ERROR_KEYS 逐键 setdefault 补齐(09-04 cum_*
+            # 事故同源;此处补的是 errors 的内层键)。errors 本身已在 needed 中校验。
+            if not isinstance(m.get("errors"), dict):
+                m["errors"] = {}
+            for k in _ERROR_KEYS:
+                m["errors"].setdefault(k, 0)
             # 终身分位数 rollup(后加字段):旧 DB 行没有就新建;有的话是 JSON 反
             # 序列化出来的**普通 dict**,没有 TDigest 方法,必须重新包一层,否则
             # record_ttfb 热路径的 .add() 会 AttributeError。
@@ -992,6 +1001,12 @@ class ProxySelector:
                 # 同 set_proxy_metrics:旧 DB 行补 http_versions 空字典。
                 if "http_versions" not in m:
                     m["http_versions"] = {}
+                # 同 set_proxy_metrics:errors 内层缺键补全(新增错误分类后旧行不含
+                # 该键,record_failure 热路径 scope["errors"][etype] 会 KeyError)。
+                if not isinstance(m.get("errors"), dict):
+                    m["errors"] = {}
+                for k in _ERROR_KEYS:
+                    m["errors"].setdefault(k, 0)
                 # 同 set_proxy_metrics:终身分位数 rollup 补全/重新包装为 TDigest。
                 for k in ("cum_ttfb_digest", "cum_ofb_digest"):
                     v = m.get(k)
