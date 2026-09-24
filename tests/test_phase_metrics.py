@@ -18,7 +18,7 @@ from auto_squid.config_schema import CircuitConfig, RouterConfig
 from auto_squid.digest import TDigest
 from auto_squid.proxy_store import ProxyInfo, ProxyStore
 from auto_squid.router import Router
-from auto_squid.selector import ProxySelector, _OBS_WINDOW
+from auto_squid.selector import ProxySelector, flush_metric_copy, _OBS_WINDOW
 
 
 # ── t-digest ────────────────────────────────────────────
@@ -647,6 +647,88 @@ def test_prune_domain_metrics_spans_multiple_domains():
     assert set(sel._domain_metrics) == {"c"}
     assert set(sel._domain_quality) == {"c"}
     assert sel._metrics_version > 0                   # 确有删除 → 缓存失效
+
+
+# ── 落盘脏追踪(flush_metric_copy / consume_dirty / collect_payloads)────────
+# 支撑 router._flush_to_db 的脏差分 UPSERT(A 项优化):selector 记录自上次 flush
+# 以来被观察写入的 (domain|None, pid) 对,Router 只落那份差分。这里钉死语义。
+def test_flush_metric_copy_drops_derived_and_legacy():
+    """flush_metric_copy 剥离派生键(percentiles/cumulative/window_*)与遗留 TTLB 键,
+    保留全部原始字段,并把 deque 转成 list 使载荷纯 JSON 安全。"""
+    sel = _selector()
+    sel.record_ttfb("p1", 0.10, domain="a:443")
+    raw = sel._domain_metrics["a:443"]["p1"]["metrics"]
+    copy_m = flush_metric_copy(raw)
+
+    for k in ("percentiles", "cumulative", "window_success_count",
+              "window_total", "window_success_rate"):
+        assert k not in copy_m, f"派生键 {k} 不应落盘"
+    for k in ("ttlb_samples", "ttlb_ewma", "cum_ttlb_n", "cum_ttlb_sum"):
+        assert k not in copy_m, f"遗留键 {k} 不应落盘"
+    # 原始字段保留
+    for k in ("ttfb_samples", "ofb_samples", "outcome_samples",
+              "cum_ttfb_digest", "cum_ofb_digest", "errors", "success", "total"):
+        assert k in copy_m, f"原始字段 {k} 必须保留"
+    # deque→list(JSON 安全);TDigest 保持 dict 子类(json.dumps 默认 list 处理)
+    assert isinstance(copy_m["ttfb_samples"], list)
+
+
+def test_dirty_tracking_tracks_write_keys():
+    """_metrics_for 登记 (domain|None, pid):域名桶与全局桶各记各的。"""
+    sel = _selector()
+    sel.record_ttfb("p1", 0.10, domain="a:443")   # 写 (a:443,p1) + (None,p1)
+    sel.record_ttfb("p1", 0.20, domain="b:443")   # 写 (b:443,p1) + (None,p1)
+    assert ("a:443", "p1") in sel._dirty_metric_keys
+    assert ("b:443", "p1") in sel._dirty_metric_keys
+    assert (None, "p1") in sel._dirty_metric_keys
+    assert len(sel._dirty_metric_keys) == 3       # 集去重
+
+
+def test_consume_dirty_metric_keys_clear_and_flags():
+    """consume 取走并清空脏键集;reset_quality/prune_domain_metrics 置全量重写。"""
+    sel = _selector()
+    sel.record_ttfb("p1", 0.10, domain="a:443")
+    full, keys = sel.consume_dirty_metric_keys()
+    assert full is False and keys == {("a:443", "p1"), (None, "p1")}
+    assert sel._dirty_metric_keys == set()        # 取走即清
+
+    # reset_quality:清表 + 置 full_rewrite(随后可能又有新写,键集伴随非空)
+    sel.record_ttfb("p1", 0.10, domain="a:443")
+    sel.reset_quality()
+    full, keys = sel.consume_dirty_metric_keys()
+    assert full is True                    # 清表路径必须全量重写
+    sel.record_ttfb("p1", 0.10, domain="a:443")   # 先录进 reset 后的空表
+    sel.reset_quality()                    # 再 reset(不再写新键)
+    full, keys = sel.consume_dirty_metric_keys()
+    assert full is True and keys == set()  # 纯 reset:只有 full_rewrite,无脏键
+
+    # prune_domain_metrics 实际删行 → full_rewrite;未删行 → 不置位
+    _fill_domains(sel, ("a", "b"))
+    sel.consume_dirty_metric_keys()                # 先消费 _fill 产生的脏键
+    sel.prune_domain_metrics(1)                    # 3 条→1,确实删除
+    full, keys = sel.consume_dirty_metric_keys()
+    assert full is True and keys == set()          # 只置 full_rewrite,无新增脏键
+    sel.prune_domain_metrics(10)                   # 超量不足 → no-op(不置位)
+    assert sel.consume_dirty_metric_keys() == (False, set())
+
+
+def test_collect_metric_payloads_incremental_and_full():
+    """差分模式只取脏键的当前值;全量模式取全部(清表后重写)。"""
+    sel = _selector()
+    sel.record_ttfb("p1", 0.10, domain="a:443")
+    sel.record_ttfb("p2", 0.30)                    # 仅全局桶 (None,p2)
+    # 差分:只含 (a:443,p1) 与 (None,p1)、(None,p2)
+    _, keys = sel.consume_dirty_metric_keys()
+    proxy_rows, domain_rows = sel.collect_metric_payloads(False, keys)
+    assert sorted(pid for pid, _ in proxy_rows) == ["p1", "p2"]
+    assert sorted((d, pid) for d, pid, _ in domain_rows) == [("a:443", "p1")]
+    # 行值纯 JSON 安全(deque→list)
+    assert isinstance(domain_rows[0][2]["ttfb_samples"], list)
+
+    # 全量模式:覆盖两张表全部条目
+    proxy_rows_all, domain_rows_all = sel.collect_metric_payloads(True, set())
+    assert len(proxy_rows_all) == 2                # p1、p2
+    assert len(domain_rows_all) == 1               # a:443 → p1
 
 
 # ── 全局窗口成功率(selector.global_window_success)──────────────

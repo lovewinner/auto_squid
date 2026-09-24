@@ -33,6 +33,7 @@
 
 import asyncio
 import base64
+import concurrent.futures
 import functools
 import logging
 import re
@@ -665,7 +666,12 @@ class Router:
         # 非线程安全,用锁串行化所有 DB 写入,避免 "database is locked"。
         # 热路径(转发)只读写下方内存缓存,不经此锁。
         self._db_lock = threading.Lock()
-        self._metrics_dirty = False
+        # 落盘专用单线程执行器:经 asyncio.to_thread 不得行,因为默认执行器无法在
+        # stop() 里精确 drain(见 _flush_loop)。自持 worker 唯一的线程,stop() 里
+        # shutdown(wait=True) 可确保正在进行的 _persist_flush_state 完成后才关 DB,
+        # 消除 to_thread + _db.close() 的跨线程竞态(cancel 只会丢弃 await,线程仍跑)。
+        self._flush_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="as-flush")
         self._init_schema()
 
         # ── Cost 权重自动调参器(P1,默认关闭) ──────────────────────
@@ -1167,66 +1173,117 @@ class Router:
             self._immediate_degraded.remove(pid)
         self._meta_dirty = True
 
-    def _flush_to_db(self):
-        """把内存里累积的统计/元数据一次性落盘(单事务)。
+    def _snapshot_flush_state(self):
+        """在**事件循环线程**一次性快照全部落盘状态,产出纯 JSON 安全的落盘载荷。
 
-        由后台 _flush_loop 周期调用,以及 stop() 收尾调用。持 _db_lock 写库。
-        注意:这里是幂等的全量覆盖——把内存当前值写回,而非增量累加,因此
-        多次 flush 结果一致;即使中间 flush 丢失,下一次 flush 仍能补齐。
+        必须由事件循环线程(或 stop() 收尾的调用线程,总之是拥有 deque/dict 状态
+        的同一线程)调用:这里遍历 _stats_cache/_meta_cache 与 selector 内部 metric
+        的 deque/TDigest,把它们拷贝成纯 JSON 安全的行(flush_metric_copy 就地
+        deque→list),返回的载荷即可安全交给 to_thread 的序列化/写库线程,避免
+        跨线程迭代 deque 的 RuntimeError 竞态。
+
+        返回 (stats_rows, meta_rows, full_rewrite, proxy_rows, domain_rows):
+          stats_rows  = [(domain, proxy_id, wins)], meta_rows = [(domain, default_proxy,
+            updated_at, ref_ewma)] —— 各自仅在对应 _dirty 时非空(全量覆盖)。
+          proxy_rows  = [(pid, flush_metric_copy(m), ...)], domain_rows = [(domain, pid,
+            flush_metric_copy(m)), ...] —— 差分只含脏键;full_rewrite 时含全部
+            (reset_quality / prune_domain_metrics 双清)。
+        取走快照即原位清零 dirty/脏键,后续新观测重新置脏,下一轮补采。
         """
-        dirty = self._stats_dirty or self._meta_dirty
-        # 监控指标总是 flush:数据量大时性能可接受,保证监控数据不过期。
+        stats_rows: list = []
+        if self._stats_dirty:
+            stats_rows = [(d, pid, w) for d, m in self._stats_cache.items()
+                          for pid, w in m.items()]
+            self._stats_dirty = False
+        meta_rows: list = []
+        if self._meta_dirty:
+            meta_rows = [(d, m["default_proxy"], m["updated_at"], m.get("ref_ewma"))
+                         for d, m in self._meta_cache.items()]
+            self._meta_dirty = False
+        full_rewrite, dirty_keys = self.selector.consume_dirty_metric_keys()
+        proxy_rows: list = []
+        domain_rows: list = []
+        if full_rewrite or dirty_keys:
+            proxy_rows, domain_rows = self.selector.collect_metric_payloads(
+                full_rewrite, dirty_keys)
+        return (stats_rows, meta_rows, full_rewrite, proxy_rows, domain_rows)
+
+    def _persist_flush_state(self, payload):
+        """把 _snapshot_flush_state 的载荷写入 DB(可在工作线程执行,只碰快照数据)。
+
+        持 _db_lock 单事务:stats/meta 全量覆盖(DELETE 后重插),监控指标差分 UPSERT
+        /全量重写,详见 _flush_to_db 注释。载荷全空时直接返回,连 commit 都不做。
+        """
+        stats_rows, meta_rows, full_rewrite, proxy_rows, domain_rows = payload
+        if not (full_rewrite or stats_rows or meta_rows or proxy_rows or domain_rows):
+            return
+        now = datetime.now(timezone.utc).isoformat()
         with self._db_lock:
-            if self._stats_dirty:
-                # 全量重建 domain_stats:内存是权威源(已含历史累加)。
+            if stats_rows:
                 self._db.execute("DELETE FROM domain_stats")
                 self._db.executemany(
                     "INSERT INTO domain_stats (domain, proxy_id, wins) VALUES (?, ?, ?)",
-                    [(d, pid, w) for d, m in self._stats_cache.items()
-                     for pid, w in m.items()],
+                    stats_rows,
                 )
-                self._stats_dirty = False
-            if self._meta_dirty:
+            if meta_rows:
                 self._db.execute("DELETE FROM domain_meta")
                 self._db.executemany(
                     "INSERT INTO domain_meta (domain, default_proxy, updated_at, ref_ewma)"
                     " VALUES (?, ?, ?, ?)",
-                    [(d, m["default_proxy"], m["updated_at"], m.get("ref_ewma"))
-                     for d, m in self._meta_cache.items()],
+                    meta_rows,
                 )
-                self._meta_dirty = False
-            # 监控指标:proxy 级全局指标
-            now = datetime.now(timezone.utc).isoformat()
-            self._db.execute("DELETE FROM proxy_metrics")
-            for pid, m in self.selector.get_proxy_metrics().items():
-                self._db.execute(
+            if full_rewrite:
+                self._db.execute("DELETE FROM proxy_metrics")
+                self._db.execute("DELETE FROM domain_metrics")
+            if proxy_rows:
+                self._db.executemany(
                     "INSERT INTO proxy_metrics (proxy_id, metrics_json, updated_at)"
-                    " VALUES (?, ?, ?)",
-                    (pid, json.dumps(m, default=list), now))
-            # 监控指标:域名 × 代理 实测指标
-            self._db.execute("DELETE FROM domain_metrics")
-            for d, per_pid in self.selector.get_domain_metrics().items():
-                for pid, mm in per_pid.items():
-                    self._db.execute(
-                        "INSERT INTO domain_metrics (domain, proxy_id, metrics_json, updated_at)"
-                        " VALUES (?, ?, ?, ?)",
-                        (d, pid, json.dumps(mm, default=list), now))
+                    " VALUES (?, ?, ?) ON CONFLICT(proxy_id) DO UPDATE SET"
+                    " metrics_json=excluded.metrics_json, updated_at=excluded.updated_at",
+                    [(pid, json.dumps(m, default=list), now) for pid, m in proxy_rows])
+            if domain_rows:
+                self._db.executemany(
+                    "INSERT INTO domain_metrics (domain, proxy_id, metrics_json, updated_at)"
+                    " VALUES (?, ?, ?, ?) ON CONFLICT(domain, proxy_id) DO UPDATE SET"
+                    " metrics_json=excluded.metrics_json, updated_at=excluded.updated_at",
+                    [(d, pid, json.dumps(m, default=list), now) for d, pid, m in domain_rows])
             self._db.commit()
+
+    def _flush_to_db(self):
+        """把内存里累积的统计/元数据/监控指标一次性落盘(单事务,同步入口)。
+
+        供后台 _flush_loop 周期调用(拆成快照+to_thread 写库,见之),以及 stop()
+        收尾调用与测试直接调用(本函数同步快照+同步写库,保证调用方线程可见)。
+        幂等性:stats/meta 仍是全量覆盖(内存权威源);监控指标改为**脏差分 UPSERT**
+        ——只写上次 flush 以来被观察写入的 (domain,pid) 键,稳态下每 5s 成本近零
+        (prior:无条件 DELETE+重插 5688 行/14MB/830ms)。全量重写保留:reset_quality
+        / prune_domain_metrics 删行后置 _metrics_full_rewrite,据此 DELETE+全量重插
+        (见 selector._dirty_metric_keys 不变式注释)。
+        """
+        self._persist_flush_state(self._snapshot_flush_state())
 
     async def _flush_loop(self):
         """后台周期 flush:把内存统计批量落盘,周期 FLUSH_INTERVAL 秒。
 
-        捕获异常不退出循环(单次 flush 失败不影响后续);被取消时静默退出
-        (stop() 会做最终 flush)。
+        _snapshot_flush_state(遍历 deque/TDigest)在**事件循环线程**完成,_persist
+        _flush_state(序列化 + sqlite 写)经 run_in_executor(self._flush_executor) 挪到
+        专用单线程 worker,使每 5s 一轮的落盘不再阻塞事件循环。stats/meta 全量、
+        监控指标脏差分 UPSERT,详见 _flush_to_db/_snapshot_flush_state。捕获异常
+        不退出循环(单次失败不影响后续);被取消时静默退出(stop() 会做最终 flush,
+        并 shutdown executor 等待在途写完成后再关 DB)。
         """
+        _loop = asyncio.get_running_loop()
         try:
             while True:
                 await asyncio.sleep(FLUSH_INTERVAL)
                 try:
-                    self._flush_to_db()
+                    await _loop.run_in_executor(
+                        self._flush_executor,
+                        self._persist_flush_state, self._snapshot_flush_state())
                     self.sticky._prune_sticky()
                     self.cluster.prune()
                     self.selector.prune_domain_quality()
+                    self.selector.prune_domain_metrics()
                 except Exception:
                     logger.exception("background flush failed")
         except asyncio.CancelledError:
@@ -3973,7 +4030,12 @@ class Router:
             except (asyncio.CancelledError, Exception):
                 pass
             self._probe_task = None
-        self._db.close()
+        # shutdown(wait=True) 等落盘 worker 把已快照的载荷写完后才关库:run_in_executor
+        # 里 cancel 只丢弃 await、不杀线程,若不 drain 会发生 worker 对已 close 的
+        # sqlite 连接 execute。shutdown 后再进入关库临界区,与 worker 的 with 锁互斥。
+        self._flush_executor.shutdown(wait=True)
+        with self._db_lock:
+            self._db.close()
 
 
     # ── #14 白名单转发(pools/httpcache/sticky)──────────────

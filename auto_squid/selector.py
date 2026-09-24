@@ -80,6 +80,30 @@ _CUM_FIELDS = {
     "cum_ofb_n": 0,                   # 累计源站首字节观测次数
 }
 
+# ── 落盘裁剪键集 ─────────────────────────────────────────────
+# 派生键:get_domain_metrics 每次在**输出拷贝**上现算 percentiles/cumulative 与
+# window_* 桶(见该函数 762-774),内部 metric_dict 从不持有;也没有任何读者从 DB
+# 读回它们(api/面板都在读时重算)。落盘只序列化原始字段,避免把读时即时算出的
+# 冗余物永久固化为 DB 载荷(实测占 34%)。
+_DERIVED_KEYS = {"cumulative", "percentiles", "window_success_count",
+                 "window_total", "window_success_rate"}
+# 遗留 TTLB 键(TTLB 语义已移除,代码零引用,仅历史 DB 行残留):落盘/恢复时丢弃,
+# 避免过时垃圾字段继续占用载荷。
+_LEGACY_KEYS = {"ttlb_samples", "ttlb_ewma", "cum_ttlb_n", "cum_ttlb_sum"}
+
+def flush_metric_copy(m: dict) -> dict:
+    """复制 + JSON 归一化一个原始 metric_dict 用于落盘。
+
+    内部 metric_dict 含 deque(窗口样本)与 TDigest(cum_*_digest,是 dict 子类);
+    json.dumps(default=list) 虽能序列化,但落盘前先在这里转成纯 JSON 安全的
+    dict(list 值),使 to_thread 里的序列化线程只碰副本,不触碰事件循环线程
+    正在变写的 deque(跨线程迭代 deque 会 RuntimeError)。同时丢弃派生键与遗留
+    TTLB 键(见 _DERIVED_KEYS/_LEGACY_KEYS)——派生键读时重算,持久化无意义。
+    """
+    return {k: (list(v) if isinstance(v, deque) else v)
+            for k, v in m.items() if k not in _DERIVED_KEYS and k not in _LEGACY_KEYS}
+
+
 # 错误分类键(统一枚举,供 _try_http/_try_tunnel 的 except 归类,见 record_failure)。
 ERROR_TIMEOUT = "timeout"
 ERROR_CONNECT = "connect"
@@ -195,6 +219,18 @@ class ProxySelector:
         # (实测单次 1.3s/6.7MB)。落盘路径(use_cache=False)永远实时,不吃缓存。
         self._metrics_version: int = 0
         self._domain_snapshot_cache: tuple = (None, None)  # (version|None, result|None)
+        # ── 指标落盘的脏追踪(增量 UPSERT)─────────────────────────
+        # _dirty_metric_keys:自上次 flush 以来被观察写入的 (domain|None, pid) 对。
+        # 所有热路径写入都经 _metrics_for(见下),在此登记;dict 集合天然去重,跨
+        # 5s 窗口内同键反复写也只占一项。domain 为 None 表示全局桶(proxy_metrics
+        # 表),为域名串表示域名桶(domain_metrics 表)。incremental 差分只在
+        # <domain, pid> 粒度上写,每次 flush 经 consume_dirty_metric_keys 取走即清,
+        # 配合落盘只写这份差分,消除每 5s 全表重写(实测 830ms/5s → 稳态近零)。
+        # 不变式:incremental 差分无法感知"行被删除"——任何删除 metric 条目的代码
+        # (目前仅 reset_quality / prune_domain_metrics)必须置 _metrics_full_rewrite,
+        # 让下一次 flush 走 DELETE+全量重写以保持 DB 与内存一致。
+        self._dirty_metric_keys: "set[tuple[Optional[str], str]]" = set()
+        self._metrics_full_rewrite: bool = False
         # 每代理熔断/慢启动状态(与 _quality 分开维护,含未观测过的新代理):
         #   {pid: {"consec_fail": int, "open_until": float(monotonic 秒), "backoff": float}}
         self._circuit: dict[str, dict[str, float]] = {}
@@ -484,11 +520,19 @@ class ProxySelector:
         return m["metrics"]
 
     def _metrics_for(self, pid: str, domain: Optional[str]) -> dict:
-        """取 (自适应 domain 存在时) 域名级或全局级 metric_dict,带惰性初始化。"""
+        """取 (自适应 domain 存在时) 域名级或全局级 metric_dict,带惰性初始化。
+
+        这是全部指标写入的唯一咽喉:六个 record_* 热路径都经它拿桶再就地改写。
+        因此在此登记 (domain, pid) 脏键,覆盖所有被观察的写入(见 _dirty_metric_keys)。
+        注意 record_failure/record_ttfb 对 domain=None 与 domain 同时取桶时,两键
+        (None,pid)/(domain,pid) 都被登记——全局桶与域名桶确实都写了,差分都要落。
+        """
         if domain is not None:
             per = self._domain_metrics.setdefault(domain, {})
             self._domain_metrics_dirty(per)
+            self._dirty_metric_keys.add((domain, pid))
             return self._ensure_metrics(per.setdefault(pid, {}))
+        self._dirty_metric_keys.add((None, pid))
         return self._ensure_metrics(self._proxy_metrics.setdefault(pid, {}))
 
     def _domain_metrics_dirty(self, _scope: dict) -> None:
@@ -499,6 +543,53 @@ class ProxySelector:
         是否仍新鲜。调用方(record_* / probe 等)不直接读该值,仅为失效信号。
         """
         self._metrics_version += 1
+
+    def consume_dirty_metric_keys(self) -> tuple[bool, set]:
+        """取走并清空上次 flush 以来的脏追踪状态(供 Router 落盘)。
+
+        返回 (metrics_full_rewrite: bool, dirty_keys: set[(domain|None, pid)])。
+        domain 为 None 的键 -> proxy_metrics 表;为域名串的键 -> domain_metrics 表。
+        full_rewrite 只在删行路径(reset_quality / prune_domain_metrics)置位,此时
+        dirty_keys 为空集,Router 应全量重写。必须在事件循环线程调用(返回的集合
+        随后用于 collect_metric_payloads 的 in-place 取数)。
+        """
+        keys, self._dirty_metric_keys = self._dirty_metric_keys, set()
+        full, self._metrics_full_rewrite = self._metrics_full_rewrite, False
+        return full, keys
+
+    def collect_metric_payloads(self, full_rewrite: bool, dirty_keys: set) -> tuple[list, list]:
+        """把 (全量 or 脏差分的) 内存指标转成可 JSON 序列化的落盘行(事件循环线程执行)。
+
+        返回 (proxy_rows, domain_rows):
+          proxy_rows  = [(pid, flush_metric_copy(metric_dict)), ...]        # proxy_metrics 表
+          domain_rows = [(domain, pid, flush_metric_copy(metric_dict)), ...] # domain_metrics 表
+
+        flush_metric_copy 在事件循环线程内就地遍历 deque/TDigest 并产出纯 JSON 安全
+        字典(deque→list、TDigest 保持 dict 子类),因此返回值可安全交给
+        asyncio.to_thread 里的序列化与写库线程,不会有跨线程迭代 deque 的竞态。
+        """
+        proxy_rows: list = []
+        domain_rows: list = []
+        if full_rewrite or dirty_keys:
+            if full_rewrite:
+                for pid, m in self._proxy_metrics.items():
+                    proxy_rows.append((pid, flush_metric_copy(m["metrics"])))
+                for d, per_pid in self._domain_metrics.items():
+                    for pid, m in per_pid.items():
+                        domain_rows.append((d, pid, flush_metric_copy(m["metrics"])))
+            else:
+                for (domain, pid) in dirty_keys:
+                    if domain is None:
+                        m = self._proxy_metrics.get(pid)
+                        if m is not None:
+                            proxy_rows.append((pid, flush_metric_copy(m["metrics"])))
+                    else:
+                        per = self._domain_metrics.get(domain)
+                        if per is not None:
+                            m = per.get(pid)
+                            if m is not None:
+                                domain_rows.append((domain, pid, flush_metric_copy(m["metrics"])))
+        return proxy_rows, domain_rows
 
     @staticmethod
     def _append_sample(samples, value: float):
@@ -846,6 +937,7 @@ class ProxySelector:
         if max_entries <= 0:
             self._domain_metrics.clear()
             self._metrics_version += 1  # 全清,缓存失效
+            self._metrics_full_rewrite = True  # 全清=删行,差分无法感知,须全量重写
             return
         total = sum(len(per_pid) for per_pid in self._domain_metrics.values())
         if total <= max_entries:
@@ -867,6 +959,7 @@ class ProxySelector:
                 self._domain_quality.pop(d, None)
         if pruned:
             self._metrics_version += 1  # 删除了域名指标条目,缓存失效
+            self._metrics_full_rewrite = True  # 删行,差分无法感知,须全量重写
 
     def prune_domain_quality(self, max_entries: int = 10_000):
         """域名级质量表容量保护:条目超上限时按最近观测 ts 淘汰最旧条目。
@@ -906,6 +999,8 @@ class ProxySelector:
         self._conc.clear()
         self._proxy_metrics.clear()
         self._domain_metrics.clear()
+        self._dirty_metric_keys.clear()  # 清空脏对;置全量重写,下轮 flush 清表
+        self._metrics_full_rewrite = True  # 删行,差分无法感知,须全量重写
         self._metrics_version += 1  # 清空域名指标,使 get_domain_metrics 缓存失效
         self._domain_snapshot_cache = (None, None)
         self._circuit_version += 1
@@ -928,6 +1023,11 @@ class ProxySelector:
             if not needed.issubset(m):
                 logger.debug("proxy_metrics %s 缺少字段,跳过: %s", pid, set(m.keys()))
                 continue
+            # 历史 DB 行含派生/遗留键(percentiles/cumulative/window_*/ttlb_*):恢复时
+            # 即剥离,既省内存又避免下一轮 flush 把这些读时重算的冗余物原样写回。
+            if _DERIVED_KEYS.intersection(m) or _LEGACY_KEYS.intersection(m):
+                for k in _DERIVED_KEYS | _LEGACY_KEYS:
+                    m.pop(k, None)
             # ofb_samples 为后加字段(TTLB 移除后新增的源站首字节窗口):旧 DB 行
             # 没有,补空 deque,否则热路径 _append_sample 会 KeyError。
             if "ofb_samples" not in m:
@@ -988,6 +1088,10 @@ class ProxySelector:
                 if not needed.issubset(m):
                     logger.debug("domain_metrics %s %s 缺少字段,跳过", d, pid)
                     continue
+                # 同 set_proxy_metrics:历史 DB 行剥离派生/遗留键。
+                if _DERIVED_KEYS.intersection(m) or _LEGACY_KEYS.intersection(m):
+                    for k in _DERIVED_KEYS | _LEGACY_KEYS:
+                        m.pop(k, None)
                 # 同 set_proxy_metrics:旧 DB 行补 ofb_samples 空 deque。
                 if "ofb_samples" not in m:
                     m["ofb_samples"] = deque([], maxlen=_OBS_WINDOW)

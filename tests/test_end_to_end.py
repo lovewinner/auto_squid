@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import logging
 import socket
 import tempfile
@@ -1393,6 +1394,50 @@ async def test_db_batching_background_flush():
         with sqlite3.connect(db) as conn:
             rows = conn.execute("SELECT wins FROM domain_stats WHERE domain='flush.example.com'").fetchall()
         assert rows == [(1,)], f"expected on-disk win=1 after flush, got {rows}"
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_flush_persists_metrics_without_derived_keys():
+    """_flush_to_db 落盘的监控指标行不含派生的 percentiles/cumulative/window_*
+    与遗留 TTLB 键,且 UPSERT 走 DB 的 (domain, proxy_id) 主键(可重复 flush)。
+    """
+    import sqlite3
+    db = tempfile.mktemp(suffix='.db')
+    proxy_srv = await run_mock_proxy(HOST, PROXY_PORT)
+    proxy_store = ProxyStore()
+    proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+                    cache_ttl=300, db_path=db)
+    await router.start()
+    try:
+        # 关掉后台 flush,隔离 _flush_to_db 为唯一落盘入口。
+        if router._flush_task is not None:
+            router._flush_task.cancel()
+            try:
+                await router._flush_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        await send_http_get(HOST, ROUTER_PORT, url=b"http://flush2.example.com/x")
+        router._flush_to_db()
+        with sqlite3.connect(db) as conn:
+            dm_rows = conn.execute(
+                "SELECT metrics_json FROM domain_metrics").fetchall()
+            pm_rows = conn.execute(
+                "SELECT metrics_json FROM proxy_metrics").fetchall()
+        assert dm_rows, "expected a domain_metrics row after flush"
+        assert pm_rows, "expected a proxy_metrics row after flush"
+        for (mj,) in dm_rows + pm_rows:
+            m = json.loads(mj)
+            for k in ("percentiles", "cumulative", "window_success_count",
+                      "window_total", "window_success_rate",
+                      "ttlb_samples", "ttlb_ewma", "cum_ttlb_n", "cum_ttlb_sum"):
+                assert k not in m, f"落盘行不应含 {k}: {sorted(m.keys())}"
+        # 重复 flush 仍可成功(UPSERT 幂等,不因主键冲突抛错)。
+        router._flush_to_db()
     finally:
         await router.stop()
         proxy_srv.close()
