@@ -2217,49 +2217,70 @@ class Router:
         except BaseException 分支自行关闭。
         """
         winner = None
-        while tasks:
-            done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            winner_task = None
-            for t in done:
-                try:
-                    winner = t.result()
-                    # HTTP 5xx 不算胜出(见 _is_acceptable_win):跳过,保持 winner
-                    # 为 None,让本批继续等待其他候选/兜底;该 t 仍是败者(由下方
-                    # losers 收集并经 cleanup 释放 resp)。
-                    if not self._is_acceptable_win(winner):
-                        winner = None
-                        continue
-                    winner_task = t
-                    self._observe_win(t)  # 调参器:赢家 TTFB(从 task 侧信道取回)
-                    break
-                except Exception:
-                    pass
-            if winner:
-                # 败者 = 未完成者(tasks) ∪ 已完成但未获胜者(done 去掉 winner_task)。
-                # 旧实现只清理 tasks,漏掉 done 里的其余完成者 → 它们的 resp 泄漏。
-                losers = set(tasks)
+        finished: set = set()  # 已完成的候选(含拿到 5xx 响应头被判非胜者):排查时清理。
+        try:
+            while tasks:
+                done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                finished.update(done)
+                winner_task = None
                 for t in done:
-                    if t is not winner_task:
-                        losers.add(t)
-                # 立即取消未完成者(停止读 body、释放竞速槽/连接池);已完成者
-                # 无需 cancel,直接进 _drain_losers 由 cleanup 释放资源。
-                for t in tasks:
-                    t.cancel()
-                if losers and cleanup is not None:
-                    # 软上限:持续高吞吐下败者清理 task 会堆积(soak 曾观测
-                    # fd_peak 569)。超过阈值则就地排空已完成的清理 task,
-                    # 释放其持有的流式 resp / 上游连接,避免无界增长。就地
-                    # gather 只等已完成的清理(多为秒级 aclose),不阻塞赢家
-                    # 首字节——此刻赢家早已返回,这是下一轮竞速前的间隙。
-                    if len(self._pending_cleanups) >= _MAX_PENDING_CLEANUPS:
-                        stale = self._pending_cleanups
-                        self._pending_cleanups = set()
-                        await asyncio.gather(*stale, return_exceptions=True)
-                    cleanup_task = asyncio.create_task(
-                        self._drain_losers(losers, cleanup))
-                    self._pending_cleanups.add(cleanup_task)
-                    cleanup_task.add_done_callback(self._pending_cleanups.discard)
-                break
+                    try:
+                        winner = t.result()
+                        # HTTP 5xx 不算胜出(见 _is_acceptable_win):跳过,保持 winner
+                        # 为 None,让本批继续等待其他候选/兜底;该 t 仍是败者(由下方
+                        # losers 收集并经 cleanup 释放 resp)。
+                        if not self._is_acceptable_win(winner):
+                            winner = None
+                            continue
+                        winner_task = t
+                        self._observe_win(t)  # 调参器:赢家 TTFB(从 task 侧信道取回)
+                        break
+                    except Exception:
+                        pass
+                if winner:
+                    # 败者 = 未完成者(tasks) ∪ 已完成但未获胜者(done 去掉 winner_task)。
+                    # 旧实现只清理 tasks,漏掉 done 里的其余完成者 → 它们的 resp 泄漏。
+                    losers = set(tasks)
+                    for t in done:
+                        if t is not winner_task:
+                            losers.add(t)
+                    # 立即取消未完成者(停止读 body、释放竞速槽/连接池);已完成者
+                    # 无需 cancel,直接进 _drain_losers 由 cleanup 释放资源。
+                    for t in tasks:
+                        t.cancel()
+                    if losers and cleanup is not None:
+                        # 软上限:持续高吞吐下败者清理 task 会堆积(soak 曾观测
+                        # fd_peak 569)。超过阈值则就地排空已完成的清理 task,
+                        # 释放其持有的流式 resp / 上游连接,避免无界增长。就地
+                        # gather 只等已完成的清理(多为秒级 aclose),不阻塞赢家
+                        # 首字节——此刻赢家早已返回,这是下一轮竞速前的间隙。
+                        if len(self._pending_cleanups) >= _MAX_PENDING_CLEANUPS:
+                            stale = self._pending_cleanups
+                            self._pending_cleanups = set()
+                            await asyncio.gather(*stale, return_exceptions=True)
+                        cleanup_task = asyncio.create_task(
+                            self._drain_losers(losers, cleanup))
+                        self._pending_cleanups.add(cleanup_task)
+                        cleanup_task.add_done_callback(self._pending_cleanups.discard)
+                    break
+        except BaseException:
+            # 竞速中途被取消(client 断开 / stop() 取消在途 handler):asyncio.wait
+            # 抛 CancelledError,尚未完成的候选 task 即失去 awaiter,其异常(如上游
+            # CONNECT 非 200)无人 retrieval → "Task exception was never retrieved"。
+            # 就地取消并 gather 排空:gather(return_exceptions=True) 同时 retrieval
+            # 每个候选的异常/取消,杜绝孤儿 task。已完成候选已在循环内 .result()
+            # 检索过;被取消候选由其 _try_http/_try_tunnel 的 except BaseException
+            # 自行关资源。最后裸 raise 保留取消语义给调用方(handle_client 的
+            # except CancelledError 分支)。
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        # 全部候选耗尽仍无胜者:finished 里那些"拿到 5xx 响应头但被判非胜"的任务
+        # 持有流式 resp(占 httpx 连接池连接),必须下放清理(与 _race_staggered 的
+        # completed 走到底兜底同构),否则反复全失败累积到连接池耗尽。
+        if finished and cleanup is not None:
+            self._spawn_cleanup(finished, cleanup)
         return winner
 
     async def _race_staggered(self, places, cleanup=None,
@@ -2304,39 +2325,50 @@ class Router:
         # gather + result),否则 asyncio 报 "Task exception was never retrieved"。
         completed: set = set()
         winner = None
-        while running or unlaunched:
-            # 等待首字节;interval 超时无候选完成则返回(未完成者仍在 running 里),
-            # 用于定时补发下一个。有候选完成则 done 含该候选。
-            done, running = await asyncio.wait(
-                running, return_when=asyncio.FIRST_COMPLETED, timeout=interval)
-            # 判胜:任一候选拿到结果(响应头/CONNECT 200)即获胜;HTTP 5xx 不算胜出
-            # (见 _is_acceptable_win),跳过并继续补发/等待其他候选。
-            winner_task = None
-            for t in done:
-                completed.add(t)
-                try:
-                    winner = t.result()
-                    if not self._is_acceptable_win(winner):
-                        winner = None
-                        continue
-                    winner_task = t
-                    self._observe_win(t)  # 调参器:赢家 TTFB(从 task 侧信道取回)
-                    break
-                except Exception:
-                    pass
-            if winner is not None:
-                losers = set(running)
-                for t in completed:
-                    if t is not winner_task:
-                        losers.add(t)
-                for t in running:
-                    t.cancel()
-                if losers:
-                    self._spawn_cleanup(losers, cleanup)
-                return winner
-            # 无胜者(完成候选均失败/被取消):定时补发下一个候选(若有)。
-            if unlaunched:
-                running.add(self._make_race_task(unlaunched.pop(), method, url, headers, body, domain))
+        try:
+            while running or unlaunched:
+                # 等待首字节;interval 超时无候选完成则返回(未完成者仍在 running 里),
+                # 用于定时补发下一个。有候选完成则 done 含该候选。
+                done, running = await asyncio.wait(
+                    running, return_when=asyncio.FIRST_COMPLETED, timeout=interval)
+                # 判胜:任一候选拿到结果(响应头/CONNECT 200)即获胜;HTTP 5xx 不算胜出
+                # (见 _is_acceptable_win),跳过并继续补发/等待其他候选。
+                winner_task = None
+                for t in done:
+                    completed.add(t)
+                    try:
+                        winner = t.result()
+                        if not self._is_acceptable_win(winner):
+                            winner = None
+                            continue
+                        winner_task = t
+                        self._observe_win(t)  # 调参器:赢家 TTFB(从 task 侧信道取回)
+                        break
+                    except Exception:
+                        pass
+                if winner is not None:
+                    losers = set(running)
+                    for t in completed:
+                        if t is not winner_task:
+                            losers.add(t)
+                    for t in running:
+                        t.cancel()
+                    if losers:
+                        self._spawn_cleanup(losers, cleanup)
+                    return winner
+                # 无胜者(完成候选均失败/被取消):定时补发下一个候选(若有)。
+                if unlaunched:
+                    running.add(self._make_race_task(unlaunched.pop(), method, url, headers, body, domain))
+        except BaseException:
+            # 竞速中途被取消(client 断开 / stop() 取消在途 handler):同 _race 的守卫。
+            # running 里的候选尚未被 retrieval,就地取消 + gather 排空;completed
+            # 里的候选已在本循环内 .result() 检索过(仅禁 retrieval 弃供),仍一并
+            # gather 兜底。裸 raise 保留取消语义。
+            pending_cands = set(running) | completed
+            for t in pending_cands:
+                t.cancel()
+            await asyncio.gather(*pending_cands, return_exceptions=True)
+            raise
         # 全部候选耗尽仍无胜者:completed 里那些"拿到 5xx 响应头但被判非胜"的任务
         # 持有流式 resp(占 httpx 连接池连接),必须下放清理,否则反复全失败累积到
         # 连接池耗尽。winner 分支已在上面处理了 completed(经 losers),_race 的

@@ -6400,6 +6400,64 @@ class TestRaceStaggeredCleanupOnAllFail:
         # 赢家路径:败者(dead)进入 cleanup——这是既有行为,回归确认未破坏。
         assert any(n >= 1 for n in rented), f"winner path should clean dead loser, got {rented}"
 
+    @pytest.mark.asyncio
+    async def test_cancel_during_race_retrieves_orphan_exceptions(self):
+        """回归:竞速中途 awaiter 被取消(客户端断开/stop() 关停)→ 在途候选 task
+        不能成为孤儿:其异常(上游 CONNECT 非 200 等)必须被 retrieval,否则
+        asyncio 报 "Task exception was never retrieved"。
+
+        复现路径:候选 task 长时间挂起(模拟慢上游),_race_staggered 仍在
+        asyncio.wait 中未判胜时,外层把整个竞速 awaiter 取消。修复前在途候选
+        永久失去 awaiter;修复后 except BaseException 就地 cancel+gather 排空。
+        用自定义 loop exception handler 捕获 "never retrieved" 型告警做断言。
+        """
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='p1', host='127.0.0.1', port=31345))
+        ps.add(ProxyInfo(id='p2', host='127.0.0.1', port=31346))
+        r = make_router(ps, listen_host='127.0.0.1', listen_port=10819,
+                   max_retries=2, enable_http_cache=False, stagger_start=True,
+                   db_path=tempfile.mktemp(suffix='.db'))
+
+        # 候选 sleep 一小段时间后抛上游型 RuntimeError:取消发生(0.02s)后仍在
+        # running 中,接着在 0.05s 失败——若被取消变成孤儿,其异常会在测试仍观察
+        # loop 的时间窗内(0.05s)触发 "never retrieved" 告警,断言可及。
+        # 若候选同步失败,竞速会在取消前正常走完并 self-retrieve,测不到 bug。
+        async def slow_tunnel(place, method, url, headers, body):
+            await asyncio.sleep(0.05)
+            raise RuntimeError(f'upstream returned non-200 for CONNECT: '
+                               f'HTTP/1.1 503 Service Unavailable')
+
+        r._make_race_task = lambda place, method, url, headers, body, domain=None: \
+            asyncio.create_task(slow_tunnel(place, method, url, headers, body))
+
+        # 捕获 "exception was never retrieved" 型 loop 告警。
+        unretrieved = []
+        loop = asyncio.get_running_loop()
+        orig_handler = loop.get_exception_handler()
+        def handler(loop_, ctx):
+            msg = str(ctx.get('message', ''))
+            if 'never retrieved' in msg:
+                unretrieved.append(ctx)
+            elif orig_handler:
+                orig_handler(loop_, ctx)
+        loop.set_exception_handler(handler)
+        try:
+            # 竞速放入独立 awaiter task(候选挂起中);在 wait 判胜前取消 awaiter。
+            awaiter = asyncio.create_task(
+                r._race_staggered(['p1', 'p2'], initial=2, interval=5.0))
+            # 给事件循环一拍让候选 task 创建并进入 pending。
+            await asyncio.sleep(0.02)
+            awaiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await awaiter
+            # 给 loop 几拍让 except 分支的 cancel+gather 排空在途候选。
+            await asyncio.sleep(0.1)
+            # 取消后洗手:在途候选异常必须被 retrieval,不得出现孤儿告警。
+            assert not unretrieved, \
+                f"race cancel must retrieve in-flight task exceptions, got {unretrieved}"
+        finally:
+            loop.set_exception_handler(orig_handler)
+
 
 class TestForwardSingleAcloseFinally:
     """回归:#4 _forward_single 在 _stream_upstream_response 抛异常时仍 aclose resp。"""
