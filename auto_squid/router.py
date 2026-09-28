@@ -2262,7 +2262,11 @@ class Router:
                             self._drain_losers(losers, cleanup))
                         self._pending_cleanups.add(cleanup_task)
                         cleanup_task.add_done_callback(self._pending_cleanups.discard)
-                    break
+                    # 立即返回赢家(而非 break 落出循环):末尾的 `finished` 兜底清理
+                    # 是给"全部候选耗尽仍无胜者"路径用的——此处 finished 含赢家,
+                    # break 后再执行它会二次清理赢家隧道(3.12 调度下必现 ConnectionReset)。
+                    # _race_staggered 赢家分支同样 return,此处保持一致。
+                    return winner
         except BaseException:
             # 竞速中途被取消(client 断开 / stop() 取消在途 handler):asyncio.wait
             # 抛 CancelledError,尚未完成的候选 task 即失去 awaiter,其异常(如上游
