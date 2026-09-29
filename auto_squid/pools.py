@@ -188,6 +188,13 @@ class ConnectionPools:
         self.established_pool_misses = 0    # 取已握手池未中需新建/新建握手的次数
         self.established_pool_expired = 0   # 已握手连接空闲超时关闭次数
         self.established_pool_returned = 0  # 隧道结束归还次数
+        # 诊断(09-29 加):分辨 established 池零复用的两类病因——
+        # 复访缺失(cur/peek miss:请求到达时该 key 库存为空,可能从未建或已被清)
+        #   vs 库存僵死(取到库存但活性探测 read(1) 立即 EOF/RST,复用前死亡)。
+        # 9 天日志回放 established_pool_hits=0 后引入:若 miss 侧远大于 probe_dead,
+        # 说明请求几乎不落在库存存在的桶上;反之则库存常见但死得太快。
+        self.established_pool_revisit_miss = 0     # miss:该 key 池为空(无库存可取)
+        self.established_pool_probe_dead = 0       # 取到库存但活性探测判死/脏丢弃
         # 预握手(被动预建升级):命中粘性/域缓存/竞速胜出的 (proxy, target) 在
         # 既有"只建 TCP"预建之外,额外自建一条 TCP 并发 CONNECT 预握手,拿到 200
         # 直接进 _established_pool(库存产生率提升,等同 target 请求复用跳过握手)。
@@ -300,12 +307,14 @@ class ConnectionPools:
         got = self._pool_peek(self._established_pool, f"{proxy_host}:{proxy_port}|{target}")
         if got is None:
             self.established_pool_misses += 1
+            self.established_pool_revisit_miss += 1  # 诊断:请求到达但该 key 库存为空
             return None
         reader, writer = got
         # 严格验证:上游缓冲残留数据 → 连接已脏,丢弃而非复用(宁可不复用也不污染)。
         # 本方法是同步热路径,关闭用 fire-and-forget 后台任务(不阻塞取用)。
         if reader.at_eof() or (reader._buffer and len(reader._buffer) > 0):
             self.established_pool_expired += 1
+            self.established_pool_probe_dead += 1  # 诊断:取到库存但已脏/对端 EOF
             logger.debug("established pool DISCARD %s via %s:%s (dirty buffer)", target, proxy_host, proxy_port)
             _discard_conn(writer)
             return None

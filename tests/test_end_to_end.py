@@ -4278,6 +4278,10 @@ class TestConnPoolIdlePause:
             echo2 = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"")
             assert echo2 == b""
             assert r.established_pool_hits == 1
+            # 诊断计数器(09-29 加):第一条请求到达时该 key 库存为空 → 计复访缺失;
+            # 复访成功(hit=1)不碰 probe_dead;复访缺失仅在 miss 分支递增。
+            assert r.established_pool_revisit_miss == 1
+            assert r.established_pool_probe_dead == 0
         finally:
             await r.stop()
             up_srv.close()
@@ -4764,6 +4768,9 @@ class TestEstablishedTunnelReuse:
         assert s['established_pool_hits'] == 0
         assert s['established_pool_size'] == 0
         assert s['established_pool_returned'] == 0
+        # 诊断计数器(09-29 加)随 snapshot 暴露,供生产观测复访缺失 vs 库存僵死。
+        assert s['established_pool_revisit_miss'] == 0
+        assert s['established_pool_probe_dead'] == 0
 
     @pytest.mark.asyncio
     async def test_established_alive_probe_states(self):
