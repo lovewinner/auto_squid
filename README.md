@@ -156,9 +156,6 @@ router:
     target_prewarm: true         # Phase 2: pre-open "upstream → target" TCP for hot targets
     established_reuse: true      # re-use already-CONNECTed idle tunnels
     established_idle_timeout: 300.0
-    prehandshake: false          # P1: extra CONNECT pre-builds established tunnels (throttled!)
-    prehandshake_throttle_window_sec: 2.0
-    prehandshake_throttle_max_per_window: 6
     cluster_predict: false       # P3: pre-warm predicted co-targets for next page load
     cluster_window_sec: 2.0
     cluster_predict_topk: 3
@@ -306,7 +303,7 @@ router:
 > - `single_send_slow_log_ms` (default 0=off) is the only anchor to attribute "won't open / needs refresh" stalls to a specific client IP (the success path emits no IP log).
 > - `http_read_timeout_sec` default is 3 s; before tightening further, watch p99/fd in production — see the [Limitations](#limitations) note.
 > - **Policy routing** (`router.policies`) narrows the racing candidate set per domain/tag — see `examples/config.yaml` for the shape.
-> - `conn_pool.target_prewarm` requires `conn_pool.enabled`; `conn_pool.prehandshake` requires `enabled` + `target_prewarm` + `established_reuse` — set all or none.
+> - `conn_pool.target_prewarm` requires `conn_pool.enabled`; `conn_pool.established_reuse` and `conn_pool.cluster_predict` additionally require `target_prewarm` for full effect.
 > - `conn_pool.cluster_predict` requires `conn_pool.enabled` **and** `conn_pool.target_prewarm`.
 > - **Escape corridor (fail-open):** when every external proxy is circuit-open and the domain is reachable from the host, the router silently falls back to dialing `local` directly — no config required.
 

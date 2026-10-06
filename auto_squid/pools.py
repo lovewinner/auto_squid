@@ -19,20 +19,10 @@
 """
 
 import asyncio
-import base64
 import collections
 import logging
-import socket
 import time
 from typing import Optional, Tuple
-
-# 预握手 CONNECT 的 Host 行编码:target 为 ascii 时直通,含多字节时逐码点映射
-# latin-1(与 Router._hb 同语义,此处避免跨模块循环依赖内联实现)。
-def _hb_conn(v: str) -> bytes:
-    try:
-        return v.encode('ascii')
-    except UnicodeEncodeError:
-        return v.encode('latin-1')
 
 logger = logging.getLogger(__name__)
 
@@ -84,11 +74,10 @@ class ConnectionPools:
 
     def __init__(self, proxy_store, enabled, per_proxy, total, idle_timeout,
                  refill_interval, refill_target, connect_timeout, target_prewarm,
-                 established_reuse, prehandshake=False, pause_minutes=60.0,
+                 established_reuse, pause_minutes=60.0,
                  pause_silence_sec=120.0, pause_activity_window=None,
                  pause_min_requests=3, idle_timeout_cluster=600.0,
-                 idle_timeout_established=None, prehandshake_throttle_window_sec=0.0,
-                 prehandshake_throttle_max_per_window=0):
+                 idle_timeout_established=None):
         self.proxy_store = proxy_store
         self.conn_pool_enabled = bool(enabled)
         self.conn_pool_per_proxy = max(1, int(per_proxy))
@@ -195,26 +184,6 @@ class ConnectionPools:
         # 说明请求几乎不落在库存存在的桶上;反之则库存常见但死得太快。
         self.established_pool_revisit_miss = 0     # miss:该 key 池为空(无库存可取)
         self.established_pool_probe_dead = 0       # 取到库存但活性探测判死/脏丢弃
-        # 预握手(被动预建升级):命中粘性/域缓存/竞速胜出的 (proxy, target) 在
-        # 既有"只建 TCP"预建之外,额外自建一条 TCP 并发 CONNECT 预握手,拿到 200
-        # 直接进 _established_pool(库存产生率提升,等同 target 请求复用跳过握手)。
-        # 需 established_reuse 同步开启(预握手库存本就是 established 隧道,无
-        # reuse 则无人取用,白建)。连接打 _prehandshook 标签走 established 超时,
-        # 归因用 established_pool_prehandshook(预握手专属命中)——
-        # 区别于竞速败者/隧道归还(_established_pooled)。
-        self.conn_pool_prehandshake = bool(prehandshake)
-        self.prehandshake_enabled = bool(prehandshake)  # snapshot 只读别名
-        self.established_pool_prehandshook = 0      # 预握手隧道被复用命中次数
-        self.established_pool_prewarm_failed = 0    # 预握手 CONNECT 失败(回退只建 TCP)
-        # 预握手节流(生产事故 09-01:页面首载瞬间对几十个 target × 多代理疯狂预握手,
-        # 3 秒内 PREHANDSHAKE 落池 20+,把上游代理压到过载→全量熔断风暴)。滑动窗口
-        # 限速:window_sec 内最多 max_per_window 条,超出静默跳过(库存下次再补,不
-        # 打扰主请求)。两值都 >0 才生效,默认 0=不限速(零行为变化)。
-        self.prehandshake_throttle_window_sec = max(0.0, float(prehandshake_throttle_window_sec))
-        self.prehandshake_throttle_max_per_window = max(0, int(prehandshake_throttle_max_per_window))
-        self.prehandshake_throttled_skips = 0       # 节流跳过次数(观测节流是否过紧)
-        # 滑动窗口内预握手发射时间戳(monotonic 秒),用于限速判定。
-        self._prehandshake_emits: collections.deque = collections.deque()
         # 观测(P1 先观测后实现):CONNECT 到上游的新建 TCP 连接计数(不含预热池
         # 命中)。供压测算 HTTPS 建链成本、验证预热池收益。
         self.connect_new_conns = 0
@@ -321,10 +290,6 @@ class ConnectionPools:
         # 标记:该连接已建握手,调用方 _try_tunnel 据此跳过 CONNECT 发送/200 校验。
         writer._established_reused = True
         self.established_pool_hits += 1
-        # 归因:预握手库存(被动预建主动 CONNECT,见 _prehandshake_one)单独计数,
-        # 区别于竞速败者/隧道归还(_established_pooled)——算预握手专属命中率。
-        if getattr(writer, '_prehandshook', False):
-            self.established_pool_prehandshook += 1
         logger.debug("established pool HIT  %s via %s:%s (hits=%d)",
                     target, proxy_host, proxy_port, self.established_pool_hits)
         return reader, writer
@@ -521,130 +486,20 @@ class ConnectionPools:
         return made
 
     async def _target_pool_prewarm(self, proxy_host: str, proxy_port: int, target: str,
-                                   cap: int = 2, source: str = 'passive',
-                                   proxy_auth: Optional[dict] = None):
+                                   cap: int = 2, source: str = 'passive'):
         """后台协程:为 (proxy, target) 键预热连接,失败静默(被取消/超时/建连
         失败都只是少一条预热,不影响主请求)。由命中域名缓存/粘性或竞速胜出的
         CONNECT 触发,是"fire-and-forget",主请求不 await 本协程。cap=2 与
         _target_pool_refill 一致(见其 docstring)。task 的注册/排空由 Router 的
         _spawn_target_prewarm 负责(Router._running_tasks)。`source` 沿
         _target_pool_refill 传递(仅'cluster'打 cluster 专属归因标签)。
-
-        **预握手升级**:`proxy_auth` 提供访问该上游代理的凭据(Router 调用点已
-        拿到 proxy.auth)。当 `prehandshake_enabled` 且 established_reuse 开启且
-        source='passive' 时,除既有裸 TCP 预建外,**额外自建一条 TCP 并发 CONNECT
-        预握手**,拿到 200 直接进 _established_pool(库存产生率提升——等同 target
-        请求到来时复用已握手隧道、跳过 CONNECT)。连接打 _prehandshook 标签,走
-        established 独立超时(600s),归因用 established_pool_prehandshook 专属命中。
-        cluster 预测(source='cluster')不做预握手:预测命中率 ~3%,预握手浪费面大
-        (v1 不做,预测仍只建裸 TCP)。
         """
         try:
             await self._target_pool_refill(proxy_host, proxy_port, target, cap=cap, source=source)
-            # 预握手:被动命中已确认 (proxy, target) 高频,extra 一条已握手库存。
-            # 自建 TCP(不复用赢家隧道——那隧道正被透传,并发写 CONNECT 会与业务
-            # 数据交织竞态)。失败静默回退(仅少一条预握手库存,不影响主请求)。
-            if (self.prehandshake_enabled and self.conn_pool_established_reuse
-                    and source == 'passive' and proxy_auth is not None):
-                await self._prehandshake_one(proxy_host, proxy_port, target, proxy_auth)
         except asyncio.CancelledError:
             pass
         except Exception:
             logger.info("target prewarm FAILED %s via %s:%s", target, proxy_host, proxy_port)
-
-    def _prehandshake_throttle_allow(self) -> bool:
-        """预握手滑动窗口限速:window 内发射数 < 上限才放行并记账。
-
-        不限速(两值任一 ≤0)恒 True,零行为变化。窗口内已满则计
-        prehandshake_throttled_skips 并返回 False(静默跳过,不打扰主请求)。
-        """
-        win = self.prehandshake_throttle_window_sec
-        cap = self.prehandshake_throttle_max_per_window
-        if win <= 0 or cap <= 0:
-            return True
-        now = time.monotonic()
-        q = self._prehandshake_emits
-        # 丢弃窗口外旧时间戳,滑动窗口内计数。
-        while q and now - q[0] > win:
-            q.popleft()
-        if len(q) >= cap:
-            self.prehandshake_throttled_skips += 1
-            return False
-        q.append(now)
-        return True
-
-    async def _prehandshake_one(self, proxy_host: str, proxy_port: int, target: str,
-                                proxy_auth: dict):
-        """预握手一条 (proxy, target):自建 TCP → 发 CONNECT → 拿到 200 进 established 池。
-
-        预算/单键 cap 检查同 _maybe_return_established(established 池计入全局
-        conn_pool_total,单键受 _ESTABLISHED_KEY_CAP);空闲暂停期间不预握手
-        (无请求期间预握手库存只会空等被清)。失败(建连/CONNECT 非 200/超时)
-        静默计 established_pool_prewarm_failed,回退——不打扰主请求。
-
-        返回 True 表示成功入 established 池;False 表示失败/跳过。
-        """
-        key = f"{proxy_host}:{proxy_port}|{target}"
-        if self._conn_pool_idle():
-            return False
-        if self._total_idle() >= self.conn_pool_total \
-                or len(self._established_pool.get(key, [])) >= _ESTABLISHED_KEY_CAP:
-            return False  # 超预算/cap:宁可这次不预握手
-        if not self._prehandshake_throttle_allow():
-            return False  # 节流窗口已满:静默跳过,库存下次再补
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(proxy_host, proxy_port),
-                timeout=self.conn_pool_connect_timeout)
-        except (asyncio.TimeoutError, OSError, ConnectionError):
-            self.established_pool_prewarm_failed += 1
-            return False
-        try:
-            raw = f"{proxy_auth['username']}:{proxy_auth['password']}"
-            encoded = base64.b64encode(raw.encode()).decode()
-            auth_hdr = f"Proxy-Authorization: Basic {encoded}\r\n"
-            writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: ".encode('latin-1')
-                         + _hb_conn(target) + f"\r\n{auth_hdr}\r\n".encode('latin-1'))
-            await writer.drain()
-            status = await asyncio.wait_for(reader.readline(),
-                                            timeout=self.conn_pool_connect_timeout)
-            if not status:
-                raise RuntimeError('no response from upstream')
-            status_text = status.decode('latin-1')
-            # 吞掉剩余响应头(直到空行)。超时保护:后台 fire-and-forget 任务
-            # 不能因对端挂起不关头而泄漏(真实上游错误响应都带头+空行,秒回)。
-            async def _drain_headers():
-                while True:
-                    h = await reader.readline()
-                    if not h or h in (b"\r\n", b"\n"):
-                        break
-            await asyncio.wait_for(_drain_headers(),
-                                   timeout=self.conn_pool_connect_timeout)
-            if '200' not in status_text:
-                raise RuntimeError(f'upstream returned non-200 for CONNECT: {status_text.strip()}')
-        except BaseException:
-            self.established_pool_prewarm_failed += 1
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
-            return False
-        # 入 established 池:打 _prehandshook 标签走 established 独立超时;SO_KEEPALIVE
-        # 由 OS 兜底判半开死连接(同 _maybe_return_established 的 keepalive)。
-        try:
-            writer.get_extra_info('socket').setsockopt(
-                socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        except Exception:
-            pass
-        writer._conn_pool_created = time.monotonic()
-        writer._prehandshook = True
-        self._established_pool.setdefault(key, []).append((reader, writer))
-        self.established_pool_returned += 1
-        # DEBUG:同上——归还进池是常规生命周期事件(实测占全部日志约 15%)。
-        logger.debug("established pool PREHANDSHAKE %s via %s:%s (returned=%d)",
-                     target, proxy_host, proxy_port, self.established_pool_returned)
-        return True
 
     # ── 清理 / 生命周期 ─────────────────────────────────────────
 
@@ -673,8 +528,7 @@ class ConnectionPools:
                     timeout = self.conn_pool_idle_timeout
                     if getattr(writer, '_cluster_prewarmed', False):
                         timeout = self.cluster_pool_idle_timeout
-                    elif (getattr(writer, '_established_pooled', False)
-                          or getattr(writer, '_prehandshook', False)) \
+                    elif getattr(writer, '_established_pooled', False) \
                             and self.established_pool_idle_timeout is not None:
                         timeout = self.established_pool_idle_timeout
                     if now - last > timeout:

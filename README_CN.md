@@ -156,9 +156,6 @@ router:
     target_prewarm: true         # Phase 2: 为热目标预开"上游 → 目标" TCP
     established_reuse: true      # 复用已握手的空闲隧道
     established_idle_timeout: 300.0
-    prehandshake: false          # P1: 额外 CONNECT 预建已握手隧道（需限流!）
-    prehandshake_throttle_window_sec: 2.0
-    prehandshake_throttle_max_per_window: 6
     cluster_predict: false       # P3: 预建下一页加载的预测共现目标 TCP
     cluster_window_sec: 2.0
     cluster_predict_topk: 3
@@ -306,7 +303,7 @@ router:
 > - `single_send_slow_log_ms`（默认 0=关闭）是唯一能把"打不开/需要多次刷新"故障归因到具体客户端 IP 的锚点（成功路径不输出 IP 日志）。
 > - `http_read_timeout_sec` 默认 3 s —— 在进一步收紧前，先在生产观察 p99/fd；详见文末 [局限性](#局限) 小节。
 > - **策略路由**（`router.policies`）按域名/标签收窄竞速候选集 —— 形状见 `examples/config.yaml`。
-> - `conn_pool.target_prewarm` 需要 `conn_pool.enabled`；`conn_pool.prehandshake` 需要 `enabled` + `target_prewarm` + `established_reuse` —— 三者全开或全关。
+> - `conn_pool.target_prewarm` 需要 `conn_pool.enabled`；`conn_pool.established_reuse` 需 `enabled`，`conn_pool.cluster_predict` 需 `enabled` **且** `target_prewarm`。
 > - `conn_pool.cluster_predict` 需要 `conn_pool.enabled` **且** `conn_pool.target_prewarm`。
 > - **逃生走廊（fail-open）：** 当所有外部代理都熔断且该域名在本机可达时，路由器会自动回退到直接拨 `local` —— 无需额外配置。
 

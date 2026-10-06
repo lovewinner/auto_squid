@@ -317,9 +317,6 @@ class Router:
         conn_pool_refill_pause_min_requests = pc.refill_pause_min_requests
         conn_pool_established_reuse = pc.established_reuse
         conn_pool_established_idle_timeout = pc.established_idle_timeout
-        conn_pool_prehandshake = pc.prehandshake
-        conn_pool_prehandshake_throttle_window_sec = pc.prehandshake_throttle_window_sec
-        conn_pool_prehandshake_throttle_max_per_window = pc.prehandshake_throttle_max_per_window
         cluster_predict = pc.cluster_predict
         cluster_window_sec = pc.cluster_window_sec
         cluster_predict_topk = pc.cluster_predict_topk
@@ -562,15 +559,12 @@ class Router:
             conn_pool_connect_timeout=conn_pool_connect_timeout,
             conn_pool_target_prewarm=conn_pool_target_prewarm,
             conn_pool_established_reuse=conn_pool_established_reuse,
-            conn_pool_prehandshake=conn_pool_prehandshake,
             conn_pool_refill_pause_minutes=conn_pool_refill_pause_minutes,
             conn_pool_refill_pause_silence_sec=conn_pool_refill_pause_silence_sec,
             conn_pool_refill_pause_activity_window=conn_pool_refill_pause_activity_window,
             conn_pool_refill_pause_min_requests=conn_pool_refill_pause_min_requests,
             cluster_pool_idle_timeout=cluster_pool_idle_timeout,
-            conn_pool_established_idle_timeout=conn_pool_established_idle_timeout,
-            conn_pool_prehandshake_throttle_window_sec=conn_pool_prehandshake_throttle_window_sec,
-            conn_pool_prehandshake_throttle_max_per_window=conn_pool_prehandshake_throttle_max_per_window)
+            conn_pool_established_idle_timeout=conn_pool_established_idle_timeout)
 
         # ── 请求簇预测预热(ClusterGraph,#新增:观察见 _cluster_observe)──────
         # 全局共现图 + 客户端瞬态窗口(不超过 window_sec)。总闸 = conn_pool 第二
@@ -844,14 +838,12 @@ class Router:
                     conn_pool_idle_timeout: float, conn_pool_refill_interval: float,
                     conn_pool_refill_target: int, conn_pool_connect_timeout: float,
                     conn_pool_target_prewarm: bool, conn_pool_established_reuse: bool,
-                    conn_pool_prehandshake: bool, conn_pool_refill_pause_minutes: float,
+                    conn_pool_refill_pause_minutes: float,
                     conn_pool_refill_pause_silence_sec: float,
                     conn_pool_refill_pause_activity_window: Optional[float],
                     conn_pool_refill_pause_min_requests: int,
                     cluster_pool_idle_timeout: float,
-                    conn_pool_established_idle_timeout: Optional[float],
-                    conn_pool_prehandshake_throttle_window_sec: float,
-                    conn_pool_prehandshake_throttle_max_per_window: int) -> None:
+                    conn_pool_established_idle_timeout: Optional[float]) -> None:
         """构造 CONNECT 上游连接池协作对象 self.pools(ConnectionPools)。
 
         统一承载三个池:通用预热池、目标半预连接池、已建握手复用池,共享全局 fd
@@ -868,15 +860,12 @@ class Router:
             idle_timeout=conn_pool_idle_timeout, refill_interval=conn_pool_refill_interval,
             refill_target=conn_pool_refill_target, connect_timeout=conn_pool_connect_timeout,
             target_prewarm=conn_pool_target_prewarm, established_reuse=conn_pool_established_reuse,
-            prehandshake=conn_pool_prehandshake,
             pause_minutes=conn_pool_refill_pause_minutes,
             pause_silence_sec=conn_pool_refill_pause_silence_sec,
             pause_activity_window=conn_pool_refill_pause_activity_window,
             pause_min_requests=conn_pool_refill_pause_min_requests,
             idle_timeout_cluster=cluster_pool_idle_timeout,
-            idle_timeout_established=conn_pool_established_idle_timeout,
-            prehandshake_throttle_window_sec=conn_pool_prehandshake_throttle_window_sec,
-            prehandshake_throttle_max_per_window=conn_pool_prehandshake_throttle_max_per_window)
+            idle_timeout_established=conn_pool_established_idle_timeout)
 
     # ── DB helpers ──────────────────────────────────────────────
 
@@ -1597,12 +1586,6 @@ class Router:
             "cluster_graph_size": self.cluster.graph_size(),
             "conn_pool_established_reuse": self.pools.conn_pool_established_reuse,
             "conn_pool_established_idle_timeout": self.pools.established_pool_idle_timeout,
-            "conn_pool_prehandshake": self.pools.prehandshake_enabled,
-            "established_pool_prehandshook": self.pools.established_pool_prehandshook,
-            "established_pool_prewarm_failed": self.pools.established_pool_prewarm_failed,
-            "prehandshake_throttled_skips": self.pools.prehandshake_throttled_skips,
-            "prehandshake_throttle_window_sec": self.pools.prehandshake_throttle_window_sec,
-            "prehandshake_throttle_max_per_window": self.pools.prehandshake_throttle_max_per_window,
             "established_pool_hits": self.pools.established_pool_hits,
             "established_pool_misses": self.pools.established_pool_misses,
             "established_pool_revisit_miss": self.pools.established_pool_revisit_miss,
@@ -2033,8 +2016,7 @@ class Router:
     # Router 侧只剩"触发预热"的一处编排 —— task 注册/排空进 _running_tasks。
 
     def _spawn_target_prewarm(self, proxy_host: Optional[str], proxy_port: Optional[int],
-                              target: str, source: str = 'passive', *,
-                              proxy_auth: Optional[dict] = None):
+                              target: str, source: str = 'passive'):
         """命中域名缓存/粘性或竞速胜出的 CONNECT → 后台预热 (proxy, target) 连接。
 
         仅在第二阶段开启且经上游代理(非本机直连)时触发;计数并登记到
@@ -2047,17 +2029,6 @@ class Router:
         ClusterGraph 预测预建经注入的 prewarm_spawn lambda 以 source='cluster'
         进入(见 __init__ 接线)。pools 据此给 cluster 连接打上 _cluster_prewarmed
         标签,算 cluster 专属命中率(cluster_pool_hits / cluster_pool_creates)。
-
-        **预握手升级(prehandshake)**:`proxy_auth` 提供访问该上游代理的凭据
-        (调用点已拿到 proxy.auth,带进 pools 免二次反查)。pools 在预握手开启且
-        established_reuse 开启时,对**被动**预建(self 发起的(proxy, target))
-        额外建一条**自建 TCP + CONNECT 预握手**隧道(CONNECT 拿 200 即进
-        established 池,skip 下次握手)——注意是**新建** TCP,不复用本次请求的
-        赢家隧道(那隧道正被 _relay_tunnel 透传,复用会与业务数据交织竞态)。
-        预握手库存打 _prehandshook 标签走 established 超时(600s),并计
-        established_pool_prehandshook 专属命中率。cluster 预测保持只建 TCP
-        (预测命中率 ~3%,预握手浪费面大,v1 不做)。未开启 established_reuse 或
-        预握手失败时回退只建 TCP 进 target 池(现状,零行为变化)。
         """
         if not (self.pools.conn_pool_enabled and self.pools.conn_pool_target_prewarm):
             return
@@ -2068,7 +2039,7 @@ class Router:
                     target, proxy_host, proxy_port, self.pools.target_prewarm_dispatched)
         task = asyncio.create_task(
             self.pools._target_pool_prewarm(proxy_host, proxy_port, target,
-                                            source=source, proxy_auth=proxy_auth))
+                                            source=source))
         self._running_tasks.add(task)
         task.add_done_callback(self._running_tasks.discard)
 
@@ -3352,11 +3323,8 @@ class Router:
                 _pid, up_reader, up_writer = await self._try_tunnel(pid, target, proxy.host, proxy.port, proxy.auth,
                                                                     client_ip=client_ip)
                 # CONNECT 目标半预连接(P2):单发命中说明该 target 高频,后台预热以下
-                # 一条到上游代理的 TCP(不阻塞本请求)。预握手升级:把 proxy.auth 交给
-                # pools,开启 prehandshake 时额外自建 TCP + CONNECT 预握手一条(库存进
-                # established 池),否则只建 TCP 进 target 池(现状)。
-                self._spawn_target_prewarm(proxy.host, proxy.port, target,
-                                           proxy_auth=proxy.auth)
+                # 一条到上游代理的 TCP(不阻塞本请求)。
+                self._spawn_target_prewarm(proxy.host, proxy.port, target)
             self._observe_single_send(client_ip, target, target, pid, _perf_t0)
             # 单发无败者,是最纯的赢家样本(调参器 objective)。
             self._observe_win(asyncio.current_task())
@@ -3624,10 +3592,7 @@ class Router:
             if pid != 'local':
                 win_proxy = self.proxy_store.get(pid)
                 if win_proxy is not None:
-                    # 预握手升级:竞速胜出同单发分支,把 win_proxy.auth 交给 pools
-                    # 预握手(竞速天然高频 target,库存直接进 established 池)。
-                    self._spawn_target_prewarm(win_proxy.host, win_proxy.port, target,
-                                               proxy_auth=win_proxy.auth)
+                    self._spawn_target_prewarm(win_proxy.host, win_proxy.port, target)
             # 请求簇预测预热:竞速胜出同样记入客户端窗口(页面的每一跳都是一簇一员)。
             self.cluster.observe(client_ip, target, pid)
             await self._connect_established(client_writer, up_writer)
@@ -4088,11 +4053,9 @@ class Router:
     _POOL_FORWARD = frozenset({'_conn_pool', '_target_pool', '_established_pool',
         'conn_pool_enabled', 'conn_pool_per_proxy', 'conn_pool_total', 'conn_pool_idle_timeout',
         'conn_pool_refill_interval', 'conn_pool_refill_target', 'conn_pool_connect_timeout',
-        'conn_pool_target_prewarm', 'conn_pool_established_reuse', 'conn_pool_prehandshake',
+        'conn_pool_target_prewarm', 'conn_pool_established_reuse',
         'conn_pool_refill_pause_minutes', 'conn_pool_refill_pause_activity_window',
         'conn_pool_refill_pause_min_requests', 'cluster_pool_idle_timeout',
-        'prehandshake_enabled', 'established_pool_prehandshook', 'established_pool_prewarm_failed',
-        'prehandshake_throttled_skips',
         'conn_pool_creates', 'conn_pool_hits', 'conn_pool_misses', 'conn_pool_expired',
         'target_pool_creates', 'target_pool_hits', 'target_pool_misses', 'target_pool_expired',
         'cluster_pool_creates', 'cluster_pool_hits', 'cluster_pool_expired',
