@@ -16,7 +16,7 @@ from auto_squid.selector import _ERROR_KEYS, ERROR_HTTP_STATUS
 from auto_squid.router import (
     Router, ProxySelector, _hb, make_router,
     _MAX_REQUEST_HEADER_LINES, _MAX_REQUEST_HEADER_BYTES,
-    _AGG_WAIT_TIMEOUT,
+    _AGG_WAIT_TIMEOUT, _ESTABLISHED_KEY_CAP,
 )
 from auto_squid.cluster import ClusterGraph
 from auto_squid.config_schema import (
@@ -4896,6 +4896,85 @@ class TestEstablishedTunnelReuse:
             assert sum(len(v) for v in r._established_pool.values()) == 0, \
                 "established pool must stay empty when global budget is exhausted"
             assert r.established_pool_returned == 0
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_skip_return_log_reports_both_budget_and_cap(self, caplog):
+        """SKIP-RETURN 日志须报出三个判据(idle/total、key/cap、命中分支)。
+
+        归还条件是「全局预算满 OR 单键满」的**析取**,只报预算无法区分是哪一支
+        触发(生产实测两者都在发生)。本用例锁定日志带 idle=<n>/<total>、
+        key=<n>/<cap> 与分支标记 over-budget / over-key-cap,这样下次日志轮转后
+        可直接定量归因,不必再靠推测。
+
+        payload=b"" 是关键:透传了业务字节的隧道 total>0,按设计不允许入池
+        (safe_for_reuse=False),根本走不到预算/cap 检查。
+        """
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router(conn_pool_total=1)
+        await r.start()
+        try:
+            # 占走全部预算(total=1),触发 over-budget 分支。
+            fake_r, fake_w = await asyncio.open_connection(HOST, 31991)
+            fake_w._conn_pool_created = time.monotonic()
+            r._target_pool[f"{HOST}:31991|other-target:443"] = [(fake_r, fake_w)]
+
+            with caplog.at_level(logging.INFO, logger='auto_squid.router'):
+                # payload=b"":客户端 CONNECT 后不转发业务字节 → total==0 → 允许归还。
+                await send_connect(HOST, ROUTER_PORT,
+                                   target=b"skiplog.example.com:443", payload=b"")
+                # 归还在隧道收尾的异步 finally 里发生,晚于 send_connect 返回;
+                # 必须在 at_level 块**内**等它,否则 handler 已被摘掉。
+                await asyncio.sleep(0.3)
+            recs = [m for m in caplog.records if "SKIP-RETURN" in m.getMessage()]
+            assert len(recs) == 1, f"应恰好一条 SKIP-RETURN,实际 {len(recs)}"
+            msg = recs[0].getMessage()
+            # 三个判据必须都在,且分支标记正确(预算 total=1 被占满 → over-budget)。
+            assert "idle=1/1" in msg, f"缺预算判据: {msg}"
+            assert f"key=0/{_ESTABLISHED_KEY_CAP}" in msg, f"缺单键判据: {msg}"
+            assert "over-budget" in msg, f"分支标记应为 over-budget: {msg}"
+            assert "over-key-cap" not in msg, \
+                f"预算满时不应同时标记 over-key-cap(会误导归因): {msg}"
+            assert r.established_pool_returned == 0
+        finally:
+            await r.stop()
+            up_srv.close()
+            await up_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_skip_return_log_marks_key_cap_branch(self, caplog):
+        """预算未满但单键已满时,分支标记须为 over-key-cap(与 over-budget 区分)。"""
+        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
+        r = self._router()          # total=8:预算充足,不会被预算拦
+        await r.start()
+        try:
+            target = b"skiplog-cap.example.com:443"
+            key = f"{HOST}:31991|{target.decode()}"
+
+            async def one(_i):
+                # payload=b"":见上,total==0 才可能入池。
+                return await send_connect(HOST, ROUTER_PORT, target=target, payload=b"")
+
+            # 必须**并发**:串行时每条新隧道会先消费掉池里那条(驻留恒为 1),
+            # 永远撞不到 cap —— 实测串行 5 条全部 RETURN、驻留始终 1 条。
+            # 4 条同键并发(> cap=2):2 条入池、2 条归还时撞单键上限被 SKIP。
+            with caplog.at_level(logging.INFO, logger='auto_squid.router'):
+                # 4 条同键并发(> cap=2):2 条入池、2 条归还时撞单键上限被 SKIP。
+                await asyncio.gather(*[one(i) for i in range(4)])
+                # 归还发生在隧道收尾的异步 finally 里,须在本块内等待。
+                await asyncio.sleep(0.3)
+            recs = [m for m in caplog.records if "SKIP-RETURN" in m.getMessage()]
+            assert recs, "撞 cap 时应打出 SKIP-RETURN"
+            msg = recs[-1].getMessage()
+            assert f"key={_ESTABLISHED_KEY_CAP}/{_ESTABLISHED_KEY_CAP}" in msg, \
+                f"该键应已达 cap: {msg}"
+            assert "over-key-cap" in msg, f"分支标记应为 over-key-cap: {msg}"
+            # 预算充足(total=8,驻留 2)时不得误标 over-budget。
+            assert "over-budget" not in msg, \
+                f"预算充足时不应标记 over-budget: {msg}"
         finally:
             await r.stop()
             up_srv.close()

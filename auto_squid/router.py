@@ -3874,10 +3874,26 @@ class Router:
             # 预算/cap 检查:established 池计入全局 conn_pool_total(与另两池同口径),
             # 单键再受 _ESTABLISHED_KEY_CAP 上限。超限则关闭不复用——宁可这次不省
             # 建连也不让 fd 无界增长。三池快照统一用 pools._total_idle(见 #14)。
-            if self.pools._total_idle() >= self.pools.conn_pool_total \
-                    or len(self.pools._established_pool.get(key, [])) >= _ESTABLISHED_KEY_CAP:
-                logger.info("established pool SKIP-RETURN %s via %s:%s (over budget/cap, returned=%d)",
-                            target, proxy_host, proxy_port, self.pools.established_pool_returned)
+            #
+            # 这是预算满 OR 单键满的**析取**条件,只报预算无法区分是哪一支触发
+            # (实测两者都在发生:同一键反复归还会撞 cap=2,而多键分散归还更像
+            # 预算被另两池占满)。故这里同时输出三个判据 idle/total、该键当前
+            # 条数/cap、命中的分支,便于下次日志轮转后定量归因:
+            #   idle≈total → 预算被 target/通用池挤占,该考虑给 established 预留份额;
+            #   idle<total 且 key_len==cap → 单键上限,该考虑放宽 cap 或换键选择;
+            #   两者都没满却出现 → 说明有第三条阻塞路径,需再查。
+            idle = self.pools._total_idle()
+            key_len = len(self.pools._established_pool.get(key, []))
+            over_budget = idle >= self.pools.conn_pool_total
+            over_cap = key_len >= _ESTABLISHED_KEY_CAP
+            if over_budget or over_cap:
+                logger.info("established pool SKIP-RETURN %s via %s:%s "
+                            "(idle=%d/%d key=%d/%d %s returned=%d)",
+                            target, proxy_host, proxy_port,
+                            idle, self.pools.conn_pool_total,
+                            key_len, _ESTABLISHED_KEY_CAP,
+                            "over-budget" if over_budget else "over-key-cap",
+                            self.pools.established_pool_returned)
                 can_reuse = False
         if can_reuse:
             self._set_pool_keepalive(up_writer)
