@@ -13,6 +13,7 @@ __pycache__/
 *.db
 *.db.bak
 *.log
+*.log.*
 *.egg-info/
 bench_report.json
 *.db-shm

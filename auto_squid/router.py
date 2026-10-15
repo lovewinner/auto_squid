@@ -564,7 +564,8 @@ class Router:
             conn_pool_refill_pause_activity_window=conn_pool_refill_pause_activity_window,
             conn_pool_refill_pause_min_requests=conn_pool_refill_pause_min_requests,
             cluster_pool_idle_timeout=cluster_pool_idle_timeout,
-            conn_pool_established_idle_timeout=conn_pool_established_idle_timeout)
+            conn_pool_established_idle_timeout=conn_pool_established_idle_timeout,
+            cluster_predict=cluster_predict)
 
         # ── 请求簇预测预热(ClusterGraph,#新增:观察见 _cluster_observe)──────
         # 全局共现图 + 客户端瞬态窗口(不超过 window_sec)。总闸 = conn_pool 第二
@@ -843,7 +844,8 @@ class Router:
                     conn_pool_refill_pause_activity_window: Optional[float],
                     conn_pool_refill_pause_min_requests: int,
                     cluster_pool_idle_timeout: float,
-                    conn_pool_established_idle_timeout: Optional[float]) -> None:
+                    conn_pool_established_idle_timeout: Optional[float],
+                    cluster_predict: bool = False) -> None:
         """构造 CONNECT 上游连接池协作对象 self.pools(ConnectionPools)。
 
         统一承载三个池:通用预热池、目标半预连接池、已建握手复用池,共享全局 fd
@@ -865,7 +867,11 @@ class Router:
             pause_activity_window=conn_pool_refill_pause_activity_window,
             pause_min_requests=conn_pool_refill_pause_min_requests,
             idle_timeout_cluster=cluster_pool_idle_timeout,
-            idle_timeout_established=conn_pool_established_idle_timeout)
+            idle_timeout_established=conn_pool_established_idle_timeout,
+            # 供 pools 侧给 cluster 归因探针(timing/bucket miss)加守卫;与
+            # _init_cluster 里 ClusterGraph 的 enabled 用同一个入参(该处再与
+            # conn_pool_enabled / target_prewarm 求 AND)。
+            cluster_predict=cluster_predict)
 
     # ── DB helpers ──────────────────────────────────────────────
 

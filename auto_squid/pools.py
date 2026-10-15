@@ -77,7 +77,7 @@ class ConnectionPools:
                  established_reuse, pause_minutes=60.0,
                  pause_silence_sec=120.0, pause_activity_window=None,
                  pause_min_requests=3, idle_timeout_cluster=600.0,
-                 idle_timeout_established=None):
+                 idle_timeout_established=None, cluster_predict=False):
         self.proxy_store = proxy_store
         self.conn_pool_enabled = bool(enabled)
         self.conn_pool_per_proxy = max(1, int(per_proxy))
@@ -135,6 +135,16 @@ class ConnectionPools:
         # 已建握手隧道复用:隧道结束时连接干净则归还而非关闭,同 (proxy,target)
         # 复用跳过 CONNECT 握手。需 conn_pool_enabled 且显式开启。
         self.conn_pool_established_reuse = bool(established_reuse)
+        # cluster 预测预建是否启用(与 Router.cluster.enabled 同源,见 Router
+        # _init_cluster 的三者 AND)。仅用于给 cluster_pool_timing_miss /
+        # cluster_pool_bucket_miss 两个**归因探针**加守卫:cluster 关闭时
+        # _target_pool_cluster_ever 永不填充,不加守卫会让 _target_pool_peek 的
+        # else 分支把**每一个**被动 miss 都记成"代理桶不匹配",使
+        # cluster_pool_bucket_miss 恒等于 target_pool_misses,计数器彻底失真
+        # (生产实测 35342 == 35342,该数字此后完全不可用于评估)。
+        # 注:cluster_pool_creates/hits/expired 无需此守卫——它们只在
+        # source=='cluster'(即 cluster 真的下过预建指令)时才可能增长。
+        self.cluster_predict_enabled = bool(cluster_predict)
         # {proxy_url: [StreamWriter,...]} —— 空闲预热连接。只由事件循环线程读写。
         self._conn_pool: dict = {}
         self.conn_pool_creates = 0      # 累计预热建连次数
@@ -239,6 +249,7 @@ class ConnectionPools:
           → 时序没赶上(预建存在但真实请求到达时已被取空/prune 清理);
         - miss 且键从未出现过 cluster 预建(标记缺失)→ "代理桶不匹配"(真实胜出代理
           的桶里根本没有 cluster 预建,预建躺在别的 (proxy|target) 桶里永不命中)。
+          前提是 cluster 启用;关闭时这两个计数器不累计(见 __init__ 的失真说明)。
         取用命中时,给被消费的 cluster 预建连接补 `_consumed_unexpired=True` 标记,
         _pool_prune 据此把"被真实消费后置空转"与"从未被消费直接空转"分开计数。
         """
@@ -246,12 +257,16 @@ class ConnectionPools:
         got = self._pool_peek(self._target_pool, key)
         if got is None:
             self.target_pool_misses += 1
-            if self._target_pool_cluster_ever.get(key, 0) > 0:
-                # 时序 miss:该桶出现过 cluster 预建但此刻为空(被取走/被 prune 清)。
-                self.cluster_pool_timing_miss += 1
-            else:
-                # 桶不匹配:该桶从未有 cluster 预建(真实请求走的代理不是预测那个)。
-                self.cluster_pool_bucket_miss += 1
+            # 归因探针只在 cluster 启用时才有意义:关闭时该键永远不会带
+            # cluster 预建标记,timing/bucket 二分法退化成"全部记 bucket_miss",
+            # 使计数器与 target_pool_misses 恒等而彻底失真(见 __init__ 说明)。
+            if self.cluster_predict_enabled:
+                if self._target_pool_cluster_ever.get(key, 0) > 0:
+                    # 时序 miss:该桶出现过 cluster 预建但此刻为空(被取走/被 prune 清)。
+                    self.cluster_pool_timing_miss += 1
+                else:
+                    # 桶不匹配:该桶从未有 cluster 预建(真实请求走的代理不是预测那个)。
+                    self.cluster_pool_bucket_miss += 1
             logger.debug("target pool MISS %s via %s:%s (misses=%d)",
                         target, proxy_host, proxy_port, self.target_pool_misses)
         else:

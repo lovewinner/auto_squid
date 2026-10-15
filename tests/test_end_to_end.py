@@ -4090,6 +4090,41 @@ class TestConnPool:
         assert s['conn_pool_idle_paused'] is False
 
 
+    def test_bucket_miss_stays_zero_when_cluster_disabled(self):
+        """cluster 预测关闭时,bucket_miss/timing_miss 必须保持 0(计数器失真栅栏)。
+
+        cluster 关闭后 _target_pool_cluster_ever 永不填充,_target_pool_peek 的
+        else 分支会把**每一个**被动 miss 都记成"代理桶不匹配",使
+        cluster_pool_bucket_miss恒等于 target_pool_misses —— 该计数器彻底失真,
+        不能用于评估(生产实测 35342 == 35342)。本用例锁住:关闭 cluster 时这两个
+        归因计数器不动;cluster 开启时仍照常累计(见
+        TestClusterPredictor::test_probe_distinguishes_timing_from_bucket_miss)。
+        """
+        r = self._router()
+        try:
+            # cluster 关闭(默认 False):多桶多目标全部 miss,归因计数器不得增长。
+            for i in range(5):
+                r.pools._target_pool_peek(HOST, 31991, f"nowhere{i}.example:443")
+            assert r.pools.target_pool_misses == 5, "前置:被动 miss 应照常计数"
+            assert r.pools.cluster_pool_bucket_miss == 0, (
+                "cluster 关闭时不得把被动 miss 记为桶不匹配")
+            assert r.pools.cluster_pool_timing_miss == 0
+        finally:
+            r._db.close()
+
+    @pytest.mark.asyncio
+    async def test_bucket_miss_counted_when_cluster_enabled(self):
+        """cluster 开启时归因计数器仍照常累计(守卫不能反向关掉诊断)。"""
+        r = self._router(cluster_predict=True)
+        try:
+            r.pools._target_pool_peek(HOST, 31991, "nowhere.example:443")
+            assert r.pools.cluster_pool_bucket_miss == 1, (
+                "cluster 开启且该桶从未预建 → 应记为桶不匹配")
+            assert r.pools.cluster_pool_timing_miss == 0
+        finally:
+            r._db.close()
+
+
 class TestConnPoolIdlePause:
     """refill 空闲感知(conn_pool.refill_pause_minutes):连续 N 分钟无"密集活动"
     (窗口内 ≥ 阈值个客户端请求成簇)则挂起 refill/目标预热,避免深夜空闲期
@@ -4295,7 +4330,6 @@ class TestConnPoolIdlePause:
                 return True
             await asyncio.sleep(0.02)
         return False
-
 
 class TestTargetPrewarm:
     """CONNECT 目标半预连接(P2, P3-5 第二阶段):命中域名缓存/粘性的高频
