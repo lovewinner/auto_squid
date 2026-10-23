@@ -1395,7 +1395,14 @@ class Router:
         try:
             up_reader, up_writer = await asyncio.wait_for(
                 asyncio.open_connection(proxy.host, proxy.port), timeout=_PROBE_TIMEOUT)
-        except (asyncio.TimeoutError, OSError, ConnectionError):
+        except (asyncio.TimeoutError, OSError, ConnectionError) as e:
+            # 探活失败必须留痕:此前此路径**不打任何日志**,于是熔断风暴期间只能
+            # 看到"circuit opened"看不到原因(生产日志里 10-22 的 239-182 有
+            # 705 次熔断警告、零条失败记录,无法归因)。这里记录失败阶段与
+            # 异常类型,便于区分"连不上上游"(TCP 层)与"上游拒绝 CONNECT"。
+            logger.info("probe FAILED %s via %s:%s canary=%s stage=connect err=%s: %s",
+                        proxy.id, proxy.host, proxy.port, canary,
+                        type(e).__name__, e)
             self.selector.record_failure(proxy.id)
             self.probes_failed += 1
             return
@@ -1410,14 +1417,17 @@ class Router:
             await up_writer.drain()
             status = await asyncio.wait_for(up_reader.readline(), timeout=_PROBE_TIMEOUT)
             if not status or b'200' not in status:
-                raise RuntimeError('probe CONNECT failed')
+                raise RuntimeError(f'probe CONNECT failed: status={status!r}')
             self.selector.record_ttfb(proxy.id, time.perf_counter() - t0)
             self.selector.record_success(proxy.id)
             self.probes_ok += 1
             # Phase 4:CONNECT 已证明上游存活,再补一次轻量 GET 让探活贴近业务指标。
             # GET 失败不影响 CONNECT 的结论(上游仍存活),故吞掉其异常。
             await self._maybe_probe_get(proxy)
-        except (asyncio.TimeoutError, OSError, ConnectionError, RuntimeError):
+        except (asyncio.TimeoutError, OSError, ConnectionError, RuntimeError) as e:
+            logger.info("probe FAILED %s via %s:%s canary=%s stage=connect-handshake err=%s: %s",
+                        proxy.id, proxy.host, proxy.port, canary,
+                        type(e).__name__, e)
             self.selector.record_failure(proxy.id)
             self.probes_failed += 1
         finally:

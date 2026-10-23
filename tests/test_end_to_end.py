@@ -2854,6 +2854,147 @@ class TestCircuitBreaker:
         finally:
             await r.stop()
 
+    @pytest.mark.asyncio
+    async def test_failure_during_open_does_not_extend_backoff(self):
+        """熔断期内再失败 → 不得续期熔断(退避永不到期 → 代理被永久锁死)。
+
+        回归 2026-10-08/09/22 的熔断风暴:239-182 连续 13 小时每 75 秒熔断
+        一次(705 次,backoff 恒为封顶 300s),期间几乎无流量。根因是退避期内
+        的失败仍被计入 consec_fail,后台探活每 probe_interval 秒喂一次,凑满
+        阈值即再次熔断并把 open_until 推后一个完整 backoff。
+
+        修复后语义:熔断期内的失败只记 metrics,不累加 consec_fail、不改
+        open_until、不加倍 backoff。
+        """
+        ps, r = await self._circuit_router()
+        try:
+            sel = r.selector
+            # 阈值 3 → 三次失败熔断。
+            for _ in range(3):
+                sel.record_failure('down')
+            assert sel.is_circuit_open('down') is True
+            st = sel.get_circuit_state()['down']
+            first_open_until = st['open_until']
+            first_backoff = st['backoff']
+            assert sel.circuit_open_count == 1
+
+            # 退避期内继续失败 20 次(模拟探活持续喂失败)——不得续期。
+            for _ in range(20):
+                sel.record_failure('down')
+            st2 = sel.get_circuit_state()['down']
+            assert sel.circuit_open_count == 1, (
+                f"熔断期内不得再次熔断(实际 {sel.circuit_open_count} 次)")
+            assert st2['open_until'] == first_open_until, (
+                "熔断期内失败不得把 open_until 推后")
+            assert st2['backoff'] == first_backoff, (
+                "熔断期内失败不得加倍 backoff")
+            assert st2['consec_fail'] == 0, (
+                "熔断期内失败不构成新证据,consec_fail 应保持 0")
+            assert sel.is_circuit_open('down') is True, "应仍处于熔断状态"
+        finally:
+            await r.stop()
+
+    @pytest.mark.asyncio
+    async def test_circuit_reopens_after_backoff_expiry_with_growing_backoff(self):
+        """退避期满 → 仍能再次熔断,且 backoff 继续指数增长(修复未削弱熔断)。"""
+        ps, r = await self._circuit_router()
+        try:
+            sel = r.selector
+            for _ in range(3):
+                sel.record_failure('down')
+            st = sel.get_circuit_state()['down']
+            first_backoff = st['backoff']
+            assert sel.circuit_open_count == 1
+
+            # 退避到期 → 惰性解熔断(置 slow-start)。
+            sel._circuit['down']['open_until'] = time.monotonic() - 0.1
+            assert sel.is_circuit_open('down') is False
+            # 解熔断后重新累计失败 → 再次熔断,backoff 翻倍。
+            for _ in range(3):
+                sel.record_failure('down')
+            st2 = sel.get_circuit_state()['down']
+            assert sel.circuit_open_count == 2, "退避期满后应能再次熔断"
+            assert st2['open'] is True
+            assert st2['backoff'] == pytest.approx(first_backoff * 2), (
+                "再次熔断的 backoff 应按指数增长")
+        finally:
+            await r.stop()
+
+    @pytest.mark.asyncio
+    async def test_probe_failure_logs_reason(self, caplog):
+        """探活失败必须留痕(此前该路径零日志,熔断风暴无法归因)。
+
+        生产日志里 10-22 的 239-182 有 705 次熔断警告、零条失败记录 —— 因为
+        探活失败路径只调 record_failure 不打日志。本用例锁定:探活失败要打出
+        含代理 id / canary / 失败阶段 / 异常类型的 INFO 日志。
+
+        注:probe_canary 必须指向本机**可达**的目标(与 test_probe_records_success_
+        and_failure 同)。_circuit_router 自身不启动 mock,故此处自起一个:
+        canary 目标需能接受 TCP 连接(供 _canary_reachable 直连预检通过),
+        而被测代理 'down' 端口无人监听 → 探活在 TCP 建连阶段失败。
+        """
+        canary_srv = await asyncio.start_server(
+            lambda rd, wr: wr.close(), HOST, 31992)
+        ps, r = await self._circuit_router(probe_canary=f"{HOST}:31992")
+        try:
+            with caplog.at_level(logging.INFO, logger='auto_squid.router'):
+                # 'down' 端口无人监听 → TCP 建连失败(stage=connect)。
+                await r._probe_proxy(ps.get('down'))
+            recs = [m for m in caplog.records if "probe FAILED" in m.getMessage()]
+            assert len(recs) == 1, f"应恰好一条探活失败日志,实际 {len(recs)}"
+            msg = recs[0].getMessage()
+            assert "down" in msg, f"日志须含代理 id: {msg}"
+            assert "stage=connect" in msg, f"日志须含失败阶段: {msg}"
+            assert "err=" in msg, f"日志须含异常类型: {msg}"
+            assert r.probes_failed == 1
+        finally:
+            await r.stop()
+            canary_srv.close()
+            await canary_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_probe_connect_handshake_failure_logs_stage(self, caplog):
+        """上游 CONNECT 非 200 时,日志须标 stage=connect-handshake(区别于建连失败)。"""
+
+        async def _connect_403(reader, writer):
+            """对 CONNECT 返 403 的 mock(上游可达但拒绝建立隧道)。"""
+            try:
+                await asyncio.wait_for(reader.readline(), timeout=5)
+                while True:
+                    h = await asyncio.wait_for(reader.readline(), timeout=5)
+                    if not h or h in (b"\r\n", b"\n"):
+                        break
+                writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+            except Exception:
+                pass
+            finally:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+
+        srv = await asyncio.start_server(_connect_403, HOST, 31991)
+        canary_srv = await asyncio.start_server(
+            lambda rd, wr: wr.close(), HOST, 31992)
+        ps, r = await self._circuit_router(probe_canary=f"{HOST}:31992")
+        try:
+            with caplog.at_level(logging.INFO, logger='auto_squid.router'):
+                await r._probe_proxy(ps.get('up'))
+            recs = [m for m in caplog.records if "probe FAILED" in m.getMessage()]
+            assert len(recs) == 1, f"应恰好一条探活失败日志,实际 {len(recs)}"
+            msg = recs[0].getMessage()
+            assert "stage=connect-handshake" in msg, f"阶段须为 connect-handshake: {msg}"
+            assert "status=" in msg, f"须带上游返回的状态行: {msg}"
+            assert r.probes_failed == 1
+            assert r.probes_ok == 0
+        finally:
+            await r.stop()
+            srv.close()
+            await srv.wait_closed()
+            canary_srv.close()
+            await canary_srv.wait_closed()
+
 
 class TestCircuitAPI:
     def test_circuit_endpoint_without_router(self):

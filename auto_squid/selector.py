@@ -1169,14 +1169,33 @@ class ProxySelector:
         self._conc_observe_failure(pid)  # 自适应并发:失败 → 乘性降低上限(P3)
         if not bypass_circuit:
             s = self._circuit_state(pid)
-            s["consec_fail"] = int(s.get("consec_fail", 0)) + 1
-            if s["consec_fail"] >= self.circuit_threshold:
-                backoff = (float(s.get("backoff", 0.0)) or 1.0) * self._CIRCUIT_BACKOFF_MULT
-                s["backoff"] = min(self.circuit_max_backoff, backoff)
-                s["open_until"] = time.monotonic() + s["backoff"]
-                s["consec_fail"] = 0  # 熔断后计数清零,恢复后的失败重新累计
-                self.circuit_open_count += 1
-                logger.warning("circuit opened for proxy %s, backoff=%.1fs", pid, s["backoff"])
+            # ── 熔断期内不续期(2026-10-08/09/22 熔断风暴根因)──────────────
+            # 退避期未到(open_until > now)说明该代理**已被排除出竞速/单发**,
+            # 此后的失败不是"新的失败证据",而是同一故障的重复观测。若照常
+            # 累加 consec_fail,后台探活会每 probe_interval 秒喂一次失败,
+            # 凑满 circuit_threshold 次即**再次熔断**并把 open_until 推后
+            # 一个完整 backoff → 退避永不到期 → 代理被永久锁死。
+            #
+            # 实测(生产日志):239-182 在 10-22 02h–14h 连续 13 小时每 75 秒
+            # 熔断一次(共 705 次,backoff 恒为封顶 300s),期间该代理几乎无
+            # 流量,而它其实在承载真实业务(全天 STALE 296 次)。
+            #
+            # 语义:熔断期内失败 → 只记 metrics(失败确实发生,须可观测),
+            # **不**累加 consec_fail、**不**改 open_until、**不**加倍 backoff。
+            # 退避期满后由 is_circuit_open 惰性解熔断并置 slow-start;此时若
+            # 仍失败,重新从 0 累计 consec_fail,按正常路径再次熔断(此时
+            # backoff 仍按上次值继续指数增长,符合"反复故障的代理退避更长")。
+            if s.get("open_until", 0.0) > time.monotonic():
+                s["consec_fail"] = 0  # 清零:退避期内的失败不构成新证据
+            else:
+                s["consec_fail"] = int(s.get("consec_fail", 0)) + 1
+                if s["consec_fail"] >= self.circuit_threshold:
+                    backoff = (float(s.get("backoff", 0.0)) or 1.0) * self._CIRCUIT_BACKOFF_MULT
+                    s["backoff"] = min(self.circuit_max_backoff, backoff)
+                    s["open_until"] = time.monotonic() + s["backoff"]
+                    s["consec_fail"] = 0  # 熔断后计数清零,恢复后的失败重新累计
+                    self.circuit_open_count += 1
+                    logger.warning("circuit opened for proxy %s, backoff=%.1fs", pid, s["backoff"])
         # ── 可观测性增强(Phase 1):错误分类 + total ──
         # 同 record_ttfb:domain=None 时两个桶是同一对象,去重只写一次
         # (否则非域名失败的 total/错误分类/cum_failure_transport 被双计,
