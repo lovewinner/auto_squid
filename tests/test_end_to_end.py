@@ -8004,3 +8004,182 @@ async def test_slow_client_header_timeout_closes_connection():
         await router.stop()
         proxy_srv.close()
         await proxy_srv.wait_closed()
+class TestDnsOrphanFuture:
+    """回归:uvloop 内部 DNS future 变孤儿 → asyncio "never retrieved" 告警。
+
+    背景(生产日志实证):12.5 天 231 条
+        ERROR:asyncio:Future exception was never retrieved
+        socket.gaierror: [Errno -3] 'Temporary failure in name resolution'
+    根因:uvloop 的 create_connection 对**域名**走内部 _getaddrinfo future
+    (loop.pyx:1747);外层 task 被取消时该 future 与等待者解绑 → 稍后 DNS 失败
+    回调 set_exception(gaierror) → 无人 await → Future.__del__ 报该告警。
+    IP 字面量走 __static_getaddrinfo 快路径(loop.pyx:1940)不做 DNS,故不受影响。
+
+    实测:stdlib asyncio 0 复现,uvloop 3/3 复现 → 本用例必须跑在 uvloop loop 上。
+    实测每条路径各 30/30 复现:_canary_reachable(探活 canary 域名)与
+    _try_tunnel 本地直连(客户端目标域名)。
+
+    修法:自己 await loop.getaddrinfo(公共 API 直接 await → 取消可传播 →
+    fut 被 cancel → 回调跳过 set_exception)再连数值地址。
+    """
+
+    def _run_under_uvloop(self, scenario):
+        """在独立 uvloop loop 里跑场景,返回 "never retrieved" 告警列表。"""
+        uvloop = pytest.importorskip("uvloop", reason="该回归需 uvloop(生产用的事件循环)")
+        orphans = []
+
+        async def _scenario():
+            loop = asyncio.get_running_loop()
+            orig = loop.get_exception_handler()
+
+            def handler(loop_, ctx):
+                if 'never retrieved' in str(ctx.get('message', '')):
+                    orphans.append(ctx)
+                elif orig:
+                    orig(loop_, ctx)
+            loop.set_exception_handler(handler)
+            try:
+                await scenario()
+            finally:
+                loop.set_exception_handler(orig)
+
+        loop = uvloop.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(_scenario())
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+            # 孤儿 Future 的 __del__ 在 GC 时才报,故须留出观察窗。
+            import gc
+            gc.collect()
+        return orphans
+
+    def test_cancelled_local_direct_connect_leaves_no_orphan(self):
+        """取消本地直连的 CONNECT(域名目标)→ 不得留下孤儿 DNS future。"""
+        import gc
+
+        async def scenario():
+            ps = ProxyStore()
+            ps.add(ProxyInfo(id='p1', host=HOST, port=31990))   # 无人监听
+            r = make_router(ps, listen_host=HOST, listen_port=10899,
+                            max_retries=1, probe_interval_sec=0.0,
+                            db_path=tempfile.mktemp(suffix='.db'))
+            await r.start()
+            try:
+                for i in range(5):
+                    # 每次用**不同**域名:同一域名的解析结果会被系统缓存,
+                    # 第二次起就没有"DNS 在途"窗口,测不到 bug(生产实况是每次不同域名)。
+                    host = f"orphan-local-{i}-{time.monotonic_ns()}.example.com"
+                    t = asyncio.ensure_future(
+                        r._try_tunnel('local', f"{host}:443", None, None, None))
+                    await asyncio.sleep(0.003)     # 让 DNS 进入在途窗口
+                    t.cancel()
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                await asyncio.sleep(0.6)          # 等 DNS 回调 + GC
+                gc.collect()
+            finally:
+                await r.stop()
+
+        orphans = self._run_under_uvloop(scenario)
+        assert not orphans, (
+            f"取消中的域名建连不得留下孤儿 DNS future,实际 {len(orphans)} 条")
+
+    def test_cancelled_canary_probe_leaves_no_orphan(self):
+        """取消探活 canary 可达性检查(域名)→ 不得留下孤儿 DNS future。"""
+        import gc
+
+        async def scenario():
+            ps = ProxyStore()
+            ps.add(ProxyInfo(id='p1', host=HOST, port=31990))
+            r = make_router(ps, listen_host=HOST, listen_port=10899,
+                            probe_interval_sec=0.0,
+                            db_path=tempfile.mktemp(suffix='.db'))
+            await r.start()
+            try:
+                for i in range(5):
+                    host = f"orphan-canary-{i}-{time.monotonic_ns()}.example.com"
+                    t = asyncio.ensure_future(r._canary_reachable(f"{host}:443"))
+                    await asyncio.sleep(0.003)
+                    t.cancel()
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                await asyncio.sleep(0.6)
+                gc.collect()
+            finally:
+                await r.stop()
+
+        orphans = self._run_under_uvloop(scenario)
+        assert not orphans, (
+            f"取消中的 canary 域名解析不得留下孤儿 DNS future,实际 {len(orphans)} 条")
+
+    def test_dns_failure_is_logged_with_context(self):
+        """DNS 失败须由我们的 logger 记录(带 phase/host/pid/target),而非匿名告警。"""
+        import logging as _logging
+
+        records = []
+
+        class _Cap(_logging.Handler):
+            def emit(self, rec):
+                records.append(rec.getMessage())
+
+        async def scenario():
+            ps = ProxyStore()
+            ps.add(ProxyInfo(id='p1', host=HOST, port=31990))
+            r = make_router(ps, listen_host=HOST, listen_port=10899,
+                            probe_interval_sec=0.0,
+                            db_path=tempfile.mktemp(suffix='.db'))
+            lg = _logging.getLogger('auto_squid.router')
+            h = _Cap()
+            lg.addHandler(h)
+            old = lg.level
+            lg.setLevel(_logging.INFO)
+            try:
+                await r.start()
+                try:
+                    # 不存在的域名 → DNS 失败(gaierror)
+                    ok = await r._canary_reachable(
+                        f"definitely-no-such-host-{time.monotonic_ns()}.invalid:443")
+                    assert ok is False, "不可达域名必须返回 False(跳过本轮)"
+                finally:
+                    await r.stop()
+            finally:
+                lg.removeHandler(h)
+                lg.setLevel(old)
+
+        self._run_under_uvloop(scenario)
+        dns_logs = [m for m in records if 'dns FAILED' in m]
+        assert dns_logs, f"DNS 失败须留痕(带上下文),实际日志: {records[:3]}"
+        msg = dns_logs[0]
+        assert 'phase=probe-canary' in msg, f"日志须含失败阶段: {msg}"
+        assert 'definitely-no-such-host' in msg, f"日志须含域名: {msg}"
+
+    def test_dns_failure_preserves_original_exception(self):
+        """DNS 失败须原样抛出 gaierror(不吞、不改类型)。
+
+        语义依据:gaierror 是 OSError 子类,调用方既有的
+        `except (TimeoutError, OSError, ConnectionError)` 分支与
+        `_classify_error` 的 "connect" 归类都依赖这一点;若被换成别的异常类型
+        或被吞掉,错误归类与熔断计数都会变。
+        """
+        async def scenario():
+            ps = ProxyStore()
+            ps.add(ProxyInfo(id='p1', host=HOST, port=31990))
+            r = make_router(ps, listen_host=HOST, listen_port=10899,
+                            probe_interval_sec=0.0,
+                            db_path=tempfile.mktemp(suffix='.db'))
+            await r.start()
+            try:
+                with pytest.raises(socket.gaierror):
+                    await r._open_resolved(
+                        f"no-such-host-{time.monotonic_ns()}.invalid", 443, 3.0,
+                        phase='unit-test', pid='p1', target='t:443')
+            finally:
+                await r.stop()
+
+        self._run_under_uvloop(scenario)

@@ -1333,6 +1333,54 @@ class Router:
                     return c["target"]
         return self.probe_canary
 
+    async def _open_resolved(self, host: str, port: int, timeout: float,
+                             *, phase: str, pid: str = '-', target: str = ''):
+        """自己解析 DNS 再连数值地址(避免 uvloop 内部 DNS future 变孤儿)。
+
+        背景:生产用 uvloop,其 `create_connection()` 对**域名**走内部
+        `_getaddrinfo` future(uvloop loop.pyx:1747);外层 task 被取消(竞速败者
+        / `wait_for` 超时)时该 future 与等待者解绑 → 稍后 DNS 失败回调
+        `set_exception(gaierror)` → 无人 await → asyncio 在 `Future.__del__`
+        报 "Future exception was never retrieved"。实测 12.5 天 231 条,
+        全部 gaierror。IP 字面量走 `__static_getaddrinfo` 快路径(loop.pyx:1940)
+        不做 DNS,故不受影响。
+
+        修法:改用 `loop.getaddrinfo` **公共 API** —— 它直接 await 内部 future
+        (loop.pyx:1529),取消可传播到该 future → future 被 cancel → 回调里
+        `if not fut.cancelled()` 跳过 set_exception → 不产生孤儿。随后连已解析
+        的数值地址,uvloop 走静态快路径,结构上不可能再产生孤儿。
+
+        语义保持不变:
+        - 总超时预算不变(DNS + 连接共用同一 deadline);
+        - 多地址回退保留(遍历 getaddrinfo 全部结果,顺序同 libc);
+        - DNS 失败原样抛出 —— `socket.gaierror` 是 `OSError` 子类,故调用方
+          既有的 `except (asyncio.TimeoutError, OSError, ConnectionError)`
+          分支与 `ERROR_CONNECT` 错误归类完全不变;但此处**补一条带上下文的
+          日志**(此前该失败完全不可见,只能看到匿名的 asyncio 告警)。
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        try:
+            infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except socket.gaierror as e:
+            logger.info("dns FAILED phase=%s host=%s:%s pid=%s target=%s err=%s: %s",
+                        phase, host, port, pid, target, type(e).__name__, e)
+            raise
+        last = None
+        for _family, _type, _proto, _canon, sockaddr in infos:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError()
+            try:
+                return await asyncio.wait_for(
+                    asyncio.open_connection(sockaddr[0], sockaddr[1]),
+                    timeout=remaining)
+            except (asyncio.TimeoutError, OSError, ConnectionError) as e:
+                last = e          # 多地址回退:换下一个地址重试
+        if last is not None:
+            raise last
+        raise OSError("getaddrinfo() returned empty list")
+
     async def _canary_reachable(self, target: str) -> bool:
         """本机直连 canary 探可达性(短超时;失败仅跳过本轮,不算任何上游失败)。
 
@@ -1346,8 +1394,11 @@ class Router:
             logger.warning("invalid probe canary target %r", target)
             return False
         try:
-            c_reader, c_writer = await asyncio.wait_for(
-                asyncio.open_connection(c_host, c_port), timeout=_PROBE_TIMEOUT)
+            # 走 _open_resolved:自己解析 canary 域名再连(见其 docstring 的
+            # uvloop 孤儿 DNS future 说明)。超时预算仍是 _PROBE_TIMEOUT。
+            c_reader, c_writer = await self._open_resolved(
+                c_host, c_port, _PROBE_TIMEOUT,
+                phase='probe-canary', pid='-', target=target)
             c_writer.close()
             await c_writer.wait_closed()
             return True
@@ -2726,8 +2777,12 @@ class Router:
                         port = int(target[host_end + 2:])
                     else:
                         port = int(target.rsplit(':', 1)[1])
-                    up_reader, up_writer = await asyncio.wait_for(
-                        asyncio.open_connection(host, port), timeout=connect_timeout)
+                    # 走 _open_resolved:本机直连的目标是**客户端域名**(需本地 DNS
+                    # 解析),自己解析再连可避免 uvloop 的孤儿 DNS future
+                    # (见 _open_resolved docstring)。超时预算仍是 connect_timeout。
+                    up_reader, up_writer = await self._open_resolved(
+                        host, port, connect_timeout,
+                        phase='local-direct', pid=pid, target=target)
             except (asyncio.TimeoutError, OSError, ConnectionError) as e:
                 # 建连阶段失败(本机→上游 open_connection 超时/拒绝)。仅"首试取的是
                 # 池连接、且这是池失效特征(非超时)"才视为陈旧重试;新建连接超时/拒绝
@@ -4001,6 +4056,7 @@ class Router:
         同时启动后台 flush task(周期把内存统计批量落盘)与探活 task
         (probe_interval_sec>0 时,周期对 enabled 代理做轻量 CONNECT 探活)。
         """
+        self._install_loop_guard()
         self._server = await asyncio.start_server(self.handle_client, host=self.listen_host, port=self.listen_port)
         if self._flush_task is None or self._flush_task.done():
             self._flush_task = asyncio.create_task(self._flush_loop())
@@ -4012,6 +4068,29 @@ class Router:
         # (#14 拆 pools.py 后 refill 循环 task 归 ConnectionPools 自管,Router 不持 task)
         self.pools.start()
         logger.info("Router listening on %s:%s", self.listen_host, self.listen_port)
+
+    @staticmethod
+    def _install_loop_guard():
+        """装事件循环级兜底异常处理器:把"孤儿 task 异常"转成我们的具名日志。
+
+        asyncio 对"创建的 task/future 从未被 await 且抛了异常"只在 GC 时报一句
+        匿名告警("Future exception was never retrieved"),既无上下文(哪个上游/
+        哪个目标)也容易淹没在别的告警里。这里接管该类告警:转成 auto_squid 的
+        ERROR 日志,保留原异常对象;其余消息仍交给原处理器。
+
+        注:已知的两处根因(uvloop 内部 DNS future 变孤儿)已在 _open_resolved
+        处根治;本兜底用于**将来可能出现的新来源**,以及兜住无法立即根治的残留。
+        """
+        loop = asyncio.get_running_loop()
+        orig = loop.get_exception_handler()
+
+        def _handler(loop_, ctx):
+            msg = str(ctx.get('message', ''))
+            if 'never retrieved' in msg:
+                logger.error("unretrieved task exception: %s | %r", msg, ctx.get('exception'))
+            elif orig:
+                orig(loop_, ctx)
+        loop.set_exception_handler(_handler)
 
     async def stop(self):
         """优雅关闭:停止接受新连接 → 最终 flush 落盘 → 关闭连接池 →
