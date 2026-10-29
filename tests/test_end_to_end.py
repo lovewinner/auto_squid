@@ -16,7 +16,7 @@ from auto_squid.selector import _ERROR_KEYS, ERROR_HTTP_STATUS
 from auto_squid.router import (
     Router, ProxySelector, _hb, make_router,
     _MAX_REQUEST_HEADER_LINES, _MAX_REQUEST_HEADER_BYTES,
-    _AGG_WAIT_TIMEOUT, _ESTABLISHED_KEY_CAP,
+    _AGG_WAIT_TIMEOUT,
 )
 from auto_squid.cluster import ClusterGraph
 from auto_squid.config_schema import (
@@ -4427,50 +4427,32 @@ class TestConnPoolIdlePause:
     async def test_idle_pause_does_not_block_requests(self):
         """方案3 安全属性回归:空闲暂停只挂起后台预建,不卡请求路径。
 
-        空闲暂停期间真实 CONNECT 请求照常工作——取池/新建/复用已握手连接全不
-        受暂停影响(_try_tunnel / _established_pool_peek / 归还均不检查空闲态)。
+        空闲暂停期间真实 CONNECT 请求照常工作——取池/新建路径全不受暂停影响
+        (_try_tunnel 不检查空闲态;后台 refill 才检查)。
         """
         hit_counter = []
         up_srv = await run_mock_proxy(HOST, 31991, hit_counter=hit_counter)
-        r = self._router(conn_pool_refill_pause_minutes=60.0,
-                         conn_pool_established_reuse=True)
+        r = self._router(conn_pool_refill_pause_minutes=60.0)
         await r.start()
         try:
             target = b"idle-request.example.com:443"
             # 置为空闲暂停态:距上次活动远超暂停阈值。
             r._last_request_activity = time.monotonic() - 7200
             assert r._conn_pool_idle() is True
-            # 真实请求仍照常工作(单发即完成;established_reuse 的 peek 也不查空闲)。
-            # payload 留空:新归还判据 safe_for_reuse=(total==0) 客观要求
-            # "未透传业务字节",空 payload 让 CONNECT-only 隧道满足入池。
-            echo = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"")
-            assert echo == b""
-            assert r.established_pool_misses == 1
-            # 请求结束后连接照常归还已握手池(不受空闲暂停影响)。
-            assert await self._wait_returned(r, target)
-            assert r.established_pool_returned == 1
-            # 第二条请求照常复用已握手连接。
-            echo2 = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"")
-            assert echo2 == b""
-            assert r.established_pool_hits == 1
-            # 诊断计数器(09-29 加):第一条请求到达时该 key 库存为空 → 计复访缺失;
-            # 复访成功(hit=1)不碰 probe_dead;复访缺失仅在 miss 分支递增。
-            assert r.established_pool_revisit_miss == 1
-            assert r.established_pool_probe_dead == 0
+            # 真实请求仍照常工作(暂停只挂起后台预建,请求路径不受影响)。
+            echo = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"x")
+            assert echo == b"x"
+            # 暂停期间请求仍会新建连接(未被暂停拦住)。
+            assert r.pools.connect_new_conns >= 1
+            # 第二条请求同样照常完成。
+            echo2 = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"y")
+            assert echo2 == b"y"
+            # 请求计数照常累加(暂停不影响可观测性)。
+            assert r.request_counts.get('p', 0) >= 2
         finally:
             await r.stop()
             up_srv.close()
             await up_srv.wait_closed()
-
-    async def _wait_returned(self, r, target, timeout=2.0):
-        """轮询等待 (proxy,target) 的已握手连接归还池(归还走异步回调)。"""
-        key = f"{HOST}:31991|{target.decode()}"
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if key in r._established_pool and len(r._established_pool[key]) > 0:
-                return True
-            await asyncio.sleep(0.02)
-        return False
 
 class TestTargetPrewarm:
     """CONNECT 目标半预连接(P2, P3-5 第二阶段):命中域名缓存/粘性的高频
@@ -4608,43 +4590,6 @@ class TestTargetPrewarm:
             await r._conn_pool_close_all()
             up_srv.close()
             await up_srv.wait_closed()
-
-    @pytest.mark.asyncio
-    async def test_established_outlives_passive_prune(self):
-        """established 池独立空闲超时:已握手库存比通用池连接活得更久。
-
-        _pool_prune 按连接级 _established_pooled 标签选超时——established 连接
-        用 established_pool_idle_timeout(默认 None=跟随 conn_pool_idle_timeout,
-        显式配置则独立),通用池仍用 conn_pool_idle_timeout。同一过期间隔下,
-        established 标签连接存活、无标签连接被关。
-        """
-        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
-        # 通用池 1s 过期;established 池独立 1000s(模拟选项1:库存多活等复访)。
-        r = self._router(conn_pool_idle_timeout=1.0,
-                         conn_pool_established_idle_timeout=1000.0)
-        try:
-            # 手工建两条 established 池连接(模拟竞速败者归还,打 _established_pooled)。
-            for i in range(2):
-                reader, writer = await asyncio.open_connection(HOST, 31991)
-                writer._established_pooled = True
-                writer._conn_pool_created = time.monotonic() - 50  # 超通用超时,未超 established
-                key = f"{HOST}:31991|est-prune.example.com:443"
-                r._established_pool.setdefault(key, []).append((reader, writer))
-            # 手工建一条通用池连接(无 established 标签),同为 50s 前建连。
-            reader, writer = await asyncio.open_connection(HOST, 31991)
-            writer._conn_pool_created = time.monotonic() - 50
-            r._conn_pool.setdefault(f"{HOST}:31991", []).append((reader, writer))
-            await r._pool_prune()
-            # established 2 条存活(独立超时 1000s 生效),通用池 1 条被关。
-            assert len(r._established_pool[key]) == 2, \
-                f"established should survive, keys={list(r._established_pool.keys())}"
-            assert r.established_pool_expired == 0
-            assert r.conn_pool_expired >= 1, "generic conn should be pruned"
-        finally:
-            await r._conn_pool_close_all()
-            up_srv.close()
-            await up_srv.wait_closed()
-
     def test_snapshot_exposes_target_pool(self):
         """snapshot_counters 暴露 target 半预连接池计数与开关。"""
         r = self._router()
@@ -4809,496 +4754,6 @@ class TestTargetPrewarm:
             await up_srv1.wait_closed()
             up_srv2.close()
             await up_srv2.wait_closed()
-
-
-class TestEstablishedTunnelReuse:
-    """已建握手隧道复用(P3-6):CONNECT 隧道结束若连接干净则归还 _established_pool,
-    下次同 (proxy, target) 复用,跳过 CONNECT 握手,省掉慢线路重建。严格验证:
-    有残留缓冲则丢弃不复用,宁可不复用也不污染下一个客户端。"""
-
-    def _router(self, **kw):
-        store = ProxyStore()
-        store.add(ProxyInfo(id='p', host=HOST, port=31991))
-        kw.setdefault('conn_pool_enabled', True)
-        kw.setdefault('conn_pool_established_reuse', True)
-        kw.setdefault('conn_pool_target_prewarm', False)
-        kw.setdefault('conn_pool_per_proxy', 4)
-        kw.setdefault('conn_pool_total', 8)
-        kw.setdefault('conn_pool_refill_interval', 0.0)  # 只取不补(测试手动)
-        kw.setdefault('conn_pool_idle_timeout', 100.0)   # 长超时,防测试中途过期
-        return make_router(store, listen_host='127.0.0.1', listen_port=10809,
-                      db_path=tempfile.mktemp(suffix='.db'), **kw)
-
-    async def _wait_returned(self, r, target, timeout=2.0):
-        """轮询等待隧道归还(归还发生在 send_connect 返回后的异步 finally 里)。"""
-        key = f"{HOST}:31991|{target.decode()}"
-        for _ in range(int(timeout / 0.02)):
-            if r._established_pool.get(key):
-                return True
-            await asyncio.sleep(0.02)
-        return False
-
-    @pytest.mark.asyncio
-    async def test_tunnel_returned_to_pool(self):
-        """已握手隧道复用:客户端仅 CONNECT 不断开业务字节 → 隧道干净,可归还 established 池。
-
-        已透传过客户端业务字节的 CONNECT 隧道含完整 TLS/应用会话,**不能**给另一客户端
-        续用(协议串流污染、隐私隔离失效)。本测试只发 CONNECT 不发 payload,使
-        _relay_tunnel 收到的客户端数据是 0 字节 → 干净 → 入池。
-        """
-        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
-        r = self._router()
-        await r.start()
-        try:
-            target = b"reuse-return.example.com:443"
-            # 只发 CONNECT,读 200 后立即关闭客户端(不发业务 payload)→ 干净隧道。
-            status = await send_connect_status(HOST, ROUTER_PORT, target=target)
-            assert b'200' in status, f"expected 200, got {status}"
-            # 客户端断开 → _relay_tunnel 异步归还已握手连接,轮询等待。
-            assert await self._wait_returned(r, target), "干净隧道应归还到已握手池"
-            assert r.established_pool_returned == 1
-            key = f"{HOST}:31991|reuse-return.example.com:443"
-            assert len(r._established_pool[key]) == 1
-        finally:
-            await r.stop()
-            up_srv.close()
-            await up_srv.wait_closed()
-
-    @pytest.mark.asyncio
-    async def test_reuse_skips_connect(self):
-        """第二次同 target 命中已握手池,established_pool_hits +1,不再发 CONNECT。
-
-        hit_counter 统计 mock 上游收到的 CONNECT 请求数:第二次应不增加。两次
-        客户端都仅 CONNECT 不发 payload,保持隧道干净可入池/可复用。
-        """
-        hit_counter = []
-        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=hit_counter)
-        r = self._router()
-        await r.start()
-        try:
-            target = b"reuse-skip.example.com:443"
-            # 第一次:建隧道 + CONNECT 计数 +1,结束后归还(异步,轮询等待)。
-            status1 = await send_connect_status(HOST, ROUTER_PORT, target=target)
-            assert b'200' in status1
-            assert len(hit_counter) == 1, f"first CONNECT must hit mock, got {len(hit_counter)}"
-            assert await self._wait_returned(r, target)
-            # 第二次:命中已握手池,跳过 CONNECT,mock 收到 CONNECT 数不增。
-            status2 = await send_connect_status(HOST, ROUTER_PORT, target=target)
-            assert b'200' in status2
-            assert len(hit_counter) == 1, f"second CONNECT must be reused, got {len(hit_counter)} CONNECTs"
-            # 第一次 peek miss(池空)→ misses=1;第二次命中 → hits=1,misses 不再增。
-            assert r.established_pool_hits == 1
-            assert r.established_pool_misses == 1
-        finally:
-            await r.stop()
-            up_srv.close()
-            await up_srv.wait_closed()
-
-    @pytest.mark.asyncio
-    async def test_reuse_disabled_returns_none(self):
-        """established_reuse=False → 不查已握手池,established_pool_misses 不增。"""
-        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
-        r = self._router(conn_pool_established_reuse=False)
-        await r.start()
-        try:
-            target = b"reuse-off.example.com:443"
-            echo = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"x")
-            assert echo == b"x"
-            assert r.established_pool_misses == 0
-            assert r.established_pool_returned == 0
-            assert sum(len(v) for v in r._established_pool.values()) == 0
-        finally:
-            await r.stop()
-            up_srv.close()
-            await up_srv.wait_closed()
-
-    @pytest.mark.asyncio
-    async def test_stop_closes_established_pool(self):
-        """stop() 关闭全部已握手连接,池清空。
-
-        用仅 CONNECT 不发 payload 的客户端,保留干净隧道入池。
-        """
-        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
-        r = self._router()
-        await r.start()
-        try:
-            target = b"reuse-stop.example.com:443"
-            status = await send_connect_status(HOST, ROUTER_PORT, target=target)
-            assert b'200' in status
-            assert await self._wait_returned(r, target)
-            assert sum(len(v) for v in r._established_pool.values()) == 1
-        finally:
-            await r.stop()
-            # stop() 内部调 _conn_pool_close_all → 已握手池清空。
-            assert sum(len(v) for v in r._established_pool.values()) == 0
-            up_srv.close()
-            await up_srv.wait_closed()
-
-    def test_snapshot_exposes_established_pool(self):
-        """snapshot_counters 暴露 established_pool 计数与开关。"""
-        r = self._router()
-        s = r.snapshot_counters()
-        assert s['conn_pool_established_reuse'] is True
-        assert s['established_pool_hits'] == 0
-        assert s['established_pool_size'] == 0
-        assert s['established_pool_returned'] == 0
-        # 诊断计数器(09-29 加)随 snapshot 暴露,供生产观测复访缺失 vs 库存僵死。
-        assert s['established_pool_revisit_miss'] == 0
-        assert s['established_pool_probe_dead'] == 0
-
-    @pytest.mark.asyncio
-    async def test_established_alive_probe_states(self):
-        """复用前活性探测三态:活(read 超时)→True;EOF(FIN)→False;脏残留→False。"""
-        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
-        r = self._router()
-        await r.start()
-        try:
-            # 活:对端空闲无数据 → read(1) 阻塞到超时 → 判活。
-            alive_r, alive_w = await asyncio.open_connection(HOST, 31991)
-            try:
-                assert await r._established_alive(alive_r, alive_w) is True
-            finally:
-                alive_w.close()
-            # EOF:对端已 FIN(数据读尽)→ read(1) 返回 b'' → 判死。
-            eof_r, eof_w = await asyncio.open_connection(HOST, 31991)
-            eof_r.feed_eof()
-            try:
-                assert await r._established_alive(eof_r, eof_w) is False
-            finally:
-                eof_w.close()
-            # 脏残留:上游残余缓冲数据 → read(1) 返回该字节 → 判死。
-            dirty_r, dirty_w = await asyncio.open_connection(HOST, 31991)
-            dirty_r.feed_data(b"X")
-            try:
-                assert await r._established_alive(dirty_r, dirty_w) is False
-            finally:
-                dirty_w.close()
-        finally:
-            await r.stop()
-            up_srv.close()
-            await up_srv.wait_closed()
-
-    @pytest.mark.asyncio
-    async def test_cap_limits_pool_per_key(self):
-        """established 池单键上限=_ESTABLISHED_KEY_CAP(2):并发隧道归还超限被关闭。
-
-        并发 4 条同 (proxy,target) 隧道全新建(mock 的 CONNECT 计数 4),结束后
-        归还受 cap 限制:池最多驻 2 条,established_pool_returned 不超过 2。
-        """
-        hit_counter = []
-        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=hit_counter)
-        r = self._router()
-        await r.start()
-        try:
-            target = b"reuse-cap.example.com:443"
-
-            async def one(_i):
-                return await send_connect(HOST, ROUTER_PORT, target=target, payload=b"x")
-
-            echoes = await asyncio.gather(*[one(i) for i in range(4)])
-            assert echoes == [b"x"] * 4, f"all 4 tunnels must echo, got {echoes}"
-            key = f"{HOST}:31991|{target.decode()}"
-            # 等异步 finally 归还全部完成。
-            for _ in range(int(2.0 / 0.02)):
-                if r.established_pool_returned >= 2:
-                    break
-                await asyncio.sleep(0.02)
-            # 池大小受 per-key cap 约束:最多 2,不会涨到 4。
-            assert len(r._established_pool.get(key, [])) <= 2, \
-                f"per-key cap breached: {len(r._established_pool.get(key, []))}"
-            # hit_counter 应到 4:每次并发都是新建(池空启动,cap 限制下不无限复用)。
-            assert len(hit_counter) == 4
-        finally:
-            await r.stop()
-            up_srv.close()
-            await up_srv.wait_closed()
-
-    @pytest.mark.asyncio
-    async def test_budget_includes_established_pool(self):
-        """established 池计入全局 conn_pool_total:预算耗尽时归还被 SKIP(close)。"""
-        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
-        # conn_pool_total=1:先手动灌满 _conn_pool(占走全部预算),再归还 established
-        # 连接应超预算被关闭,而不是新增到已握手池。
-        r = self._router(conn_pool_total=1)
-        await r.start()
-        try:
-            # 手动注入 1 条到"其它 target"的目标池 key,占走全部预算(total=1)。
-            # 不能用 _conn_pool 的 proxy-key:当前 CONNECT 会 peek 通用池把它取走,
-            # 归还时预算又归零。用不同 target 的目标池 key 既能占预算、又不会被取用。
-            fake_r, fake_w = await asyncio.open_connection(HOST, 31991)
-            fake_w._conn_pool_created = time.monotonic()
-            r._target_pool[f"{HOST}:31991|other-target:443"] = [(fake_r, fake_w)]
-
-            target = b"reuse-budget.example.com:443"
-            echo = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"y")
-            assert echo == b"y"
-            # 归还应被预算检查拦下:established 池保持空。
-            await asyncio.sleep(0.2)
-            assert sum(len(v) for v in r._established_pool.values()) == 0, \
-                "established pool must stay empty when global budget is exhausted"
-            assert r.established_pool_returned == 0
-        finally:
-            await r.stop()
-            up_srv.close()
-            await up_srv.wait_closed()
-
-    @pytest.mark.asyncio
-    async def test_skip_return_log_reports_both_budget_and_cap(self, caplog):
-        """SKIP-RETURN 日志须报出三个判据(idle/total、key/cap、命中分支)。
-
-        归还条件是「全局预算满 OR 单键满」的**析取**,只报预算无法区分是哪一支
-        触发(生产实测两者都在发生)。本用例锁定日志带 idle=<n>/<total>、
-        key=<n>/<cap> 与分支标记 over-budget / over-key-cap,这样下次日志轮转后
-        可直接定量归因,不必再靠推测。
-
-        payload=b"" 是关键:透传了业务字节的隧道 total>0,按设计不允许入池
-        (safe_for_reuse=False),根本走不到预算/cap 检查。
-        """
-        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
-        r = self._router(conn_pool_total=1)
-        await r.start()
-        try:
-            # 占走全部预算(total=1),触发 over-budget 分支。
-            fake_r, fake_w = await asyncio.open_connection(HOST, 31991)
-            fake_w._conn_pool_created = time.monotonic()
-            r._target_pool[f"{HOST}:31991|other-target:443"] = [(fake_r, fake_w)]
-
-            with caplog.at_level(logging.INFO, logger='auto_squid.router'):
-                # payload=b"":客户端 CONNECT 后不转发业务字节 → total==0 → 允许归还。
-                await send_connect(HOST, ROUTER_PORT,
-                                   target=b"skiplog.example.com:443", payload=b"")
-                # 归还在隧道收尾的异步 finally 里发生,晚于 send_connect 返回;
-                # 必须在 at_level 块**内**等它,否则 handler 已被摘掉。
-                await asyncio.sleep(0.3)
-            recs = [m for m in caplog.records if "SKIP-RETURN" in m.getMessage()]
-            assert len(recs) == 1, f"应恰好一条 SKIP-RETURN,实际 {len(recs)}"
-            msg = recs[0].getMessage()
-            # 三个判据必须都在,且分支标记正确(预算 total=1 被占满 → over-budget)。
-            assert "idle=1/1" in msg, f"缺预算判据: {msg}"
-            assert f"key=0/{_ESTABLISHED_KEY_CAP}" in msg, f"缺单键判据: {msg}"
-            assert "over-budget" in msg, f"分支标记应为 over-budget: {msg}"
-            assert "over-key-cap" not in msg, \
-                f"预算满时不应同时标记 over-key-cap(会误导归因): {msg}"
-            assert r.established_pool_returned == 0
-        finally:
-            await r.stop()
-            up_srv.close()
-            await up_srv.wait_closed()
-
-    @pytest.mark.asyncio
-    async def test_skip_return_log_marks_key_cap_branch(self, caplog):
-        """预算未满但单键已满时,分支标记须为 over-key-cap(与 over-budget 区分)。"""
-        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
-        r = self._router()          # total=8:预算充足,不会被预算拦
-        await r.start()
-        try:
-            target = b"skiplog-cap.example.com:443"
-            key = f"{HOST}:31991|{target.decode()}"
-
-            async def one(_i):
-                # payload=b"":见上,total==0 才可能入池。
-                return await send_connect(HOST, ROUTER_PORT, target=target, payload=b"")
-
-            # 必须**并发**:串行时每条新隧道会先消费掉池里那条(驻留恒为 1),
-            # 永远撞不到 cap —— 实测串行 5 条全部 RETURN、驻留始终 1 条。
-            # 4 条同键并发(> cap=2):2 条入池、2 条归还时撞单键上限被 SKIP。
-            with caplog.at_level(logging.INFO, logger='auto_squid.router'):
-                # 4 条同键并发(> cap=2):2 条入池、2 条归还时撞单键上限被 SKIP。
-                await asyncio.gather(*[one(i) for i in range(4)])
-                # 归还发生在隧道收尾的异步 finally 里,须在本块内等待。
-                await asyncio.sleep(0.3)
-            recs = [m for m in caplog.records if "SKIP-RETURN" in m.getMessage()]
-            assert recs, "撞 cap 时应打出 SKIP-RETURN"
-            msg = recs[-1].getMessage()
-            assert f"key={_ESTABLISHED_KEY_CAP}/{_ESTABLISHED_KEY_CAP}" in msg, \
-                f"该键应已达 cap: {msg}"
-            assert "over-key-cap" in msg, f"分支标记应为 over-key-cap: {msg}"
-            # 预算充足(total=8,驻留 2)时不得误标 over-budget。
-            assert "over-budget" not in msg, \
-                f"预算充足时不应标记 over-budget: {msg}"
-        finally:
-            await r.stop()
-            up_srv.close()
-            await up_srv.wait_closed()
-
-    @pytest.mark.asyncio
-    async def test_pool_keepalive_set_on_return(self):
-        """归还到 established 池的连接设了 SO_KEEPALIVE(OS 兜底判死半开)。
-
-        用仅 CONNECT 不发 payload 的客户端,保留干净隧道入池。
-        """
-        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
-        r = self._router()
-        await r.start()
-        try:
-            target = b"reuse-keepalive.example.com:443"
-            status = await send_connect_status(HOST, ROUTER_PORT, target=target)
-            assert b'200' in status
-            assert await self._wait_returned(r, target)
-            key = f"{HOST}:31991|{target.decode()}"
-            _reader, writer = r._established_pool[key][0]
-            sock = writer.get_extra_info('socket')
-            assert sock is not None
-            if hasattr(socket, 'SO_KEEPALIVE'):
-                ka = sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE)
-                assert ka == 1, f"SO_KEEPALIVE should be 1, got {ka}"
-        finally:
-            await r.stop()
-            up_srv.close()
-            await up_srv.wait_closed()
-
-    @pytest.mark.asyncio
-    async def test_dead_probe_tunnel_falls_back_without_nameerror(self):
-        """复用候选在活性探测时判死 → _discard_conn 丢弃并回落新建(回归 #14)。
-
-        修复前 Router 的 `_discard_conn(up_writer)` 以裸名调用(类内裸名不查类作用域)
-        → 命中的就是 NameError。本测试构造"通过 peek 干净检查(at_eof=False、无残留
-        缓冲)但活性探测必死(reader 带 RST 异常)"的复用候选:探测抛异常 → 判死 →
-        丢弃 → 回落新建 CONNECT,客户端仍拿到 echo,established_pool_expired 计数。
-        """
-        up_srv = await run_mock_proxy(HOST, 31991, hit_counter=None)
-        r = self._router()
-        await r.start()
-        try:
-            target = b"reuse-dead.example.com:443"
-            # 第一次:仅 CONNECT 不断开业务字节 → 干净隧道 → 归还 established 池。
-            status1 = await send_connect_status(HOST, ROUTER_PORT, target=target)
-            assert b'200' in status1
-            assert await self._wait_returned(r, target)
-            key = f"{HOST}:31991|{target.decode()}"
-            # 手动造一条"已 RST"的候选(模拟对端静默 RST 却又过了 peek 干净检查):
-            # at_eof()=False、无残留缓冲 → _established_pool_peek 放行;read(1)
-            # 抛出 -> _established_alive 判死。
-            dead_r, dead_w = await asyncio.open_connection(HOST, 31991)
-            dead_r.set_exception(ConnectionResetError("peer reset"))
-            r._established_pool[key].append((dead_r, dead_w))
-            # 第二次:peek 拿到死候选 → 探测判死 → _discard_conn → 回落 _conn_pool/新建。
-            echo2 = await send_connect(HOST, ROUTER_PORT, target=target, payload=b"two")
-            assert echo2 == b"two", "死隧道探测后必须正常回落新建,且不再触发 NameError"
-            assert r.established_pool_expired >= 1, "死连接应计入 expired(探测判死丢弃)"
-        finally:
-            await r.stop()
-            up_srv.close()
-            await up_srv.wait_closed()
-
-
-class TestRaceLoserEstablishedReturn:
-    """杠杆C:竞速败者(CONNECT 200 但输掉)隧道归还 _established_pool。
-
-    竞速胜出后,已完成 CONNECT 200 但首字节更慢的败者隧道,过去被 _cleanup_tunnel_result
-    直接关闭(浪费);现在经 partial 绑定 target 的清理路径归还已握手池,下次同
-    (proxy,target) 请求复用跳过握手。established_reuse 关闭时败者仍关闭(回归保护)。
-    """
-
-    def _router(self, **kw):
-        store = ProxyStore()
-        store.add(ProxyInfo(id='fast', host=HOST, port=31991))
-        store.add(ProxyInfo(id='slow', host=HOST, port=31992))
-        kw.setdefault('conn_pool_enabled', True)
-        kw.setdefault('conn_pool_established_reuse', True)
-        kw.setdefault('conn_pool_target_prewarm', False)
-        kw.setdefault('conn_pool_per_proxy', 4)
-        kw.setdefault('conn_pool_total', 8)
-        kw.setdefault('conn_pool_refill_interval', 0.0)  # 只取不补(测试手动)
-        kw.setdefault('conn_pool_idle_timeout', 100.0)   # 长超时,防测试中途过期
-        kw.setdefault('max_retries', 2)
-        kw.setdefault('stickiness_enabled', False)
-        kw.setdefault('enable_local_racing', False)       # 排除 local 直连,确保胜者是上游
-        return make_router(store, listen_host='127.0.0.1', listen_port=10809,
-                      db_path=tempfile.mktemp(suffix='.db'), **kw)
-
-    @staticmethod
-    def _keys(r):
-        return {k for k, v in r._established_pool.items() if v}
-
-    @pytest.mark.asyncio
-    async def test_cleanup_returns_loser_to_pool(self):
-        """_cleanup_tunnel_result 直接把"已 CONNECT 200 的败者"隧道归还池。
-
-        单元级(无竞速时序):手动建一条已握手的隧道,调清理函数,断言落池且计数 +1。
-        竞速时序里"败者已完成 200"是同一批次与赢家并列完成的情形,此处直接驱动。
-        """
-        up_srv = await run_mock_proxy_delayed_connect(HOST, 31992, connect_delay=0.0)
-        r = self._router()
-        await r.start()
-        try:
-            target = "loser-cleanup.example.com:443"
-            # 手动模拟一个已 CONNECT 200 的败者隧道(经 slow 上游 31992 握手成功)。
-            reader, writer = await asyncio.open_connection(HOST, 31992)
-            writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
-            await writer.drain()
-            status = await reader.readline()
-            assert b'200' in status, f"mock should return 200, got {status!r}"
-            # 消费残余头部直到空行(与 _try_tunnel 的 200 读取一致),否则残留
-            # \r\n 会让 _maybe_return_established 判脏不复用。
-            while True:
-                h = await reader.readline()
-                if not h or h in (b"\r\n", b"\n"):
-                    break
-            # 调用败者清理:应归还池而非关闭。
-            await r._cleanup_tunnel_result(('slow', reader, writer), target=target)
-            key = f"{HOST}:31992|{target}"
-            assert r._established_pool.get(key), \
-                f"loser tunnel should be returned, keys={self._keys(r)}"
-            assert r.established_pool_returned == 1
-        finally:
-            await r.stop()
-            up_srv.close()
-            await up_srv.wait_closed()
-
-    @pytest.mark.asyncio
-    async def test_e2e_race_pools_both_winner_and_loser(self):
-        """E2E 竞速:两个无延迟代理同时完成 CONNECT 200,赢家经 relay 归还、
-        败者经 cleanup 归还 → 两键都入池。
-
-        胜者:仅 CONNECT 立即关闭客户端(不发业务 payload) → 干净 → 入池。
-        败者:仅 CONNECT 已握手 → safe_for_reuse=True → 入池。
-        """
-        up_srv_fast = await run_mock_proxy(HOST, 31991, hit_counter=None)
-        up_srv_slow = await run_mock_proxy_delayed_connect(HOST, 31992, connect_delay=0.0)
-        r = self._router(stagger_start=False)  # _race 全发,两候选同时完成 200
-        await r.start()
-        try:
-            target = b"loser-e2e.example.com:443"
-            # 仅 CONNECT 立即关闭(不发业务 payload)→ 干净胜者隧道,可入池。
-            status = await send_connect_status(HOST, ROUTER_PORT, target=target)
-            assert b'200' in status
-            # 两键最终都应入池:赢家(客户端断开后 relay 归还)+ 败者(cleanup 归还)。
-            for _ in range(int(3.0 / 0.02)):
-                if len(r._established_pool) >= 2:
-                    break
-                await asyncio.sleep(0.02)
-            assert len(r._established_pool) == 2, \
-                f"both winner+loser tunnels should be pooled, keys={self._keys(r)}"
-            assert r.established_pool_returned >= 2
-        finally:
-            await r.stop()
-            up_srv_fast.close()
-            await up_srv_fast.wait_closed()
-            up_srv_slow.close()
-            await up_srv_slow.wait_closed()
-
-    @pytest.mark.asyncio
-    async def test_cleanup_closes_when_reuse_disabled(self):
-        """established_reuse=False → 败者清理仍关闭连接,池保持空(回归保护)。"""
-        up_srv = await run_mock_proxy_delayed_connect(HOST, 31992, connect_delay=0.0)
-        r = self._router(conn_pool_established_reuse=False)
-        await r.start()
-        try:
-            target = "loser-off.example.com:443"
-            reader, writer = await asyncio.open_connection(HOST, 31992)
-            writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
-            await writer.drain()
-            status = await reader.readline()
-            assert b'200' in status
-            await r._cleanup_tunnel_result(('slow', reader, writer), target=target)
-            assert sum(len(v) for v in r._established_pool.values()) == 0, \
-                "reuse disabled: loser tunnels must be closed, not pooled"
-            assert r.established_pool_returned == 0
-        finally:
-            await r.stop()
-            up_srv.close()
-            await up_srv.wait_closed()
 
 
 class TestStickyProbeEviction:
@@ -6044,7 +5499,6 @@ class TestRouterConfigPassThrough:
             conn_pool_refill_pause_silence_sec=pc.refill_pause_silence_sec,
             conn_pool_refill_pause_activity_window=pc.refill_pause_activity_window,
             conn_pool_refill_pause_min_requests=pc.refill_pause_min_requests,
-            conn_pool_established_reuse=pc.established_reuse,
             cluster_predict=pc.cluster_predict, cluster_window_sec=pc.cluster_window_sec,
             cluster_predict_topk=pc.cluster_predict_topk, cluster_min_support=pc.cluster_min_support,
             cluster_graph_ttl_sec=pc.cluster_graph_ttl_sec,
@@ -6079,7 +5533,7 @@ class TestRouterConfigPassThrough:
                                    add_on_success=2, mult_on_failure=0.6, failure_window=10),
             conn_pool=dict(enabled=True, per_proxy=3, total=20, idle_timeout=15.0,
                            refill_interval=2.0, refill_target=1, connect_timeout=5.0,
-                           target_prewarm=True, established_reuse=True,
+                           target_prewarm=True,
                            refill_pause_minutes=0.0,
                            cluster_predict=True, cluster_window_sec=3.5,
                            cluster_predict_topk=5, cluster_min_support=3,
@@ -6110,7 +5564,7 @@ class TestRouterConfigPassThrough:
             # 关键配置属性逐一比对(r_cfg vs r_kw;Router 自有属性直接比,selector 上的
             # 质控/熔断属性经 r.selector 比)。
             for attr in ('max_retries', 'cache_ttl', 'stagger_interval', 'probe_interval_sec',
-                         'conn_pool_enabled', 'conn_pool_total', 'conn_pool_established_reuse',
+                         'conn_pool_enabled', 'conn_pool_total',
                          'conn_pool_idle_timeout', 'cluster_proxy_fanout', 'cluster_probe_decay_sec',
                          'cluster_pool_idle_timeout', 'single_send_slow_log_ms',
                          'connect_tunnel_timeout_sec', 'http_read_timeout_sec'):
@@ -6120,7 +5574,6 @@ class TestRouterConfigPassThrough:
                 assert getattr(r_cfg.selector, attr) == getattr(r_kw.selector, attr), \
                     f"selector.{attr} 两条构造路径不一致"
             assert r_cfg.conn_pool_total == 20 and r_cfg.max_retries == 5
-            assert r_cfg.conn_pool_established_reuse is True
         finally:
             r_cfg._db.close()
             r_kw._db.close()
@@ -6137,11 +5590,10 @@ class TestRouterConfigPassThrough:
 
     def test_pool_forward_identity(self):
         """池成员转发到 self.pools 的同一对象(白名单 __getattr__/__setattr__)。"""
-        r = self._router(conn_pool_enabled=True, conn_pool_established_reuse=True)
+        r = self._router(conn_pool_enabled=True)
         try:
             assert r._conn_pool is r.pools._conn_pool
             assert r._target_pool is r.pools._target_pool
-            assert r._established_pool is r.pools._established_pool
             assert r.conn_pool_creates == r.pools.conn_pool_creates == 0
             # set 经 __setattr__ 转发到 pools。
             r.conn_pool_creates = 7
@@ -6217,7 +5669,6 @@ class TestRouterConfigPassThrough:
         c.conn_pool.enabled = True
         c.conn_pool.target_prewarm = True
         c.conn_pool.cluster_predict = True
-        c.conn_pool.established_reuse = True
         c.auto_tune.enabled = True
         return c
 
@@ -6315,6 +5766,18 @@ class TestRouterConfigFromFlat:
         """未知散装名 → TypeError(与重构前散装签名"不认识的键即报错"一致)。"""
         with pytest.raises(TypeError, match="unexpected keyword argument"):
             router_config_from_flat(not_a_real_option=1)
+
+    def test_removed_established_pool_kwargs_rejected(self):
+        """已删除的已握手池散装名 → TypeError(该功能层已整体移除)。
+
+        established_reuse / established_idle_timeout 随"已握手隧道复用池"一并
+        删除(命中率 0.06%,纯成本)。兼容层的映射表同步删除后,这两个名字不再是
+        合法散装名,须报错而非静默忽略 —— 静默忽略会让调用方以为功能仍生效。
+        """
+        for name in ('conn_pool_established_reuse',
+                     'conn_pool_established_idle_timeout'):
+            with pytest.raises(TypeError, match="unexpected keyword argument"):
+                router_config_from_flat(**{name: True})
 
     def test_mapping_paths_all_resolve(self):
         """映射表每条路径都能在 RouterConfig 上解析(防映射表笔误导致静默丢失)。"""
@@ -6704,7 +6167,6 @@ class TestConfigSchemaStrict:
         from pathlib import Path
         cfg = Config(**yaml.safe_load(Path("config_xxh_example.yaml").read_text()))
         assert cfg.router.conn_pool.enabled
-        assert cfg.router.conn_pool.established_reuse
         assert cfg.router.stagger_initial == 2
 
     @pytest.mark.asyncio
@@ -6735,9 +6197,6 @@ class TestConfigSchemaStrict:
         with pytest.raises(Exception) as ei:
             ConnPoolConfig(enabled=False, target_prewarm=True)
         assert "conn_pool.enabled" in str(ei.value)
-        with pytest.raises(Exception) as ei:
-            ConnPoolConfig(enabled=False, established_reuse=True)
-        assert "conn_pool.enabled" in str(ei.value)
 
     def test_conn_pool_cluster_requires_enabled(self):
         # cluster_predict 依赖 conn_pool.enabled(第三阶段隐性依赖显式化)。
@@ -6756,7 +6215,7 @@ class TestConfigSchemaStrict:
         ConnPoolConfig(enabled=True, target_prewarm=True, cluster_predict=True)
 
     def test_conn_pool_enabled_allows_stages(self):
-        ConnPoolConfig(enabled=True, target_prewarm=True, established_reuse=True)
+        ConnPoolConfig(enabled=True, target_prewarm=True)
         ConnPoolConfig(enabled=True, target_prewarm=True, cluster_predict=True)
 
     def test_logging_bad_level_rejected(self):

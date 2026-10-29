@@ -48,7 +48,7 @@ curl -x http://127.0.0.1:10808 https://www.baidu.com
 - **HTTP 响应缓存** —— 幂等 `GET` 响应内存缓存（TTL 60 s，遵循 `Cache-Control`；POST/PUT/DELETE/PATCH 使该域名缓存的 GET 失效）
 - **在途 GET 合并** —— 同一 URL 的并发请求共享一个上游请求（有界等待，超时后回落竞速）
 - **本机竞速** —— 可选让网关主机自身作为代理节点直接参与竞速（不走上游）
-- **三层 CONNECT TCP 连接池** —— 通用上游池、目标半预连接（`target_prewarm`）、已握手复用（`established_reuse`）；另有**请求簇预测预暖**（`cluster_predict`），预建下一页加载窗口内预测会共现目标的"到上游" TCP
+- **两层 CONNECT TCP 连接池** —— 通用上游池、目标半预连接（`target_prewarm`）；另有**请求簇预测预暖**（`cluster_predict`），预建下一页加载窗口内预测会共现目标的"到上游" TCP
 - **业务对齐探活**（默认关闭）—— `probe_with_get` 在 CONNECT 探路后追加一次白名单内的轻量 GET，将 TTFB/协议/吞吐记入真实域指标桶
 - **可观测性** —— 每代理/每域名**窗口**（最近 256 次）**与终身**（t-digest，跨重启）双族分位数；错误分类（超时/连接/5xx/HTTP 状态/TLS/协议/取消/其他）；HTTP 协议版本分布；每代理 **Cost 分解**显示哪个分量主导排序；贝叶斯平滑成功率带低样本警示
 - **域名统计** —— 每域名胜出次数持久化到 SQLite，重启不丢失
@@ -154,8 +154,6 @@ router:
     refill_target: 2
     connect_timeout: 10.0
     target_prewarm: true         # Phase 2: 为热目标预开"上游 → 目标" TCP
-    established_reuse: true      # 复用已握手的空闲隧道
-    established_idle_timeout: 300.0
     cluster_predict: false       # P3: 预建下一页加载的预测共现目标 TCP
     cluster_window_sec: 2.0
     cluster_predict_topk: 3
@@ -303,7 +301,7 @@ router:
 > - `single_send_slow_log_ms`（默认 0=关闭）是唯一能把"打不开/需要多次刷新"故障归因到具体客户端 IP 的锚点（成功路径不输出 IP 日志）。
 > - `http_read_timeout_sec` 默认 3 s —— 在进一步收紧前，先在生产观察 p99/fd；详见文末 [局限性](#局限) 小节。
 > - **策略路由**（`router.policies`）按域名/标签收窄竞速候选集 —— 形状见 `examples/config.yaml`。
-> - `conn_pool.target_prewarm` 需要 `conn_pool.enabled`；`conn_pool.established_reuse` 需 `enabled`，`conn_pool.cluster_predict` 需 `enabled` **且** `target_prewarm`。
+> - `conn_pool.target_prewarm` 需要 `conn_pool.enabled`；`conn_pool.cluster_predict` 需 `enabled` **且** `target_prewarm`。
 > - `conn_pool.cluster_predict` 需要 `conn_pool.enabled` **且** `conn_pool.target_prewarm`。
 > - **逃生走廊（fail-open）：** 当所有外部代理都熔断且该域名在本机可达时，路由器会自动回退到直接拨 `local` —— 无需额外配置。
 

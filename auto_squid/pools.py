@@ -1,6 +1,6 @@
 """CONNECT 上游 TCP 预热池子系统(从 Router 拆出,见 #14 pools.py)。
 
-三个池统一成 `ConnectionPools` 类,共享单个全局 fd 预算(conn_pool_total):
+两个池统一成 `ConnectionPools` 类,共享单个全局 fd 预算(conn_pool_total):
 
 - `_conn_pool`(第一阶段通用池):每上游代理维护少量空闲 TCP,CONNECT 请求到来
   时优先取已连接到代理的 socket 再发 CONNECT target,省掉"本机→上游代理"的
@@ -9,11 +9,6 @@
   CONNECT target 在后台提前建立"到上游代理"的 TCP(不提前 CONNECT 到目标),
   按 (proxy, target) 键区分,下一次同 target 命中时直接复用,节省"取到通用池
   但 target 不同"时的 CONNECT 前建连。
-- `_established_pool`(第三阶段已建握手隧道复用):隧道结束若连接干净(上游无
-  残留缓冲)则归还而非关闭,下次同 (proxy, target) 直接复用已发 CONNECT 且
-  收到 200 的连接、跳过握手。归还受全局预算 + 单键天花板(_ESTABLISHED_KEY_CAP)
-  约束;复用前做廉价活性探测(_established_alive),死/脏连接回落到新建。
-
 状态全部由事件循环单线程读写。prewarm 后台任务注册进 Router._running_tasks
 (Router._spawn_target_prewarm 持有),本类只自管 refill 循环 task。
 """
@@ -27,42 +22,6 @@ from typing import Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
-def _discard_conn(writer: asyncio.StreamWriter):
-    """fire-and-forget 关闭一条废弃连接(同步路径不能用 await 时的清理)。
-
-    已握手池复用前发现脏缓冲 / 死连接 → 丢弃。close 放入后台 task 执行,不阻塞
-    取用热路径;3.12 的 wait_closed() 严格等对端 FIN,用 0.5s 超时保护。
-
-    #14 顺带修复:原模块方法以裸名 `_discard_conn(writer)` 被调用(router.py
-    _established_pool_peek / _try_tunnel),Python 类内裸名不查类作用域 → 运行到
-    即 NameError。抽成模块级函数,裸名调用直接命中本函数。
-    """
-    async def _close():
-        try:
-            writer.close()
-            await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
-        except BaseException:
-            pass
-    try:
-        asyncio.create_task(_close())
-    except RuntimeError:
-        # 事件循环未运行(如构造期)时直接 close,不等待。
-        try:
-            writer.close()
-        except BaseException:
-            pass
-
-
-# 已握手隧道池单键上限:与 target_pool 的 cap=2 对齐,防同一 (proxy, target)
-# 堆太多条全双工 socket(见 #15 拆池前的 #2 修复)。
-_ESTABLISHED_KEY_CAP = 2
-# 复用前活性探测超时(秒):read(1) 阻塞等这一时长的数据/EOF。
-# 0.01s 足以区分"连接已死(立即 FIN/RST)"和"连接存活(需等数据)":
-# 死连接 read(1) 在 10ms 内必返回 0 字节或异常;活连接 10ms 内大概率无
-# 数据到达(正常 HTTP 响应体尚未下发),read 超时返回空 → 视为存活。
-_ESTABLISHED_PROBE_TIMEOUT = 0.01
-
-
 class ConnectionPools:
     """三个 CONNECT 预热池 + 空闲暂停/refill 的统一状态与操作。#14 pools.py。
 
@@ -74,10 +33,10 @@ class ConnectionPools:
 
     def __init__(self, proxy_store, enabled, per_proxy, total, idle_timeout,
                  refill_interval, refill_target, connect_timeout, target_prewarm,
-                 established_reuse, pause_minutes=60.0,
+                 pause_minutes=60.0,
                  pause_silence_sec=120.0, pause_activity_window=None,
                  pause_min_requests=3, idle_timeout_cluster=600.0,
-                 idle_timeout_established=None, cluster_predict=False):
+                 cluster_predict=False):
         self.proxy_store = proxy_store
         self.conn_pool_enabled = bool(enabled)
         self.conn_pool_per_proxy = max(1, int(per_proxy))
@@ -88,14 +47,6 @@ class ConnectionPools:
         # 被清 → timing_miss。预测连接打 _cluster_prewarmed 标签,_pool_prune 按
         # 连接级标签选超时;本值独立于被动预建的空闲超时。
         self.cluster_pool_idle_timeout = max(1.0, float(idle_timeout_cluster))
-        # 已建握手隧道池(established_reuse)的独立空闲超时(默认 None=跟随
-        # conn_pool_idle_timeout)。竞速败者/隧道结束归还的已握手连接,复访同一
-        # (proxy,target) 的频率常低于通用池取用频率,统一用通用池超时会导致
-        # 归还后 90% 在复访前被清(观测 returned=133/expired=120)。独立超时
-        # 让已握手库存多活一阵等复访;连接打 _established_pooled 标签,_pool_prune
-        # 按连接级标签选超时(cluster > established > conn)。
-        self.established_pool_idle_timeout = max(
-            1.0, float(idle_timeout_established)) if idle_timeout_established else None
         self.conn_pool_refill_interval = max(0.0, float(refill_interval))
         self.conn_pool_refill_target = max(0, min(self.conn_pool_per_proxy, int(refill_target)))
         self.conn_pool_connect_timeout = max(1.0, float(connect_timeout))
@@ -132,9 +83,6 @@ class ConnectionPools:
         self._activity_timestamps = collections.deque(maxlen=1024)
         # 第二阶段(CONNECT 目标半预连接):需 conn_pool_enabled 且显式开启。
         self.conn_pool_target_prewarm = bool(target_prewarm)
-        # 已建握手隧道复用:隧道结束时连接干净则归还而非关闭,同 (proxy,target)
-        # 复用跳过 CONNECT 握手。需 conn_pool_enabled 且显式开启。
-        self.conn_pool_established_reuse = bool(established_reuse)
         # cluster 预测预建是否启用(与 Router.cluster.enabled 同源,见 Router
         # _init_cluster 的三者 AND)。仅用于给 cluster_pool_timing_miss /
         # cluster_pool_bucket_miss 两个**归因探针**加守卫:cluster 关闭时
@@ -182,18 +130,6 @@ class ConnectionPools:
         # 存"已发 CONNECT 且收到 200"的隧道连接,隧道结束若连接干净则归还,
         # 下次同 (proxy, target) 直接复用,跳过 CONNECT 握手。与 _target_pool
         # 区分:后者是"未发 CONNECT 的裸 TCP",取用后必须重新握手。
-        self._established_pool: dict = {}
-        self.established_pool_hits = 0      # 已握手连接取用成功次数
-        self.established_pool_misses = 0    # 取已握手池未中需新建/新建握手的次数
-        self.established_pool_expired = 0   # 已握手连接空闲超时关闭次数
-        self.established_pool_returned = 0  # 隧道结束归还次数
-        # 诊断(09-29 加):分辨 established 池零复用的两类病因——
-        # 复访缺失(cur/peek miss:请求到达时该 key 库存为空,可能从未建或已被清)
-        #   vs 库存僵死(取到库存但活性探测 read(1) 立即 EOF/RST,复用前死亡)。
-        # 9 天日志回放 established_pool_hits=0 后引入:若 miss 侧远大于 probe_dead,
-        # 说明请求几乎不落在库存存在的桶上;反之则库存常见但死得太快。
-        self.established_pool_revisit_miss = 0     # miss:该 key 池为空(无库存可取)
-        self.established_pool_probe_dead = 0       # 取到库存但活性探测判死/脏丢弃
         # 观测(P1 先观测后实现):CONNECT 到上游的新建 TCP 连接计数(不含预热池
         # 命中)。供压测算 HTTPS 建链成本、验证预热池收益。
         self.connect_new_conns = 0
@@ -279,65 +215,6 @@ class ConnectionPools:
                         target, proxy_host, proxy_port, self.target_pool_hits)
         return got
 
-    def _established_pool_peek(self, proxy_host: str, proxy_port: int, target: str) -> Optional[Tuple[asyncio.StreamReader, asyncio.StreamWriter]]:
-        """从已建握手隧道池取一条到该上游的连接 (reader, writer);无则返回 None。
-
-        键为 "proxy_host:proxy_port|target"。存的是"已发 CONNECT 且收到 200"的
-        隧道连接,复用时**跳过 CONNECT 握手**(连接已处于可透传状态)。取用成功
-        计 established_pool_hits,未中计 established_pool_misses。复用前验证连接
-        干净(无残留缓冲),有残留则视为过期丢弃,避免脏数据污染下一个客户端。
-        仅当 conn_pool_enabled 且 conn_pool_established_reuse 时由调用方使用。
-        """
-        got = self._pool_peek(self._established_pool, f"{proxy_host}:{proxy_port}|{target}")
-        if got is None:
-            self.established_pool_misses += 1
-            self.established_pool_revisit_miss += 1  # 诊断:请求到达但该 key 库存为空
-            return None
-        reader, writer = got
-        # 严格验证:上游缓冲残留数据 → 连接已脏,丢弃而非复用(宁可不复用也不污染)。
-        # 本方法是同步热路径,关闭用 fire-and-forget 后台任务(不阻塞取用)。
-        if reader.at_eof() or (reader._buffer and len(reader._buffer) > 0):
-            self.established_pool_expired += 1
-            self.established_pool_probe_dead += 1  # 诊断:取到库存但已脏/对端 EOF
-            logger.debug("established pool DISCARD %s via %s:%s (dirty buffer)", target, proxy_host, proxy_port)
-            _discard_conn(writer)
-            return None
-        # 标记:该连接已建握手,调用方 _try_tunnel 据此跳过 CONNECT 发送/200 校验。
-        writer._established_reused = True
-        self.established_pool_hits += 1
-        logger.debug("established pool HIT  %s via %s:%s (hits=%d)",
-                    target, proxy_host, proxy_port, self.established_pool_hits)
-        return reader, writer
-
-    async def _established_alive(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> bool:
-        """复用已握手连接前的廉价活性探测(不超过 _ESTABLISHED_PROBE_TIMEOUT)。
-
-        用 read(1):asyncio 的 read(0) 会在方法开头直接返回 b"" 不碰网络(故不可做
-        探测);read(1) 才真正阻塞等待数据/EOF:
-        - 超时(连接活且无数据)→ 可复用(探测被 wait_for 取消,未消费任何字节,无
-          状态残留,`_waiter` 置空即可);
-        - 返回 b""(对端已 FIN)→ 死,不可复用;
-        - 抛出(对端已 RST,reader._exception 设置)→ 死,不可复用;
-        - 返回非空 1 字节(上游残余/对端推送)→ 已脏,不可复用且该字节丢失可接受
-          (连接整条丢弃,宁可不复用也不污染)。
-
-        纯半开(对端静默、无 FIN 无数据)会让 read(1) 阻塞到超时 → 误判"活",由归还
-        时设的 SO_KEEPALIVE 由 OS 兜底判死(KEEPIDLE 60s 后探测)。返回 False 时
-        调用方负责丢弃连接并回落新建。
-        """
-        try:
-            data = await asyncio.wait_for(reader.read(1), timeout=_ESTABLISHED_PROBE_TIMEOUT)
-        except asyncio.TimeoutError:
-            return True          # 活且无数据,探测未消费任何字节
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            return False         # read 抛异常 → 对端已关/RST
-        # read(1) 返回了字节或 EOF
-        return False
-
-    # ── 空闲暂停 / refill 补充 ─────────────────────────────────
-
     def _record_request_activity(self):
         """刷新"密集活动"时间戳(refill 空闲感知的活动信号)。
 
@@ -386,7 +263,7 @@ class ConnectionPools:
         只要没有"密集活动"(窗口内 ≥ 阈值个真实请求成簇)持续到来,本判定在距
         最后密集活动超过阈值后返回 True,refill/目标预热挂起。**空闲暂停只挂起
         后台预建(refill/目标预热),不卡请求路径**:真实请求照常取池/新建/复用
-        已握手连接(见 Router._try_tunnel / _established_pool_peek,均不检查本判定)。
+        已建连接(见 Router._try_tunnel,均不检查本判定)。
         仅当预热池开启且配置了暂停时长才可能返回 True;0(默认关闭该特性)恒
         False——refill/目标预热行为与未加本特性时完全一致,不改变默认语义。
         """
@@ -395,14 +272,13 @@ class ConnectionPools:
         return (time.monotonic() - self._last_request_activity) >= self.conn_pool_refill_pause_minutes * 60.0
 
     def _total_idle(self) -> int:
-        """三池空闲连接总数(共享全局 fd 预算 conn_pool_total 的当前占用)。
+        """两池空闲连接总数(共享全局 fd 预算 conn_pool_total 的当前占用)。
 
         #14(拆 pools.py)统一 #2 三处手写预算快照(conn_pool_refill /
-        target_pool_refill / relay_tunnel 归还),消除对三池 dict 的三段重复求和。
+        target_pool_refill / relay_tunnel 归还),消除对两池 dict 的两段重复求和。
         """
         return (sum(len(v) for v in self._conn_pool.values())
-                + sum(len(v) for v in self._target_pool.values())
-                + sum(len(v) for v in self._established_pool.values()))
+                + sum(len(v) for v in self._target_pool.values()))
 
     async def _conn_pool_refill(self):
         """补充第一阶段预热连接到目标水位(后台 refill task 周期调用)。
@@ -416,7 +292,7 @@ class ConnectionPools:
         # 空闲暂停:深夜无请求时挂起补充,避免"建了又过期"的空转。
         if self._conn_pool_idle():
             return
-        # 快照当前空闲总数,防止并发补充超过全局预算(三池共享 conn_pool_total)。
+        # 快照当前空闲总数,防止并发补充超过全局预算(两池共享 conn_pool_total)。
         total_idle = self._total_idle()
         for proxy in self.proxy_store.list():
             if not proxy.enabled:
@@ -465,7 +341,7 @@ class ConnectionPools:
         if self._conn_pool_idle():
             return 0
         key = f"{proxy_host}:{proxy_port}|{target}"
-        # 全局 fd 预算:三池共享 conn_pool_total,超限则不补。
+        # 全局 fd 预算:两池共享 conn_pool_total,超限则不补。
         total_idle = self._total_idle()
         made = 0
         while len(self._target_pool.get(key, [])) < cap and total_idle < self.conn_pool_total:
@@ -519,7 +395,7 @@ class ConnectionPools:
     # ── 清理 / 生命周期 ─────────────────────────────────────────
 
     async def _pool_prune(self):
-        """关闭空闲超时的预热连接(三池,每 refill 周期顺带清理,防 fd 泄漏)。
+        """关闭空闲超时的预热连接(两池,每 refill 周期顺带清理,防 fd 泄漏)。
 
         用 writer._conn_pool_created 记录建连时间戳(各处建连统一打)。
         """
@@ -528,8 +404,7 @@ class ConnectionPools:
         # 先收集待关连接,再统一重建 dict —— 迭代中 pop 会触发
         # "dictionary changed size during iteration"。
         for pool, expired_counter in ((self._conn_pool, 'conn_pool_expired'),
-                                      (self._target_pool, 'target_pool_expired'),
-                                      (self._established_pool, 'established_pool_expired')):
+                                      (self._target_pool, 'target_pool_expired')):
             for key in list(pool.keys()):
                 stack = pool[key]
                 alive = []
@@ -538,14 +413,11 @@ class ConnectionPools:
                     if writer.is_closing():
                         continue
                     last = getattr(writer, '_conn_pool_created', 0)
-                    # 连接级超时选择:cluster 预测预建 > established 已握手库存 >
-                    # 通用池。各自有独立 idle 超时,避免归还没被复访就过早清掉。
+                    # 连接级超时选择:cluster 预测预建 > 通用池。两者各有独立
+                    # idle 超时,避免预建还没被复访就过早清掉。
                     timeout = self.conn_pool_idle_timeout
                     if getattr(writer, '_cluster_prewarmed', False):
                         timeout = self.cluster_pool_idle_timeout
-                    elif getattr(writer, '_established_pooled', False) \
-                            and self.established_pool_idle_timeout is not None:
-                        timeout = self.established_pool_idle_timeout
                     if now - last > timeout:
                         stale.append(writer)
                         setattr(self, expired_counter, getattr(self, expired_counter) + 1)
@@ -565,10 +437,6 @@ class ConnectionPools:
                         # DEBUG:过期淘汰是常规生命周期(实测占全部日志约 17%),
                         # 与 target pool MISS/HIT 同属高频诊断,非异常。
                         logger.debug("target prewarm EXPIRED %s (%s conn(s))",
-                                     key, len(stack))
-                    elif expired_counter == 'established_pool_expired':
-                        # DEBUG:同上,常规生命周期事件(实测占全部日志约 8%)。
-                        logger.debug("established pool EXPIRED %s (%s conn(s))",
                                      key, len(stack))
                     pool.pop(key, None)
         for w in stale:
@@ -599,18 +467,16 @@ class ConnectionPools:
             pass
 
     async def _conn_pool_close_all(self):
-        """关闭全部预热连接(stop 时调用),含 target 半预连接池与已握手池。
+        """关闭全部预热连接(stop 时调用),含 target 半预连接池。
 
         预热连接是"半连接"(只建 TCP 未发数据),对端(mock/真实上游)可能一直
         挂起等待客户端数据而不主动关闭。Python 3.12 的 StreamWriter.wait_closed()
         会严格等待对端 FIN 确认,此时会无限挂起(本地 3.11 立即返回,CI 3.12
         卡死)。故用超时保护:close() 后最多等 0.5s,超时即放弃等待,避免阻塞。
         """
-        stacks = list(self._conn_pool.values()) + list(self._target_pool.values()) \
-            + list(self._established_pool.values())
+        stacks = list(self._conn_pool.values()) + list(self._target_pool.values())
         self._conn_pool.clear()
         self._target_pool.clear()
-        self._established_pool.clear()
         for stack in stacks:
             for item in stack:
                 reader, writer = item
@@ -634,7 +500,7 @@ class ConnectionPools:
         """停止 refill 循环并关闭全部预热连接(Router.stop 调用)。
 
         先取消并等待 refill 循环(它正在 _conn_pool_refill/_pool_prune,可能持有
-        建连在途),再统一关闭三池。prewarm 后台 task 由 Router.stop 在
+        建连在途),再统一关闭两池。prewarm 后台 task 由 Router.stop 在
         _conn_pool_close_all 之后的 _running_tasks 排空阶段取消(保持原顺序)。
         """
         if self._pool_task and not self._pool_task.done():

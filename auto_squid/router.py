@@ -51,7 +51,7 @@ from .auth import check_auth
 from .config_schema import (PolicyConfig, RouterConfig, AutoTuneConfig,
                             router_config_from_flat)
 from .tuner import AutoTuner
-from .pools import ConnectionPools, _discard_conn, _ESTABLISHED_KEY_CAP, _ESTABLISHED_PROBE_TIMEOUT
+from .pools import ConnectionPools
 from .selector import (ProxySelector, _CIRCUIT_THRESHOLD, _CIRCUIT_MAX_BACKOFF,
                        _SLOW_START_WINDOW, _SLOW_START_SUCCESS, _LB_BIAS_DEFAULT,
                        _FAIL_PENALTY_DEFAULT,
@@ -122,11 +122,6 @@ _CLIENT_BODY_TIMEOUT = 120.0
 # 败者清理后台 task 的软上限。超过则在 _race 里就地排空一次,防止持续高吞吐
 # 下 _pending_cleanups 无界堆积(soak 模式曾观测 fd_peak 冲到 569)。
 _MAX_PENDING_CLEANUPS = 64
-
-# 已建握手隧道池(_established_pool)的 per-key 驻池上限 / 复用前活性探测超时,
-# #14 拆 pools.py 后统一定义在 pools.py(ConnectionPools 使用)。
-_ESTABLISHED_KEY_CAP, _ESTABLISHED_PROBE_TIMEOUT = (
-    _ESTABLISHED_KEY_CAP, _ESTABLISHED_PROBE_TIMEOUT)
 
 # 错峰启动(staggered start,RFC 8305 §5)的配置下限。
 # 默认间隔 100ms,下限 100ms(绝对值下限 10ms,防止丢包率高时拥塞崩溃),上限 2s。
@@ -315,8 +310,6 @@ class Router:
         conn_pool_refill_pause_silence_sec = pc.refill_pause_silence_sec
         conn_pool_refill_pause_activity_window = pc.refill_pause_activity_window
         conn_pool_refill_pause_min_requests = pc.refill_pause_min_requests
-        conn_pool_established_reuse = pc.established_reuse
-        conn_pool_established_idle_timeout = pc.established_idle_timeout
         cluster_predict = pc.cluster_predict
         cluster_window_sec = pc.cluster_window_sec
         cluster_predict_topk = pc.cluster_predict_topk
@@ -558,13 +551,11 @@ class Router:
             conn_pool_refill_target=conn_pool_refill_target,
             conn_pool_connect_timeout=conn_pool_connect_timeout,
             conn_pool_target_prewarm=conn_pool_target_prewarm,
-            conn_pool_established_reuse=conn_pool_established_reuse,
             conn_pool_refill_pause_minutes=conn_pool_refill_pause_minutes,
             conn_pool_refill_pause_silence_sec=conn_pool_refill_pause_silence_sec,
             conn_pool_refill_pause_activity_window=conn_pool_refill_pause_activity_window,
             conn_pool_refill_pause_min_requests=conn_pool_refill_pause_min_requests,
             cluster_pool_idle_timeout=cluster_pool_idle_timeout,
-            conn_pool_established_idle_timeout=conn_pool_established_idle_timeout,
             cluster_predict=cluster_predict)
 
         # ── 请求簇预测预热(ClusterGraph,#新增:观察见 _cluster_observe)──────
@@ -838,13 +829,12 @@ class Router:
                     conn_pool_per_proxy: int, conn_pool_total: int,
                     conn_pool_idle_timeout: float, conn_pool_refill_interval: float,
                     conn_pool_refill_target: int, conn_pool_connect_timeout: float,
-                    conn_pool_target_prewarm: bool, conn_pool_established_reuse: bool,
+                    conn_pool_target_prewarm: bool,
                     conn_pool_refill_pause_minutes: float,
                     conn_pool_refill_pause_silence_sec: float,
                     conn_pool_refill_pause_activity_window: Optional[float],
                     conn_pool_refill_pause_min_requests: int,
                     cluster_pool_idle_timeout: float,
-                    conn_pool_established_idle_timeout: Optional[float],
                     cluster_predict: bool = False) -> None:
         """构造 CONNECT 上游连接池协作对象 self.pools(ConnectionPools)。
 
@@ -861,13 +851,12 @@ class Router:
             enabled=conn_pool_enabled, per_proxy=conn_pool_per_proxy, total=conn_pool_total,
             idle_timeout=conn_pool_idle_timeout, refill_interval=conn_pool_refill_interval,
             refill_target=conn_pool_refill_target, connect_timeout=conn_pool_connect_timeout,
-            target_prewarm=conn_pool_target_prewarm, established_reuse=conn_pool_established_reuse,
+            target_prewarm=conn_pool_target_prewarm,
             pause_minutes=conn_pool_refill_pause_minutes,
             pause_silence_sec=conn_pool_refill_pause_silence_sec,
             pause_activity_window=conn_pool_refill_pause_activity_window,
             pause_min_requests=conn_pool_refill_pause_min_requests,
             idle_timeout_cluster=cluster_pool_idle_timeout,
-            idle_timeout_established=conn_pool_established_idle_timeout,
             # 供 pools 侧给 cluster 归因探针(timing/bucket miss)加守卫;与
             # _init_cluster 里 ClusterGraph 的 enabled 用同一个入参(该处再与
             # conn_pool_enabled / target_prewarm 求 AND)。
@@ -1651,15 +1640,6 @@ class Router:
             "cluster_prewarm_spawned": self.cluster.cluster_prewarm_spawned,
             "cluster_bucket_spawns": self.cluster.cluster_bucket_spawns,
             "cluster_graph_size": self.cluster.graph_size(),
-            "conn_pool_established_reuse": self.pools.conn_pool_established_reuse,
-            "conn_pool_established_idle_timeout": self.pools.established_pool_idle_timeout,
-            "established_pool_hits": self.pools.established_pool_hits,
-            "established_pool_misses": self.pools.established_pool_misses,
-            "established_pool_revisit_miss": self.pools.established_pool_revisit_miss,
-            "established_pool_probe_dead": self.pools.established_pool_probe_dead,
-            "established_pool_expired": self.pools.established_pool_expired,
-            "established_pool_returned": self.pools.established_pool_returned,
-            "established_pool_size": sum(len(v) for v in self.pools._established_pool.values()),
             "connect_new_conns": self.pools.connect_new_conns,
             "probes_sent": self.probes_sent,
             "probes_ok": self.probes_ok,
@@ -1988,34 +1968,6 @@ class Router:
             except (OSError, AttributeError):
                 pass
 
-    @staticmethod
-    def _set_pool_keepalive(writer):
-        """对驻池连接设 SO_KEEPALIVE:OS 在 TCP_KEEPIDLE 后探测半开连接。
-
-        已握手隧道池(_established_pool)的复用前活性探测(read(1)+超时)只能查出对端
-        已发 FIN/RST 的死连接;纯半开(对端静默、连接仍 ESTABLISHED)会让 read 一直
-        阻塞到超时而误判"活"。启用 SO_KEEPALIVE 后 OS 在 KEEPIDLE(60s)后发探测包,
-        对端不可达即判死(RST/错误),进程内 read 随即收到异常——在驻池期间就把半开
-        清掉,而不是等到复用后首包才暴露。失败静默(部分平台/socket 阶段无 socket)。
-        """
-        try:
-            sock = writer.get_extra_info('socket')
-            if sock is None:
-                return
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            if hasattr(socket, 'TCP_KEEPIDLE'):
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
-            if hasattr(socket, 'TCP_KEEPINTVL'):
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
-        except (OSError, AttributeError):
-            pass
-
-    # ── HTTP GET 缓存(HttpCache,#14)────────────────────────
-    # _http_cache_key/_get/_remove/_set/_invalidate 已随 #14 拆分搬入
-    # HttpCache(self.httpcache),经类尾 _CACHE_FORWARD 白名单 __getattr__
-    # 转发。_write_cached_response/流式缓冲/flow 编排留 Router。
-    # ── 上游连接池 ──────────────────────────────────────────────
-
     def _client_key(self, pid: str, proxy_url: Optional[str]) -> str:
         """连接池键:用 proxy_url 区分"同一 pid 不同上游凭据/地址"的情形。
 
@@ -2155,7 +2107,7 @@ class Router:
         桶——但**探路只握手不拉数据**,单次握手延迟混入域名 EWMA 有噪声。设计上
         接受:探路频率低(节流 interval),且只影响该桶的 best 基准,不参与 sticky
         驱逐的 cur(那吃真实请求 TTFB)。探路建出的隧道经 _cleanup_tunnel_result
-        归还 _established_pool(杠杆C,探路即备货)。
+        关闭(隧道不再归还任何池)。
         """
         try:
             # 探路时间戳在此刷新:只有真正进入探路才消耗节流。
@@ -2501,31 +2453,19 @@ class Router:
             pass
 
     async def _cleanup_tunnel_result(self, result, target=None):
-        """竞速败者 CONNECT 隧道的统一清理:可归还时归还 _established_pool,
-        否则关闭上游连接。result = (pid, up_reader, up_writer)。
+        """竞速败者 CONNECT 隧道的统一清理:关闭上游连接。result = (pid, up_reader, up_writer)。
 
-        target 由 CONNECT 竞速调用点经 functools.partial 部分绑定(缺省 None 时
-        退化为旧行为——只关闭连接,用于 HTTP 竞速等无 target 上下文路径)。
-        上游地址按 result[0] 的 pid 反查 proxy_store(避免 partial 在 mixed
-        local/上游批次里绑定错 host;local 直连 proxy 为 None → 不归还)。
-        竞速败者 CONNECT 200 后 _try_tunnel 已 record_ttfb;竞速 harness 只读
-        响应头不读数据字节,败者连接无脏 buffer,满足 _maybe_return_established
-        的干净判定。开启 established_reuse 后,竞速浪费的已握手隧道变库存。
+        target 由 CONNECT 竞速调用点经 functools.partial 部分绑定(签名保留以兼容
+        既有调用点;隧道不再归还任何池,该参数已无实际用途)。
         """
         if not result:
             return
-        pid = result[0]
-        proxy = None if pid == 'local' else self.proxy_store.get(pid)
-        if (self.pools.conn_pool_established_reuse and proxy is not None and target):
-            await self._maybe_return_established(
-                result[2], result[1], proxy.host, proxy.port, target, safe_for_reuse=True)
-        else:
-            up_writer = result[-1]
-            try:
-                up_writer.close()
-                await up_writer.wait_closed()
-            except Exception:
-                pass
+        up_writer = result[-1]
+        try:
+            up_writer.close()
+            await up_writer.wait_closed()
+        except Exception:
+            pass
 
     @staticmethod
     async def _pipe(reader, writer, close_writer: bool = True, on_chunk=None):
@@ -2732,25 +2672,11 @@ class Router:
                     # CONNECT 预热池(P1)+ 目标半预连接(P2):取用顺序为——
                     # 1) 已握手隧道池(命中则跳过下方 CONNECT 握手);2) target 半预连接池
                     #    (按 proxy|target 键,只预连"到上游代理"的 TCP,未发 CONNECT);
-                    # 3) 第一阶段通用池;4) 新建。取用成功即省掉"本机→上游"建连 TTFB。
+                    # 2) 第一阶段通用池;3) 新建。取用成功即省掉"本机→上游"建连 TTFB。
                     # 重试(_attempt==1)强制跳过所有池、只用全新连接。
                     if _attempt == 0 and self.pools.conn_pool_enabled:
                         up_reader, up_writer = None, None
-                        # 已握手隧道复用:优先取"已发 CONNECT 且收到 200"的连接,命中则
-                        # 跳过下方 CONNECT 握手,直接返回(连接已处于可透传状态)。
-                        if self.pools.conn_pool_established_reuse:
-                            up_reader, up_writer = self.pools._established_pool_peek(proxy_host, proxy_port, target) or (None, None)
-                            if up_reader is not None and not await self.pools._established_alive(up_reader, up_writer):
-                                # 死/脏连接:丢弃(peek 已计 hits),不跳过多余 I/O、不影响下
-                                # 一候选判定——回落后续池/新建。避免一个 tick 赢竞速。
-                                self.pools.established_pool_expired += 1
-                                logger.info("established pool DEAD-ON-PROBE %s via %s:%s",
-                                            target, proxy_host, proxy_port)
-                                _discard_conn(up_writer)
-                                up_reader = up_writer = None
-                            else:
-                                _used_pooled = True  # 命中已握手池且活性探测通过
-                        if up_reader is None and self.pools.conn_pool_target_prewarm:
+                        if self.pools.conn_pool_target_prewarm:
                             up_reader, up_writer = self.pools._target_pool_peek(proxy_host, proxy_port, target) or (None, None)
                             if up_reader is not None:
                                 _used_pooled = True
@@ -2806,49 +2732,43 @@ class Router:
                 self.selector.record_failure(pid, ERROR_OTHER, target)
                 raise
             # 首字节计时:从 CONNECT 发出到收到 200。用于 EWMA 质量跟踪(竞速排序)。
-            # 复用已握手隧道时无 CONNECT 往返,计时为 0(不做 EWMA 观测)。
-            reused_established = (self.pools.conn_pool_established_reuse
-                                  and proxy_host is not None
-                                  and up_reader is not None
-                                  and getattr(up_writer, '_established_reused', False))
             t0 = time.perf_counter()
             # 计入该代理在途数(从 CONNECT 发起到拿到 200/失败/被取消),finally 释放。
             self.selector._inflight_start(pid)
             try:
-                if not reused_established:
-                    auth_hdr = ""
-                    if proxy_auth:
-                        raw = f"{proxy_auth['username']}:{proxy_auth['password']}"
-                        encoded = base64.b64encode(raw.encode()).decode()
-                        auth_hdr = f"Proxy-Authorization: Basic {encoded}\r\n"
-                    up_writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: ".encode('latin-1') + _hb(target) + f"\r\n{auth_hdr}\r\n".encode('latin-1'))
-                    await up_writer.drain()
-                    self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
-                    self.upstream_attempts += 1  # 聚合竞速扇出总数(供 /metrics 算放大率)
-                    status = await asyncio.wait_for(up_reader.readline(), timeout=connect_timeout)
-                    if not status:
-                        raise RuntimeError('no response from upstream')
-                    status_text = status.decode('latin-1')
-                    # 审计 P3#7:精确解析状态码(HTTP/1.x <code> <reason>),而不是子串
-                    # 匹配——"HTTP/1.1 2000" 或原因短语含 "200" 会被旧实现误判为成功。
-                    _parts = status_text.split(' ', 2)
-                    status_code = _parts[1] if (len(_parts) >= 2 and _parts[0].startswith('HTTP/')) else ''
-                    if status_code != '200':
-                        while True:
-                            h = await up_reader.readline()
-                            if not h or h in (b"\r\n", b"\n"):
-                                break
-                        raise RuntimeError(f'upstream returned non-200 for CONNECT: {status_text.strip()}')
+                auth_hdr = ""
+                if proxy_auth:
+                    raw = f"{proxy_auth['username']}:{proxy_auth['password']}"
+                    encoded = base64.b64encode(raw.encode()).decode()
+                    auth_hdr = f"Proxy-Authorization: Basic {encoded}\r\n"
+                up_writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: ".encode('latin-1') + _hb(target) + f"\r\n{auth_hdr}\r\n".encode('latin-1'))
+                await up_writer.drain()
+                self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
+                self.upstream_attempts += 1  # 聚合竞速扇出总数(供 /metrics 算放大率)
+                status = await asyncio.wait_for(up_reader.readline(), timeout=connect_timeout)
+                if not status:
+                    raise RuntimeError('no response from upstream')
+                status_text = status.decode('latin-1')
+                # 审计 P3#7:精确解析状态码(HTTP/1.x <code> <reason>),而不是子串
+                # 匹配——"HTTP/1.1 2000" 或原因短语含 "200" 会被旧实现误判为成功。
+                _parts = status_text.split(' ', 2)
+                status_code = _parts[1] if (len(_parts) >= 2 and _parts[0].startswith('HTTP/')) else ''
+                if status_code != '200':
                     while True:
                         h = await up_reader.readline()
                         if not h or h in (b"\r\n", b"\n"):
                             break
-                    self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
-                    # CONNECT 域名 key = 原始 target("host:port"),与 _record_attempt /
-                    # _get_fresh_proxy(target) / sticky key(client_ip|target)一致。
-                    ttfb = time.perf_counter() - t0
-                    self.selector.record_ttfb(pid, ttfb, target)
-                    self._stash_attempt_ttfb(ttfb)  # 调参器侧信道:胜出点取回(见 _observe_win)
+                    raise RuntimeError(f'upstream returned non-200 for CONNECT: {status_text.strip()}')
+                while True:
+                    h = await up_reader.readline()
+                    if not h or h in (b"\r\n", b"\n"):
+                        break
+                self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
+                # CONNECT 域名 key = 原始 target("host:port"),与 _record_attempt /
+                # _get_fresh_proxy(target) / sticky key(client_ip|target)一致。
+                ttfb = time.perf_counter() - t0
+                self.selector.record_ttfb(pid, ttfb, target)
+                self._stash_attempt_ttfb(ttfb)  # 调参器侧信道:胜出点取回(见 _observe_win)
                 # 仅记尝试统计;meta 由 _handle_connect 在确认赢家后调 _record_win_meta。
                 self._record_attempt(target, pid)
                 # CONNECT 拿到 200 即视为一次成功观测(EWMA + 连续失败归零)。
@@ -3846,9 +3766,10 @@ class Router:
                             proxy_host=None, proxy_port=None, target=None, pid=None):
         """双向透传一个已建立的隧道。
 
-        任一方向结束即结束透传。若启用了已握手隧道复用(conn_pool_established_reuse
-        且经上游代理)、且上游连接健康(未关闭、无残留缓冲),则归还 _established_pool
-        供下一条同 (proxy, target) 请求复用;否则关闭上游连接。客户端侧连接始终关闭。
+        任一方向结束即结束透传,随后**关闭上游连接**(客户端侧连接始终关闭)。
+        隧道不归还任何池:已转发过客户端字节的 CONNECT 隧道含完整 TLS/应用会话,
+        不能交给另一客户端续用;竞速败者那类从未透传业务字节的隧道同样不再
+        入池(该复用层已移除,见 git 历史)。
         pid: 本隧道胜出的代理 id(含 'local' 直连),用于累计 HTTPS 透传字节与
         吞吐统计(record_complete);为 None 时不统计(旧行为/安全兜底)。
         """
@@ -3859,18 +3780,15 @@ class Router:
         # 源站首字节(OFB):隧道建立 → 上游→客户端方向首个数据块的耗时。用列表
         # 承载以便 lambda 内赋值(None 表示尚未收到首字节)。
         _ofb = [None]
-        # 复用已握手隧道时不再有 TLS 握手,首个上行字节是应用响应数据而非
-        # ServerHello,语义不同 —— 该情形不记 OFB(判据同 _try_tunnel)。
-        _reused = bool(getattr(up_writer, '_established_reused', False))
-        # 客户端→上游 方向的 _pipe 结束时**不关上游**(close_writer=False),让
-        # _relay_tunnel 在结束时统一判断归还/关闭;上游→客户端 方向照常关客户端。
+        # 客户端→上游 与 上游→客户端 两个方向的 _pipe 结束时各自关闭各自的
+        # writer;上游连接的最终关闭由本函数 finally 兜底(幂等)。
         # wait(FIRST_COMPLETED):任一端结束(客户端断开 EOF / 上游结束 / 超时)
         # 即返回并取消另一端——客户端断开后不等待上游挂起(上游可能长连不关),
         # 立即进入 finally 决定归还/关闭。原 gather 会等两个 pipe 都结束,
         # 若上游长连不关则归还延迟到其 idle 超时。
         try:
             done, pending = await asyncio.wait(
-                {asyncio.create_task(Router._pipe(client_reader, up_writer, close_writer=False,
+                {asyncio.create_task(Router._pipe(client_reader, up_writer,
                                                   on_chunk=lambda n: _bytes.__setitem__(0, _bytes[0] + n))),
                  asyncio.create_task(Router._pipe(up_reader, client_writer,
                                                   on_chunk=lambda n: (_ofb.__setitem__(0, time.perf_counter())
@@ -3898,7 +3816,7 @@ class Router:
             # 源站首字节(仅新建隧道):新建隧道的首个上行字节是 TLS ServerHello,
             # 故 ofb ≈ 源站 TCP 建连 + TLS 握手首字节,是盲隧道里唯一能观测到的
             # 源站侧延迟(与 record_ttfb 的"代理侧握手"互补,覆盖整条链路)。
-            if pid is not None and not _reused and _ofb[0] is not None:
+            if pid is not None and _ofb[0] is not None:
                 self.selector.record_origin_first_byte(
                     pid, _ofb[0] - _t0, domain=target)
             total = _bytes[0] + _bytes[1]
@@ -3908,75 +3826,13 @@ class Router:
                     # 隧道寿命只用于吞吐/累计字节;不再是任何"完整响应耗时"分位
                     # (原 TTLB 维度已移除,见 selector.record_complete)。
                     self.selector.record_complete(pid, total, duration, domain=target)
-            # 已转发过客户端字节的 CONNECT 隧道包含完整 TLS/应用会话,不能交给另一
-            # 客户端续用；只有竞速败者等从未透传业务字节的隧道才允许入池。
-            # 安全判据客观化:total==0(客户端只 CONNECT 立即断开,未发业务字节)
-            # → 干净隧道,允许入池,无需调用方主观判断 safe_for_reuse。
-            await self._maybe_return_established(
-                up_writer, up_reader, proxy_host, proxy_port, target,
-                safe_for_reuse=(total == 0))
-
-    async def _maybe_return_established(self, up_writer, up_reader,
-                                        proxy_host, proxy_port, target,
-                                        safe_for_reuse: bool = False) -> bool:
-        """仅为从未透传业务字节的 CONNECT 隧道判定是否归还库存。
-
-        safe_for_reuse 只由竞速败者清理路径传 True：它们仅完成 CONNECT 握手，
-        从未承载客户端 TLS/应用会话。正常隧道即使缓冲为空，也不能复用给另一
-        客户端；此时本函数关闭连接。其余预算、活性和单键 cap 约束保持不变。
-        """
-        can_reuse = (safe_for_reuse and self.pools.conn_pool_enabled
-                     and self.pools.conn_pool_established_reuse
-                     and proxy_host is not None and target is not None
-                     and not up_writer.is_closing())
-        # 严格验证:上游残留缓冲 → 连接已脏,不归还(宁可不复用也不污染)。
-        if can_reuse and up_reader._buffer and len(up_reader._buffer) > 0:
-            logger.info("established pool NOT-RETURN %s via %s:%s (dirty buffer)",
-                        target, proxy_host, proxy_port)
-            can_reuse = False
-        if can_reuse:
-            key = f"{proxy_host}:{proxy_port}|{target}"
-            # 预算/cap 检查:established 池计入全局 conn_pool_total(与另两池同口径),
-            # 单键再受 _ESTABLISHED_KEY_CAP 上限。超限则关闭不复用——宁可这次不省
-            # 建连也不让 fd 无界增长。三池快照统一用 pools._total_idle(见 #14)。
-            #
-            # 这是预算满 OR 单键满的**析取**条件,只报预算无法区分是哪一支触发
-            # (实测两者都在发生:同一键反复归还会撞 cap=2,而多键分散归还更像
-            # 预算被另两池占满)。故这里同时输出三个判据 idle/total、该键当前
-            # 条数/cap、命中的分支,便于下次日志轮转后定量归因:
-            #   idle≈total → 预算被 target/通用池挤占,该考虑给 established 预留份额;
-            #   idle<total 且 key_len==cap → 单键上限,该考虑放宽 cap 或换键选择;
-            #   两者都没满却出现 → 说明有第三条阻塞路径,需再查。
-            idle = self.pools._total_idle()
-            key_len = len(self.pools._established_pool.get(key, []))
-            over_budget = idle >= self.pools.conn_pool_total
-            over_cap = key_len >= _ESTABLISHED_KEY_CAP
-            if over_budget or over_cap:
-                logger.info("established pool SKIP-RETURN %s via %s:%s "
-                            "(idle=%d/%d key=%d/%d %s returned=%d)",
-                            target, proxy_host, proxy_port,
-                            idle, self.pools.conn_pool_total,
-                            key_len, _ESTABLISHED_KEY_CAP,
-                            "over-budget" if over_budget else "over-key-cap",
-                            self.pools.established_pool_returned)
-                can_reuse = False
-        if can_reuse:
-            self._set_pool_keepalive(up_writer)
-            up_writer._conn_pool_created = time.monotonic()
-            # 打 established 标签:过期清理按此选独立 idle 超时(established 库存
-            # 复访频率低,统一用通用池超时会在复访前被清——见 pools._pool_prune)。
-            up_writer._established_pooled = True
-            self.pools._established_pool.setdefault(key, []).append((up_reader, up_writer))
-            self.pools.established_pool_returned += 1
-            logger.info("established pool RETURN %s via %s:%s (returned=%d)",
-                        target, proxy_host, proxy_port, self.pools.established_pool_returned)
-        else:
+            # 上游连接必须在此关闭(隧道不再归还任何池)。close 后最多等 0.5s:
+            # 对端可能挂起不关,3.12 的 wait_closed() 严格等 FIN 会挂死。
             try:
                 up_writer.close()
                 await asyncio.wait_for(up_writer.wait_closed(), timeout=0.5)
             except Exception:
                 pass
-        return can_reuse
 
     async def _local_direct_connect(self, target: str, client_reader: asyncio.StreamReader,
                                     client_writer: asyncio.StreamWriter, client_ip: str = ""):
@@ -3984,8 +3840,8 @@ class Router:
 
         由 _handle_connect 在命中白名单时调用。_try_tunnel('local', ..., relaxed=True)
         用 local_direct_timeout_sec(默认 10s)放宽建连/读响应,本机回环不被全局 3s
-        掐断。透传复用 _relay_tunnel(proxy_host=None → 不归还 established 池不预热,
-        正确)。失败回 502 不绕远端(用户决策:白名单目标若绕远端又会被全局 3s 掐)。
+        掐断。透传复用 _relay_tunnel(proxy_host=None → 不预热)。失败回 502
+        不绕远端(用户决策:白名单目标若绕远端又会被全局 3s 掐)。
 
         熔断短路:同 _forward_local_direct_http,local 熔断时直接 502。
         """
@@ -4161,10 +4017,10 @@ class Router:
     # _set_nodelay/handle_client 等)走正常属性查找。构造期协作类尚未创建时的
     # 转发名赋值走 __setattr__ 守卫(对应协作名不在 self.__dict__ → super().__setattr__)。
 
-    _POOL_FORWARD = frozenset({'_conn_pool', '_target_pool', '_established_pool',
+    _POOL_FORWARD = frozenset({'_conn_pool', '_target_pool',
         'conn_pool_enabled', 'conn_pool_per_proxy', 'conn_pool_total', 'conn_pool_idle_timeout',
         'conn_pool_refill_interval', 'conn_pool_refill_target', 'conn_pool_connect_timeout',
-        'conn_pool_target_prewarm', 'conn_pool_established_reuse',
+        'conn_pool_target_prewarm',
         'conn_pool_refill_pause_minutes', 'conn_pool_refill_pause_activity_window',
         'conn_pool_refill_pause_min_requests', 'cluster_pool_idle_timeout',
         'conn_pool_creates', 'conn_pool_hits', 'conn_pool_misses', 'conn_pool_expired',
@@ -4173,13 +4029,11 @@ class Router:
         'cluster_pool_timing_miss', 'cluster_pool_bucket_miss', 'cluster_pool_consumed_expired',
         '_target_pool_cluster_ever',
         'target_prewarm_dispatched', 'target_prewarm_success', 'target_prewarm_failed',
-        'established_pool_hits', 'established_pool_misses', 'established_pool_expired',
-        'established_pool_returned', 'established_pool_revisit_miss', 'established_pool_probe_dead',
         'connect_new_conns',
         '_last_request_activity', '_activity_timestamps',
         '_record_request_activity', '_conn_pool_idle', '_conn_pool_refill',
-        '_target_pool_refill', '_pool_prune', '_conn_pool_close_all', '_established_alive',
-        '_conn_pool_peek', '_target_pool_peek', '_established_pool_peek'})
+        '_target_pool_refill', '_pool_prune', '_conn_pool_close_all',
+        '_conn_pool_peek', '_target_pool_peek'})
 
     _CACHE_FORWARD = frozenset({'_http_cache', '_http_cache_ttl', '_http_cache_max_entries',
         '_http_cache_max_bytes', '_stream_cache_limit', '_http_cache_bytes',

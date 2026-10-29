@@ -47,7 +47,7 @@ The router is a thin **orchestration shell** (`Router` in `router.py`) plus focu
 |--------|----------------|
 | `router.py` | `Router` shell: client handling, the racing loop (`_race`/`_try_http`/`_try_tunnel`), domain cache, single-send degrade, policy routing, SQLite persistence, win-recording decision chain. Largest file; hot path. |
 | `selector.py` | `ProxySelector`: per-proxy EWMA first-byte latency, circuit breaker + slow-start, adaptive concurrency, racing-order ranking, and all **metrics** (windowed + cumulative, see below). |
-| `pools.py` | `ConnectionPools`: three CONNECT warm pools (generic, target prewarm, established-handshake reuse). |
+| `pools.py` | `ConnectionPools`: two CONNECT warm pools (generic, target prewarm). |
 | `sticky.py` | `StickyCache`: per-client+domain session stickiness (in-memory, sliding TTL). |
 | `http_cache.py` | `HttpCache`: GET response cache (LRU, in-flight coalescing, write-method invalidation). |
 | `cluster.py` | `ClusterGraph`: request co-occurrence graph → predicts & pre-warms next CONNECT targets. |

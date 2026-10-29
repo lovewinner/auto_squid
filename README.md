@@ -48,7 +48,7 @@ Then open the dashboard: [http://127.0.0.1:18080/](http://127.0.0.1:18080/)
 - **HTTP response cache** — idempotent `GET` responses cached in memory (TTL 60 s, respects `Cache-Control`; POST/PUT/DELETE/PATCH invalidate the domain's cached GETs)
 - **In-flight GET coalescing** — concurrent requests to the same URL share one upstream request (bounded wait, falls back to racing)
 - **Local racing** — optionally let the gateway host itself race as a proxy node (direct, no upstream)
-- **Three-layer CONNECT TCP pooling** — generic upstream pool, target half-preconnection (`target_prewarm`), and established-handshake reuse (`established_reuse`); plus **request-cluster predictive pre-warm** (`cluster_predict`) that pre-builds "to-upstream" TCP for targets predicted to co-occur in the next page-load window
+- **Two-layer CONNECT TCP pooling** — generic upstream pool and target half-preconnection (`target_prewarm`); plus **request-cluster predictive pre-warm** (`cluster_predict`) that pre-builds "to-upstream" TCP for targets predicted to co-occur in the next page-load window
 - **Business-aligned probing** (default off) — `probe_with_get` follows the CONNECT liveness probe with a lightweight GET against a whitelist, recording TTFB/protocol/throughput into the real domain metric buckets
 - **Observability** — per-proxy & per-domain **windowed** (last 256) **and** lifetime (t-digest, cross-restart) percentiles; error classification (timeout/connect/5xx/HTTP-status/TLS/protocol/cancelled/other); HTTP protocol-version distribution; per-proxy **Cost breakdown** showing which component dominates the ranking; Bayesian-smoothed success rates with low-confidence flags
 - **Domain stats** — per-domain win counts persisted to SQLite, survive restarts
@@ -77,7 +77,7 @@ Every connection goes through the same decision chain (all in `auto_squid/router
    - **Racing** (`_race_staggered`) — Cost-sorted candidates, staggered start; first first-byte wins
 4. **Degradation feedback** — a failing single-send triggers `_degrade_send_proxy` so the *next* request for that domain skips stickiness/cache and re-races; immediate-degrade markers clear when a new race winner is established.
 5. **Failure accounting** — racing losers call `record_failure` per attempt, feeding the circuit breaker in `selector.py`: `circuit_threshold` consecutive failures open a circuit with exponential backoff (8 s → up to 300 s). Business rejections (`http_status`, e.g. CONNECT upstream returning non-200) do **not** trip the circuit — only proxy-quality signals do.
-6. **Connection reuse** — three pooling layers sit beneath everything: generic upstream TCP pool, target half-preconnection, and established-handshake reuse; stale pooled connections are detected on handshake and retried fresh without penalizing the circuit breaker.
+6. **Connection reuse** — two pooling layers sit beneath everything: generic upstream TCP pool and target half-preconnection; stale pooled connections are detected on handshake and retried fresh without penalizing the circuit breaker.
 
 ### Where each knob acts
 
@@ -154,8 +154,6 @@ router:
     refill_target: 2
     connect_timeout: 10.0
     target_prewarm: true         # Phase 2: pre-open "upstream → target" TCP for hot targets
-    established_reuse: true      # re-use already-CONNECTed idle tunnels
-    established_idle_timeout: 300.0
     cluster_predict: false       # P3: pre-warm predicted co-targets for next page load
     cluster_window_sec: 2.0
     cluster_predict_topk: 3
@@ -303,7 +301,7 @@ router:
 > - `single_send_slow_log_ms` (default 0=off) is the only anchor to attribute "won't open / needs refresh" stalls to a specific client IP (the success path emits no IP log).
 > - `http_read_timeout_sec` default is 3 s; before tightening further, watch p99/fd in production — see the [Limitations](#limitations) note.
 > - **Policy routing** (`router.policies`) narrows the racing candidate set per domain/tag — see `examples/config.yaml` for the shape.
-> - `conn_pool.target_prewarm` requires `conn_pool.enabled`; `conn_pool.established_reuse` and `conn_pool.cluster_predict` additionally require `target_prewarm` for full effect.
+> - `conn_pool.target_prewarm` requires `conn_pool.enabled`; `conn_pool.cluster_predict` additionally requires `target_prewarm` for full effect.
 > - `conn_pool.cluster_predict` requires `conn_pool.enabled` **and** `conn_pool.target_prewarm`.
 > - **Escape corridor (fail-open):** when every external proxy is circuit-open and the domain is reachable from the host, the router silently falls back to dialing `local` directly — no config required.
 
@@ -328,7 +326,7 @@ curl -x http://127.0.0.1:10808 http://www.baidu.com
 .venv/bin/python -m pytest -q
 ```
 
-The suite covers HTTP/CONNECT forwarding, the HTTP response cache (LRU/eviction, in-flight coalescing), the domain cache, racing/aggregation timeouts, client auth, circuit breaker / probing / EWMA selection / in-flight weighting, session stickiness, per-domain stats + SQLite persistence, UTF-8 / binary-safe body handling, connection warm pools + established-handshake reuse + idle pause, robustness (header limits, truncated responses), and the config layer (`extra="forbid"`, cross-field validation, exit code 2). The Phase-2+ metric/ranking layer has its own suites: `tests/test_phase_metrics.py` and `tests/test_tuner.py`.
+The suite covers HTTP/CONNECT forwarding, the HTTP response cache (LRU/eviction, in-flight coalescing), the domain cache, racing/aggregation timeouts, client auth, circuit breaker / probing / EWMA selection / in-flight weighting, session stickiness, per-domain stats + SQLite persistence, UTF-8 / binary-safe body handling, connection warm pools + idle pause, robustness (header limits, truncated responses), and the config layer (`extra="forbid"`, cross-field validation, exit code 2). The Phase-2+ metric/ranking layer has its own suites: `tests/test_phase_metrics.py` and `tests/test_tuner.py`.
 
 CI runs the suite on **Python 3.10, 3.11 and 3.12** via GitHub Actions (`.github/workflows/test.yml`) with a per-test 60 s timeout.
 
