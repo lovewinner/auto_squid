@@ -2444,11 +2444,18 @@ class Router:
         return winner
 
     def _spawn_cleanup(self, losers: set, cleanup):
-        """把竞速败者清理下放后台 task(_drain_losers),带软上限就地排空。
+        """把竞速败者清理下放后台 task(_drain_losers),超上限时再下放一层排空。
 
-        _race / _race_staggered 共用:败者清理不阻塞赢家首字节。软上限阈值
-        _MAX_PENDING_CLEANUPS 下,持续高吞吐时先就地 gather 已完成的清理 task,
-        释放其持有的流式 resp / 上游连接,避免 _pending_cleanups 无界堆积。
+        _race / _race_staggered 共用:败者清理不阻塞赢家首字节。软上限
+        _MAX_PENDING_CLEANUPS 之下每轮败者各起一个清理 task;顶到上限时先把已
+        积压的一批换成**一个**排空 task(等它们跑完,顺带释放各自持有的流式
+        resp / 上游连接),再登记本轮的新清理 —— 这样 _pending_cleanups 规模
+        收敛,而赢家路径始终不 await 任何东西。
+
+        关键:换出去的排空 task 本身也必须登记。它原来是 create_task 后直接丢
+        引用 —— 既与 docstring 说的"就地排空"不符(就地 gather 会卡在赢家首字节
+        之前),更糟的是 stop() 的排空名单里没有它:收尾时那批败者的 socket 还在
+        等它关,于是泄漏成正文里专门要避免的 ResourceWarning 残留。
         """
         if not losers:
             return
@@ -2456,11 +2463,25 @@ class Router:
             if len(self._pending_cleanups) >= _MAX_PENDING_CLEANUPS:
                 stale = self._pending_cleanups
                 self._pending_cleanups = set()
-                asyncio.get_running_loop().create_task(
-                    asyncio.gather(*stale, return_exceptions=True))
+                drain = asyncio.get_running_loop().create_task(
+                    self._drain_cleanup_tasks(stale), name='drain-stale-cleanups')
+                self._pending_cleanups.add(drain)
+                drain.add_done_callback(self._pending_cleanups.discard)
             cleanup_task = asyncio.create_task(self._drain_losers(losers, cleanup))
             self._pending_cleanups.add(cleanup_task)
             cleanup_task.add_done_callback(self._pending_cleanups.discard)
+
+    async def _drain_cleanup_tasks(self, tasks):
+        """等一批败者清理 task 收尾(超上限时的"排空"步)。
+
+        必须包成协程再交给 create_task:`asyncio.gather(...)` 返回的是
+        _GatheringFuture,而 loop.create_task() 只接受协程 —— 原写法
+        `create_task(asyncio.gather(*stale))` 直接 TypeError,且它恰好抛在
+        "赢家已选定、正要下放清理"的路径上:清理 task 堆到 _MAX_PENDING_CLEANUPS
+        (64)个就把当前请求打成 502,同时那批 stale 已经被换出登记、无人 await
+        (连接泄漏)。两处缺陷同根。
+        """
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _drain_losers(self, losers: set, cleanup):
         """后台清理竞速败者:等未完成者取消结束,对已完成者调 cleanup。

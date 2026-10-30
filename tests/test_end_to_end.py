@@ -7582,6 +7582,38 @@ class TestTaskLifecycle:
         probe.close()
         await probe.wait_closed()
 
+    @pytest.mark.asyncio
+    async def test_over_limit_cleanup_drain_is_tracked(self, monkeypatch):
+        """超上限换出去的"排空 task"必须登记进 _pending_cleanups。
+
+        原实现 create_task 后把引用丢掉:stop() 的排空名单里没有它,收尾时那批
+        败者仍持有的流式 resp / 上游 socket 没人关 —— 正是 stop() 顺序要避免的
+        连接泄漏;docstring 还写着"就地排空"(那会卡在赢家首字节之前)。
+        """
+        import auto_squid.router as router_mod
+        monkeypatch.setattr(router_mod, "_MAX_PENDING_CLEANUPS", 1)
+        r = self._router(port=10831)
+        closed = []
+
+        async def loser_cleanup(_res):
+            await asyncio.sleep(0.01)
+            closed.append(1)
+
+        async def loser_body():
+            await asyncio.sleep(0.02)
+            return 'ok'
+
+        for _ in range(4):                     # 每轮都会触发一次超上限下放
+            t = asyncio.create_task(loser_body())
+            r._spawn_cleanup({t}, loser_cleanup)
+            await asyncio.sleep(0)
+        names = {tt.get_name() for tt in r._pending_cleanups}
+        assert 'drain-stale-cleanups' in names, \
+            f"排空 task 未被登记(它会成为 stop() 看不见孤儿): {names}"
+        await asyncio.wait_for(r.stop(), timeout=10)
+        assert closed, "败者清理未被真正排空"
+        assert r._pending_cleanups == set()
+
 
 @pytest.mark.asyncio
 async def test_aggregation_wait_timeout_is_second_scale():
