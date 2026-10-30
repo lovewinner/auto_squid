@@ -2495,15 +2495,7 @@ class Router:
         """
         if not result:
             return
-        up_writer = result[-1]
-        try:
-            up_writer.close()
-            # 最多等 0.5s:对端可能挂起不回 FIN,3.12 的 wait_closed() 严格等连接
-            # 关闭事件会挂住这个后台清理 task(socket 已由 close() 释放,但 task 与
-            # 其 reader/writer 引用会一直堆在 _pending_cleanups)。
-            await asyncio.wait_for(up_writer.wait_closed(), timeout=0.5)
-        except Exception:
-            pass
+        await self._close_stream_writer(result[-1])
 
     @staticmethod
     async def _pipe(reader, writer, close_writer: bool = True, on_chunk=None):
@@ -3473,9 +3465,9 @@ class Router:
                     self.sticky._bump_sticky(client_ip, domain_key, sticky_pid)
                     # 杠杆A:粘性命中后台探路——竞争代理显著更快则驱逐(不阻塞单发)。
                     self._spawn_sticky_probe(client_ip, domain_key, sticky_pid)
-                    await self._connect_established(client_writer, up_writer)
-                    await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer,
-                                             ph, pp, target, pid=sticky_pid)
+                    await self._establish_and_relay(
+                        client_reader, client_writer, up_reader, up_writer,
+                        ph, pp, target, pid=sticky_pid)
                     return None
                 except Exception:
                     # 慢单发失败采样已在 _forward_single(HTTP)/_connect_single_send
@@ -3508,9 +3500,9 @@ class Router:
                         pid=cached_pid, target=target, domain=domain_key, client_ip=client_ip)
                     logger.debug("proxy %s cache hit CONNECT %s", cached_pid, target)
                     self.sticky._record_sticky(client_ip, domain_key, cached_pid)
-                    await self._connect_established(client_writer, up_writer)
-                    await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer,
-                                             ph, pp, target, pid=cached_pid)
+                    await self._establish_and_relay(
+                        client_reader, client_writer, up_reader, up_writer,
+                        ph, pp, target, pid=cached_pid)
                     return None
                 except Exception:
                     logger.debug("cached proxy %s failed for %s", cached_pid, domain_key)
@@ -3624,11 +3616,11 @@ class Router:
                     self._spawn_target_prewarm(win_proxy.host, win_proxy.port, target)
             # 请求簇预测预热:竞速胜出同样记入客户端窗口(页面的每一跳都是一簇一员)。
             self.cluster.observe(client_ip, target, pid)
-            await self._connect_established(client_writer, up_writer)
-            await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer,
-                                     win_proxy.host if win_proxy is not None else None,
-                                     win_proxy.port if win_proxy is not None else None,
-                                     target, pid=pid)
+            await self._establish_and_relay(
+                client_reader, client_writer, up_reader, up_writer,
+                win_proxy.host if win_proxy is not None else None,
+                win_proxy.port if win_proxy is not None else None,
+                target, pid=pid)
             return None
 
         # 4) 全失败:HTTP 写 502;CONNECT 写 502 并关闭客户端连接(与旧内联体一致)。
@@ -3799,6 +3791,37 @@ class Router:
         self._set_nodelay(up_writer)
         client_writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
         await client_writer.drain()
+
+    @staticmethod
+    async def _close_stream_writer(writer):
+        """关闭一侧 StreamWriter(即整个 socket),确认最多等 0.5s。
+
+        3.12 的 wait_closed() 严格等连接真正关闭事件:对端挂起不回 FIN 时会一直
+        等,而 close() 已经释放了 fd —— 等待只是"确认",不该成为挂死/泄漏源头。
+        """
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
+        except Exception:
+            pass
+
+    async def _establish_and_relay(self, client_reader, client_writer,
+                                   up_reader, up_writer, proxy_host, proxy_port,
+                                   target, pid=None):
+        """给客户端写 CONNECT 200,随后双向透传。
+
+        单独成函数的唯一理由:异常安全。`up_writer` 原本只在 `_relay_tunnel` 的
+        finally 里关闭,而它前面的 `_connect_established`(内含 drain)在客户端
+        已经断开时就会抛 BrokenPipeError,或被 handler 取消时抛 CancelledError
+        —— 那两种情况下这条**已握手**的上游隧道没有任何人负责关闭。
+        """
+        try:
+            await self._connect_established(client_writer, up_writer)
+        except BaseException:
+            await self._close_stream_writer(up_writer)
+            raise
+        await self._relay_tunnel(client_reader, up_writer, up_reader, client_writer,
+                                 proxy_host, proxy_port, target, pid=pid)
 
     async def _relay_tunnel(self, client_reader, up_writer, up_reader, client_writer,
                             proxy_host=None, proxy_port=None, target=None, pid=None):

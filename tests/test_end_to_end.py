@@ -7231,6 +7231,10 @@ class _FakeConnectWriter:
     async def wait_closed(self):
         pass
 
+    def get_extra_info(self, name, default=None):
+        # _set_nodelay 会取 'socket';返回 None 让它跳过 setsockopt。
+        return default
+
 
 class _FakeConnectReader:
     async def read(self, n=-1):
@@ -7275,6 +7279,73 @@ class TestConnectNoCandidates502:
         assert b"Content-Length: 11" in client_writer.buf
         assert b"Bad Gateway" in client_writer.buf
         assert client_writer.closed, "回 502 后应关闭客户端连接"
+
+
+class TestConnectEstablishFailure:
+    """回归:CONNECT 赢家在"写 200"这一步失败时,已握手的上游隧道必须被关闭。
+
+    up_writer 原本只在 _relay_tunnel 的 finally 里关闭,而它前面的
+    _connect_established(内含 drain)在客户端已断开时会抛 BrokenPipeError、
+    handler 被取消时抛 CancelledError —— 两条路径都绕过了 _relay_tunnel,
+    上游那条 socket 从此无人负责(客户端断连风暴下即 fd 泄漏)。
+    """
+
+    def _router(self):
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host='127.0.0.1', port=31991))
+        return make_router(store, listen_host='127.0.0.1', listen_port=10821,
+                           db_path=':memory:')
+
+    @pytest.mark.asyncio
+    async def test_drain_failure_closes_upstream(self):
+        router = self._router()
+
+        class _DeadClient(_FakeConnectWriter):
+            async def drain(self):
+                raise BrokenPipeError("client gone")
+
+        client_w, up_w = _DeadClient(), _FakeConnectWriter()
+        with pytest.raises(BrokenPipeError):
+            await router._establish_and_relay(
+                _FakeConnectReader(), client_w,
+                _FakeConnectReader(), up_w, None, None, 'example.com:443', pid='p')
+        assert up_w.closed, "写 200 失败后上游隧道未关闭 → fd 泄漏"
+
+    @pytest.mark.asyncio
+    async def test_cancellation_closes_upstream(self):
+        """handler 被取消(stop / 客户端断连)时同样不能留下半条握手隧道。"""
+        router = self._router()
+
+        class _CancelledDrain(_FakeConnectWriter):
+            async def drain(self):
+                raise asyncio.CancelledError()
+
+        up_w = _FakeConnectWriter()
+        with pytest.raises(asyncio.CancelledError):
+            await router._establish_and_relay(
+                _FakeConnectReader(), _CancelledDrain(),
+                _FakeConnectReader(), up_w, None, None, 'example.com:443', pid='p')
+        assert up_w.closed
+
+    @pytest.mark.asyncio
+    async def test_success_reaches_relay(self, monkeypatch):
+        """正常路径:200 写给客户端后进入 _relay_tunnel,且不提前关上游。"""
+        router = self._router()
+        relayed = {}
+
+        async def fake_relay(client_reader, up_writer, up_reader, client_writer,
+                             proxy_host=None, proxy_port=None, target=None, pid=None):
+            relayed['target'] = target
+            relayed['pid'] = pid
+
+        monkeypatch.setattr(router, '_relay_tunnel', fake_relay)
+        client_w, up_w = _FakeConnectWriter(), _FakeConnectWriter()
+        await router._establish_and_relay(
+            _FakeConnectReader(), client_w,
+            _FakeConnectReader(), up_w, '10.0.0.1', 3128, 'example.com:443', pid='p')
+        assert b"200 Connection established" in bytes(client_w.buf)
+        assert relayed == {'target': 'example.com:443', 'pid': 'p'}
+        assert not up_w.closed
 
 
 class TestStaleConnRetry:
