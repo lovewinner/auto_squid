@@ -57,7 +57,7 @@ from .selector import (ProxySelector, _CIRCUIT_THRESHOLD, _CIRCUIT_MAX_BACKOFF,
                        _FAIL_PENALTY_DEFAULT,
                        ERROR_TIMEOUT, ERROR_CONNECT, ERROR_HTTP_5XX, ERROR_TLS,
                        ERROR_PROTOCOL, ERROR_CANCELLED, ERROR_OTHER)
-from .http_cache import HttpCache, CACHEABLE_STATUS, _INVALIDATING_METHODS
+from .http_cache import HttpCache, CACHEABLE_STATUS, NO_BODY_STATUS, _INVALIDATING_METHODS
 from .sticky import StickyCache
 from .cluster import ClusterGraph
 import json
@@ -3717,7 +3717,21 @@ class Router:
         client_disconnected = False
         # 先决定 body 的定界方式。
         upstream_cl = resp.headers.get('content-length')
-        use_chunked = upstream_cl is None
+        try:
+            # 重复的 content-length 头 httpx 会逗号拼接成 "10, 10":那不是长度,
+            # 而是两个互相冲突的承诺(int() 抛 ValueError 或原样写给客户端都是非法
+            # 报文)。按"上游没给可用长度"处理,退回 chunked 定界。
+            promised_len = int(upstream_cl) if upstream_cl is not None else None
+        except ValueError:
+            logger.warning("unusable content-length %r from upstream for %s", upstream_cl, url)
+            promised_len = None
+        if resp.status_code in NO_BODY_STATUS or resp.status_code < 200:
+            # 204/304/1xx 按定义没有 body:既不能补 Content-Length,也不能套
+            # Transfer-Encoding: chunked(客户端会把其后的字节当成空 body 的内容)。
+            promised_len = None
+            use_chunked = False
+        else:
+            use_chunked = promised_len is None
         try:
             # 状态行 + 转发头(剔除 hop-by-hop,含 content-length)。
             # 用 multi_items():httpx 的 items() 会把同名头(如多个 Set-Cookie)合并成
@@ -3730,9 +3744,9 @@ class Router:
                 client_writer.write(f"{k}: ".encode('latin-1') + _hb(v) + b"\r\n")
             if use_chunked:
                 client_writer.write(b"Transfer-Encoding: chunked\r\n")
-            else:
-                # 上游给了 content-length:按其原值重写(aiter_raw 字节数与之等长)。
-                client_writer.write(f"Content-Length: {upstream_cl}\r\n".encode('latin-1'))
+            elif promised_len is not None:
+                # 上游给了可用的 content-length:按其原值重写(aiter_raw 字节数与之等长)。
+                client_writer.write(f"Content-Length: {promised_len}\r\n".encode('latin-1'))
             client_writer.write(b"\r\n")
             await client_writer.drain()
         except (BrokenPipeError, ConnectionError, OSError):
@@ -3741,6 +3755,7 @@ class Router:
         buffered = bytearray()
         buffering = True
         streamed = 0
+        stream_error = False      # aiter_raw 是否异常终止(上游中途断开)
         total_streamed = 0  # 无论 chunked 与否都累计原始 body 字节(供 Phase 1.1 吞吐)
         # 不为每个小 chunk 都 drain：transport 高水位前只入用户态缓冲，减少事件
         # 循环调度与系统调用；达到阈值立即 drain，仍保留对慢客户端的背压。
@@ -3782,6 +3797,7 @@ class Router:
                     client_disconnected = True
         except Exception:
             client_disconnected = True
+            stream_error = True
             # aiter_raw 抛异常(最常见:上游 Content-Length 未流式完就断开的截断响应,
             # httpcore 的 RemoteProtocolError)。客户端已拿到 200 头部,无法撤回,收到
             # 的是截断 body——交由下方统一长度校验暴露,失败观测由竞速 fail 回调记录。
@@ -3789,16 +3805,21 @@ class Router:
         # 走完或 aiter_raw 提前抛异常都会在这里比对。客户端已收到响应头,无法撤回,
         # 只能记 warn(URL + 承诺/实际长度)并关闭上游连接,暴露问题。客户端断开不
         # 在此列:断开后循环仍排空上游 body,streamed 会到 CL,不误报。
-        if use_chunked is False and streamed != int(upstream_cl):
+        complete = not stream_error
+        if promised_len is not None and streamed != promised_len:
+            complete = False
             logger.warning("truncated upstream response for %s: content-length=%s, streamed=%d",
-                           url, upstream_cl, streamed)
+                           url, promised_len, streamed)
             try:
                 await resp.aclose()
             except Exception:
                 pass
-        # 返回缓冲:仅当未超上限且仍在 buffering 状态。
+        # 返回缓冲:仅当未超上限、仍在 buffering 状态**且 body 完整**。
+        # 半截 body 绝不能进缓存:_http_cache_set 不看完整性,而 _write_cached_response
+        # 会按缓冲长度重写 Content-Length —— 截断响应就此被伪装成完整对象,在 TTL 内
+        # 反复回放给所有客户端(上游抖动/竞速到不可靠中继即可触发,静默数据损坏)。
         body_duration = time.perf_counter() - _body_t0
-        if buffering:
+        if buffering and complete:
             return bytes(buffered), total_streamed, body_duration
         return None, total_streamed, body_duration
 

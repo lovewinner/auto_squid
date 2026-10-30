@@ -336,6 +336,35 @@ async def run_mock_proxy_truncated(host, port, declared, sent):
     return server
 
 
+async def run_mock_proxy_304(host, port, hit_counter=None):
+    """HTTP mock proxy answering with 304 Not Modified and no body-framing
+    headers — the shape an origin returns for a conditional GET. `hit_counter`
+    lets a test observe whether a second request had to re-fetch (i.e. the 304
+    was not stored as if it were a resource representation)."""
+    async def handle(reader, writer):
+        try:
+            line = await reader.readline()
+            if not line:
+                writer.close()
+                return
+            while True:
+                h = await reader.readline()
+                if not h or h in (b"\r\n", b"\n"):
+                    break
+            if hit_counter is not None:
+                hit_counter.append(line)
+            writer.write(b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+            writer.close()
+        except Exception:
+            try:
+                writer.close()
+            except Exception:
+                pass
+    server = await asyncio.start_server(handle, host=host, port=port)
+    return server
+
+
 async def run_mock_proxy_status(host, port, status=500, pre_header_delay=0.0):
     """HTTP mock proxy returning a fixed status with an empty body.
 
@@ -6437,6 +6466,105 @@ async def test_truncated_upstream_response_detected():
     msgs = [r.getMessage() for r in records]
     assert any('truncated upstream response' in m for m in msgs), \
         f"must log truncated-response warning, got {msgs}"
+
+
+class TestResponseCacheIntegrity:
+    """响应缓存里只能放"完整的资源表示"。
+
+    两个曾经的洞:
+    - 304 被列为可缓存:带 If-None-Match 的请求存下空体 304,后续**无条件** GET
+      命中即回 `304 + 空 body`,客户端被告知"用本地副本"而它手上什么都没有;
+    - 上游中途断开的截断响应照样返回 buffered 半截字节并被入缓存,回放时还会
+      重写 Content-Length,把残体伪装成完整对象(TTL 内所有客户端共享损坏内容)。
+    """
+
+    @staticmethod
+    async def _get(url: bytes):
+        reader, writer = await asyncio.open_connection(HOST, ROUTER_PORT)
+        writer.write(b"GET " + url + b" HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        await writer.drain()
+        status = await reader.readline()
+        headers = []
+        cl = 0
+        while True:
+            h = await reader.readline()
+            if not h or h in (b"\r\n", b"\n"):
+                break
+            headers.append(h)
+            if h.lower().startswith(b'content-length:'):
+                cl = int(h.split(b':', 1)[1].strip())
+        # read(n) 而非 readexactly(n):上游"承诺 1000 只发 5"时客户端就是拿到残体,
+        # readexactly 会因 EOF 抛 IncompleteReadError,把断言变成异常。
+        body = await asyncio.wait_for(reader.read(cl), timeout=2.0) if cl else b''
+        writer.close()
+        await writer.wait_closed()
+        return status, headers, body
+
+    @pytest.mark.asyncio
+    async def test_304_is_not_cacheable(self):
+        hit = []
+        proxy_srv = await run_mock_proxy_304(HOST, PROXY_PORT, hit_counter=hit)
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+        router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                             db_path=tempfile.mktemp(suffix='.db'))
+        await router.start()
+        try:
+            status, headers, body = await self._get(b"http://cond.example.com/a")
+            assert b'304' in status, status
+            assert body == b''
+            low = b' '.join(headers).lower()
+            # 304 按定义没有 body:不能套 chunked 框架,也不该补 Content-Length。
+            assert b'transfer-encoding' not in low, f"304 被加了分块框架: {headers!r}"
+            assert b'content-length' not in low, f"304 被补了长度头: {headers!r}"
+            # 且没有被当成对象存进缓存:第二次同 URL 仍回源。
+            await self._get(b"http://cond.example.com/a")
+            assert len(hit) == 2, f"304 被缓存,第二次没回源: hits={len(hit)}"
+            assert list(router._http_cache.keys()) == []
+        finally:
+            await router.stop()
+            proxy_srv.close()
+            await proxy_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_truncated_response_is_not_cached(self):
+        proxy_srv = await run_mock_proxy_truncated(HOST, PROXY_PORT, declared=1000, sent=5)
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+        router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                             db_path=tempfile.mktemp(suffix='.db'))
+        await router.start()
+        try:
+            status, headers, body = await self._get(b"http://trunc-nocache.example.com/")
+            assert b'200' in status, status
+            assert len(body) < 1000
+            # 关键:半截 body 不得进缓存(否则 TTL 内被伪装成完整对象回放)。
+            assert list(router._http_cache.keys()) == [], \
+                f"截断响应被写入缓存: {list(router._http_cache.keys())}"
+        finally:
+            await router.stop()
+            proxy_srv.close()
+            await proxy_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_complete_200_is_still_cached(self):
+        """反向守卫:完整性判定不能顺手把正常响应也排除在缓存外。"""
+        hit = []
+        proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=hit)
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+        router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                             db_path=tempfile.mktemp(suffix='.db'))
+        await router.start()
+        try:
+            await self._get(b"http://integrity-ok.example.com/")
+            await self._get(b"http://integrity-ok.example.com/")
+            assert len(hit) == 1, f"完整 200 未被缓存,第二次回源: hits={len(hit)}"
+            assert len(router._http_cache) == 1
+        finally:
+            await router.stop()
+            proxy_srv.close()
+            await proxy_srv.wait_closed()
 
 
 @pytest.mark.asyncio
