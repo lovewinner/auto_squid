@@ -190,7 +190,8 @@ class RoutingAnalyzer:
             circuit_open = self.router.selector.is_circuit_open(pid)
 
         # Check immediate degraded
-        immediate_degraded = pid in self.router._immediate_degraded if pid else False
+        # 即时降级现在按 (代理, 域名) 计时,判定要走 router 的同一个入口。
+        immediate_degraded = bool(pid) and self.router._is_send_degraded(pid, self.domain)
 
         # Check quality degrade
         quality_degraded = False
@@ -246,7 +247,8 @@ class RoutingAnalyzer:
             policy_allows = self.router._policy_allows_sticky(self.domain, pid)
 
         # Check immediate degraded
-        immediate_degraded = pid in self.router._immediate_degraded if pid else False
+        # 即时降级现在按 (代理, 域名) 计时,判定要走 router 的同一个入口。
+        immediate_degraded = bool(pid) and self.router._is_send_degraded(pid, self.domain)
 
         return {
             "hit": is_valid and policy_allows and not circuit_open and not immediate_degraded,
@@ -296,7 +298,7 @@ class RoutingAnalyzer:
             conc_limit = concurrency_limits.get(pid)
 
             # Check if proxy is in immediate degraded set
-            immediate_degraded = pid in self.router._immediate_degraded
+            immediate_degraded = self.router._is_send_degraded(pid, self.domain)
 
             # Check if proxy is in degraded single send (display set)
             degraded_display = pid in self.router._degraded_single_send

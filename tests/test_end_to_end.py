@@ -7511,14 +7511,14 @@ class TestDispatchSingleUnified:
                                          client_writer=object(), client_ip="_test_ip")
             except Exception:
                 pass
-            assert 'slow' in r._immediate_degraded
+            assert r._is_send_degraded('slow', target)
             assert 'slow' in r._degraded_single_send
             assert r.single_send_degrades >= 1
             # 下一请求:域名缓存也应跳过 slow(门控),不再次单发。
             assert r._get_fresh_proxy(target) is None
-            # 竞速赢家接管后清除标记(既有机制,纯即时集与展示集都清)。
+            # 竞速赢家接管后清除标记(既有机制,即时标记与展示集都清)。
             r._record_win_meta(target, 'slow')
-            assert 'slow' not in r._immediate_degraded
+            assert not r._is_send_degraded('slow', target)
             assert 'slow' not in r._degraded_single_send
         finally:
             await r.stop()
@@ -7533,9 +7533,61 @@ class TestDispatchSingleUnified:
         r = make_router(store, listen_host=HOST, listen_port=10812,
                    max_retries=2, enable_http_cache=False,
                    db_path=tempfile.mktemp(suffix='.db'))
-        r._immediate_degraded.add('slow')
+        r._immediate_degraded[('slow', 'x.test')] = time.monotonic() + 60.0
         r._meta_cache["x.test"] = {"default_proxy": 'slow', "updated_at": "2026-01-01T00:00:00+00:00", "_updated_mono": time.monotonic(), "ref_ewma": None}
         assert r._get_fresh_proxy("x.test") is None
+
+    def test_immediate_degrade_expires(self):
+        """标记到期即自动解除:降级必须只是"退一轮竞速",不能是永久惩罚。"""
+        store = ProxyStore()
+        store.add(ProxyInfo(id='slow', host=HOST, port=31396))
+        r = make_router(store, listen_host=HOST, listen_port=10812,
+                   max_retries=2, enable_http_cache=False,
+                   db_path=tempfile.mktemp(suffix='.db'))
+        r._degrade_send_proxy('slow', 'x.test')
+        assert r._is_send_degraded('slow', 'x.test')
+        # 把到期时刻推到过去(等价于过了 _IMMEDIATE_DEGRADE_TTL)。
+        r._immediate_degraded[('slow', 'x.test')] = time.monotonic() - 0.001
+        assert not r._is_send_degraded('slow', 'x.test')
+        assert ('slow', 'x.test') not in r._immediate_degraded, "到期条目未被回收"
+
+    def test_immediate_degrade_is_per_domain(self):
+        """一次超时只说明"该代理对这个域名慢了",不得冻结它服务过的其它域名。"""
+        store = ProxyStore()
+        store.add(ProxyInfo(id='slow', host=HOST, port=31396))
+        r = make_router(store, listen_host=HOST, listen_port=10812,
+                   max_retries=2, enable_http_cache=False,
+                   db_path=tempfile.mktemp(suffix='.db'))
+        r._degrade_send_proxy('slow', 'sick.test')
+        for d in ('sick.test', 'healthy.test'):
+            r._meta_cache[d] = {"default_proxy": 'slow',
+                                "updated_at": "2026-01-01T00:00:00+00:00",
+                                "_updated_mono": time.monotonic(), "ref_ewma": None}
+        assert r._get_fresh_proxy('sick.test') is None
+        assert r._get_fresh_proxy('healthy.test') == 'slow'
+
+    def test_immediate_degrade_table_is_bounded(self):
+        """降级表要有上限:域名基数被刷大时不能无界增长。"""
+        from auto_squid.router import _IMMEDIATE_DEGRADE_MAX_ENTRIES
+        store = ProxyStore()
+        store.add(ProxyInfo(id='slow', host=HOST, port=31396))
+        r = make_router(store, listen_host=HOST, listen_port=10812,
+                        enable_http_cache=False, db_path=tempfile.mktemp(suffix='.db'))
+        now = time.monotonic()
+        # 全部到期 → 一次剔除清空。
+        r._immediate_degraded = {('p', f'd{i}'): now - 1
+                                 for i in range(_IMMEDIATE_DEGRADE_MAX_ENTRIES + 50)}
+        r._prune_immediate_degraded(now)
+        assert r._immediate_degraded == {}
+        # 全部未到期但超上限 → 按最早到期收缩到上限。
+        r._immediate_degraded = {('p', f'd{i}'): now + 100 + i
+                                 for i in range(_IMMEDIATE_DEGRADE_MAX_ENTRIES + 50)}
+        r._prune_immediate_degraded(now)
+        assert len(r._immediate_degraded) == _IMMEDIATE_DEGRADE_MAX_ENTRIES
+        # 写入超限也触发收缩(不再无限累积)。
+        for i in range(_IMMEDIATE_DEGRADE_MAX_ENTRIES + 10):
+            r._degrade_send_proxy('slow', f'w{i}.test')
+        assert len(r._immediate_degraded) <= _IMMEDIATE_DEGRADE_MAX_ENTRIES
 
     @pytest.mark.asyncio
     async def test_http_sticky_failure_marks_immediate_degrade(self):
@@ -7565,7 +7617,7 @@ class TestDispatchSingleUnified:
                                          proto='http', client_ip="_test_ip")
             except Exception:
                 pass
-            assert 'slow' in r._immediate_degraded
+            assert r._is_send_degraded('slow', domain)
             assert 'slow' in r._degraded_single_send
             assert r.single_send_degrades >= 1
             assert r._get_fresh_proxy(domain) is None

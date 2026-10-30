@@ -125,6 +125,12 @@ _CLIENT_BODY_TIMEOUT = 120.0
 # 下 _pending_cleanups 无界堆积(soak 模式曾观测 fd_peak 冲到 569)。
 _MAX_PENDING_CLEANUPS = 64
 
+# 即时单发降级标记的解除时限(秒)。标记的作用是让该域名至少退化一轮"全量
+# 竞速",60s 足够 EWMA 重新排序选出健康代理;再长就等于没有兜底的永久惩罚。
+_IMMEDIATE_DEGRADE_TTL = 60.0
+# 标记表的最大条目数:超过则先清已到期、再按最早到期剔除(防域名基数无界)。
+_IMMEDIATE_DEGRADE_MAX_ENTRIES = 4096
+
 # 错峰启动(staggered start,RFC 8305 §5)的配置下限。
 # 默认间隔 100ms,下限 100ms(绝对值下限 10ms,防止丢包率高时拥塞崩溃),上限 2s。
 # stagger_interval 由 __init__ 钳制到此区间,配置传 0/负值时落到默认。
@@ -482,13 +488,17 @@ class Router:
         # 重新可单发,无需冷却),此集合只供 /metrics /circuit 展示"当前被判定降级的
         # 代理";由 _record_win_meta(新赢家接管)或 reset_proxy_quality 清除。
         self._degraded_single_send: set[str] = set()
-        # 即时单发降级门控(专用集合,非展示):单发失败后被 _degrade_send_proxy 标记的
-        # 代理存于此,域名缓存/粘性选择时立即跳过(不再重复被钉死)。与展示型
-        # _degraded_single_send 分开:展示型由 _single_send_degraded 实时重估且代理恢复
-        # 后自然放行(不冻结);即时降级是"这次失败即剔除",保持到竞速赢家接管
-        # (_record_win_meta 清除)或 reset_proxy_quality 清空,避免混用导致代理恢复后仍
-        # 被永久误挡(语义回退)。
-        self._immediate_degraded: set[str] = set()
+        # 即时单发降级门控(专用,非展示):单发失败后标记的 (代理, 域名) 在此登记
+        # **到期时刻**,域名缓存/粘性选择时立即跳过(不再重复被钉死)。与展示型
+        # _degraded_single_send 分开:展示型由 _single_send_degraded 实时重估且代理
+        # 恢复后自然放行(不冻结)。
+        #
+        # 为什么必须"按域名 + 带到期时间":旧实现是全局按 pid 的**永久** set,而唯一
+        # 清除点 _record_win_meta 前面还挡着 _damping_allows_switch 与
+        # _worse_than_best 两处早退 —— 一次瞬时超时就能让该代理在所有域名上永久
+        # 不可单发(每个请求都退化成全量竞速,扇出放大),且没有任何时间兜底。
+        # 现在两条独立恢复路径:被新的竞速赢家接管即清除,或到期自动解除。
+        self._immediate_degraded: dict[tuple[str, str], float] = {}
         # ── 会话粘性协作类(StickyCache,#14)──────────────────────
         # 键 = "{client_ip}|{domain}",值 = {"proxy_id": pid, "updated_at": ts}。
         # 纯内存、滑动 TTL:同一客户端+域名复用上次胜出的代理,保持 egress IP
@@ -1125,6 +1135,10 @@ class Router:
         P3 切换阻尼:开启时若 _damping_allows_switch 判定新赢家不可替换旧赢家,
         则**不更新** _meta_cache(保持旧赢家钉住,降低出口 IP 抖动),仅记录尝试。
         """
+        # 解除该代理在这个域名上的即时降级标记。放在**所有早退之前**:下面两道门
+        # (阻尼 / 显著差于最优)会 return,旧实现把清除写在它们后面,于是"赢家被
+        # 拦住 → 标记永不清除"。
+        self._immediate_degraded.pop((pid, domain), None)
         if not self._damping_allows_switch(domain, pid):
             return  # 阻尼拦截:保持旧赢家,不替换
         # 方向 A:竞速赢家显著差于当前最优代理 → 不钉进域名缓存,继续竞速。
@@ -1159,8 +1173,6 @@ class Router:
             self._domain_last_pid[domain] = pid
         if pid in self._degraded_single_send:
             self._degraded_single_send.remove(pid)
-        if pid in self._immediate_degraded:
-            self._immediate_degraded.remove(pid)
         self._meta_dirty = True
 
     def _snapshot_flush_state(self):
@@ -1895,20 +1907,50 @@ class Router:
         return False
 
     def _degrade_send_proxy(self, pid: str, domain: str) -> None:
-        """单发失败即时降级:把被钉代理标记进「即时降级门控」,下次不再被粘性/域名缓存单发。
+        """单发失败即时降级:标记 (pid, domain) 在 _IMMEDIATE_DEGRADE_TTL 内不可单发。
 
         与 _evict_sticky 配套:evict 只清粘性条目,但域名缓存 meta 仍钉同一 pid;
         此标记让 _get_fresh_proxy 下一请求直接 miss 回落到竞速,避免同一条慢代理
         被反复单发钉死(zhimg/github 事故根因:被钉代理单发 3s 超时只 _evict_sticky,
-        域名缓存复用同一 pid 继续钉)。竞速赢家 _record_win_meta 清除标记。
-        写入专用门控集 _immediate_degraded、并同步计入展示集 _degraded_single_send
-        (后者仅作 /circuit 展示,非门控)。
+        域名缓存复用同一 pid 继续钉)。
+
+        作用域是 **(代理, 域名)** 而非代理全局:一次超时说明"这条代理对这个域名
+        慢了",不构成把该代理从其它完全健康的域名上也冻结的理由(旧的全局永久
+        标记会让一次瞬时抖动波及该代理服务过的所有域名)。同时写入展示集
+        _degraded_single_send(仅作 /circuit 展示,非门控)。
         """
-        if pid not in self._immediate_degraded:
-            self._immediate_degraded.add(pid)
-            self._degraded_single_send.add(pid)
-            self.single_send_degrades += 1
-            logger.warning("single send degrade(immediate) pid=%s domain=%s", pid, domain)
+        now = time.monotonic()
+        key = (pid, domain)
+        if self._immediate_degraded.get(key, 0.0) > now:
+            return                     # 仍在标记期内:不重复计数/刷日志
+        self._immediate_degraded[key] = now + _IMMEDIATE_DEGRADE_TTL
+        self._degraded_single_send.add(pid)
+        self.single_send_degrades += 1
+        logger.warning("single send degrade(immediate) pid=%s domain=%s ttl=%.0fs",
+                       pid, domain, _IMMEDIATE_DEGRADE_TTL)
+        if len(self._immediate_degraded) > _IMMEDIATE_DEGRADE_MAX_ENTRIES:
+            self._prune_immediate_degraded(now)
+
+    def _prune_immediate_degraded(self, now: float) -> None:
+        """剔除已到期的即时降级标记,必要时按最早到期进一步收缩(表要有界)。"""
+        expired = [k for k, deadline in self._immediate_degraded.items() if deadline <= now]
+        for k in expired:
+            del self._immediate_degraded[k]
+        overflow = len(self._immediate_degraded) - _IMMEDIATE_DEGRADE_MAX_ENTRIES
+        if overflow > 0:
+            oldest = sorted(self._immediate_degraded.items(), key=lambda kv: kv[1])
+            for k, _ in oldest[:overflow]:
+                del self._immediate_degraded[k]
+
+    def _is_send_degraded(self, pid: str, domain: str) -> bool:
+        """该 (代理, 域名) 是否仍在即时降级期内;到期则顺手解除。"""
+        deadline = self._immediate_degraded.get((pid, domain))
+        if deadline is None:
+            return False
+        if time.monotonic() >= deadline:
+            del self._immediate_degraded[(pid, domain)]
+            return False
+        return True
 
     def _get_fresh_proxy(self, domain: str) -> Optional[str]:
         """返回某域名在 cache_ttl 内的缓存代理 id;过期或无记录返回 None。
@@ -1928,12 +1970,10 @@ class Router:
             return None
         if self.selector.is_circuit_open(pid):
             return None
-        # 即时降级门控(单发失败即时剔除):该代理刚在一次单发中失败/超时,即使 consec_fail
-        # 还没到 slow_start 阈值,也立即视为不可单发,回落到竞速让 EWMA 排序换健康代理。
-        # 标记由竞速赢家 _record_win_meta(新赢家接管)清除,代理恢复后自然重新可单发。
-        # 只查 _immediate_degraded(专用门控集合),不查展示集 _degraded_single_send——
-        # 后者由 _single_send_degraded 实时重估且恢复后自然放行,不应被本门控永久冻结。
-        if pid in self._immediate_degraded:
+        # 即时降级门控(单发失败即时剔除):该代理刚在这个域名上单发失败/超时,即使
+        # consec_fail 还没到 slow_start 阈值,也立即视为不可单发,回落到竞速让 EWMA
+        # 排序换健康代理。标记由 _record_win_meta(新赢家接管)或到期自动解除。
+        if self._is_send_degraded(pid, domain):
             return None
         # Goal #6:质量感知单发。基线 ref_ewma 在钉住时刻捕获(见 _record_win_meta),
         # 已是浮点 EWMA 值(非质量 dict)。
