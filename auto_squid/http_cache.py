@@ -3,7 +3,8 @@
 `HttpCache` 持有 LRU + 容量上限的内存响应缓存:
 
 - 幂等 GET 的成功响应(状态码 ∈ CACHEABLE_STATUS、未禁存)在内存缓存
-  `_http_cache_ttl` 秒,命中滑动刷新 last_access(滑动 TTL + LRU 顺序);
+  `_http_cache_ttl` 秒(TTL 按 cached_at 硬过期),命中刷新 last_access 并挪到
+  OrderedDict 队尾(LRU 顺序),超容量时从队首 O(1) 淘汰;
 - 写方法(POST/PUT/DELETE/PATCH, INVALIDATING_METHODS)在转发前经
   `_http_cache_invalidate` 按域名(O(K),二级索引)失效 GET 缓存,使变更后的
   GET 回源拿新内容;
@@ -20,6 +21,7 @@ import logging
 import re
 import time
 import urllib.parse
+from collections import OrderedDict
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -94,12 +96,17 @@ class HttpCache:
         # 缓存门开关:enable_http_cache=False 时 _http_cache_get 一律未命中(用于
         # 压测隔离缓存层,测纯路由性能)。
         self.enable_http_cache = enable_http_cache
-        # P2:LRU + 容量上限。普通 dict 升级为 OrderedDict + 访问时间戳:
-        #   - _http_cache_get 命中时刷新 last_access(滑动 TTL + LRU 顺序);
-        #   - _http_cache_set 写入前检查 max_entries / max_bytes,超限淘汰
-        #     last_access 最旧的条目(避免高基数 URL 下内存无界增长)。
+        # P2:LRU + 容量上限。用 OrderedDict 把"最近使用顺序"直接编码进键顺序:
+        #   - _http_cache_get 命中刷新 last_access 并 move_to_end(硬 TTL 仍按
+        #     cached_at 过期,不随命中滑动);
+        #   - _http_cache_set 写入(含覆盖已有 key)同样 move_to_end;
+        #   - 超限淘汰 = 取队首 next(iter(...)),即 last_access 最旧的一条。
+        # 淘汰必须是 O(1):默认 max_entries=10_000 在真实流量下很容易达到,而每次
+        # 回源写入都要做容量检查;原实现用 min(全表, key=last_access) 扫描,缓存一满
+        # 就退化成"每个缓存写入 O(N) 的事件循环停顿"(10k 条 ≈ 毫秒级,叠加高 QPS
+        # 直接吃掉整个循环的预算,拖慢所有在途请求)。
         # 二级索引 _http_cache_domain_index 与淘汰同步维护,防漏删。
-        self._http_cache: dict[str, dict] = {}
+        self._http_cache: "OrderedDict[str, dict]" = OrderedDict()
         self._http_cache_ttl = max(1, ttl)
         self._http_cache_max_entries = max(1, max_entries)
         self._http_cache_max_bytes = max(1, max_bytes)
@@ -150,7 +157,10 @@ class HttpCache:
         if now - entry['cached_at'] > self._http_cache_ttl:
             self._http_cache_remove(key)
             return None
-        entry['last_access'] = now  # 滑动 TTL + LRU 顺序
+        entry['last_access'] = now  # LRU 热度位点(TTL 仍按 cached_at 硬过期)
+        # 命中即"最近使用":挪到队尾,使队首恒为 last_access 最旧的条目。move_to_end
+        # 是 O(1),而省掉的正是写入侧的 O(N) 全表 min() 扫描(见 __init__ 注释)。
+        self._http_cache.move_to_end(key)
         return entry
 
     def _http_cache_remove(self, key: str) -> None:
@@ -230,11 +240,17 @@ class HttpCache:
             'last_access': now,
         }
         self._http_cache_bytes += size
-        # 容量保护(LRU):条目数或字节数超限 → 淘汰 last_access 最旧的条目,
-        # 直至回到上限以内。单次 O(N),写入远低于读取频率,可接受。
+        # 新写入/覆盖都算"最近使用":OrderedDict 里对已存在的 key 赋值不会移动位置,
+        # 必须显式挪到队尾,否则刚回源刷新的条目会滞留在队首被优先淘汰。
+        self._http_cache.move_to_end(key)
+        # 容量保护(LRU):条目数或字节数超限 → 从队首淘汰 last_access 最旧的条目,
+        # 直至回到上限以内。队首即最久未访问(键顺序 = 访问顺序),取键 O(1);删除
+        # 仍统一走 _http_cache_remove,保证字节数与二级索引不漏不重。
         while len(self._http_cache) > self._http_cache_max_entries \
                 or self._http_cache_bytes > self._http_cache_max_bytes:
-            oldest = min(self._http_cache, key=lambda k: self._http_cache[k].get('last_access', 0.0))
+            oldest = next(iter(self._http_cache), None)
+            if oldest is None:
+                break
             self._http_cache_remove(oldest)
             self.http_cache_evictions += 1
         # 同步更新二级索引:缓存键 -> 域名,供 O(1) 域名级批量失效。

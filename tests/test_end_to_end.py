@@ -4355,6 +4355,46 @@ class TestHttpCacheLRU:
         assert r._http_cache_bytes == 6
         assert len(r._http_cache) == 1
 
+    def test_overwrite_existing_key_moves_to_mru_end(self):
+        """覆盖写入也要把键挪到队尾:OrderedDict 里对已存在键赋值不改变位置,
+        漏了 move_to_end 会让"刚回源刷新过的条目"滞留在队首被优先淘汰。"""
+        r = self._router(http_cache_max_entries=3)
+        r._http_cache_set('GET', 'http://a.example.com/', 200, 'OK', {}, b'aaa')
+        r._http_cache_set('GET', 'http://b.example.com/', 200, 'OK', {}, b'bbb')
+        r._http_cache_set('GET', 'http://c.example.com/', 200, 'OK', {}, b'ccc')
+        # 覆盖 a(等价于一次回源刷新):a 成为最近使用,队首应是 b。
+        r._http_cache_set('GET', 'http://a.example.com/', 200, 'OK', {}, b'aaaa')
+        r._http_cache_set('GET', 'http://d.example.com/', 200, 'OK', {}, b'ddd')
+        assert set(r._http_cache) == {'GET:http://a.example.com/',
+                                      'GET:http://c.example.com/',
+                                      'GET:http://d.example.com/'}, \
+            "覆盖写入的条目不该被优先淘汰(位置未刷新到队尾)"
+
+    def test_eviction_is_o1_not_a_full_table_scan(self):
+        """容量已满时淘汰不得退化成全表扫描(事件循环停顿)。
+
+        缓存一满(默认 max_entries=10_000,真实流量很容易达到),每次回源写入都要做
+        容量检查;原实现用 min(全表, key=last_access) 选victim,写放大成 O(N) 并直接
+        卡住事件循环。这里塞一个"被读值就抛"的毒条目:O(1) 队首淘汰不会碰它,而任何
+        扫描全表取 last_access 的实现都会立刻炸。
+        """
+        class _Poison(dict):
+            def get(self, *a, **k):
+                raise AssertionError("LRU 淘汰退化成全表扫描(O(N) 事件循环停顿)")
+            def __getitem__(self, k):
+                raise AssertionError("LRU 淘汰退化成全表扫描(O(N) 事件循环停顿)")
+
+        r = self._router(http_cache_max_entries=4)
+        r._http_cache_set('GET', 'http://a.example.com/', 200, 'OK', {}, b'aaa')
+        r._http_cache_set('GET', 'http://b.example.com/', 200, 'OK', {}, b'bbb')
+        r._http_cache_set('GET', 'http://c.example.com/', 200, 'OK', {}, b'ccc')
+        # 毒条目放在队尾方向(第 4 位),淘汰 victim 恒为队首 a,不会被读到。
+        r._http_cache['GET:http://poison.example.com/'] = _Poison()
+        r._http_cache_set('GET', 'http://d.example.com/', 200, 'OK', {}, b'ddd')
+        assert 'GET:http://a.example.com/' not in r._http_cache
+        assert 'GET:http://poison.example.com/' in r._http_cache
+        assert r.http_cache_evictions == 1
+
     def test_invalidate_updates_bytes_and_index(self):
         """写方法按域名失效:字节计数与二级索引同步,不残留。"""
         r = self._router(http_cache_max_entries=1000, http_cache_max_bytes=100_000)
