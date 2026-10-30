@@ -19,6 +19,8 @@ import logging
 import time
 from typing import Optional, Tuple
 
+from .net import open_resolved
+
 logger = logging.getLogger(__name__)
 
 #: `_target_pool_cluster_ever` 的键数上限(归因探针标记位,见该字段注释)。
@@ -414,9 +416,12 @@ class ConnectionPools:
                     return          # 全局预算用尽:后续代理也补不动,直接收工
                 self._begin_create(key)
                 try:
-                    reader, writer = await asyncio.wait_for(
-                        asyncio.open_connection(proxy.host, proxy.port),
-                        timeout=self.conn_pool_connect_timeout)
+                    # 预热是后台 task,stop()/取消会打断它:代理 host 写成域名时
+                    # 裸 open_connection 会让 uvloop 的内部 DNS future 变成无人取回
+                    # 的孤儿(见 net.open_resolved)。数值地址仍走直连快路径。
+                    reader, writer = await open_resolved(
+                        proxy.host, proxy.port, self.conn_pool_connect_timeout,
+                        phase='pool-refill', pid=proxy.id)
                 except (asyncio.TimeoutError, OSError, ConnectionError):
                     break           # 该上游临时不可达,跳过它(下轮 refill 再试)
                 finally:
@@ -459,9 +464,11 @@ class ConnectionPools:
                and self._budget_left(proxy_key) > 0):
             self._begin_create(proxy_key, key)
             try:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(proxy_host, proxy_port),
-                    timeout=self.conn_pool_connect_timeout)
+                # 同 _conn_pool_refill:target 预热的 host 来自 ProxyInfo.host,
+                # 可能是域名 → 必须走 open_resolved,否则取消即产生孤儿 DNS future。
+                reader, writer = await open_resolved(
+                    proxy_host, proxy_port, self.conn_pool_connect_timeout,
+                    phase='target-prewarm', target=target)
             except (asyncio.TimeoutError, OSError, ConnectionError):
                 self.target_prewarm_failed += 1
                 logger.info("target prewarm CONNECT-FAIL %s via %s:%s (failed=%d)",

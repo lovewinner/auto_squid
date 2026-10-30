@@ -48,6 +48,7 @@ import httpx
 
 from .proxy_store import ProxyStore
 from .auth import check_auth
+from .net import open_resolved
 from .config_schema import (PolicyConfig, RouterConfig, AutoTuneConfig,
                             is_valid_host, router_config_from_flat)
 from .tuner import AutoTuner
@@ -1368,51 +1369,12 @@ class Router:
 
     async def _open_resolved(self, host: str, port: int, timeout: float,
                              *, phase: str, pid: str = '-', target: str = ''):
-        """自己解析 DNS 再连数值地址(避免 uvloop 内部 DNS future 变孤儿)。
+        """连"可能是域名"的地址:委托 net.open_resolved(根因与修法见该函数 docstring)。
 
-        背景:生产用 uvloop,其 `create_connection()` 对**域名**走内部
-        `_getaddrinfo` future(uvloop loop.pyx:1747);外层 task 被取消(竞速败者
-        / `wait_for` 超时)时该 future 与等待者解绑 → 稍后 DNS 失败回调
-        `set_exception(gaierror)` → 无人 await → asyncio 在 `Future.__del__`
-        报 "Future exception was never retrieved"。实测 12.5 天 231 条,
-        全部 gaierror。IP 字面量走 `__static_getaddrinfo` 快路径(loop.pyx:1940)
-        不做 DNS,故不受影响。
-
-        修法:改用 `loop.getaddrinfo` **公共 API** —— 它直接 await 内部 future
-        (loop.pyx:1529),取消可传播到该 future → future 被 cancel → 回调里
-        `if not fut.cancelled()` 跳过 set_exception → 不产生孤儿。随后连已解析
-        的数值地址,uvloop 走静态快路径,结构上不可能再产生孤儿。
-
-        语义保持不变:
-        - 总超时预算不变(DNS + 连接共用同一 deadline);
-        - 多地址回退保留(遍历 getaddrinfo 全部结果,顺序同 libc);
-        - DNS 失败原样抛出 —— `socket.gaierror` 是 `OSError` 子类,故调用方
-          既有的 `except (asyncio.TimeoutError, OSError, ConnectionError)`
-          分支与 `ERROR_CONNECT` 错误归类完全不变;但此处**补一条带上下文的
-          日志**(此前该失败完全不可见,只能看到匿名的 asyncio 告警)。
+        这层薄包装只为让调用点少传一个模块名;Pools 侧直接 import net.open_resolved。
         """
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        try:
-            infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-        except socket.gaierror as e:
-            logger.info("dns FAILED phase=%s host=%s:%s pid=%s target=%s err=%s: %s",
-                        phase, host, port, pid, target, type(e).__name__, e)
-            raise
-        last = None
-        for _family, _type, _proto, _canon, sockaddr in infos:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                raise asyncio.TimeoutError()
-            try:
-                return await asyncio.wait_for(
-                    asyncio.open_connection(sockaddr[0], sockaddr[1]),
-                    timeout=remaining)
-            except (asyncio.TimeoutError, OSError, ConnectionError) as e:
-                last = e          # 多地址回退:换下一个地址重试
-        if last is not None:
-            raise last
-        raise OSError("getaddrinfo() returned empty list")
+        return await open_resolved(host, port, timeout, phase=phase, pid=pid,
+                                   target=target)
 
     async def _canary_reachable(self, target: str) -> bool:
         """本机直连 canary 探可达性(短超时;失败仅跳过本轮,不算任何上游失败)。
@@ -1490,8 +1452,11 @@ class Router:
         self.probes_sent += 1
         t0 = time.perf_counter()
         try:
-            up_reader, up_writer = await asyncio.wait_for(
-                asyncio.open_connection(proxy.host, proxy.port), timeout=_PROBE_TIMEOUT)
+            # 探活同样要防孤儿:ProxyInfo.host 允许写成域名,裸 open_connection(域名)
+            # 被 wait_for 超时会解绑 uvloop 的内部 DNS future(见 net.open_resolved)。
+            up_reader, up_writer = await self._open_resolved(
+                proxy.host, proxy.port, _PROBE_TIMEOUT,
+                phase='probe-connect', pid=proxy.id, target=canary)
         except (asyncio.TimeoutError, OSError, ConnectionError) as e:
             # 探活失败必须留痕:此前此路径**不打任何日志**,于是熔断风暴期间只能
             # 看到"circuit opened"看不到原因(生产日志里 10-22 的 239-182 有
@@ -2821,12 +2786,14 @@ class Router:
                                 _used_pooled = True
                         if up_reader is None:
                             self.pools.connect_new_conns += 1  # 观测:池未中需新建
-                            up_reader, up_writer = await asyncio.wait_for(
-                                asyncio.open_connection(proxy_host, proxy_port), timeout=connect_timeout)
+                            up_reader, up_writer = await self._open_resolved(
+                                proxy_host, proxy_port, connect_timeout,
+                                phase='tunnel-connect', pid=pid, target=target)
                     else:
                         self.pools.connect_new_conns += 1  # 观测:无池路径/重试路径每次新建
-                        up_reader, up_writer = await asyncio.wait_for(
-                            asyncio.open_connection(proxy_host, proxy_port), timeout=connect_timeout)
+                        up_reader, up_writer = await self._open_resolved(
+                            proxy_host, proxy_port, connect_timeout,
+                            phase='tunnel-connect', pid=pid, target=target)
                 else:
                     host = self._try_tunnel_host(target)
                     if not host:
@@ -4194,8 +4161,9 @@ class Router:
         哪个目标)也容易淹没在别的告警里。这里接管该类告警:转成 auto_squid 的
         ERROR 日志,保留原异常对象;其余消息仍交给原处理器。
 
-        注:已知的两处根因(uvloop 内部 DNS future 变孤儿)已在 _open_resolved
-        处根治;本兜底用于**将来可能出现的新来源**,以及兜住无法立即根治的残留。
+        注:已知的孤儿来源(uvloop 内部 DNS future)已统一到 net.open_resolved
+        ——凡 host 可能是域名的建连(本地直连目标、canary、上游代理 host、两阶段
+        预热)都走它;本兜底用于**将来可能出现的新来源**,以及兜住无法立即根治的残留。
         """
         loop = asyncio.get_running_loop()
         orig = loop.get_exception_handler()

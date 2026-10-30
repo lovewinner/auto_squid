@@ -8622,11 +8622,16 @@ class TestConnectEstablishFailure:
 
 class TestStaleConnRetry:
     """审计 D 项修复回归:池化连接失效(上游已 EOF)时,首试记 stale 观测(不喂熔断),
-    并用一条全新连接重试一次;重试成功则该候选最终成功,且代理不被误熔断。"""
+    并用一条全新连接重试一次;重试成功则该候选最终成功,且代理不被误熔断。
+
+    代理 host 用 IP 字面量:建连统一走 net.open_resolved(域名会先 getaddrinfo),
+    而这些用例 monkeypatch 的是 asyncio.open_connection —— 用域名的话失败会发生在
+    解析阶段,根本走不到被替换的建连,用例就只是在测"DNS 解析失败"。
+    """
 
     def _router(self, **kw):
         store = ProxyStore()
-        store.add(ProxyInfo(id='p', host='h', port=3128))
+        store.add(ProxyInfo(id='p', host=HOST, port=3128))
         return make_router(store, listen_host=HOST, listen_port=10819,
                       db_path=tempfile.mktemp(suffix='.db'), **kw)
 
@@ -8670,7 +8675,7 @@ class TestStaleConnRetry:
             with pytest.MonkeyPatch.context() as mp:
                 mp.setattr(asyncio, "open_connection", fake_open_connection)
                 pid, _rd, _wr = await r._try_tunnel(
-                    'p', 'x.com:443', 'h', 3128, None, client_ip='1.2.3.4')
+                    'p', 'x.com:443', HOST, 3128, None, client_ip='1.2.3.4')
             assert pid == 'p'
             # 首试的陈旧失败未喂 record_failure → 不应熔断
             assert r.selector.is_circuit_open('p') is False
@@ -8695,7 +8700,8 @@ class TestStaleConnRetry:
                 for _ in range(3):
                     with pytest.raises(RuntimeError):
                         asyncio.run(
-                            r._try_tunnel('p', 'x.com:443', 'h', 3128, None, client_ip='1.2.3.4'))
+                            r._try_tunnel('p', 'x.com:443', HOST, 3128, None,
+                            client_ip='1.2.3.4'))
             # 真失败应累计熔断
             assert r.selector.is_circuit_open('p') is True
             # 非池连接,不应记 stale
@@ -9029,8 +9035,19 @@ class TestDnsOrphanFuture:
     """
 
     def _run_under_uvloop(self, scenario):
-        """在独立 uvloop loop 里跑场景,返回 "never retrieved" 告警列表。"""
+        """在独立 uvloop loop 里跑场景,返回 "never retrieved" 告警列表。
+
+        两条观察路径都得听,否则用例是假绿:
+
+        1) loop 的异常处理器 —— 场景没起 Router 时,孤儿告警走这里;
+        2) Router.start() 会**覆盖**上面那个 handler,并装自己的兜底处理器,把
+           'never retrieved' 转成 auto_squid 的 ERROR 日志("unretrieved task
+           exception: ...")且不再链回原处理器。只挂 (1) 时,凡跑过 Router 的场景
+           对孤儿完全失明——实测把已修好的建连改回裸 open_connection(域名),
+           原用例照样通过。
+        """
         uvloop = pytest.importorskip("uvloop", reason="该回归需 uvloop(生产用的事件循环)")
+        import logging as _logging
         orphans = []
 
         async def _scenario():
@@ -9043,9 +9060,24 @@ class TestDnsOrphanFuture:
                 elif orig:
                     orig(loop_, ctx)
             loop.set_exception_handler(handler)
+
+            class _Cap(_logging.Handler):
+                def emit(self, rec):
+                    if 'unretrieved task exception' in rec.getMessage():
+                        orphans.append({'message': rec.getMessage()})
+
+            # 挂在父 logger 上:兜底日志由 auto_squid.router 记录,而 DNS 留痕在
+            # auto_squid.net,子模块名各挂一个容易漏。
+            lg = _logging.getLogger('auto_squid')
+            cap = _Cap()
+            old_level = lg.level
+            lg.addHandler(cap)
+            lg.setLevel(_logging.INFO)
             try:
                 await scenario()
             finally:
+                lg.removeHandler(cap)
+                lg.setLevel(old_level)
                 loop.set_exception_handler(orig)
 
         loop = uvloop.new_event_loop()
@@ -9139,7 +9171,9 @@ class TestDnsOrphanFuture:
             r = make_router(ps, listen_host=HOST, listen_port=10899,
                             probe_interval_sec=0.0,
                             db_path=tempfile.mktemp(suffix='.db'))
-            lg = _logging.getLogger('auto_squid.router')
+            # 挂在父 logger 上:DNS 留痕由 auto_squid.net 记录(建连路径已抽到
+            # net.open_resolved,Router/Pools 共用),挂子模块名会漏。
+            lg = _logging.getLogger('auto_squid')
             h = _Cap()
             lg.addHandler(h)
             old = lg.level
@@ -9163,6 +9197,78 @@ class TestDnsOrphanFuture:
         msg = dns_logs[0]
         assert 'phase=probe-canary' in msg, f"日志须含失败阶段: {msg}"
         assert 'definitely-no-such-host' in msg, f"日志须含域名: {msg}"
+
+    def test_cancelled_target_prewarm_leaves_no_orphan(self):
+        """取消 target 预热(代理 host 是域名)→ 不得留下孤儿 DNS future。
+
+        b7eaa82 只把 canary 与本地直连两处改走自解析,而**预热**路径仍是裸
+        `asyncio.wait_for(open_connection(host, port))`。ProxyInfo.host 允许写
+        域名,而预热 task 恰好是"会被取消"的那一类(stop() 批量取消 / 预算门),
+        所以同一条孤儿路径在生产里仍然开着。
+        """
+        async def scenario():
+            ps = ProxyStore()
+            ps.add(ProxyInfo(id='p1', host=HOST, port=31990))
+            r = make_router(ps, listen_host=HOST, listen_port=10899,
+                            probe_interval_sec=0.0,
+                            conn_pool_enabled=True, conn_pool_target_prewarm=True,
+                            db_path=tempfile.mktemp(suffix='.db'))
+            await r.start()
+            # 场景自检:确认预热真的走到了"发起建连"那一步(否则"无孤儿"可能只是
+            # 因为整个分支被门控提前返回,用例失明)。_begin_create 紧贴建连调用。
+            entered = []
+            orig_begin = r.pools._begin_create
+
+            def counting_begin(proxy_key, bucket_key=''):
+                entered.append(bucket_key)
+                return orig_begin(proxy_key, bucket_key)
+
+            r.pools._begin_create = counting_begin
+            try:
+                for i in range(5):
+                    host = f"orphan-prewarm-{i}-{time.monotonic_ns()}.example.com"
+                    t = asyncio.ensure_future(
+                        r.pools._target_pool_prewarm(host, 3128,
+                                                     "page.example.com:443"))
+                    await asyncio.sleep(0.003)      # 让 DNS 进入在途窗口
+                    t.cancel()
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                await asyncio.sleep(0.6)            # 等 DNS 回调 + GC
+                import gc
+                gc.collect()
+                assert len(entered) >= 5, f"预热未发起建连(entered={len(entered)}),用例失明"
+            finally:
+                await r.stop()
+
+        orphans = self._run_under_uvloop(scenario)
+        assert not orphans, (
+            f"取消中的预热域名解析不得留下孤儿 DNS future,实际 {len(orphans)} 条")
+
+    def test_ip_literal_proxy_skips_resolution_and_still_connects(self):
+        """数值地址走直连快路径:预热/竞速的建连延迟不因自解析多一次线程池往返。"""
+        from auto_squid.net import is_ip_literal, open_resolved
+
+        async def scenario():
+            up = await run_mock_proxy(HOST, 31993)
+            try:
+                reader, writer = await open_resolved(HOST, 31993, 3.0, phase='unit-test')
+                writer.write(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n")
+                await writer.drain()
+                assert b'200' in await reader.readline()
+                writer.close()
+                await writer.wait_closed()
+            finally:
+                up.close()
+                await up.wait_closed()
+
+        self._run_under_uvloop(scenario)
+        assert is_ip_literal(HOST) is True
+        assert is_ip_literal('::1') is True
+        assert is_ip_literal('[::1]') is True
+        assert is_ip_literal('no-such-host.invalid') is False
 
     def test_dns_failure_preserves_original_exception(self):
         """DNS 失败须原样抛出 gaierror(不吞、不改类型)。
