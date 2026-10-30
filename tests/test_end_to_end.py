@@ -4871,7 +4871,7 @@ class TestStickyProbeEviction:
     设计要点(与方案C _sticky_slow_probe_due 互补但不同):方案C 在"取用"时
     被动比较域名 EWMA;杠杆A 在"命中"后主动探路,用探路赢家的 CONNECT 握手
     EWMA 作 best 基准。探路不写 _domain_quality(只握手不拉数据,单次握手延迟
-    喂域名 EWMA 会混入噪声);建出的隧道经 C 的 _cleanup_tunnel_result 归还池。
+    喂域名 EWMA 会混入噪声);建出的隧道由 _cleanup_tunnel_result 关闭(隧道不归还池)。
     节流:probe_interval_sec 冷却,时间戳在 _sticky_probe_race 启动时刷新
     (前置门提前 return 的分支不消耗节流)。默认 interval=0.0 关闭。
     """
@@ -4981,6 +4981,61 @@ class TestStickyProbeEviction:
         assert r._get_sticky_proxy('1.2.3.4', 'example.com') == 'slow'
         assert r.sticky_probes_fired == 1
         assert r.sticky_probe_evictions == 0
+
+    @pytest.mark.asyncio
+    async def test_probe_race_closes_winner_tunnel(self, monkeypatch):
+        """探路赢家的隧道必须关闭。
+
+        _race_staggered 的 cleanup 刻意只覆盖败者(真实请求路径要把赢家的
+        reader/writer 交给 _relay_tunnel),而探路是唯一"拿到 CONNECT 赢家却
+        不转发"的调用点 —— 漏关即每发一次探路泄漏一条已握手上游 socket。
+        """
+        class FakeWriter:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+            async def wait_closed(self):
+                return None
+
+        winner_w, loser_w = FakeWriter(), FakeWriter()
+
+        async def fake_race(places, cleanup=None, **kw):
+            await cleanup(('slow', object(), loser_w))   # harness 清理败者
+            return ('fast', object(), winner_w)
+
+        r = self._router()
+        r.selector.record_ttfb('slow', 0.50, 'example.com')
+        monkeypatch.setattr(r, '_race_staggered', fake_race)
+        await r._sticky_probe_race('1.2.3.4', 'example.com', 'example.com:443', 'slow')
+        assert loser_w.closed
+        assert winner_w.closed, "探路赢家隧道未关闭 → fd 泄漏"
+
+    @pytest.mark.asyncio
+    async def test_probe_race_closes_winner_when_verdict_skipped(self, monkeypatch):
+        """判定分支提前 return(无 EWMA 可比)时,赢家隧道同样必须被关闭。"""
+        class FakeWriter:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+            async def wait_closed(self):
+                return None
+
+        winner_w = FakeWriter()
+
+        async def fake_race(places, cleanup=None, **kw):
+            return ('fast', object(), winner_w)
+
+        r = self._router()
+        # 不记录 slow 的域名 EWMA → dq is None → 提前 return。
+        monkeypatch.setattr(r, '_race_staggered', fake_race)
+        await r._sticky_probe_race('1.2.3.4', 'example.com', 'example.com:443', 'slow')
+        assert winner_w.closed
 
     def test_counters_reported_in_metrics(self):
         """探路发射/驱逐计数进入 snapshot_counters() 供 /metrics 展示。"""

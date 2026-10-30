@@ -2152,24 +2152,32 @@ class Router:
                 initial=1, interval=self.stagger_interval)
             if winner is None:
                 return
-            win_pid = winner[0]
-            self.sticky.sticky_probes_fired += 1
-            # 判定:探路赢家是"候选里最快的",若它显著快于 sticky 代理 → 驱逐。
-            dq = self.selector._domain_quality_for(domain, sticky_pid)
-            if dq is None:
-                return
-            cur = self.selector._proxy_quality_ewma(dq)
-            if cur is None:
-                return
-            best_ewma = self.selector._proxy_quality_ewma(
-                self.selector._domain_quality_for(probe_target, win_pid)) or cur
-            slack = self.single_send_degrade_slack_ms / 1000.0
-            if cur > best_ewma * self.single_send_degrade_ratio \
-                    and (cur - best_ewma) > slack:
-                self.sticky.sticky_probe_evictions += 1
-                self.sticky._evict_sticky(client_ip, domain)
-                logger.info("sticky probe EVICT %s pid=%s cur=%.3fs best=%.3fs",
-                            domain, sticky_pid, cur, best_ewma)
+            try:
+                win_pid = winner[0]
+                self.sticky.sticky_probes_fired += 1
+                # 判定:探路赢家是"候选里最快的",若它显著快于 sticky 代理 → 驱逐。
+                dq = self.selector._domain_quality_for(domain, sticky_pid)
+                if dq is None:
+                    return
+                cur = self.selector._proxy_quality_ewma(dq)
+                if cur is None:
+                    return
+                best_ewma = self.selector._proxy_quality_ewma(
+                    self.selector._domain_quality_for(probe_target, win_pid)) or cur
+                slack = self.single_send_degrade_slack_ms / 1000.0
+                if cur > best_ewma * self.single_send_degrade_ratio \
+                        and (cur - best_ewma) > slack:
+                    self.sticky.sticky_probe_evictions += 1
+                    self.sticky._evict_sticky(client_ip, domain)
+                    logger.info("sticky probe EVICT %s pid=%s cur=%.3fs best=%.3fs",
+                                domain, sticky_pid, cur, best_ewma)
+            finally:
+                # 探路只要握手延迟,隧道一个字节都不搬,必须显式关闭。
+                # _race_staggered 的 cleanup 刻意排除赢家(真实请求路径要把它的
+                # reader/writer 交给 _relay_tunnel),而探路是唯一"拿到 CONNECT
+                # 赢家却不转发"的调用点 —— 不关就是每发一次探路泄漏一条已握手的
+                # 上游 socket(transport 被 loop 的 selector 强引用,GC 收不回)。
+                await race_cleanup(winner)
         except Exception:
             logger.debug("sticky probe failed", exc_info=True)
 
@@ -2490,7 +2498,10 @@ class Router:
         up_writer = result[-1]
         try:
             up_writer.close()
-            await up_writer.wait_closed()
+            # 最多等 0.5s:对端可能挂起不回 FIN,3.12 的 wait_closed() 严格等连接
+            # 关闭事件会挂住这个后台清理 task(socket 已由 close() 释放,但 task 与
+            # 其 reader/writer 引用会一直堆在 _pending_cleanups)。
+            await asyncio.wait_for(up_writer.wait_closed(), timeout=0.5)
         except Exception:
             pass
 
