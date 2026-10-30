@@ -1319,16 +1319,54 @@ class TestPanelXss:
     """
 
     def test_domain_key_never_contains_html_metachars(self):
-        from auto_squid.router import _domain_key_from_url, _DOMAIN_KEY_MAX_LEN
+        from auto_squid.http_cache import domain_key_from_url, DOMAIN_KEY_MAX_LEN
         payload = '/<svg onload=alert(1)>'
-        key = _domain_key_from_url(payload)
+        key = domain_key_from_url(payload)
         assert not set('<>"\'&\\') & set(key), key
-        assert len(key) <= _DOMAIN_KEY_MAX_LEN
+        assert len(key) <= DOMAIN_KEY_MAX_LEN
         # 正常 absolute-form 仍取 hostname(行为不变)。
-        assert _domain_key_from_url("http://Example.COM:8080/a?b=1") == "example.com"
+        assert domain_key_from_url("http://Example.COM:8080/a?b=1") == "example.com"
         # 非法 IPv6 字面量让 urlparse 抛 ValueError,不能冒泡到请求路径。
-        assert '<' not in _domain_key_from_url("http://[not::an::ipv6]/x")
-        assert _domain_key_from_url("") == "unknown"
+        assert '<' not in domain_key_from_url("http://[not::an::ipv6]/x")
+        assert domain_key_from_url("") == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_malformed_ipv6_url_does_not_crash_request_path(self):
+        """`http://[bad::ipv6::not]/x` 让 urlparse 抛 ValueError:域名键在**转发之前**
+        就要算出来(缓存失效/统计),这里必须净化而不是把异常抛成内部错误。"""
+        records = []
+
+        class H(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        log = logging.getLogger('auto_squid.router')
+        handler = H()
+        log.addHandler(handler)
+        proxy_srv = await run_mock_proxy(HOST, PROXY_PORT)
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+        router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                             db_path=tempfile.mktemp(suffix='.db'))
+        await router.start()
+        try:
+            reader, writer = await asyncio.open_connection(HOST, ROUTER_PORT)
+            # 写方法:域名级缓存失效一定会走 domain_key_from_url。
+            writer.write(b"POST http://[bad::ipv6::not]/x HTTP/1.1\r\n"
+                         b"Host: x\r\nContent-Length: 1\r\n\r\na")
+            await writer.drain()
+            status = await asyncio.wait_for(reader.readline(), timeout=5)
+            writer.close()
+            await writer.wait_closed()
+            # 允许 502(上游本就拒绝这个 URL),但不能是"处理客户端时抛异常"。
+            assert status, "没有任何响应"
+            assert not any('error handling client' in r.getMessage() for r in records), \
+                "域名键解析异常冒泡到了 handle_client"
+        finally:
+            log.removeHandler(handler)
+            await router.stop()
+            proxy_srv.close()
+            await proxy_srv.wait_closed()
 
     @staticmethod
     def _code_only(html: str) -> str:

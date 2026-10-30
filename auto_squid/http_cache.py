@@ -17,6 +17,7 @@ snapshot_counters 直读)。流式响应转发的缓冲上限 `_stream_cache_lim
 
 import asyncio
 import logging
+import re
 import time
 import urllib.parse
 from typing import Optional
@@ -46,6 +47,36 @@ NO_BODY_STATUS = frozenset({204, 304})
 # "GET:<url>",写方法不会被缓存(_http_cache_set 对非 GET 直接 return),
 # 故失效只需按同一 URL 删 GET 条目;无需前缀扫描。
 _INVALIDATING_METHODS = frozenset({'POST', 'PUT', 'DELETE', 'PATCH'})
+
+# 域名维度键的最大长度:DNS 主机名上限 253 字符,超出即视为伪造/垃圾输入。
+DOMAIN_KEY_MAX_LEN = 253
+
+
+def domain_key_from_url(url: str) -> str:
+    """域名维度(缓存二级索引 / 统计 / 粘性 / meta)统一的键:取 URL 的 hostname。
+
+    常见写法 `urlparse(url).hostname or url` 有两个问题:
+
+    1. hostname 取不到时回退成**整段原文**。origin-form 请求
+       (`GET /<svg onload=alert(1)> HTTP/1.1`,客户端直连本代理即可构造)会把
+       请求行原文变成键:管理面板拼进 innerHTML 即是 XSS 源头,而且每个畸形
+       路径都是一条永久条目(键空间无界)。
+    2. 非法 IPv6 字面量(`http://[not::ipv6]/x`)让 urlparse **抛 ValueError**
+       —— 而本函数被 _http_cache_remove/_set 这类"响应已写出之后"的内务路径调用,
+       一次崩溃会把整条转发失败变成一个本该静默的记账错误。
+
+    兜底不再回原文:净化到 URL 语法字符并截断,既保留"这是哪个请求"的可读线索,
+    又不让 HTML 元字符或超长字符串进入键。
+    """
+    try:
+        host = urllib.parse.urlparse(url).hostname
+    except ValueError:
+        host = None
+    if host:
+        return host
+    cleaned = re.sub(r'[^A-Za-z0-9._~:/?#\[\]@!$()*+,;=%-]', '_',
+                     url)[:DOMAIN_KEY_MAX_LEN]
+    return cleaned or 'unknown'
 
 
 class HttpCache:
@@ -133,7 +164,7 @@ class HttpCache:
             return False
         self._http_cache_bytes -= len(entry.get('content', b'') or b'')
         cached_url = key[len('GET:'):] if key.startswith('GET:') else key
-        cached_host = urllib.parse.urlparse(cached_url).hostname or cached_url
+        cached_host = domain_key_from_url(cached_url)
         idx = self._http_cache_domain_index.get(cached_host)
         if idx:
             idx.discard(key)
@@ -207,7 +238,7 @@ class HttpCache:
             self._http_cache_remove(oldest)
             self.http_cache_evictions += 1
         # 同步更新二级索引:缓存键 -> 域名,供 O(1) 域名级批量失效。
-        cached_host = urllib.parse.urlparse(url).hostname or url
+        cached_host = domain_key_from_url(url)
         self._http_cache_domain_index.setdefault(cached_host, set()).add(key)
 
     def _http_cache_invalidate(self, domain: str) -> None:
