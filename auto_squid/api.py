@@ -2,6 +2,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field, field_validator
 from typing import Dict, List
+import asyncio
+import json
 
 from .auth import check_auth
 from .config_schema import AuthConfig, ProxyInfo, is_valid_host
@@ -439,10 +441,24 @@ async def metrics_per_destination(domain: str | None = None):
     (use_cache=True):面板 30s 轮询无新样本时直接复用快照,避免重复重算分位
     (近式单次 1.3s/6.7MB);面板口径剔除原始样本数组,载荷大幅缩减。
     落盘路径(router._flush_to_db)用 use_cache=False 不全缓存/不减样本。
+
+    **全量查询不能跑在事件循环上**:它与转发共用同一个 loop,单次重算约 1.3s,
+    且真实流量下缓存版本几乎每次都在变(等于每次重算)。此前只要有人反复拉这个
+    URL,代理侧所有隧道就跟着停摆 —— 一个小请求换全站中断。现把重算与序列化
+    一起挪进工作线程:循环只负责 await,不再被占用。序列化也一并挪走是必须的,
+    否则 6.7MB 的 json.dumps 仍然卡在循环里。
     """
     if not _router:
         return {}
-    return _router.selector.get_domain_metrics(use_cache=True, domain=domain)
+    if domain is not None:
+        # 单域名明细是 O(代理数) 的小计算,留在循环内(避免为几 KB 起线程切换)。
+        return _router.selector.get_domain_metrics(use_cache=True, domain=domain)
+    loop = asyncio.get_running_loop()
+    payload = await loop.run_in_executor(
+        None,
+        lambda: json.dumps(_router.selector.get_domain_metrics(use_cache=True),
+                           default=list))
+    return Response(content=payload.encode('utf-8'), media_type="application/json")
 
 
 @app.get("/server-stats")

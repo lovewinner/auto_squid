@@ -1401,6 +1401,66 @@ class TestPanelXss:
         assert "+ activeProxy +" not in html
 
 
+class TestPerDestinationOffload:
+    """/metrics/per-destination 的全量网格不能占用事件循环。
+
+    它与转发共用同一个 loop,单次重算约 1.3s,而真实流量下缓存版本几乎每次都变
+    (= 每次都重算)。任何人反复拉这一个 URL,代理侧所有隧道就跟着停摆。
+    """
+
+    @pytest.mark.asyncio
+    async def test_full_grid_offloaded_from_event_loop(self, monkeypatch):
+        import httpx
+        from auto_squid import api as api_mod
+
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host='h', port=3128))
+        router = make_router(store, listen_host='127.0.0.1', listen_port=10833,
+                             db_path=tempfile.mktemp(suffix='.db'))
+        api_mod.mount(store, router)
+        try:
+            def slow_snapshot(*a, **kw):
+                time.sleep(0.5)          # 模拟全量重算(按 1.3s 量级缩短以保持测试快)
+                return {'d.test': {'p': {'total': 1}}}
+
+            monkeypatch.setattr(router.selector, 'get_domain_metrics', slow_snapshot)
+
+            ticks = 0
+
+            async def heartbeat():
+                nonlocal ticks
+                while True:
+                    await asyncio.sleep(0.02)
+                    ticks += 1
+
+            hb = asyncio.create_task(heartbeat())
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api_mod.app),
+                                         base_url='http://test') as client:
+                r = await client.get('/metrics/per-destination')
+            hb.cancel()
+            assert r.status_code == 200
+            assert r.headers['content-type'].startswith('application/json')
+            assert r.json() == {'d.test': {'p': {'total': 1}}}
+            assert ticks >= 10, f"重算期间事件循环被占住(心跳只跳了 {ticks} 次)"
+        finally:
+            api_mod.mount(None, None)
+
+    def test_domain_scoped_still_returns_dict(self):
+        """带 domain 的明细路径保持返回 dict(未挪线程,行为不变)。"""
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host='h', port=3128))
+        router = make_router(store, listen_host='127.0.0.1', listen_port=10834,
+                             db_path=tempfile.mktemp(suffix='.db'))
+        mount(store, router)
+        try:
+            client = TestClient(api_app)
+            r = client.get('/metrics/per-destination', params={'domain': 'x.test'})
+            assert r.status_code == 200
+            assert r.json() == {}
+        finally:
+            mount(None, None)
+
+
 # ── streaming / pooling / DB-batching tests ───────────────────────
 
 
