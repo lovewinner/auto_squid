@@ -341,6 +341,30 @@ def test_post_tuner_toggle_reverts_on_disable(client):
 
 
 @pytest.mark.asyncio
+async def test_disable_then_enable_leaves_a_running_loop():
+    """关→开必须真的把评估循环重新跑起来(旧写法会静默停摆)。
+
+    旧 set_enabled(False) 把 stop() 下放成一个没人 await 的 task,而 _task 引用
+    要到那个 task 跑起来才清空;紧随其后的 set_enabled(True) 里 start() 看到"旧
+    task 还活着"就直接 return,随后那个 stop task 又取消掉唯一在跑的循环 ——
+    结果是 enabled=True 而后台没有循环,调参器不再工作且没有任何日志/告警。
+    """
+    tuner, sel = _tuner(enabled=True, window_sec=5.0)
+    tuner.start()
+    first = tuner._task
+    assert first is not None and not first.done()
+
+    await tuner.set_enabled(False)
+    assert tuner._task is None, "关闭后仍留着 task 引用"
+
+    await tuner.set_enabled(True)
+    assert tuner._task is not None and not tuner._task.done(), \
+        "关→开后评估循环没起来(调参器静默停摆)"
+    assert tuner._task is not first
+    await tuner.stop()
+
+
+@pytest.mark.asyncio
 async def test_router_start_stop_runs_tuner_loop():
     """集成:enabled 时 start() 启动循环、stop() 干净取消(不悬挂)。"""
     r = _router(auto_tune=AutoTuneConfig(enabled=True, window_sec=0.2, min_samples=3))

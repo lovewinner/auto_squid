@@ -629,7 +629,7 @@ async def toggle_tuner(req: TunerToggleRequest):
     """运行时启停自动调参器。关闭时回滚到最近已采纳的基线权重(若有)。"""
     if not _router:
         raise HTTPException(status_code=503, detail="router not ready")
-    _router.tuner.set_enabled(req.enabled)
+    await _router.tuner.set_enabled(req.enabled)
     return _router.tuner.snapshot()
 
 

@@ -106,9 +106,16 @@ class AutoTuner:
             pass
         self._task = None
 
-    def set_enabled(self, enabled: bool) -> None:
+    async def set_enabled(self, enabled: bool) -> None:
         """运行时启停(POST /tuner)。开启=全新开始(基线清零重测);关闭=回滚到
-        已知好的基线权重(若有),避免停在试跑到一半的权重上。"""
+        已知好的基线权重(若有),避免停在试跑到一半的权重上。
+
+        必须是 async:关闭要真正 await stop()。旧写法把 stop 下放成一个没人 await 的
+        task,而 `self._task` 直到那个 task 跑起来才被清空 —— 于是"关→立刻开"里,
+        start() 看到旧 task 还活着就直接 return,随后那个 stop task 又把唯一在跑的
+        评估循环取消掉:结果 enabled=True 而后台循环没了,调参器静默停摆,面板上
+        什么都看不出来(得再关再开一次才恢复)。
+        """
         enabled = bool(enabled)
         if enabled == self.enabled:
             return
@@ -120,6 +127,7 @@ class AutoTuner:
             self._since_measure = 0
             self._win_ttfb.clear()
             self._win_count = 0
+            await self.stop()      # 先确保上一任循环真的没了,再起新的
             self.start()
             logger.info("auto tuner enabled at runtime")
         else:
@@ -130,15 +138,7 @@ class AutoTuner:
                             self.baseline[0])
             else:
                 logger.info("auto tuner disabled at runtime (no baseline measured)")
-            # stop 需在事件循环里 await;本方法由 async 端点调用(有运行循环),
-            # 兜底:无循环时直接丢弃 task 引用(测试/异常上下文)。
-            try:
-                asyncio.get_running_loop().create_task(self._stop_async())
-            except RuntimeError:
-                self._task = None
-
-    async def _stop_async(self) -> None:
-        await self.stop()
+            await self.stop()
 
     # ── 热路径采样(必须极便宜) ─────────────────────────────────
     def observe(self, ttfb: float) -> None:
