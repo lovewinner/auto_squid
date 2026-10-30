@@ -35,6 +35,7 @@ import asyncio
 import base64
 import concurrent.futures
 import functools
+import heapq
 import logging
 import re
 import socket
@@ -1565,12 +1566,21 @@ class Router:
                 if resp.status_code >= 500:
                     self.selector.record_http_error(proxy.id, resp.status_code, domain=domain)
 
-    def get_domain_stats_from_db(self) -> dict[str, dict[str, int]]:
-        """读取全量域名胜出统计,组织为 {domain: {proxy_id: wins}}。
+    def get_domain_stats_from_db(self, limit: Optional[int] = None) -> dict[str, dict[str, int]]:
+        """读取域名胜出统计,组织为 {domain: {proxy_id: wins}}。
 
         读内存镜像(权威源),供管理 API / 仪表盘使用。无需触 DB/锁。
+
+        `limit`:只回胜出总数最多的 N 个域名(None/<=0 = 全量)。域名基数可以很高,
+        全量快照 = 逐项拷贝 + 整包 JSON 序列化,全部跑在事件循环上,而面板是按
+        周期自动刷新的 —— 那是周期性停顿。top-N 选择本身仍要扫一遍键(heapq.nlargest,
+        O(N log limit)),但省掉了逐项 dict(m) 拷贝与序列化体积的大头。
         """
-        return {d: dict(m) for d, m in self._stats_cache.items()}
+        items = self._stats_cache.items()
+        if limit is None or limit <= 0 or len(items) <= limit:
+            return {d: dict(m) for d, m in items}
+        top = heapq.nlargest(limit, items, key=lambda kv: sum(kv[1].values()))
+        return {d: dict(m) for d, m in top}
 
     def get_domain_meta_from_db(self) -> dict[str, dict[str, str]]:
         """读取全量域名元数据 {domain: {default_proxy, updated_at}}。
@@ -1581,13 +1591,22 @@ class Router:
         return {d: {k: v for k, v in m.items() if k != '_updated_mono'}
                 for d, m in self._meta_cache.items()}
 
-    def get_domain_meta_enriched(self) -> dict[str, dict]:
+    def get_domain_meta_enriched(self, limit: Optional[int] = None) -> dict[str, dict]:
         """读取域名元数据 + 自适应 TTL 状态(P2 验收:/domains/meta 展示
         ttl/expires_at/switch_count)。仅自适应 TTL 开启时附加字段,否则与
         get_domain_meta_from_db 同构(兼容旧消费方)。
+
+        `limit`:只回 updated_at 最新的 N 条(None/<=0 = 全量)。自适应 TTL 开启时
+        每条都要 fromisoformat + timedelta 运算,原实现对**全部**域名做这件事 ——
+        这才是 /domains/meta 真正的 CPU 大头(见 /metrics/per-destination 同类的
+        事件循环停顿修复)。按 updated_at 取 top-N,面板默认就是看最近变化的域名。
         """
+        items = self._meta_cache.items()
+        if limit is not None and limit > 0 and len(items) > limit:
+            items = heapq.nlargest(limit, items,
+                                   key=lambda kv: kv[1].get('updated_at', ''))
         out = {d: {k: v for k, v in m.items() if k != '_updated_mono'}
-               for d, m in self._meta_cache.items()}
+               for d, m in items}
         if self.adaptive_ttl_enabled:
             now = datetime.now(timezone.utc)
             for d, m in out.items():

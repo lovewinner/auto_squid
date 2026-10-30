@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field, field_validator
 from typing import Dict, List
@@ -244,6 +244,11 @@ async def api_auth_middleware(request: Request, call_next):
 
 
 # GET /proxies 默认把凭据值替换成这个占位符(见 list_proxies 的说明)。
+#: 管理端点单次返回的条目上限:表规模上限是 10 万量级,全量快照的拷贝与序列化
+#: 都在事件循环上跑,而面板是按几秒一次自动刷新的 —— 默认截断到最近/最相关的
+#: N 条,要全量显式传 limit=0(见各端点 docstring)。
+_ADMIN_DEFAULT_LIMIT = 2000
+
 _AUTH_MASK = "***"
 
 
@@ -597,15 +602,17 @@ async def toggle_tuner(req: TunerToggleRequest):
 
 
 @app.get("/domains")
-async def domains():
-    """返回各域名在各代理上的获胜次数"""
+async def domains(limit: int = Query(_ADMIN_DEFAULT_LIMIT, ge=0,
+                                     description="返回条数上限,0=不限")):
+    """返回各域名在各代理上的获胜次数(默认只回 top-N,见 limit)。"""
     if not _router:
         return {}
-    return _router.get_domain_stats_from_db()
+    return _router.get_domain_stats_from_db(limit=limit or None)
 
 
 @app.get("/domains/meta")
-async def domains_meta():
+async def domains_meta(limit: int = Query(_ADMIN_DEFAULT_LIMIT, ge=0,
+                                          description="返回条数上限,0=不限")):
     """返回域名缓存元数据(当前默认代理、更新时间;自适应 TTL 开启时含
     ttl/expires_at/switch_count)。
 
@@ -618,15 +625,16 @@ async def domains_meta():
     """
     if not _router:
         return {}
-    return _router.get_domain_meta_enriched()
+    return _router.get_domain_meta_enriched(limit=limit or None)
 
 
 @app.get("/stickiness")
-async def stickiness():
-    """返回会话粘性表（客户端IP|域名 → 粘性代理、更新时间）"""
+async def stickiness(limit: int = Query(_ADMIN_DEFAULT_LIMIT, ge=0,
+                                        description="返回条数上限,0=不限")):
+    """返回会话粘性表(客户端IP|域名 → 粘性代理、更新时间;默认只回最近 N 条)。"""
     if not _router:
         return {}
-    return _router.get_sticky_cache()
+    return _router.get_sticky_cache(limit=limit or None)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -982,7 +990,13 @@ function renderStickyTable() {
   pagerHtml += `<button onclick="goPage(${page+1})"${page>=pageCount-1?' disabled':''}>&rsaquo;</button>`;
   pagerHtml += `<button onclick="goPage(${pageCount-1})"${page>=pageCount-1?' disabled':''}>&raquo;</button>`;
   document.getElementById('pager').innerHTML = pagerHtml;
-  document.getElementById('footer').textContent = sticky.length + ' sticky entries · page ' + (page+1) + '/' + pageCount;
+  // 服务端默认只回最近 2000 条(_ADMIN_DEFAULT_LIMIT):表内真实条数取自
+  // /metrics 的 sticky_cache_size,两者不等时明确告诉运维"这是截断视图"。
+  let note = sticky.length + ' sticky entries · page ' + (page+1) + '/' + pageCount;
+  if (!document.getElementById('filter').value && stickyStats.size > sticky.length) {
+    note += ' · 粘性表共 ' + stickyStats.size + ' 条,此处仅最近 ' + sticky.length + ' 条(?limit=0 取全量)';
+  }
+  document.getElementById('footer').textContent = note;
 }
 
 function goPage(n) { page = n; renderStickyTable(); }

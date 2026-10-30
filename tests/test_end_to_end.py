@@ -1336,6 +1336,82 @@ class TestAPI:
         assert proxy_store.get("d") is None
 
 
+class TestAdminPayloadLimits:
+    """管理端点默认截断:/stickiness、/domains、/domains/meta 原先一律全量吐。
+
+    三张表的容量上限是 10 万 / 无上限域名量级,而"全量快照 = 逐项拷贝 + 整包
+    JSON 序列化"整个跑在事件循环上,面板又按几秒一次自动刷新 —— 等于周期性把
+    代理卡住。默认改为 top-N(limit=0 显式取全量)。
+    """
+
+    def _mount(self, **kw):
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='p1', host=HOST, port=PROXY_PORT))
+        r = make_router(ps, listen_host=HOST, listen_port=10831,
+                        db_path=tempfile.mktemp(suffix='.db'), **kw)
+        mount(ps, r)
+        return r
+
+    def test_stickiness_limit_is_most_recently_used(self):
+        r = self._mount(stickiness_enabled=True, stickiness_max_entries=20)
+        client = TestClient(api_app)
+        try:
+            for i in range(6):
+                r._record_sticky(f'c{i}', 'example.com', 'p1')
+            assert len(client.get('/stickiness', params={'limit': 0}).json()) == 6
+            limited = client.get('/stickiness', params={'limit': 2}).json()
+            assert set(limited) == {'c4|example.com', 'c5|example.com'}, limited
+            # 命中刷新 = 最近使用,必须重新进入截断视图(依赖 OrderedDict 位置)。
+            r._bump_sticky('c0', 'example.com', 'p1')
+            assert 'c0|example.com' in client.get('/stickiness', params={'limit': 2}).json()
+        finally:
+            mount(None, None)
+
+    def test_domains_stats_limit_picks_top_winners(self):
+        r = self._mount()
+        client = TestClient(api_app)
+        try:
+            r._stats_cache = {'a.com': {'p1': 5}, 'b.com': {'p1': 50}, 'c.com': {'p1': 9}}
+            got = client.get('/domains', params={'limit': 2}).json()
+            assert set(got) == {'b.com', 'c.com'}, got
+            assert len(client.get('/domains', params={'limit': 0}).json()) == 3
+        finally:
+            mount(None, None)
+
+    def test_domains_meta_limit_picks_latest_and_skips_ttl_work(self):
+        r = self._mount(adaptive_ttl=True)
+        client = TestClient(api_app)
+        base = datetime.now(timezone.utc)
+        try:
+            r._meta_cache = {
+                f'd{i}.com': {'default_proxy': 'p1', 'updated_at':
+                              (base + timedelta(seconds=i)).isoformat(),
+                              '_updated_mono': 0.0}
+                for i in range(5)}
+            got = client.get('/domains/meta', params={'limit': 2}).json()
+            assert set(got) == {'d3.com', 'd4.com'}, got
+            # 内部字段不外露,自适应 TTL 的派生字段仍在
+            assert '_updated_mono' not in got['d4.com']
+            assert 'expires_at' in got['d4.com']
+        finally:
+            mount(None, None)
+
+    def test_getters_default_to_full_snapshot(self):
+        """limit 缺省仍是全量:截断只发生在管理端点这一层,内部调用方行为不变。"""
+        r = self._mount(stickiness_enabled=True)
+        try:
+            for i in range(5):
+                r._record_sticky(f'c{i}', 'example.com', 'p1')
+            assert len(r.get_sticky_cache()) == 5
+            assert len(r.get_sticky_cache(limit=2)) == 2
+            r._stats_cache = {f'a{i}.com': {'p1': i} for i in range(4)}
+            assert len(r.get_domain_stats_from_db()) == 4
+            assert len(r.get_domain_stats_from_db(limit=0)) == 4
+            assert len(r.get_domain_stats_from_db(limit=2)) == 2
+        finally:
+            mount(None, None)
+
+
 class TestApiAuth:
     """管理 API 的 HTTP Basic 认证(api.auth,默认关闭)。
 

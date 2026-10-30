@@ -17,6 +17,7 @@
 (粘性是瞬态,重启即清)。
 """
 
+import itertools
 import time
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -80,12 +81,21 @@ class StickyCache:
         # 生效(由 _record_win_meta 新赢家接管 / reset_proxy_quality 清除)。
         self._degraded_single_send = router._degraded_single_send
 
-    def get_sticky_cache(self) -> dict[str, dict[str, object]]:
-        """返回全量会话粘性表快照 {key: {proxy_id, updated_at, hits}}。
+    def get_sticky_cache(self, limit: Optional[int] = None) -> dict[str, dict[str, object]]:
+        """返回会话粘性表快照 {key: {proxy_id, updated_at, hits}}。
 
         供管理 API / 仪表盘展示。读内存镜像,无锁无 I/O。
+
+        `limit`:只回最近使用的 N 条(None 或 <=0 = 全量)。粘性表上限 10 万条,
+        全量快照是 O(N) 的逐项 dict(v) 拷贝 + 几十 MB JSON,而且它在**事件循环
+        上**跑 —— 面板每几秒自动刷新一次,等于周期性把整个代理卡住。OrderedDict
+        的键顺序就是"最后刷新时刻"(_record/_bump 都 move_to_end),所以取尾部
+        N 条就是最近使用的那批,代价 O(N) → O(limit)。
         """
-        return {k: dict(v) for k, v in self._sticky_cache.items()}
+        if limit is None or limit <= 0:
+            return {k: dict(v) for k, v in self._sticky_cache.items()}
+        recent = itertools.islice(reversed(self._sticky_cache), limit)
+        return {k: dict(self._sticky_cache[k]) for k in recent}
 
     @staticmethod
     def _sticky_key(client_ip: str, domain: str) -> str:

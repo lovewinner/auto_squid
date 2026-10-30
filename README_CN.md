@@ -217,9 +217,9 @@ config error: invalid configuration:
 | `GET /proxies` | 列出已配置代理（上游 `auth` 值默认打码，`?include_secrets=true` 取原文） |
 | `POST /proxies` | 添加代理（`ProxyIn` JSON）；回写绑定的 `proxies.yaml`，响应里 `persisted` 说明是否真的落盘 |
 | `GET /stats` | 每代理 `request_counts`（胜出）+ `attempted_counts`（总尝试） |
-| `GET /domains` | 每域名胜出统计（SQLite） |
-| `GET /domains/meta` | 每域名默认代理 + 最后更新时间（adaptive TTL 开启时含 TTL 字段） |
-| `GET /stickiness` | 会话粘性表（client_ip\|domain → 粘性代理） |
+| `GET /domains` | 每域名胜出统计（按胜数取 top-N；`?limit=`，`limit=0` 为全量） |
+| `GET /domains/meta` | 每域名默认代理 + 最后更新时间（adaptive TTL 开启时含 TTL 字段）。按 updated_at 取最近 N 条（`?limit=`，`limit=0` 全量） |
+| `GET /stickiness` | 会话粘性表（client_ip\|domain → 粘性代理）。默认只回最近 2000 条（`?limit=`，`limit=0` 全量）——10 万条全量快照是事件循环上的 O(N) 拷贝 + JSON |
 | `GET /policies` | 策略路由配置快照 |
 | `GET /config` | 路由器配置快照 |
 

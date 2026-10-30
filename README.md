@@ -217,9 +217,9 @@ All on the management port `:18080`. `POST` bodies are JSON; unknown fields are 
 | `GET /proxies` | List configured proxies (upstream `auth` values masked; `?include_secrets=true` to reveal) |
 | `POST /proxies` | Add a proxy (`ProxyIn` JSON); writes back to the bound `proxies.yaml` (response reports `persisted`) |
 | `GET /stats` | `request_counts` (wins) + `attempted_counts` (total attempts) per proxy |
-| `GET /domains` | Per-domain win stats from SQLite |
-| `GET /domains/meta` | Per-domain default proxy + last-updated time (+ TTL fields when adaptive TTL is on) |
-| `GET /stickiness` | Session stickiness table (client_ip\|domain → sticky proxy) |
+| `GET /domains` | Per-domain win stats (top-N by wins; `?limit=`, `limit=0` = all) |
+| `GET /domains/meta` | Per-domain default proxy + last-updated time (+ TTL fields when adaptive TTL is on). Returns the N most recently updated (`?limit=`, `limit=0` = all) |
+| `GET /stickiness` | Session stickiness table (client_ip\|domain → sticky proxy). Returns the N most recently used (`?limit=`, `limit=0` = all; default 2000 — a full dump of a 100k-entry table is an O(N) copy + JSON on the event loop) |
 | `GET /policies` | Policy-routing config snapshot |
 | `GET /config` | Router config snapshot |
 
