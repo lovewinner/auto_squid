@@ -4578,6 +4578,175 @@ class TestConnPool:
             r._db.close()
 
 
+class TestPoolBudget:
+    """预热预算必须把"在途建连"算进占用。
+
+    旧实现 `_total_idle()` 在 await open_connection 之前取一次快照,循环里只自增
+    本地变量、从不重读池:每个 CONNECT 胜出/粘性命中/域缓存命中都会 spawn 一个
+    预热 task(router 侧还 × fanout),它们在同一时刻各自看到"桶是空的",各自补到
+    cap —— 实际连接数远超 conn_pool_total,而 conn_pool_per_proxy 在第二阶段完全
+    没被检查。
+    """
+
+    class _FakeWriter:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+        async def wait_closed(self):
+            pass
+
+        def is_closing(self):
+            return False
+
+    def _pools(self, total=4, per_proxy=8, refill_target=2, proxies=2):
+        from auto_squid.pools import ConnectionPools
+        store = ProxyStore()
+        for i in range(proxies):
+            store.add(ProxyInfo(id=f'p{i}', host=f'10.0.0.{i + 1}', port=3128))
+        # pause_minutes=0:不启用空闲暂停,refill/预热照常。
+        return ConnectionPools(store, True, per_proxy, total, 180.0, 5.0,
+                               refill_target, 1.0, True, pause_minutes=0.0)
+
+    def _gate_open(self, monkeypatch):
+        """把 open_connection 换成"全部卡在途"的假建连,便于观察并发窗口。"""
+        gate = asyncio.Event()
+
+        async def fake_open(host, port):
+            await gate.wait()
+            return object(), self._FakeWriter()
+
+        monkeypatch.setattr(asyncio, "open_connection", fake_open)
+        return gate
+
+    @pytest.mark.asyncio
+    async def test_concurrent_target_prewarm_capped_by_total(self, monkeypatch):
+        gate = self._gate_open(monkeypatch)
+        pools = self._pools(total=4, per_proxy=8)
+        tasks = [asyncio.create_task(
+            pools._target_pool_refill('10.0.0.1', 3128, f't{i}:443', cap=2))
+            for i in range(10)]
+        await asyncio.sleep(0.05)          # 让全部 task 进入假建连
+        assert pools._pending_creates + pools._total_idle() <= 4, (
+            f"在途+落池 {pools._pending_creates}+{pools._total_idle()} 超出 conn_pool_total")
+        gate.set()
+        await asyncio.gather(*tasks)
+        assert pools._pending_creates == 0
+        assert pools._total_idle() <= 4
+        assert pools._pending_creates_by_key == {}
+        assert pools._pending_creates_by_bucket == {}
+
+    @pytest.mark.asyncio
+    async def test_target_prewarm_respects_per_proxy_cap(self, monkeypatch):
+        """第二阶段以前不查 conn_pool_per_proxy:单个代理可经多 target 桶占满 fd。"""
+        gate = self._gate_open(monkeypatch)
+        pools = self._pools(total=64, per_proxy=2)
+        tasks = [asyncio.create_task(
+            pools._target_pool_refill('10.0.0.1', 3128, f't{i}:443', cap=2))
+            for i in range(10)]
+        await asyncio.sleep(0.05)
+        assert pools._pending_creates <= 2, "每代理上限未作用于目标预热"
+        gate.set()
+        await asyncio.gather(*tasks)
+        assert pools._total_idle() <= 2
+
+    @pytest.mark.asyncio
+    async def test_conn_pool_refill_capped_by_total(self, monkeypatch):
+        gate = self._gate_open(monkeypatch)
+        pools = self._pools(total=3, per_proxy=2, refill_target=2, proxies=2)
+        refill = asyncio.create_task(pools._conn_pool_refill())
+        await asyncio.sleep(0.05)
+        assert pools._pending_creates + pools._total_idle() <= 3
+        gate.set()
+        await refill
+        assert pools._total_idle() <= 3
+
+    @pytest.mark.asyncio
+    async def test_cancelled_prewarm_releases_budget(self, monkeypatch):
+        """被取消的预热必须归还在途额度:CancelledError 不是 OSError,
+        少一次配对就永久占住预算,池子从此不再预热。"""
+        started = asyncio.Event()
+        hang = asyncio.Event()
+
+        async def fake_open(host, port):
+            started.set()
+            await hang.wait()               # 永不返回,等 task 被取消
+            return object(), self._FakeWriter()
+
+        monkeypatch.setattr(asyncio, "open_connection", fake_open)
+        pools = self._pools(total=8, per_proxy=8)
+        t = asyncio.create_task(pools._target_pool_refill('10.0.0.1', 3128, 'a:443', cap=2))
+        await started.wait()
+        t.cancel()
+        await asyncio.gather(t, return_exceptions=True)
+        assert pools._pending_creates == 0
+        assert pools._pending_creates_by_key == {}
+        assert pools._pending_creates_by_bucket == {}
+        # 预算仍在:后续预热可以再建(未被幽灵占用)。
+        assert pools._budget_left('10.0.0.1:3128') == 8
+
+    @staticmethod
+    def _live_by_proxy(pools):
+        """直接从两池数出每代理存活连接(计数的对照真值)。"""
+        out = {}
+        for pool in (pools._conn_pool, pools._target_pool):
+            for key, stack in pool.items():
+                pk = pools._proxy_of(key)
+                out[pk] = out.get(pk, 0) + len(stack)
+        return out
+
+    @pytest.mark.asyncio
+    async def test_per_proxy_counter_matches_pools(self, monkeypatch):
+        """_proxy_conn_count 是 conn_pool_per_proxy 的唯一依据,必须与池内容一致。
+
+        落池(+1)、取用(-1)、废弃丢弃(-1)、prune 过期(批量 -1)四类出口都要配对,
+        任何一处漏掉都会让上限单向漂移(要么形同虚设,要么永久占满不再预热)。
+        """
+        gate = self._gate_open(monkeypatch)
+        gate.set()
+        pools = self._pools(total=64, per_proxy=8, refill_target=2)
+        await pools._target_pool_refill('10.0.0.1', 3128, 'a:443', cap=2)
+        await pools._target_pool_refill('10.0.0.1', 3128, 'b:443', cap=2)
+        await pools._conn_pool_refill()
+        assert pools._proxy_conn_count == self._live_by_proxy(pools)
+
+        # 取用一条(离池)。
+        got = pools._target_pool_peek('10.0.0.1', 3128, 'a:443')
+        assert got is not None
+        assert pools._proxy_conn_count == self._live_by_proxy(pools)
+
+        # 已关闭的废弃连接被 _pool_peek 顺手丢弃,也要扣(用一个此前无量的代理键)。
+        dead_key = '10.0.9.9:3128'
+
+        class _Dead:
+            def is_closing(self):
+                return True
+
+            def close(self):
+                pass
+
+            async def wait_closed(self):
+                pass
+
+        pools._conn_pool[dead_key] = [(object(), _Dead()), (object(), _Dead())]
+        pools._count_put(dead_key, 2)
+        assert pools._proxy_conn_count.get(dead_key) == 2
+        assert pools._conn_pool_peek('10.0.9.9', 3128) is None
+        assert dead_key not in pools._proxy_conn_count, "废弃连接未从计数扣减"
+
+        # prune:把所有连接判为过期,批量离池后计数应清零。
+        pools.conn_pool_idle_timeout = 0.0
+        pools.cluster_pool_idle_timeout = 0.0
+        for stack in list(pools._target_pool.values()) + list(pools._conn_pool.values()):
+            for _r, w in stack:
+                w._conn_pool_created = 0.0
+        await pools._pool_prune()
+        assert pools._proxy_conn_count == {}, f"prune 后计数未归零: {pools._proxy_conn_count}"
+        assert self._live_by_proxy(pools) == {}
+
+
 class TestConnPoolIdlePause:
     """refill 空闲感知(conn_pool.refill_pause_minutes):连续 N 分钟无"密集活动"
     (窗口内 ≥ 阈值个客户端请求成簇)则挂起 refill/目标预热,避免深夜空闲期

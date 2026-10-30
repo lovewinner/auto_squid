@@ -95,6 +95,16 @@ class ConnectionPools:
         self.cluster_predict_enabled = bool(cluster_predict)
         # {proxy_url: [StreamWriter,...]} —— 空闲预热连接。只由事件循环线程读写。
         self._conn_pool: dict = {}
+        # 在途建连计数(键:全局 / 按桶):用于把"已经发起但还没落池"的连接也算进
+        # 预算。建连前 +1、落池或失败后 -1(见 _begin_create/_end_create)。
+        self._pending_creates = 0
+        self._pending_creates_by_key: dict = {}
+        self._pending_creates_by_bucket: dict = {}
+        # 每代理**已落池**的连接数(第一阶段通用池 + 第二阶段各 target 桶合计)。
+        # conn_pool_per_proxy 是"单个代理最多吃掉多少 fd"的公平上限;没有这张表,
+        # 第二阶段只能按 (proxy|target) 桶看,一个代理靠多桶各自补 cap 就能把
+        # 全局预算整块占走。由 _count_put/_count_take 在所有增删点成对维护。
+        self._proxy_conn_count: dict = {}
         self.conn_pool_creates = 0      # 累计预热建连次数
         self.conn_pool_hits = 0         # 池中取用成功次数
         self.conn_pool_misses = 0       # 取池未中需新建的次数
@@ -137,22 +147,57 @@ class ConnectionPools:
     # ── 建连 / 收尾 / 取用热路径 ────────────────────────────────
 
     @staticmethod
-    def _pool_peek(pool: dict, key: str) -> Optional[Tuple[asyncio.StreamReader, asyncio.StreamWriter]]:
+    def _proxy_of(pool_key: str) -> str:
+        """池键 → 所属代理键:第一阶段 "host:port",第二阶段 "host:port|target"。"""
+        return pool_key.partition('|')[0]
+
+    def _count_put(self, pool_key: str, n: int = 1) -> None:
+        """记录 n 条连接落池(与 _count_take 成对;prune 传批量数量)。"""
+        if n <= 0:
+            return
+        pk = self._proxy_of(pool_key)
+        self._proxy_conn_count[pk] = self._proxy_conn_count.get(pk, 0) + n
+
+    def _count_take(self, pool_key: str, n: int = 1) -> None:
+        """记录 n 条连接离池:被取用、被当作废弃丢弃、被 prune 过期关闭。"""
+        if n <= 0:
+            return
+        pk = self._proxy_of(pool_key)
+        left = self._proxy_conn_count.get(pk, 0) - n
+        if left > 0:
+            self._proxy_conn_count[pk] = left
+        else:
+            self._proxy_conn_count.pop(pk, None)
+
+    def _pool_peek(self, pool: dict, key: str) -> Optional[Tuple[asyncio.StreamReader, asyncio.StreamWriter]]:
         """从预热池取一条空闲连接 (reader, writer);无则返回 None。
 
         连接在取用后由调用方发 CONNECT,隧道结束即关闭(不归还——CONNECT 后
         socket 已被隧道占用)。池中存 (reader, writer) 对:asyncio 的
         get_extra_info('reader') 不可靠,必须由建连处成对保存。
+
+        改成实例方法(不再是 staticmethod)的唯一理由:取用与"顺手丢弃已关闭的
+        废弃连接"都要从每代理计数里扣,静态方法拿不到 self。
         """
         stack = pool.get(key)
+        if not stack:
+            return None
+        discarded = 0
+        found = None
         while stack:
-            reader, writer = stack.pop()
-            if writer.is_closing():
+            item = stack.pop()
+            if item[1].is_closing():
+                discarded += 1
                 continue  # 已关闭的废弃连接直接丢弃
-            return reader, writer
-        if stack is not None and not stack:
+            found = item
+            break
+        if discarded:
+            self._count_take(key, discarded)
+        if found is not None:
+            self._count_take(key, 1)     # 取用即离池(调用方随后 CONNECT 占用它)
+        if not stack:
             pool.pop(key, None)
-        return None
+        return found
 
     def _conn_pool_peek(self, proxy_host: str, proxy_port: int) -> Optional[Tuple[asyncio.StreamReader, asyncio.StreamWriter]]:
         """从预热池取一条到该上游的空闲连接 (reader, writer);无则返回 None。
@@ -276,9 +321,56 @@ class ConnectionPools:
 
         #14(拆 pools.py)统一 #2 三处手写预算快照(conn_pool_refill /
         target_pool_refill / relay_tunnel 归还),消除对两池 dict 的两段重复求和。
+
+        注意:这是"已落池"的数量,不含在途建连(_pending_creates)。任何预算判断
+        都要用 `_budget_left()`,否则并发预热的多个 task 会各自看到同一份过期快照。
         """
         return (sum(len(v) for v in self._conn_pool.values())
                 + sum(len(v) for v in self._target_pool.values()))
+
+    def _budget_left(self, proxy_key: str = "") -> int:
+        """还能新建几条连接(全局预算,并把**在途建连**算进占用)。
+
+        旧实现在 `await open_connection()` 之前把 `_total_idle()` 取一次快照,循环
+        里只自增本地变量、从不重读池:每个 CONNECT 胜出/粘性命中/域缓存命中都会
+        spawn 一个预热带出(router 侧再 × fanout),这些 task 在同一时刻各自看到
+        "桶是空的",各自补到 cap —— 实际连接数可以远超 conn_pool_total(默认 64),
+        而 conn_pool_per_proxy 在第二阶段根本没被检查。
+        proxy_key 非空时再叠加"该代理在途"的约束(conn_pool_per_proxy)。
+        """
+        room = self.conn_pool_total - self._total_idle() - self._pending_creates
+        if proxy_key:
+            have = (self._proxy_conn_count.get(proxy_key, 0)
+                    + self._pending_creates_by_key.get(proxy_key, 0))
+            room = min(room, self.conn_pool_per_proxy - have)
+        return max(0, room)
+
+    def _begin_create(self, proxy_key: str, bucket_key: str = "") -> None:
+        """登记一次在途建连(在 await open_connection **之前**)。
+
+        proxy_key 用于全局/每代理预算,bucket_key(第二阶段才有)用于该
+        (proxy,target) 桶的水位 cap —— 两个粒度都会被并发预热同时"看到空桶"。
+        """
+        self._pending_creates += 1
+        self._pending_creates_by_key[proxy_key] = self._pending_creates_by_key.get(proxy_key, 0) + 1
+        if bucket_key:
+            self._pending_creates_by_bucket[bucket_key] = \
+                self._pending_creates_by_bucket.get(bucket_key, 0) + 1
+
+    def _end_create(self, proxy_key: str, bucket_key: str = "") -> None:
+        """在途建连结束(落池或失败),与 _begin_create 严格配对(放在 finally)。"""
+        self._pending_creates -= 1
+        left = self._pending_creates_by_key.get(proxy_key, 0) - 1
+        if left > 0:
+            self._pending_creates_by_key[proxy_key] = left
+        else:
+            self._pending_creates_by_key.pop(proxy_key, None)
+        if bucket_key:
+            bleft = self._pending_creates_by_bucket.get(bucket_key, 0) - 1
+            if bleft > 0:
+                self._pending_creates_by_bucket[bucket_key] = bleft
+            else:
+                self._pending_creates_by_bucket.pop(bucket_key, None)
 
     async def _conn_pool_refill(self):
         """补充第一阶段预热连接到目标水位(后台 refill task 周期调用)。
@@ -292,31 +384,30 @@ class ConnectionPools:
         # 空闲暂停:深夜无请求时挂起补充,避免"建了又过期"的空转。
         if self._conn_pool_idle():
             return
-        # 快照当前空闲总数,防止并发补充超过全局预算(两池共享 conn_pool_total)。
-        total_idle = self._total_idle()
         for proxy in self.proxy_store.list():
             if not proxy.enabled:
                 continue
             key = f"{proxy.host}:{proxy.port}"
-            have = len(self._conn_pool.get(key, []))
-            need = self.conn_pool_refill_target - have
-            if need <= 0 or total_idle >= self.conn_pool_total:
-                continue
-            need = min(need, self.conn_pool_total - total_idle,
-                       self.conn_pool_per_proxy - have)
-            for _ in range(max(0, need)):
+            # 逐条重读预算(含在途建连):旧写法在 await 之前取一次快照、循环里只自增
+            # 本地计数,并发补充会一起越过 conn_pool_total / conn_pool_per_proxy。
+            while len(self._conn_pool.get(key, [])) < self.conn_pool_refill_target:
+                if self._budget_left(key) <= 0:
+                    return          # 全局预算用尽:后续代理也补不动,直接收工
+                self._begin_create(key)
                 try:
                     reader, writer = await asyncio.wait_for(
                         asyncio.open_connection(proxy.host, proxy.port),
                         timeout=self.conn_pool_connect_timeout)
                 except (asyncio.TimeoutError, OSError, ConnectionError):
-                    break
+                    break           # 该上游临时不可达,跳过它(下轮 refill 再试)
+                finally:
+                    # finally 保证与 _begin_create 配对:CancelledError 不是 OSError,
+                    # 漏减一次就永久占住全局预算,refill 从此不再建连。
+                    self._end_create(key)
                 writer._conn_pool_created = time.monotonic()
                 self._conn_pool.setdefault(key, []).append((reader, writer))
+                self._count_put(key)
                 self.conn_pool_creates += 1
-                total_idle += 1
-                if total_idle >= self.conn_pool_total:
-                    break
 
     async def _target_pool_refill(self, proxy_host: str, proxy_port: int, target: str,
                                   cap: int = 2, source: str = 'passive'):
@@ -340,11 +431,14 @@ class ConnectionPools:
         # 空闲暂停:无请求期间不发起目标预热(省建连;已有半连接照常可复用)。
         if self._conn_pool_idle():
             return 0
-        key = f"{proxy_host}:{proxy_port}|{target}"
-        # 全局 fd 预算:两池共享 conn_pool_total,超限则不补。
-        total_idle = self._total_idle()
+        proxy_key = f"{proxy_host}:{proxy_port}"
+        key = f"{proxy_key}|{target}"
         made = 0
-        while len(self._target_pool.get(key, [])) < cap and total_idle < self.conn_pool_total:
+        # 逐条重读:桶水位要算上"在途还没落池"的建连,全局/每代理预算亦然。
+        while (len(self._target_pool.get(key, []))
+               + self._pending_creates_by_bucket.get(key, 0) < cap
+               and self._budget_left(proxy_key) > 0):
+            self._begin_create(proxy_key, key)
             try:
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(proxy_host, proxy_port),
@@ -354,6 +448,10 @@ class ConnectionPools:
                 logger.info("target prewarm CONNECT-FAIL %s via %s:%s (failed=%d)",
                             target, proxy_host, proxy_port, self.target_prewarm_failed)
                 break
+            finally:
+                # 放在 finally:CancelledError(stop() 取消预热 task / 客户端断连)不是
+                # OSError,漏配对一次就永久占住预算,池子从此不再预热。
+                self._end_create(proxy_key, key)
             writer._conn_pool_created = time.monotonic()
             if source == 'cluster':
                 writer._cluster_prewarmed = True
@@ -362,10 +460,10 @@ class ConnectionPools:
                 # 时据此分诊"时序没赶上"(标记存在)vs"代理桶不匹配"(标记缺失)。
                 self._target_pool_cluster_ever[key] = 1
             self._target_pool.setdefault(key, []).append((reader, writer))
+            self._count_put(key)
             self.target_pool_creates += 1
             self.target_prewarm_success += 1
             made += 1
-            total_idle += 1
         if made:
             # DEBUG:预建是"每次命中/胜出都会发生"的常规后台事件,不是异常。实测
             # 生产 10 天日志里这一类占全部日志约 30%(单条最高),把真信号(失败/
@@ -430,6 +528,9 @@ class ConnectionPools:
                                 self.cluster_pool_consumed_expired += 1
                         continue
                     alive.append(item)
+                # 离池数量 = 原栈长 − 存活数(过期关闭 + 废弃丢弃都算),
+                # 必须同步扣每代理计数,否则 conn_pool_per_proxy 只增不减。
+                self._count_take(key, len(stack) - len(alive))
                 if alive:
                     pool[key] = alive
                 else:
@@ -477,6 +578,12 @@ class ConnectionPools:
         stacks = list(self._conn_pool.values()) + list(self._target_pool.values())
         self._conn_pool.clear()
         self._target_pool.clear()
+        # 池整体清空:每代理计数与在途登记一起归零(留旧值会让重建后的池误判
+        # "预算已被占满",从此不再预热)。
+        self._proxy_conn_count.clear()
+        self._pending_creates = 0
+        self._pending_creates_by_key.clear()
+        self._pending_creates_by_bucket.clear()
         for stack in stacks:
             for item in stack:
                 reader, writer = item
