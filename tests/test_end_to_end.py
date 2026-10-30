@@ -6680,6 +6680,114 @@ class TestConnectTargetValidation:
             await proxy_srv.wait_closed()
 
 
+class TestTaskLifecycle:
+    """后台 task 与隧道的生命周期必须有界:挂死/孤儿都会静默改变路由行为。"""
+
+    def _router(self, port=10823, **kw):
+        store = ProxyStore()
+        store.add(ProxyInfo(id='a', host='127.0.0.1', port=31991))
+        store.add(ProxyInfo(id='b', host='127.0.0.1', port=31992))
+        return make_router(store, listen_host='127.0.0.1', listen_port=port,
+                           db_path=tempfile.mktemp(suffix='.db'), **kw)
+
+    @pytest.mark.asyncio
+    async def test_probe_round_timeout_cancels_stalled_probe(self, monkeypatch):
+        """一个卡住的探活不能永久停掉 _probe_task。
+
+        _probe_all 原本是无超时的 gather:某上游半开(accept 但不响应、drain 阻塞)
+        时,探活循环从此不再返回,熔断恢复与 EWMA 更新静默失效,且没有任何日志
+        说明"为什么代理不恢复"。
+        """
+        router = self._router()
+        monkeypatch.setattr("auto_squid.router._PROBE_ROUND_TIMEOUT", 0.2)
+        finished = []
+
+        async def probe_stub(proxy):
+            if proxy.id == 'a':
+                await asyncio.sleep(30)          # 模拟被半开上游挂住
+            finished.append(proxy.id)
+
+        monkeypatch.setattr(router, '_probe_proxy', probe_stub)
+        await asyncio.wait_for(router._probe_all(), timeout=5)
+        assert finished == ['b'], "整轮探活被单个卡住的探活拖死"
+
+    @pytest.mark.asyncio
+    async def test_cancelling_tunnel_handler_cancels_pipe_tasks(self):
+        """_relay_tunnel 的两个 _pipe 不能成为孤儿 task。
+
+        外层被取消(stop / 客户端 RST)时 asyncio.wait 不会取消已在跑的子 task:
+        两个 _pipe 各自等到自己的 300s 读超时,期间持有双端 socket,而且既不
+        在 _running_tasks 也不在 _pending_cleanups,stop() 无从收敛。
+        """
+        class _IdleReader:
+            async def read(self, n=-1):
+                await asyncio.sleep(3600)
+                return b''
+
+        class _Writer:
+            def __init__(self):
+                self.closed = False
+
+            def write(self, data):
+                pass
+
+            async def drain(self):
+                pass
+
+            def close(self):
+                self.closed = True
+
+            async def wait_closed(self):
+                pass
+
+        router = self._router(port=10824)
+        up_w = _Writer()
+        task = asyncio.create_task(router._relay_tunnel(
+            _IdleReader(), up_w, _IdleReader(), _Writer(),
+            None, None, 'target.example:443', pid='a'))
+        await asyncio.sleep(0.05)                    # 让两个 _pipe 起来
+        orphans = [t for t in asyncio.all_tasks() if t.get_name().startswith('pipe-')]
+        assert len(orphans) == 2, f"隧道应有两个 pipe task: {orphans}"
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        still_running = [t for t in asyncio.all_tasks()
+                         if t.get_name().startswith('pipe-') and not t.done()]
+        assert still_running == [], f"取消隧道后仍有孤儿 pipe 在跑: {still_running}"
+        assert up_w.closed
+
+    @pytest.mark.asyncio
+    async def test_stop_closes_clients_only_after_handlers_exit(self, monkeypatch):
+        """stop() 必须先取消 handler,再关 httpx client 池。
+
+        旧顺序下在途 handler 会在 client 池已关的情况下继续跑,经 `_get_client`
+        重建 client 放回池里(这批再无人关闭),并只抛 RuntimeError 而不是干净的
+        CancelledError。
+        """
+        router = self._router(port=10825)
+        order = []
+
+        async def handler():
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                order.append('handler_exit')
+                raise
+
+        t = asyncio.create_task(handler())
+        await asyncio.sleep(0)                       # 让 task 真正开始
+        router._running_tasks.add(t)
+
+        original = router._aclose_all_clients
+
+        async def spy():
+            order.append('aclose_clients')
+            return await original()
+
+        monkeypatch.setattr(router, '_aclose_all_clients', spy)
+        await asyncio.wait_for(router.stop(), timeout=30)
+        assert order == ['handler_exit', 'aclose_clients'], order
+
+
 @pytest.mark.asyncio
 async def test_aggregation_wait_timeout_is_second_scale():
     """#8: 聚合等待超时必须提升到秒级(而非 100ms 形同虚设)。

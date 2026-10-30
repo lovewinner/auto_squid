@@ -137,6 +137,10 @@ _STAGGER_MAX_MS = 2000
 _PROBE_INTERVAL_DEFAULT = 30.0
 _PROBE_CANARY_DEFAULT = "1.1.1.1:443"
 _PROBE_TIMEOUT = 4.0
+# 单轮探活的兜底上限(远大于单代理预算:建连+握手+GET 各 4~15s)。只在"某个探活
+# 卡住"时触发:没有它,一个半开上游就能让 _probe_task 永久停摆(熔断恢复、EWMA
+# 更新无声失效)。
+_PROBE_ROUND_TIMEOUT = 90.0
 
 # Hop-by-hop 请求头：只服务于"客户端→本代理"这一跳，绝不能转发给上游。
 # 特别是 Proxy-Authorization——若把客户端访问本代理的凭据透传到上游，
@@ -1412,7 +1416,20 @@ class Router:
         if not proxies:
             return
         tasks = [asyncio.create_task(self._probe_proxy(p)) for p in proxies]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            # 整轮兜底超时:单个探活卡住(半开上游让 drain 阻塞等)不能永久停掉
+            # _probe_task —— 那会让熔断恢复与 EWMA 更新无声失效。
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True),
+                                   timeout=_PROBE_ROUND_TIMEOUT)
+        except asyncio.TimeoutError:
+            for t in tasks:
+                t.cancel()
+            # gather(return_exceptions) 排空被取消的 task,避免 "Task was destroyed
+            # but it is pending" 与未 retrieval 的异常。
+            await asyncio.gather(*tasks, return_exceptions=True)
+            logger.warning("probe round timed out after %.0fs (%d proxies) — "
+                           "circuit recovery may be stale until next round",
+                           _PROBE_ROUND_TIMEOUT, len(proxies))
 
     async def _probe_proxy(self, proxy):
         """对单个代理发起一次 CONNECT 探活:经该上游 CONNECT 到其 canary 后关闭。
@@ -1458,7 +1475,11 @@ class Router:
                 f"CONNECT {canary} HTTP/1.1\r\nHost: ".encode('latin-1') + _hb(canary) + f"\r\n{auth_hdr}\r\n".encode('latin-1'))
             await up_writer.drain()
             status = await asyncio.wait_for(up_reader.readline(), timeout=_PROBE_TIMEOUT)
-            if not status or b'200' not in status:
+            # 精确解析状态码:子串判断 `b'200' in status` 会把 "HTTP/1.1 50200 ..."
+            # 之类的畸形行也算成功,且与 _handle_connect 里逐字段解析的写法不一致。
+            status_fields = status.split(b' ', 2)
+            code = status_fields[1] if len(status_fields) > 1 else b''
+            if not (code.isdigit() and int(code) == 200):
                 raise RuntimeError(f'probe CONNECT failed: status={status!r}')
             self.selector.record_ttfb(proxy.id, time.perf_counter() - t0)
             self.selector.record_success(proxy.id)
@@ -1473,11 +1494,10 @@ class Router:
             self.selector.record_failure(proxy.id)
             self.probes_failed += 1
         finally:
-            try:
-                up_writer.close()
-                await up_writer.wait_closed()
-            except Exception:
-                pass
+            # 有上限的关闭:此前是无超时 `await up_writer.wait_closed()`。半开上游
+            # 不回 FIN 时这一句永久挂住,而它跑在 _probe_task 里 —— 从此探活再也不
+            # 执行,熔断恢复与 EWMA 更新静默失效(没有任何日志说明"为什么不恢复")。
+            await self._close_stream_writer(up_writer)
 
     async def _maybe_probe_get(self, proxy) -> None:
         """按需发起一次轻量 GET 探活(Phase 4):白名单轮转 + 每(代理,目标)限速率。
@@ -3947,15 +3967,22 @@ class Router:
         # 即返回并取消另一端——客户端断开后不等待上游挂起(上游可能长连不关),
         # 立即进入 finally 决定归还/关闭。原 gather 会等两个 pipe 都结束,
         # 若上游长连不关则归还延迟到其 idle 超时。
+        # 具名持有:pipes 必须在 finally 里被兜底取消(见下方 finally),写在
+        # 集合字面量里会让它们在 handler 被取消时成为无人认领的孤儿 task。
+        pipes = {
+            asyncio.create_task(
+                Router._pipe(client_reader, up_writer,
+                             on_chunk=lambda n: _bytes.__setitem__(0, _bytes[0] + n)),
+                name=f"pipe-up {target}"),
+            asyncio.create_task(
+                Router._pipe(up_reader, client_writer,
+                             on_chunk=lambda n: (_ofb.__setitem__(0, time.perf_counter())
+                                                 if _ofb[0] is None else None,
+                                                 _bytes.__setitem__(1, _bytes[1] + n))),
+                name=f"pipe-down {target}"),
+        }
         try:
-            done, pending = await asyncio.wait(
-                {asyncio.create_task(Router._pipe(client_reader, up_writer,
-                                                  on_chunk=lambda n: _bytes.__setitem__(0, _bytes[0] + n))),
-                 asyncio.create_task(Router._pipe(up_reader, client_writer,
-                                                  on_chunk=lambda n: (_ofb.__setitem__(0, time.perf_counter())
-                                                                      if _ofb[0] is None else None,
-                                                                      _bytes.__setitem__(1, _bytes[1] + n))))},
-                return_when=asyncio.FIRST_COMPLETED)
+            done, pending = await asyncio.wait(pipes, return_when=asyncio.FIRST_COMPLETED)
             for t in pending:
                 t.cancel()
             # 审计 P2#6:被取消的 pipe task 必须 await 排空,否则其 CancelledError
@@ -3970,6 +3997,17 @@ class Router:
                 except (asyncio.CancelledError, Exception):
                     pass
         finally:
+            # 兜底取消两个方向:handler 被取消(stop / 客户端 RST)时 asyncio.wait
+            # 抛出的是外层 CancelledError,**不会**取消已在跑的子 task,两个 _pipe
+            # 会各自等到自己的 300s 读超时,期间持有双端 socket,而且既不在
+            # _running_tasks 也不在 _pending_cleanups —— stop() 无从收敛。
+            # 对已完成的 task 调 cancel() 是 no-op,重复 gather 亦幂等。
+            for t in pipes:
+                t.cancel()
+            try:
+                await asyncio.gather(*pipes, return_exceptions=True)
+            except (asyncio.CancelledError, Exception):
+                pass
             # HTTPS 隧道的吞吐/累计字节:以双向透传总字节 / 隧道存活时长估算。
             # 与 HTTP 的 body 转发耗时语义不同(此处是整条隧道寿命,而非单响应
             # body 下载),但足以反映该代理对该 target 的真实中转速率,填补此前
@@ -3989,11 +4027,7 @@ class Router:
                     self.selector.record_complete(pid, total, duration, domain=target)
             # 上游连接必须在此关闭(隧道不再归还任何池)。close 后最多等 0.5s:
             # 对端可能挂起不关,3.12 的 wait_closed() 严格等 FIN 会挂死。
-            try:
-                up_writer.close()
-                await asyncio.wait_for(up_writer.wait_closed(), timeout=0.5)
-            except Exception:
-                pass
+            await self._close_stream_writer(up_writer)
 
     async def _local_direct_connect(self, target: str, client_reader: asyncio.StreamReader,
                                     client_writer: asyncio.StreamWriter, client_ip: str = ""):
@@ -4110,21 +4144,33 @@ class Router:
         loop.set_exception_handler(_handler)
 
     async def stop(self):
-        """优雅关闭:停止接受新连接 → 最终 flush 落盘 → 关闭连接池 →
-        取消并等待在途连接 → 取消 flush task → 关闭 DB。
+        """优雅关闭:停止接受新连接 → 取消并等待在途连接 → 排空后台清理 →
+        关闭上游/预热连接池 → 最终 flush 落盘 → 取消 flush/探活 task → 关闭 DB。
 
-        先关 _server(不再接受新连接),做一次最终 flush 把残留统计落盘,
-        关闭上游连接池;再取消所有正在处理的 handle_client task 并等待其退出
-        (此时它们已无法再写库);最后停止 flush task 并 _db.close()。
+        顺序里有两个"必须先"的约束:
+
+        1. **handler 先于连接池关闭**。先前是 `_aclose_all_clients()` 在前、取消
+           handler 在后:在途 handler 随后仍会经 `_get_client` 重建 client 并放回
+           池里(这批再无人关闭),同时面对正在关闭的 client 只会抛 RuntimeError
+           而不是干净的 CancelledError。
+        2. **handler 先于最终 flush**。取消后它们不再写内存,残量统计才能一次
+           性落盘,而不是 flush 之后又来一批"落不下去"的增量。
         """
         if self._server:
             self._server.close()
             await self._server.wait_closed()
-        # 最终 flush:把内存里尚未落盘的统计/元数据写库。
-        try:
-            self._flush_to_db()
-        except Exception:
-            logger.exception("final flush failed")
+        # 停止接受新连接后，取消仍在处理的客户端连接 task 并等待它们退出，
+        # 避免在 _db.close() 之后还有在途请求尝试写库而报错。
+        for t in list(self._running_tasks):
+            t.cancel()
+        if self._running_tasks:
+            await asyncio.gather(*self._running_tasks, return_exceptions=True)
+            self._running_tasks.clear()
+        # 排空竞速败者的后台清理 task:它们正在 aclose 流式 resp / 关上游裸连接,
+        # 必须在 _db.close() 前完成,否则连接泄漏(ResourceWarning)。
+        if self._pending_cleanups:
+            await asyncio.gather(*self._pending_cleanups, return_exceptions=True)
+            self._pending_cleanups.clear()
         # 关闭上游连接池(归还所有 keep-alive 连接)。
         await self._aclose_all_clients()
         # 关闭 CONNECT 预热池(P1):停补充循环,关闭全部预热连接。
@@ -4135,18 +4181,11 @@ class Router:
         # 请求簇预测预热:停用即清空瞬态窗口与共现图(簇是瞬态观察,不落盘)。
         if self.cluster.enabled:
             self.cluster.reset()
-        # 排空竞速败者的后台清理 task:它们正在 aclose 流式 resp / 关上游裸连接,
-        # 必须在 _db.close() 前完成,否则连接泄漏(ResourceWarning)。
-        if self._pending_cleanups:
-            await asyncio.gather(*self._pending_cleanups, return_exceptions=True)
-            self._pending_cleanups.clear()
-        # 停止接受新连接后，取消仍在处理的客户端连接 task 并等待它们退出，
-        # 避免在 _db.close() 之后还有在途请求尝试写库而报错。
-        for t in list(self._running_tasks):
-            t.cancel()
-        if self._running_tasks:
-            await asyncio.gather(*self._running_tasks, return_exceptions=True)
-            self._running_tasks.clear()
+        # 最终 flush:把内存里尚未落盘的统计/元数据写库。
+        try:
+            self._flush_to_db()
+        except Exception:
+            logger.exception("final flush failed")
         if self._flush_task and not self._flush_task.done():
             self._flush_task.cancel()
             try:
