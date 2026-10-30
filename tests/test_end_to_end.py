@@ -1669,6 +1669,121 @@ async def test_stream_chunked_upstream():
 
 
 @pytest.mark.asyncio
+async def test_http10_client_gets_close_delimited_body_not_chunked():
+    """HTTP/1.0 客户端不能收到 chunked 框架:它不认 Transfer-Encoding。
+
+    旧行为是把上游的无长度响应一律套上 HTTP/1.1 chunked 再发给客户端 —— 1.0 客户
+    端(curl --http1.0 / 老工具 / 部分健康检查)会把 "20000\r\n<bytes>\r\n" 这些
+    框架字节当成 body 内容,拿到的是被污染的数据。代理必须向下转换成"关闭定界"
+    (RFC 9112 §2.7)。
+    """
+    proxy_srv = await run_chunked_proxy(HOST, PROXY_PORT)
+    proxy_store = ProxyStore()
+    proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        reader, writer = await asyncio.open_connection(HOST, ROUTER_PORT)
+        writer.write(b"GET http://chunk10.example.com/ HTTP/1.0\r\n"
+                     b"Host: chunk10.example.com\r\n\r\n")
+        await writer.drain()
+        status = await asyncio.wait_for(reader.readline(), timeout=10)
+        assert b'200' in status, status
+        assert status.startswith(b'HTTP/1.0'), f"应答版本须跟随请求: {status!r}"
+        raw_headers = b''
+        while True:
+            h = await asyncio.wait_for(reader.readline(), timeout=10)
+            if not h or h in (b"\r\n", b"\n"):
+                break
+            raw_headers += h
+        low = raw_headers.lower()
+        assert b'transfer-encoding' not in low, raw_headers
+        assert b'content-length' not in low, raw_headers
+        # 关闭定界:读到 EOF 即结束,拿到的必须是干净的 2MB 原文(没有框架字节)。
+        body = await asyncio.wait_for(reader.read(), timeout=20)
+        assert len(body) == 2 * 1024 * 1024, f"body 长度不对(疑似混入 chunk 框架): {len(body)}"
+        assert body == b"A" * (2 * 1024 * 1024)
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
+
+async def run_mock_proxy_head(host, port, declared):
+    """HEAD mock:按 RFC 只回 Content-Length(与 GET 同值)**不带 body**。"""
+    async def handle(reader, writer):
+        try:
+            await reader.readline()
+            while True:
+                h = await reader.readline()
+                if not h or h in (b"\r\n", b"\n"):
+                    break
+            writer.write(f"HTTP/1.1 200 OK\r\nContent-Length: {declared}\r\n"
+                         f"\r\n".encode('latin-1'))
+            await writer.drain()
+            await asyncio.sleep(0.05)          # 让代理有时间读完头并结束
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            try:
+                writer.close()
+            except Exception:
+                pass
+    return await asyncio.start_server(handle, host=host, port=port)
+
+
+@pytest.mark.asyncio
+async def test_head_with_content_length_is_not_reported_truncated():
+    """HEAD 响应没有 body 是**正确的**,不能记成"上游截断"。
+
+    旧实现按 content-length 比对已转发字节:HEAD 永远读到 0 字节,于是每个 HEAD
+    都刷一条 "truncated upstream response" 告警(假信号),并把响应判为不完整。
+    """
+    declared = 12345
+    proxy_srv = await run_mock_proxy_head(HOST, PROXY_PORT, declared)
+    proxy_store = ProxyStore()
+    proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    records = []
+
+    class _Cap(logging.Handler):
+        def emit(self, rec):
+            records.append(rec.getMessage())
+
+    lg = logging.getLogger('auto_squid.router')
+    h = _Cap()
+    lg.addHandler(h)
+    try:
+        reader, writer = await asyncio.open_connection(HOST, ROUTER_PORT)
+        writer.write(b"HEAD http://heady.example.com/ HTTP/1.1\r\n"
+                     b"Host: heady.example.com\r\n\r\n")
+        await writer.drain()
+        status = await asyncio.wait_for(reader.readline(), timeout=10)
+        assert b'200' in status, status
+        cl = None
+        while True:
+            line = await asyncio.wait_for(reader.readline(), timeout=10)
+            if not line or line in (b"\r\n", b"\n"):
+                break
+            if line.lower().startswith(b'content-length:'):
+                cl = int(line.split(b':', 1)[1])
+        assert cl == declared, f"HEAD 应把上游声明的长度透给客户端: {cl}"
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        lg.removeHandler(h)
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+    assert not [m for m in records if 'truncated' in m], records
+
+
+@pytest.mark.asyncio
 async def test_stream_large_response_with_content_length():
     """A large upstream response with Content-Length must stream through
     byte-for-byte without being fully buffered server-side (content-length

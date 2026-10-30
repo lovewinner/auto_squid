@@ -3016,6 +3016,11 @@ class Router:
             await self._write_cached_response(writer, 400, 'Bad Request', {}, b'Bad Request')
             return False
         method, url, version = parts
+        # 记下客户端的请求版本,供响应侧降级(见 _stream_upstream_response)。HTTP/1.0
+        # 客户端不认 Transfer-Encoding,给它套 chunked 就是把分块框架字节当 body 内容
+        # 显示出来。打在 writer 上与本仓既有的连接级 tag 一致(如 _conn_pool_created),
+        # 省掉把版本穿过 _dispatch_single/_forward_single/缓存命中三层签名。
+        writer._client_http10 = version.upper() != 'HTTP/1.1'
         # Transfer-Encoding 优先于 Content-Length(RFC 9112 §6.1):两者同时出现是
         # 请求走私的经典形态,按下文解码后必须重写 CL,否则上游按客户端的旧 CL 解读。
         te_tokens = {t.strip().lower()
@@ -3810,7 +3815,8 @@ class Router:
         重复)但单独按上游原值重写一条 content-length(aiter_raw 给的是已编码
         原始字节,与该值语义一致,长度正确);否则用 HTTP/1.1 chunked 传输编码
         逐块写出。两种方式都保证客户端能正确界定 body 边界,且不破坏流式收益。
-
+        例外:客户端用 HTTP/1.0 发来请求时不做 chunked(RFC 9112 §2.7 要求代理
+        向下转换)—— 既不写 TE 也不写长度,由本条响应后关闭连接定界。
         返回 (buffered, streamed, body_duration):
           - buffered:缓冲的 body(若未超上限);超过上限返回 None 表示放弃缓存。
           - streamed / body_duration:实际转发的 body 字节数与 body 转发耗时(秒,
@@ -3836,12 +3842,23 @@ class Router:
             use_chunked = False
         else:
             use_chunked = promised_len is None
+        # HTTP/1.0 客户端不认 chunked(RFC 9112 §2.7 要求代理向下转换):既不给
+        # TE 也不给长度,改由"连接关闭"定界 —— 本条响应后连接必然关闭
+        # (keep-alive 判定只对 HTTP/1.1 为真)。
+        # 注:HEAD 不在此列 —— 正常 HEAD 响应本就没有 body(aiter_raw 不产出字节),
+        # 而若上游违反 RFC 硬塞了 body,保留它原本的自定界框架比抹掉边界更安全
+        # (抹掉后 keep-alive 连接上的下一条请求会读错位)。
+        http10 = bool(getattr(client_writer, '_client_http10', False))
+        if http10:
+            use_chunked = False
         try:
             # 状态行 + 转发头(剔除 hop-by-hop,含 content-length)。
             # 用 multi_items():httpx 的 items() 会把同名头(如多个 Set-Cookie)合并成
             # 逗号拼接的单行值,浏览器据此只解析出第一个 cookie,其余(如 Django 的
             # sessionid)被当未知属性丢弃,导致登录会话丢失。逐条写回保留重复头。
-            client_writer.write(f"HTTP/1.1 {resp.status_code} ".encode('latin-1') + _hb(resp.reason_phrase) + b"\r\n")
+            client_writer.write((b"HTTP/1.0 " if http10 else b"HTTP/1.1 ")
+                                + f"{resp.status_code} ".encode('latin-1')
+                                + _hb(resp.reason_phrase) + b"\r\n")
             for k, v in resp.headers.multi_items():
                 if k.lower() in _HOP_BY_HOP_RESPONSE_HEADERS:
                     continue
@@ -3910,7 +3927,7 @@ class Router:
         # 只能记 warn(URL + 承诺/实际长度)并关闭上游连接,暴露问题。客户端断开不
         # 在此列:断开后循环仍排空上游 body,streamed 会到 CL,不误报。
         complete = not stream_error
-        if promised_len is not None and streamed != promised_len:
+        if promised_len is not None and streamed != promised_len and method != 'HEAD':
             complete = False
             logger.warning("truncated upstream response for %s: content-length=%s, streamed=%d",
                            url, promised_len, streamed)
