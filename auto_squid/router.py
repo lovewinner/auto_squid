@@ -2912,6 +2912,20 @@ class Router:
             await self._write_cached_response(writer, 400, 'Bad Request', {}, b'Bad Request')
             return False
         method, url, version = parts
+        # Transfer-Encoding 优先于 Content-Length(RFC 9112 §6.1):两者同时出现是
+        # 请求走私的经典形态,按下文解码后必须重写 CL,否则上游按客户端的旧 CL 解读。
+        te_tokens = {t.strip().lower()
+                     for t in req_headers.get('transfer-encoding', '').replace(';', ',').split(',')
+                     if t.strip()}
+        if te_tokens - {'chunked'}:
+            # TE 里出现 chunked 之外的编码(gzip/自定义):既不解码,也不能原样
+            # 转发(转发前 hop-by-hop 会剔除 TE,上游会把分块字节当成消息体)。
+            await self._write_cached_response(
+                writer, 501, 'Not Implemented',
+                {'Content-Type': 'text/plain'},
+                _hb(f"Unsupported Transfer-Encoding: {', '.join(sorted(te_tokens))}"))
+            return False
+        chunked = 'chunked' in te_tokens
         cl = req_headers.get('content-length')
         try:
             content_length = int(cl) if cl is not None else 0
@@ -2922,13 +2936,58 @@ class Router:
             await self._write_cached_response(writer, 413, 'Payload Too Large', {}, b'Payload Too Large')
             return False
         # 无长度的写请求无法在持久连接上确定消息边界；明确拒绝而不是读到 EOF。
-        if cl is None and method.upper() in _INVALIDATING_METHODS:
+        if cl is None and not chunked and method.upper() in _INVALIDATING_METHODS:
             await self._write_cached_response(writer, 411, 'Length Required', {}, b'Length Required')
             return False
-        body = await asyncio.wait_for(reader.readexactly(content_length), timeout=_CLIENT_BODY_TIMEOUT) if content_length else b''
+        if chunked:
+            # 以前这里只认 content-length:GET/HEAD 带 chunked 体时按 0 字节读,
+            # 剩下的分块字节留在同一条连接上,被下一轮当成请求行解析 —— 客户端
+            # 与代理的持久连接就此错位(并把上游引到错误边界)。解码失败一律关连接。
+            try:
+                body = await self._read_chunked_body(reader)
+            except Exception as e:
+                logger.debug("client %s bad chunked body: %s", client_ip, type(e).__name__)
+                try:
+                    await self._write_cached_response(
+                        writer, 400, 'Bad Request',
+                        {'Connection': 'close'}, b'Bad Request')
+                except Exception:
+                    pass
+                return False
+            req_headers['content-length'] = str(len(body))
+        else:
+            body = await asyncio.wait_for(reader.readexactly(content_length), timeout=_CLIENT_BODY_TIMEOUT) if content_length else b''
         await self._handle_http_request(method, url, req_headers, body, writer, client_ip)
         connection = {v.strip().lower() for v in req_headers.get('connection', '').split(',')}
         return version.upper() == 'HTTP/1.1' and 'close' not in connection
+
+    async def _read_chunked_body(self, reader) -> bytes:
+        """解码客户端的 chunked 请求体,返回拼装后的原始字节。
+
+        最后一块(0 尺寸)之后的 trailer 头按 RFC 9110 §7.1.2 读到空行丢弃:代理
+        不消费它们,但必须读完才能让连接回到下一个请求的边界。任何格式错误/超限
+        都抛出,由调用方关闭连接(此时字节流位置已不可预测,复用必然错位)。
+        """
+        out = bytearray()
+        while True:
+            line = await asyncio.wait_for(reader.readline(), timeout=_CLIENT_HEADER_TIMEOUT)
+            if not line:
+                raise ConnectionError('connection ended mid-chunk')
+            try:
+                size = int(line.split(b';', 1)[0].strip(), 16)
+            except ValueError:
+                raise ValueError('bad chunk size')
+            if size == 0:
+                while True:
+                    t = await asyncio.wait_for(reader.readline(), timeout=_CLIENT_HEADER_TIMEOUT)
+                    if not t or t in (b'\r\n', b'\n'):
+                        break
+                return bytes(out)
+            if len(out) + size > MAX_BODY:
+                raise ValueError('chunked body exceeds MAX_BODY')
+            out += await asyncio.wait_for(reader.readexactly(size), timeout=_CLIENT_BODY_TIMEOUT)
+            if await asyncio.wait_for(reader.readexactly(2), timeout=_CLIENT_BODY_TIMEOUT) != b'\r\n':
+                raise ValueError('chunk not terminated by CRLF')
 
     # ── HTTP 请求处理 ──────────────────────────────────────────
 

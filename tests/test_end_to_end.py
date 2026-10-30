@@ -701,7 +701,10 @@ async def test_auth_disabled_allows_all():
 
 async def run_header_echo_proxy(host, port):
     """HTTP mock proxy that echoes the request headers it received as the body,
-    so a test can assert which headers were forwarded upstream."""
+    so a test can assert which headers were forwarded upstream. The request body
+    is appended after a '|' separator (empty when there is none), so a test can
+    also assert what the proxy actually delivered as the message body.
+    """
     async def handle(reader, writer):
         try:
             line = await reader.readline()
@@ -716,9 +719,8 @@ async def run_header_echo_proxy(host, port):
             for hl in echoed.split(b'\r\n'):
                 if hl.lower().startswith(b'content-length:'):
                     cl = int(hl.split(b':', 1)[1].strip())
-            if cl:
-                await reader.readexactly(cl)
-            body = echoed
+            req_body = await reader.readexactly(cl) if cl else b''
+            body = echoed + b'|' + req_body
             writer.write(b"HTTP/1.1 200 OK\r\n")
             writer.write(f"Content-Length: {len(body)}\r\n".encode())
             writer.write(b"Content-Type: text/plain\r\nConnection: close\r\n\r\n")
@@ -784,6 +786,141 @@ async def test_hop_by_hop_request_headers_not_forwarded():
         await router.stop()
         proxy_srv.close()
         await proxy_srv.wait_closed()
+
+
+class TestClientChunkedRequestBody:
+    """客户端 Transfer-Encoding: chunked 请求体必须被解码,并按解码长度转发。
+
+    旧实现只认 content-length:带 chunked 的请求按 0 字节读 body,剩下的分块字节
+    留在同一条持久连接上,被下一轮 readline() 当成请求行解析 —— 客户端与代理的
+    消息边界就此错位(并把上游引到错误边界,即请求走私形态)。
+    """
+
+    @staticmethod
+    async def _read_one_response(reader):
+        status = await reader.readline()
+        cl = 0
+        while True:
+            h = await reader.readline()
+            if not h or h in (b"\r\n", b"\n"):
+                break
+            if h.lower().startswith(b'content-length:'):
+                cl = int(h.split(b':', 1)[1].strip())
+        body = await reader.readexactly(cl) if cl else b''
+        return status, body
+
+    async def _router_with_echo(self):
+        proxy_srv = await run_header_echo_proxy(HOST, PROXY_PORT)
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+        router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                             db_path=tempfile.mktemp(suffix='.db'))
+        await router.start()
+        return router, proxy_srv
+
+    @pytest.mark.asyncio
+    async def test_chunked_decoded_and_connection_stays_aligned(self):
+        router, proxy_srv = await self._router_with_echo()
+        try:
+            reader, writer = await asyncio.open_connection(HOST, ROUTER_PORT)
+            # TE 与 Content-Length 同时出现:TE 优先(RFC 9112 §6.1),那个 999 必须被忽略。
+            writer.write(b"POST http://chunky.test.example.com/echo HTTP/1.1\r\n"
+                         b"Host: chunky.test.example.com\r\n"
+                         b"Content-Length: 999\r\n"
+                         b"Transfer-Encoding: chunked\r\n\r\n"
+                         b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n")
+            await writer.drain()
+            status, echoed = await self._read_one_response(reader)
+            assert b'200' in status, status
+            head, sep, body = echoed.partition(b'|')
+            assert sep and body == b'hello world', f"上游收到的不是解码结果: {echoed!r}"
+            low = head.lower()
+            assert b'transfer-encoding' not in low, "hop-by-hop 头不得转发给上游"
+            assert b'content-length: 11' in low, f"应按解码长度重写 CL: {head!r}"
+
+            # 核心断言:同一条连接上的第二个请求。未解码时残留的 chunk 字节会被
+            # 当作请求行,这个请求就再也回不来(或回到错位的响应)。
+            writer.write(b"POST http://chunky.test.example.com/second HTTP/1.1\r\n"
+                         b"Host: chunky.test.example.com\r\n"
+                         b"Content-Length: 3\r\n\r\nabc")
+            await writer.drain()
+            status2, echoed2 = await self._read_one_response(reader)
+            assert b'200' in status2, f"第二个请求被残留字节污染: {status2} {echoed2!r}"
+            assert echoed2.partition(b'|')[2] == b'abc'
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await router.stop()
+            proxy_srv.close()
+            await proxy_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_trailer_headers_consumed(self):
+        """最后一个 0 尺寸块之后的 trailer 必须读完,否则留在连接上错位。"""
+        router, proxy_srv = await self._router_with_echo()
+        try:
+            reader, writer = await asyncio.open_connection(HOST, ROUTER_PORT)
+            writer.write(b"POST http://chunky2.test.example.com/ HTTP/1.1\r\n"
+                         b"Host: chunky2.test.example.com\r\n"
+                         b"Transfer-Encoding: chunked\r\n\r\n"
+                         b"3\r\nxyz\r\n0\r\nX-Trail: 1\r\n\r\n")
+            await writer.drain()
+            status, echoed = await self._read_one_response(reader)
+            assert b'200' in status, status
+            assert echoed.partition(b'|')[2] == b'xyz'
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await router.stop()
+            proxy_srv.close()
+            await proxy_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_unsupported_transfer_encoding_rejected_501(self):
+        """TE 里出现 chunked 之外的编码:不解码也不能原样转发,明确拒绝。"""
+        router, proxy_srv = await self._router_with_echo()
+        try:
+            reader, writer = await asyncio.open_connection(HOST, ROUTER_PORT)
+            writer.write(b"POST http://gzipce.test.example.com/ HTTP/1.1\r\n"
+                         b"Host: gzipce.test.example.com\r\n"
+                         b"Transfer-Encoding: gzip\r\n\r\n")
+            await writer.drain()
+            status = await reader.readline()
+            assert b'501' in status, status
+            while True:
+                h = await reader.readline()
+                if not h or h in (b"\r\n", b"\n"):
+                    break
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await router.stop()
+            proxy_srv.close()
+            await proxy_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_malformed_chunk_size_closes_connection(self):
+        """坏 chunk 尺寸:回 400 并关闭连接(此时字节位置已不可预测,不能复用)。"""
+        router, proxy_srv = await self._router_with_echo()
+        try:
+            reader, writer = await asyncio.open_connection(HOST, ROUTER_PORT)
+            writer.write(b"POST http://badchunk.test.example.com/ HTTP/1.1\r\n"
+                         b"Host: badchunk.test.example.com\r\n"
+                         b"Transfer-Encoding: chunked\r\n\r\n"
+                         b"ZZ\r\nnope\r\n0\r\n\r\n")
+            await writer.drain()
+            status = await reader.readline()
+            assert b'400' in status, status
+            while True:
+                h = await reader.readline()
+                if not h or h in (b"\r\n", b"\n"):
+                    break
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await router.stop()
+            proxy_srv.close()
+            await proxy_srv.wait_closed()
 
 
 class TestCheckAuth:
