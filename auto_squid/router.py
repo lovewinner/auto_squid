@@ -2920,6 +2920,17 @@ class Router:
             # 客户端在 router 读到 header 前就 RST / FIN(浏览器关、代理被前端 cancel、
             # 扫码/扫描器只探活)。健康流量,不该 traceback。
             logger.debug("client %s disconnected before request", client_ip)
+        except ConnectionError as e:
+            # 客户端自己把请求写坏:超出 _MAX_REQUEST_HEADER_LINES/BYTES 的头(见
+            # _handle_one_client_request 里唯一的手动 raise)。这是**协议事实**,不是
+            # Router 的缺陷,原先落到下面的 catch-all → 每个坏请求打一整段 traceback,
+            # 扫描器一来就是日志风暴(把熔断/STALE 这些真信号淹掉)。这里一行 INFO,
+            # traceback 降到 DEBUG:排查真 bug 时开 debug 仍然拿得到。
+            # 只接 ConnectionError 而不扩大到 ValueError —— ValueError 在请求路径里
+            # 也可能来自我们自己的代码,那类必须继续走 ERROR + traceback。
+            logger.info("client %s protocol error: %s: %s",
+                        client_ip, type(e).__name__, e)
+            logger.debug("client protocol error detail", exc_info=True)
         except Exception:
             logger.exception("error handling client")
         finally:

@@ -954,6 +954,51 @@ class TestClientChunkedRequestBody:
             await proxy_srv.wait_closed()
 
 
+class TestClientProtocolErrorLogging:
+    """客户端写坏请求是协议事实,不该每条打一整段 traceback(日志风暴淹真信号)。"""
+
+    @pytest.mark.asyncio
+    async def test_header_limit_exceeded_logs_one_line_not_traceback(self):
+        import auto_squid.router as router_mod
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host=HOST, port=31994))
+        r = make_router(store, listen_host=HOST, listen_port=10830,
+                        db_path=tempfile.mktemp(suffix='.db'))
+        await r.start()
+        records = []
+
+        class _Cap(logging.Handler):
+            def emit(self, rec):
+                records.append((rec.levelno, rec.getMessage(), rec.exc_info))
+
+        lg = logging.getLogger('auto_squid.router')
+        h = _Cap()
+        old_level = lg.level
+        lg.addHandler(h)
+        lg.setLevel(logging.DEBUG)
+        try:
+            reader, writer = await asyncio.open_connection(HOST, 10830)
+            req = (b"GET http://limit.test.example.com/ HTTP/1.1\r\n"
+                   b"Host: limit.test.example.com\r\n"
+                   + b"X-Pad: 1\r\n" * (router_mod._MAX_REQUEST_HEADER_LINES + 5)
+                   + b"\r\n")
+            writer.write(req)
+            await writer.drain()
+            await asyncio.wait_for(reader.read(), timeout=5)   # 等到 handler 收尾
+            writer.close()
+        finally:
+            lg.removeHandler(h)
+            lg.setLevel(old_level)
+            await r.stop()
+        # 一条 INFO 说清楚是谁、为什么;没有任何 ERROR/traceback。
+        infos = [m for lv, m, ei in records if lv == logging.INFO and 'protocol error' in m]
+        assert infos and 'limit exceeded' in infos[0], infos
+        assert not [m for lv, m, ei in records if lv >= logging.ERROR], \
+            "客户端畸形请求不应升级为 ERROR(更不该 traceback)"
+        assert not [ei for lv, m, ei in records if lv == logging.INFO and ei], \
+            "INFO 行不应附带 traceback"
+
+
 class TestCheckAuth:
     def test_disabled_allows(self):
         assert check_auth({}, False, 'u', 'p') == (True, None)
