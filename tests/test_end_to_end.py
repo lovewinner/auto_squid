@@ -2,7 +2,9 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import socket
+import sqlite3
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
@@ -1710,6 +1712,102 @@ async def test_db_batching_background_flush():
         await router.stop()
         proxy_srv.close()
         await proxy_srv.wait_closed()
+
+
+class TestSqliteRobustness:
+    """落盘层:失败要回滚、WAL 前提要校验、关库要排空 -wal。"""
+
+    class _FlakyDb:
+        """包一层 sqlite Connection:让 domain_stats 的 INSERT 抛错。
+
+        (不能直接 monkeypatch Connection 实例方法——它是 C 扩展类型,属性只读。)
+        """
+
+        def __init__(self, real, fail_on):
+            self._real = real
+            self._fail_on = fail_on
+            self.rolled_back = False
+            self.committed = False
+
+        def execute(self, sql, *a):
+            return self._real.execute(sql, *a)
+
+        def executemany(self, sql, rows):
+            if self._fail_on in sql:
+                raise sqlite3.OperationalError("simulated disk failure")
+            return self._real.executemany(sql, rows)
+
+        def commit(self):
+            self.committed = True
+            return self._real.commit()
+
+        def rollback(self):
+            self.rolled_back = True
+            return self._real.rollback()
+
+    def _router(self, db):
+        store = ProxyStore()
+        store.add(ProxyInfo(id='p', host='h', port=3128))
+        return make_router(store, listen_host='127.0.0.1', listen_port=10831,
+                           db_path=db)
+
+    def test_failed_flush_rolls_back_instead_of_leaving_open_transaction(self):
+        """DELETE 已开事务,INSERT 抛错后若不 rollback,下一次 commit() 就会把
+        "删了一半"的中间状态固化进库。"""
+        db = tempfile.mktemp(suffix='.db')
+        r = self._router(db)
+        try:
+            r._stats_cache = {'a.test': {'p': 1}}
+            r._stats_dirty = True
+            r._flush_to_db()                      # 第一次正常落盘
+
+            real = r._db
+            flaky = self._FlakyDb(real, fail_on='INSERT INTO domain_stats')
+            r._db = flaky
+            try:
+                r._stats_cache = {'b.test': {'p': 5}}
+                r._stats_dirty = True
+                r._flush_to_db()                  # DELETE 成功、INSERT 抛错
+            finally:
+                r._db = real
+            assert flaky.rolled_back, "失败后未回滚"
+            assert not flaky.committed, "失败事务不应被 commit"
+            # 另一个连接(独立事务视图)必须仍看到第一次的内容。
+            with sqlite3.connect(db) as conn:
+                rows = conn.execute("SELECT domain, proxy_id, wins FROM domain_stats").fetchall()
+            assert rows == [('a.test', 'p', 1)], f"半截事务泄漏到库中: {rows}"
+        finally:
+            r._db.close()
+
+    def test_wal_pragmas_are_verified(self):
+        """synchronous=NORMAL 只在 WAL 真的生效时才允许;否则回退 FULL。"""
+        db = tempfile.mktemp(suffix='.db')
+        r = self._router(db)
+        try:
+            mode = r._db.execute("PRAGMA journal_mode").fetchone()[0]
+            sync = r._db.execute("PRAGMA synchronous").fetchone()[0]
+            if str(mode).lower() == 'wal':
+                assert sync == 1, f"WAL 下应为 NORMAL(1),实际 {sync}"
+            else:
+                assert sync == 2, f"非 WAL 必须回退 FULL(2),实际 {sync}"
+            # 并发访问要等而不是立刻 "database is locked"。
+            assert r._db.execute("PRAGMA busy_timeout").fetchone()[0] >= 5000
+        finally:
+            r._db.close()
+
+    @pytest.mark.asyncio
+    async def test_stop_checkpoints_wal(self):
+        """干净退出时把 -wal 排空回主库(否则它停在峰值大小直到下次启动)。"""
+        db = tempfile.mktemp(suffix='.db')
+        r = self._router(db)
+        await r.start()
+        r._stats_cache = {'wal.test': {'p': 3}}
+        r._stats_dirty = True
+        r._flush_to_db()
+        await r.stop()
+        wal = db + '-wal'
+        if os.path.exists(wal):
+            assert os.path.getsize(wal) == 0, f"退出后 -wal 未排空: {os.path.getsize(wal)}B"
 
 
 @pytest.mark.asyncio

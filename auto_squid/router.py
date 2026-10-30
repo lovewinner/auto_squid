@@ -93,6 +93,10 @@ STREAM_CACHE_LIMIT = 1 * 1024 * 1024  # 1 MiB
 # 后台 flush 周期(秒):把内存里累积的胜出统计/元数据批量落盘。
 FLUSH_INTERVAL = 5.0
 
+# WAL 文件在 checkpoint 后的截断上限(字节)。不设的话 -wal 会停在最近一次峰值
+# 大小直到下次启动(生产上主库 29MB 时 -wal 堆到 21MB)。
+_WAL_SIZE_LIMIT_BYTES = 8 * 1024 * 1024
+
 # 可缓存状态码(CACHEABLE_STATUS)与写方法(_INVALIDATING_METHODS)随 http_cache
 # 拆分搬入 http_cache.py,顶部 re-import(http_cache 方法与 _handle_http_request/
 # _forward_single 两端共用)。
@@ -657,13 +661,24 @@ class Router:
         self._db_lock(本方法内创建),故必须在建表之后执行。
         """
         self._db_path = db_path
-        self._db = sqlite3.connect(db_path, check_same_thread=False)
-        # WAL 模式 + synchronous=NORMAL:热路径已不 commit,后台 flush 是低频
-        # 单写者;WAL 让 commit 只追加 -wal 文件、把 fsync 推迟到 checkpoint,
-        # 缩短 _flush_to_db 持锁时长。NORMAL 在 WAL 下安全(仅断电可能丢最后
-        # 一次 flush,而 flush 是幂等全量覆盖,下次启动可补齐)。
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA synchronous=NORMAL")
+        # busy_timeout:同一库文件可能被第二个进程(测试/运维脚本/tail 工具)打开,
+        # 默认 0 表示"立刻 database is locked",一次读库就把写事务打断。
+        self._db = sqlite3.connect(db_path, check_same_thread=False, timeout=5.0)
+        self._db.execute("PRAGMA busy_timeout=5000")
+        mode = self._db.execute("PRAGMA journal_mode=WAL").fetchone()
+        journal_wal = bool(mode and mode[0] and str(mode[0]).lower() == 'wal')
+        if journal_wal:
+            # synchronous=NORMAL 的安全性**建立在 WAL 之上**(仅断电可能丢最后一次
+            # flush,而 flush 是幂等全量覆盖)。库不支持 WAL(网络文件系统、某些
+            # 容器卷、只读目录)时回退成 FULL,否则这个前提不成立、可能损坏库。
+            self._db.execute("PRAGMA synchronous=NORMAL")
+            # 限制 -wal 在 checkpoint 后被截断到的大小,避免它长期停留在几十 MB
+            # (生产观察:主库 29MB 时 -wal 曾堆到 21MB)。
+            self._db.execute("PRAGMA journal_size_limit=%d" % _WAL_SIZE_LIMIT_BYTES)
+        else:
+            logger.warning("SQLite journal_mode=WAL not active (got %r) — falling back "
+                           "to synchronous=FULL (slower flush, but safe)",
+                           mode[0] if mode else None)
         # 后台 flush task 与 FastAPI 线程池都可能触达 DB;同一连接的并发使用
         # 非线程安全,用锁串行化所有 DB 写入,避免 "database is locked"。
         # 热路径(转发)只读写下方内存缓存,不经此锁。
@@ -1215,41 +1230,52 @@ class Router:
 
         持 _db_lock 单事务:stats/meta 全量覆盖(DELETE 后重插),监控指标差分 UPSERT
         /全量重写,详见 _flush_to_db 注释。载荷全空时直接返回,连 commit 都不做。
+
+        任何一步失败都 **rollback**:python-sqlite 默认 is_level=autocommit off,
+        DELETE 已经开了事务,若让它保持打开,下一次 commit()(本函数的成功路径或
+        tuner._save_state)就会把"删了一半"的中间状态固化进库。
         """
         stats_rows, meta_rows, full_rewrite, proxy_rows, domain_rows = payload
         if not (full_rewrite or stats_rows or meta_rows or proxy_rows or domain_rows):
             return
         now = datetime.now(timezone.utc).isoformat()
         with self._db_lock:
-            if stats_rows:
-                self._db.execute("DELETE FROM domain_stats")
-                self._db.executemany(
-                    "INSERT INTO domain_stats (domain, proxy_id, wins) VALUES (?, ?, ?)",
-                    stats_rows,
-                )
-            if meta_rows:
-                self._db.execute("DELETE FROM domain_meta")
-                self._db.executemany(
-                    "INSERT INTO domain_meta (domain, default_proxy, updated_at, ref_ewma)"
-                    " VALUES (?, ?, ?, ?)",
-                    meta_rows,
-                )
-            if full_rewrite:
-                self._db.execute("DELETE FROM proxy_metrics")
-                self._db.execute("DELETE FROM domain_metrics")
-            if proxy_rows:
-                self._db.executemany(
-                    "INSERT INTO proxy_metrics (proxy_id, metrics_json, updated_at)"
-                    " VALUES (?, ?, ?) ON CONFLICT(proxy_id) DO UPDATE SET"
-                    " metrics_json=excluded.metrics_json, updated_at=excluded.updated_at",
-                    [(pid, json.dumps(m, default=list), now) for pid, m in proxy_rows])
-            if domain_rows:
-                self._db.executemany(
-                    "INSERT INTO domain_metrics (domain, proxy_id, metrics_json, updated_at)"
-                    " VALUES (?, ?, ?, ?) ON CONFLICT(domain, proxy_id) DO UPDATE SET"
-                    " metrics_json=excluded.metrics_json, updated_at=excluded.updated_at",
-                    [(d, pid, json.dumps(m, default=list), now) for d, pid, m in domain_rows])
-            self._db.commit()
+            try:
+                if stats_rows:
+                    self._db.execute("DELETE FROM domain_stats")
+                    self._db.executemany(
+                        "INSERT INTO domain_stats (domain, proxy_id, wins) VALUES (?, ?, ?)",
+                        stats_rows,
+                    )
+                if meta_rows:
+                    self._db.execute("DELETE FROM domain_meta")
+                    self._db.executemany(
+                        "INSERT INTO domain_meta (domain, default_proxy, updated_at, ref_ewma)"
+                        " VALUES (?, ?, ?, ?)",
+                        meta_rows,
+                    )
+                if full_rewrite:
+                    self._db.execute("DELETE FROM proxy_metrics")
+                    self._db.execute("DELETE FROM domain_metrics")
+                if proxy_rows:
+                    self._db.executemany(
+                        "INSERT INTO proxy_metrics (proxy_id, metrics_json, updated_at)"
+                        " VALUES (?, ?, ?) ON CONFLICT(proxy_id) DO UPDATE SET"
+                        " metrics_json=excluded.metrics_json, updated_at=excluded.updated_at",
+                        [(pid, json.dumps(m, default=list), now) for pid, m in proxy_rows])
+                if domain_rows:
+                    self._db.executemany(
+                        "INSERT INTO domain_metrics (domain, proxy_id, metrics_json, updated_at)"
+                        " VALUES (?, ?, ?, ?) ON CONFLICT(domain, proxy_id) DO UPDATE SET"
+                        " metrics_json=excluded.metrics_json, updated_at=excluded.updated_at",
+                        [(d, pid, json.dumps(m, default=list), now) for d, pid, m in domain_rows])
+                self._db.commit()
+            except sqlite3.Error:
+                logger.exception("flush to DB failed; rolling back transaction")
+                try:
+                    self._db.rollback()
+                except sqlite3.Error:
+                    logger.exception("rollback after failed flush also failed")
 
     def _flush_to_db(self):
         """把内存里累积的统计/元数据/监控指标一次性落盘(单事务,同步入口)。
@@ -4245,6 +4271,13 @@ class Router:
         # sqlite 连接 execute。shutdown 后再进入关库临界区,与 worker 的 with 锁互斥。
         self._flush_executor.shutdown(wait=True)
         with self._db_lock:
+            # 关库前把 WAL 排空回主库:否则 -wal 停留在峰值大小直到下次启动才
+            # checkpoint(生产上见过 21MB),且 `wal_checkpoint(TRUNCATE)` 是唯一
+            # 会把 -wal 归零的模式。失败不影响关库(下次启动自动 checkpoint)。
+            try:
+                self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                logger.warning("wal_checkpoint(TRUNCATE) before close failed", exc_info=True)
             self._db.close()
 
 
