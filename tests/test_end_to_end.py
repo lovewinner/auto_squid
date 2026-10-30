@@ -6138,6 +6138,64 @@ class TestClusterPredictor:
         finally:
             g.reset()
 
+    def test_graph_cap_eviction_does_not_scan_whole_graph(self):
+        """容量驱逐必须是 O(1):图顶到 max_entries 后每次学习都扫全图 = 事件循环停顿。
+
+        _enforce_cap 在**写路径**上(每关一个窗口调一次),原实现每轮
+        sum(len(out) for out in _cooccur.values()) 数边 + 扫全图找最小 last_seen,
+        图上限 10 万条时是纯 CPU 的 O(E)/O(E²) 停顿。这里给主表装上"被遍历就计数"
+        的 dict 子类:O(1) 侧索引实现零遍历,任何扫全图的实现都会让计数飙起来。
+        """
+        class _Counting(dict):
+            scans = 0
+
+            def items(self):
+                _Counting.scans += 1
+                return dict.items(self)
+
+            def values(self):
+                _Counting.scans += 1
+                return dict.values(self)
+
+        g = self._graph(max_entries=8)
+        try:
+            g._cooccur = _Counting(g._cooccur)
+            _Counting.scans = 0
+            # 直接经 _bump_edge 造 12 条边(> cap),不触碰 prune(它有合法的遍历)。
+            for i in range(12):
+                g._bump_edge(f's{i}.com:443', 'x.com:443', 'p', now=100.0 + i)
+            g._enforce_cap()
+            scans = _Counting.scans
+            assert scans == 0, f"容量驱逐遍历了主表 {scans} 次(应为 O(1) 侧索引弹出)"
+            assert g.graph_size() == 8
+            # 驱逐后侧索引与主表仍逐键一致(漏删会让后续 cap 计算错位)。
+            live = {(src, co) for src, out in dict.items(g._cooccur) for co in out}
+            assert set(g._edge_lru) == live
+        finally:
+            g.reset()
+
+    def test_prune_keeps_lru_index_in_sync(self):
+        """prune 删过期边必须同步 LRU 侧索引,否则 graph_size 与主表背离。
+
+        侧索引多出的残键会让 _edge_count 高估边数 → 提前驱逐还活着的边(预测变差),
+        少删则图实际超出 max_entries(内存无界)。两边都必须归零。
+        """
+        spawn = self._stub_spawn()
+        g = self._graph(prewarm_spawn=spawn, ttl_sec=3600, max_entries=1000)
+        try:
+            self._learn(g, '7.7.7.7', ['a.com:443', 'b.com:443'], t0=10.0)
+            assert g.graph_size() == 2
+            g.prune(now=20.0 + 3600 + 1)                     # 边全部过期
+            assert g.graph_size() == 0
+            assert len(g._edge_lru) == 0, "TTL 删边未同步 LRU 侧索引"
+            assert dict(g._cooccur) == {}
+            # 再学一窗:索引与主表必须仍逐键一致(残留会让 cap 计算错位)。
+            self._learn(g, '8.8.8.8', ['c.com:443', 'd.com:443'], t0=5000.0)
+            live = {(src, co) for src, out in g._cooccur.items() for co in out}
+            assert set(g._edge_lru) == live
+        finally:
+            g.reset()
+
     def test_prune_ttl_and_stale_window_close(self):
         """prune:TTL 过期边清理;越过窗口宽未关的陈旧窗口兜底关窗学习。"""
         spawn = self._stub_spawn()

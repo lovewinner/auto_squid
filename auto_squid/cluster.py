@@ -36,6 +36,7 @@ refill_pause 簇度活动判定同源)。本子系统记录这些簇,学习"同�
 
 import logging
 import time
+from collections import OrderedDict
 from typing import Callable, Optional
 
 from .proxy_store import ProxyStore
@@ -131,6 +132,15 @@ class ClusterGraph:
         self._active_windows: dict[str, _Window] = {}
         # 全局共现图:src_target → {co_target: _CoEntry}。
         self._cooccur: dict[str, dict[str, _CoEntry]] = {}
+        # 全图 LRU 侧索引:(src, co) → 同一个 _CoEntry 对象(**共享引用,不复制)。
+        # 存在的理由只有一个:让"边数"与"last_seen 最旧的一条边"都能 O(1) 拿到。
+        # 否则 _edge_count 要 sum 全部邻接表、_evict_oldest_edge 要扫全图找最小
+        # last_seen,而 _enforce_cap 是"每次学完一个窗口就调用"的写路径 —— 图顶到
+        # max_entries(默认 10 万)后每次学习都是 O(E) 甚至 O(E²) 的纯 CPU 扫描,
+        # 单线程事件循环被直接钉住(所有在途请求跟着掉速)。
+        # bump 时 move_to_end,(src,co) 的任何删除路径必须同步 pop(见 prune /
+        # _evict_oldest_edge / reset)。
+        self._edge_lru: "OrderedDict[tuple, _CoEntry]" = OrderedDict()
         # 预测节流:(src, co) → 上次发射的 monotonic 时间(防 reload 反复预建)。
         self._last_predict: dict[tuple, float] = {}
         # 计数器 / 快照。
@@ -234,11 +244,12 @@ class ClusterGraph:
         for client_ip, win in list(self._active_windows.items()):
             if now - win.opened_mono > self.window_sec and win.observed:
                 self._close_and_learn(client_ip, win, now)
-        # 图:TTL 边淘汰(超过 ttl 未再共现的边)。
+        # 图:TTL 边淘汰(超过 ttl 未再共现的边)。删除必须同步 LRU 侧索引。
         for src, out in list(self._cooccur.items()):
             stale = [co for co, e in out.items() if now - e.last_seen > self.cluster_graph_ttl_sec]
             for co in stale:
                 del out[co]
+                self._edge_lru.pop((src, co), None)
             if not out:
                 del self._cooccur[src]
         # 图:LRU 上限(边数超 max_entries → 淘汰 last_seen 最旧的一条)。
@@ -248,6 +259,7 @@ class ClusterGraph:
         """清空全部状态(stop() 与强制重启学习时调用)。"""
         self._active_windows.clear()
         self._cooccur.clear()
+        self._edge_lru.clear()
         self._last_predict.clear()
 
     def graph_size(self) -> int:
@@ -301,7 +313,8 @@ class ClusterGraph:
         out = self._cooccur.setdefault(src, {})
         entry = out.get(co)
         if entry is None:
-            out[co] = _CoEntry(pid, now)
+            entry = _CoEntry(pid, now)
+            out[co] = entry
         else:
             entry.hits += 1
             if pid is not None:
@@ -316,6 +329,9 @@ class ClusterGraph:
                 entry.probe_pids[pid] = entry.probe_pids.get(pid, 0.0) + 1.0
                 entry.probe_pid = pid  # 兼容保留:最近一次胜出 pid
             entry.last_seen = now
+        # LRU 侧索引:新建=追加到队尾,复用=挪到队尾(last_seen 刚刷新过)。
+        self._edge_lru[(src, co)] = entry
+        self._edge_lru.move_to_end((src, co))
 
     def _probe_decay(self, last_seen: float, now: float) -> float:
         """胜出直方图计数的单次衰减率:距上次 bump 越久衰减越狠。
@@ -362,24 +378,22 @@ class ClusterGraph:
             logger.info("cluster prewarm spawn failed for %s", co_target, exc_info=True)
 
     def _edge_count(self) -> int:
-        return sum(len(out) for out in self._cooccur.values())
+        """边数,O(1)。取自 LRU 侧索引(与 _cooccur 逐键同步,见 _bump_edge/prune)。"""
+        return len(self._edge_lru)
 
     def _enforce_cap(self):
-        """边数超 max_entries → LRU 淘汰 last_seen 最旧的边(仿 sticky _evict_oldest)。"""
+        """边数超 max_entries → LRU 淘汰 last_seen 最旧的边(仿 sticky _evict_oldest)。
+
+        每轮代价 O(1):计数走 _edge_lru 长度,victim 走队首弹出。
+        """
         while self._edge_count() > self.cluster_graph_max_entries:
             self._evict_oldest_edge()
 
     def _evict_oldest_edge(self):
-        """LRU 淘汰:找全图 last_seen 最旧的一条边并删除。"""
-        target = None
-        best = None
-        for src, out in self._cooccur.items():
-            for co, e in out.items():
-                if best is None or e.last_seen < best:
-                    best, target = e.last_seen, (src, co)
-        if target is None:
+        """LRU 淘汰:删除 last_seen 最旧的一条边(= LRU 侧索引的队首)。"""
+        if not self._edge_lru:
             return
-        src, co = target
+        (src, co), _entry = self._edge_lru.popitem(last=False)
         out = self._cooccur[src]
         del out[co]
         if not out:
