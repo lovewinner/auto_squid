@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 # _SLOW_START_SUCCESS 次成功(或窗口期满)才恢复完整权重,防冷启动被打懵。
 _CIRCUIT_THRESHOLD = 3
 _CIRCUIT_MAX_BACKOFF = 300.0
+# 退避下限(也即首次熔断的退避时长):恢复良好时 backoff 逐半向它回落。
+_CIRCUIT_BACKOFF_BASE = 1.0
 _SLOW_START_WINDOW = 60.0
 _SLOW_START_SUCCESS = 3
 
@@ -532,6 +534,10 @@ class ProxySelector:
             self._domain_metrics_dirty(per)
             self._dirty_metric_keys.add((domain, pid))
             return self._ensure_metrics(per.setdefault(pid, {}))
+        # 全局桶(domain=None)同样要让 _metrics_version 前进:cost 缓存的 state_key
+        # 用它判新鲜(见 _cost_scores),而探活与非域名流量只写全局桶 —— 不 bump
+        # 会让 ordered_proxies 在"只有探活写入"的时段一直按陈旧的全局 p99/成功率排序。
+        self._metrics_version += 1
         self._dirty_metric_keys.add((None, pid))
         return self._ensure_metrics(self._proxy_metrics.setdefault(pid, {}))
 
@@ -1166,7 +1172,15 @@ class ProxySelector:
         etype = error_type if error_type in _ERROR_KEYS else ERROR_OTHER
         bypass_circuit = (etype == ERROR_HTTP_STATUS)
         self._circuit_version += 1
-        self._conc_observe_failure(pid)  # 自适应并发:失败 → 乘性降低上限(P3)
+        s = self._circuit_state(pid) if not bypass_circuit else None
+        in_backoff = bool(s) and s.get("open_until", 0.0) > time.monotonic()
+        # 自适应并发:失败 → 乘性降低上限(P3)。两类失败不是容量信号,不钳制:
+        #  - http_status:目标端拒绝(403/502),代理本身健康,钳它会把它排到最慢;
+        #    退避期内的重复观测:该代理已被排除出竞速/单发,后台探活每
+        #    probe_interval 秒失败一次会持续乘 0.5,把 limit 一路打到 _conc_min,
+        #    熔断恢复后仍被限流。与 78a9d9b"熔断期内失败不续期熔断"同源。
+        if not bypass_circuit and not in_backoff:
+            self._conc_observe_failure(pid)
         if not bypass_circuit:
             s = self._circuit_state(pid)
             # ── 熔断期内不续期(2026-10-08/09/22 熔断风暴根因)──────────────
@@ -1185,12 +1199,12 @@ class ProxySelector:
             # 退避期满后由 is_circuit_open 惰性解熔断并置 slow-start;此时若
             # 仍失败,重新从 0 累计 consec_fail,按正常路径再次熔断(此时
             # backoff 仍按上次值继续指数增长,符合"反复故障的代理退避更长")。
-            if s.get("open_until", 0.0) > time.monotonic():
+            if in_backoff:
                 s["consec_fail"] = 0  # 清零:退避期内的失败不构成新证据
             else:
                 s["consec_fail"] = int(s.get("consec_fail", 0)) + 1
                 if s["consec_fail"] >= self.circuit_threshold:
-                    backoff = (float(s.get("backoff", 0.0)) or 1.0) * self._CIRCUIT_BACKOFF_MULT
+                    backoff = (float(s.get("backoff", 0.0)) or _CIRCUIT_BACKOFF_BASE) * self._CIRCUIT_BACKOFF_MULT
                     s["backoff"] = min(self.circuit_max_backoff, backoff)
                     s["open_until"] = time.monotonic() + s["backoff"]
                     s["consec_fail"] = 0  # 熔断后计数清零,恢复后的失败重新累计
@@ -1234,6 +1248,16 @@ class ProxySelector:
         self._circuit_version += 1
         if self._in_slow_start(pid, s):
             s["slow_start_ok"] = int(s.get("slow_start_ok", 0)) + 1
+            # 退避只增不减是单向棘轮:record_failure 每次熔断 ×2 封顶 300s,而
+            # record_success 过去只清 consec_fail / 累加 slow_start_ok,从不衰减
+            # backoff。于是一次"三连瞬时失败"就让该代理今后**永久**以 300s 起步
+            # 熔断,偶发抖动的代价过大。slow-start 完成(证明它确实回来了)即把
+            # backoff 减半,向 _CIRCUIT_BACKOFF_BASE 回落。
+            if (s["slow_start_ok"] >= self.slow_start_success
+                    and float(s.get("backoff", 0.0)) > _CIRCUIT_BACKOFF_BASE):
+                s["backoff"] = max(_CIRCUIT_BACKOFF_BASE, float(s["backoff"]) / 2.0)
+                logger.info("circuit backoff decayed for proxy %s → %.1fs (slow-start done)",
+                            pid, s["backoff"])
 
     def _in_slow_start(self, pid: str, s: Optional[dict] = None) -> bool:
         """是否处于 slow-start 恢复期:退避刚结束(started_at 新鲜)且累计成功不足。

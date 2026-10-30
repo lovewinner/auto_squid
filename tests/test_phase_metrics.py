@@ -9,6 +9,7 @@
 
 import asyncio
 import json
+import time
 from unittest import mock
 
 import httpx
@@ -18,7 +19,8 @@ from auto_squid.config_schema import CircuitConfig, RouterConfig
 from auto_squid.digest import TDigest
 from auto_squid.proxy_store import ProxyInfo, ProxyStore
 from auto_squid.router import Router
-from auto_squid.selector import ProxySelector, flush_metric_copy, _OBS_WINDOW
+from auto_squid.selector import (ProxySelector, flush_metric_copy, _OBS_WINDOW,
+                                 ERROR_HTTP_STATUS)
 
 
 # ── t-digest ────────────────────────────────────────────
@@ -349,6 +351,82 @@ def test_cost_sort_default_enabled():
     sel = ProxySelector(_store_with("p1"))
     assert sel.cost_sort_enabled is True
     assert sel.cost_latency_metric == "p99"
+
+
+def test_global_metric_write_bumps_metrics_version():
+    """domain=None 的观测(探活、非域名流量)也要让 _metrics_version 前进。
+
+    cost 评分缓存的 state_key 含 _metrics_version;只有域名分支 bump 版本号时,
+    "夜间只有探活写入"的时段里 ordered_proxies 会一直复用陈旧的全局 p99/成功率。
+    """
+    sel = ProxySelector(_store_with("p1", "p2"))
+    sel.record_ttfb("p1", 0.5, domain=None)
+    sel.record_failure("p1")
+    sel.ordered_proxies()                        # 建立 cost 评分缓存(热路径自带缓存)
+    v0 = sel._metrics_version
+    cached = next(iter(sel._cost_scores_cache.values()))
+    assert cached[0][0] == v0, "前置:缓存应记录当前版本号"
+
+    sel.record_ttfb("p2", 0.001, domain=None)    # 只写全局桶
+    assert sel._metrics_version > v0, "全局指标写入未推进版本 → cost 缓存永不失效"
+    sel.ordered_proxies()
+    after = next(iter(sel._cost_scores_cache.values()))
+    assert after[0][0] == sel._metrics_version, "重算后缓存未跟进新版本"
+    assert sel.ordered_proxies() == ["p2", "p1"], "快起来的全局观测未反映到排序"
+
+
+def test_backoff_decays_after_slow_start_completes():
+    """退避是双向的:slow-start 完成(确实回来了)就把 backoff 减半,向下限回落。
+
+    旧实现只增不减:record_failure 每次熔断 ×2 封顶 300s,record_success 从不衰减
+    → 一次"三连瞬时失败"就让该代理今后永久以 300s 起步熔断。
+    """
+    sel = ProxySelector(_store_with("p1"), circuit_threshold=2,
+                        circuit_max_backoff=300.0, slow_start_success=2,
+                        slow_start_window=60.0)
+    sel._circuit_state("p1")["backoff"] = 300.0
+    sel._circuit_state("p1")["open_until"] = time.monotonic() + 60
+    sel.record_failure("p1")
+    sel.record_failure("p1")
+    # 手工模拟熔断生效 → 退避到期 → slow-start。
+    sel._circuit_state("p1")["open_until"] = time.monotonic() - 0.1
+    assert sel.is_circuit_open("p1") is False
+    assert sel._in_slow_start("p1") is True
+    for _ in range(2):
+        sel.record_success("p1")
+    assert sel._circuit_state("p1")["backoff"] == 150.0
+
+    # 再次恢复再减半;向下限 1s 收敛,不会到 0。
+    sel._circuit_state("p1")["started_at"] = time.monotonic()
+    sel._circuit_state("p1")["slow_start_ok"] = 0
+    sel._circuit_state("p1")["backoff"] = 1.0
+    sel.record_success("p1")
+    sel.record_success("p1")
+    assert sel._circuit_state("p1")["backoff"] == 1.0
+
+
+def test_backoff_failures_do_not_clamp_concurrency():
+    """退避期内的重复失败与业务拒绝(http_status)不钳制自适应并发上限。
+
+    与 78a9d9b"熔断期内失败不续期熔断"同源:后台探活每 probe_interval 秒失败一次
+    会把 limit 一路乘 0.5 打到 min(恢复后仍被限流);CONNECT 403 这类目标端拒绝
+    会把健康代理钳到最低。
+    """
+    sel = ProxySelector(_store_with("p1", "p2"),
+                        concurrency_limit_enabled=True, concurrency_limit_initial=4,
+                        concurrency_limit_min=1, concurrency_limit_max=32,
+                        concurrency_mult_on_failure=0.5, concurrency_failure_window=3,
+                        circuit_threshold=2)
+    sel.record_failure("p1")
+    limit_after_first = sel._conc_state("p1")["limit"]
+    assert limit_after_first < 4
+    sel._circuit_state("p1")["open_until"] = time.monotonic() + 60
+    for _ in range(5):
+        sel.record_failure("p1")
+    assert sel._conc_state("p1")["limit"] == limit_after_first, "退避期内失败仍在钳并发"
+    # 业务拒绝:不在退避期也不钳。
+    sel.record_failure("p2", error_type=ERROR_HTTP_STATUS)
+    assert sel._conc_state("p2")["limit"] == 4
 
 
 def test_cost_sort_equivalent_to_ewma_when_only_latency():
