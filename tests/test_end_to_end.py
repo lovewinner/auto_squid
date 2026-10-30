@@ -1103,6 +1103,78 @@ class TestProxyStore:
         finally:
             Path(tmppath).unlink(missing_ok=True)
 
+    def test_save_is_atomic_no_tmp_leftover(self, tmp_path):
+        """save() 走临时文件 + os.replace:失败不留半成品,成功也不留 .tmp。"""
+        target = tmp_path / 'proxies.yaml'
+        target.write_text("- id: old\n  host: 1.0.0.1\n  port: 3128\n")
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='new', host='2.0.0.2', port=3128))
+        ps.save(str(target))
+        assert '- id: new' in target.read_text()
+        assert not (tmp_path / 'proxies.yaml.tmp').exists(), "临时文件未清理"
+
+        # 写不了(目标是目录)→ 抛出,且原文件保持旧内容、无临时残留。
+        blocked = tmp_path / 'blocked'
+        blocked.mkdir()
+        ps2 = ProxyStore()
+        ps2.add(ProxyInfo(id='x', host='3.3.3.3'))
+        before = target.read_text()
+        with pytest.raises(OSError):
+            ps2.save(str(blocked))
+        assert target.read_text() == before, "失败的 save 不应动到原文件"
+        assert not (tmp_path / 'blocked.tmp').exists()
+
+    def test_post_proxies_persists_to_store_file(self, tmp_path):
+        """README 承诺"POST /proxies 持久化到 proxies.yaml":过去 save() 全仓无调用点。"""
+        cfg = tmp_path / 'proxies.yaml'
+        cfg.write_text("- id: base\n  host: 10.0.0.1\n  port: 3128\n")
+        store = ProxyStore(str(cfg))
+        mount(store, None)
+        client = TestClient(api_app)
+        try:
+            r = client.post("/proxies", json={"id": "added", "host": "10.0.0.9",
+                                              "port": 3129, "enabled": False})
+            assert r.status_code == 200, r.text
+            assert r.json() == {"added": "added", "persisted": True}, r.text
+        finally:
+            mount(None, None)
+        reloaded = ProxyStore(str(cfg))
+        assert reloaded.get('added') is not None, "重启后节点消失(未落盘)"
+        assert reloaded.get('added').enabled is False
+        assert reloaded.get('base') is not None
+
+    def test_post_proxies_reports_persist_failure(self, tmp_path):
+        """落盘失败(只读挂载/目录不存在)不报错回滚:节点已在服务流量,
+        但必须如实回报 persisted=false,否则调用方以为改好了、重启却丢失。"""
+        store = ProxyStore(str(tmp_path / 'missing-dir' / 'proxies.yaml'))
+        mount(store, None)
+        client = TestClient(api_app)
+        try:
+            r = client.post("/proxies", json={"id": "tmp", "host": "10.0.0.5"})
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["persisted"] is False, body
+            assert "persist_error" in body
+            assert store.get("tmp") is not None, "内存态不应因落盘失败被回滚"
+        finally:
+            mount(None, None)
+
+    def test_post_proxies_without_path_reports_not_persisted(self):
+        """store 未绑定路径时不能报"已持久化":那是"以为改了其实重启就丢"的错觉。"""
+        store = ProxyStore()
+        mount(store, None)
+        client = TestClient(api_app)
+        try:
+            r = client.post("/proxies", json={"id": "mem", "host": "10.0.0.6"})
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["added"] == "mem"
+            assert body["persisted"] is False, body
+            assert "路径" in body["persist_error"], body
+            assert store.get("mem") is not None
+        finally:
+            mount(None, None)
+
 
 class TestAPI:
     def test_health(self):
@@ -7375,6 +7447,35 @@ class TestCliConfigErrorExit:
                              flag_path=p)
         assert cfg is not None
         assert cfg.logging.level == "INFO"
+
+    def _run_proxy_load(self, path):
+        import subprocess, sys
+        return subprocess.run(
+            [sys.executable, "-c",
+             "from auto_squid.cli import _load_proxy_store; _load_proxy_store(%r)" % path],
+            capture_output=True, text=True)
+
+    def test_bad_proxies_yaml_exits_code_2(self, tmp_path):
+        """proxies.yaml 语法错也要可读报错退出(过去是裸 pydantic/yaml 回溯)。"""
+        p = tmp_path / "bad_proxies.yaml"
+        p.write_text("- id: a\n  host: [unclosed\n")
+        r = self._run_proxy_load(str(p))
+        assert r.returncode == 2, r.stderr
+        assert "proxies error" in r.stderr
+
+    def test_invalid_proxies_entry_exits_code_2(self, tmp_path):
+        """条目缺必填字段(id/host)→ 可读错误,不抛裸 ValidationError。"""
+        p = tmp_path / "missing_field.yaml"
+        p.write_text("- name: no-id-no-host\n")
+        r = self._run_proxy_load(str(p))
+        assert r.returncode == 2, r.stderr
+        assert "proxies error" in r.stderr
+
+    def test_missing_proxies_file_starts_empty(self, tmp_path):
+        """文件不存在不是错误:空表启动是既有的"先用管理 API 加节点"用法。"""
+        from auto_squid.cli import _load_proxy_store
+        store = _load_proxy_store(str(tmp_path / 'nope.yaml'))
+        assert store.list() == []
 
 
 class TestSetupLoggingLevel:

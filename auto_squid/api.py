@@ -4,11 +4,14 @@ from pydantic import BaseModel, Field, field_validator
 from typing import Dict, List
 import asyncio
 import json
+import logging
 
 from .auth import check_auth
 from .config_schema import AuthConfig, ProxyInfo, is_valid_host
 from .proxy_store import ProxyStore
 from .router import Router
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="auto_squid API")
 
@@ -308,7 +311,26 @@ async def add_proxy(p: ProxyIn):
                    "取回真实凭据再提交,或整体省略 auth 字段")
     proxy = ProxyInfo(**p.model_dump())
     _proxy_store.add(proxy)
-    return {"added": proxy.id}
+    # 落盘(README 承诺"添加代理会持久化到 proxies.yaml"):此前 save() 全仓无调用点,
+    # 经 API 加的节点重启即丢。落盘失败(只读挂载、目录不存在)**不回滚内存态**——
+    # 节点此刻已在服务流量,回滚会让正在工作的路由与响应互相矛盾;改为如实回报
+    # persisted=false,让调用方知道这是"本次进程有效、重启后消失"的临时改动。
+    persisted = False
+    persist_error = None
+    if _proxy_store.path is None:
+        persist_error = "store 未绑定 proxies.yaml 路径,节点仅在本次进程内有效"
+    else:
+        try:
+            _proxy_store.save()
+            persisted = True
+        except OSError as e:
+            persist_error = f"{type(e).__name__}: {e}"
+            logger.warning("POST /proxies: node %s added in-memory but persist to %s failed: %s",
+                           proxy.id, _proxy_store.path, e)
+    out = {"added": proxy.id, "persisted": persisted}
+    if persist_error:
+        out["persist_error"] = persist_error
+    return out
 
 
 @app.get("/proxies", response_model=List[ProxyIn])

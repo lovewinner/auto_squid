@@ -60,6 +60,29 @@ def _load_config(config_path: str) -> Config:
         sys.exit(2)
 
 
+def _load_proxy_store(proxies_path: str) -> ProxyStore:
+    """加载上游代理列表,失败时打印可读错误并退出码 2(与 _load_config 同规格)。
+
+    ProxyStore 构造即 load,而 load 可能抛 YAML 语法错或缺字段的条目(裸 pydantic
+    ValidationError)—— 运维面对的是配置文件,不该看到 Python 回溯。
+    (文件不存在不是错误:ProxyStore 只在 path.exists() 时读,空表启动是既有的
+    "先用管理 API 加节点"用法,保持原行为。)
+    """
+    try:
+        return ProxyStore(proxies_path)
+    except yaml.YAMLError as e:
+        print(f"proxies error: bad YAML in {proxies_path}: {e}", file=sys.stderr)
+        sys.exit(2)
+    except OSError as e:
+        print(f"proxies error: cannot read {proxies_path}: {e}", file=sys.stderr)
+        sys.exit(2)
+    except Exception as e:
+        print(f"proxies error: invalid {proxies_path}: {type(e).__name__}", file=sys.stderr)
+        for line in str(e).splitlines()[:12]:
+            print(f"  {line}", file=sys.stderr)
+        sys.exit(2)
+
+
 def setup_logging(cfg: Config):
     """配置根日志:控制台只输出 WARNING 及以上,文件按 cfg.logging.level。
 
@@ -133,7 +156,7 @@ def start(config: str = "", proxies: str = "", db: str = "auto_squid.db"):
     setup_logging(cfg)
     _warn_insecure(cfg)
     # 加载上游代理列表(未指定 --proxies 时用当前目录 proxies.yaml)。
-    proxy_store = ProxyStore(proxies if proxies else "proxies.yaml")
+    proxy_store = _load_proxy_store(proxies if proxies else "proxies.yaml")
     # 构造 Router 并注入配置(#15:整块 RouterConfig 传入,内部读取,删掉手工映射)。
     router = Router(
         proxy_store,

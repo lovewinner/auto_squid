@@ -8,6 +8,7 @@
 (见 router._db_lock)。
 """
 
+import os
 import urllib.parse
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -79,16 +80,32 @@ class ProxyStore:
         return url
 
     def save(self, path: Optional[str] = None):
-        """把当前所有代理节点写入 YAML 文件。
+        """把当前所有代理节点**原子地**写入 YAML 文件。
 
         优先用传入的 path,其次用构造时绑定的 self.path;两者都没有则报错。
         用 yaml.safe_dump 序列化(每个 ProxyInfo 经 model_dump 转为 dict)。
+
+        先写同目录临时文件再 os.replace:直接 write_text 会在进程被杀/磁盘满时
+        留下截断的 proxies.yaml —— 下次启动就是"配置文件语法错",整个代理起不来。
+        replace 在同一文件系统内是原子的,读者只会看到旧文件或新文件。
         """
         p = Path(path) if path else self.path
         if not p:
             raise RuntimeError("No path provided to save proxies")
         data = [proxy.model_dump() for proxy in self._proxies.values()]
-        p.write_text(yaml.safe_dump(data, sort_keys=False))
+        text = yaml.safe_dump(data, sort_keys=False)
+        tmp = p.with_name(p.name + '.tmp')
+        try:
+            tmp.write_text(text)
+            os.replace(tmp, p)
+        except BaseException:
+            # 失败不留半成品:临时文件删掉(原文件仍是旧内容)。
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        return p
 
     def load(self, path: str):
         """从 YAML 文件加载代理节点,逐条 add 进内存(覆盖同 id)。
