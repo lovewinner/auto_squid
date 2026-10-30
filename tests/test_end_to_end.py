@@ -8468,7 +8468,9 @@ class TestDispatchSingleUnified:
                 r.selector.record_failure('local')
             assert r.selector.is_circuit_open('local') is True
         finally:
-            r.stop()
+            # 同步用例也得真正执行 stop():裸 r.stop() 只创建协程从不 await,
+            # 除了 RuntimeWarning,SQLite 句柄也一直悬着没关。
+            asyncio.run(r.stop())
 
     def test_local_respected_when_circuit_open_in_race_builders(self):
         """熔断中的 local 不进入竞速候选(_prep_http/_build_racing_tasks_http)。
@@ -8500,7 +8502,9 @@ class TestDispatchSingleUnified:
             assert r.selector.is_circuit_open('local') is False
             assert 'local' in r._build_racing_tasks_http(['p1', 'p2'], 'example.com')
         finally:
-            r.stop()
+            # 同步用例也得真正执行 stop():裸 r.stop() 只创建协程从不 await,
+            # 除了 RuntimeWarning,SQLite 句柄也一直悬着没关。
+            asyncio.run(r.stop())
 
     def test_local_real_failure_through_try_tunnel_except(self):
         """真失败经 _try_tunnel 的 except 喂熔断:record_failure('local') 被调用。
@@ -8526,7 +8530,9 @@ class TestDispatchSingleUnified:
             assert r.selector.is_circuit_open('local') is True, \
                 "3 次真失败应熔断 local"
         finally:
-            r.stop()
+            # 同步用例也得真正执行 stop():裸 r.stop() 只创建协程从不 await,
+            # 除了 RuntimeWarning,SQLite 句柄也一直悬着没关。
+            asyncio.run(r.stop())
 
 
 class _FakeConnectWriter:
@@ -8727,7 +8733,7 @@ class TestStaleConnRetry:
             # selector 应记过一次 stale 观测
             assert r.selector.stale_conn_retries == 1
         finally:
-            r.stop()
+            await r.stop()
 
     def test_fresh_conn_no_response_is_real_failure(self):
         """池为空回退到全新连接仍无响应 → 是代理真故障,必须喂熔断(不掩盖)。"""
@@ -8752,7 +8758,9 @@ class TestStaleConnRetry:
             # 非池连接,不应记 stale
             assert r.selector.stale_conn_retries == 0
         finally:
-            r.stop()
+            # 同步用例也得真正执行 stop():裸 r.stop() 只创建协程从不 await,
+            # 除了 RuntimeWarning,SQLite 句柄也一直悬着没关。
+            asyncio.run(r.stop())
 
     def test_stale_classification_excludes_timeout(self):
         """握手超时(TimeoutError)不是池陈旧特征,不应触发重试/掩盖真故障。"""
@@ -8772,7 +8780,9 @@ class TestStaleConnRetry:
             # 未触发任何熔断副作用
             assert r.selector.is_circuit_open('p') is False
         finally:
-            r.stop()
+            # 同步用例也得真正执行 stop():裸 r.stop() 只创建协程从不 await,
+            # 除了 RuntimeWarning,SQLite 句柄也一直悬着没关。
+            asyncio.run(r.stop())
 
     """审计 P2#2 回归:共享缓存对"携带 Cookie/Authorization 的请求"在读、写
     两侧都按私密头集收敛,防止 A 客户端的个性化响应串给 B 客户端。"""
