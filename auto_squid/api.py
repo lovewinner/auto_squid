@@ -1,7 +1,8 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from typing import Dict, List
+import re
 
 from .auth import check_auth
 from .config_schema import AuthConfig, ProxyInfo
@@ -225,6 +226,10 @@ async def api_auth_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+# GET /proxies 默认把凭据值替换成这个占位符(见 list_proxies 的说明)。
+_AUTH_MASK = "***"
+
+
 class ProxyIn(BaseModel):
     """POST /proxies 的入参模型:与 ProxyInfo 字段对齐。
 
@@ -237,11 +242,46 @@ class ProxyIn(BaseModel):
     id: str
     name: str | None = None
     host: str
-    port: int = 3128
+    port: int = Field(3128, ge=1, le=65535)
     protocol: str = "http"
     auth: Dict[str, str] | None = None
     enabled: bool = True
     tags: Dict[str, str] | None = None
+
+    @field_validator("host")
+    @classmethod
+    def _check_host(cls, v: str):
+        """host 只接受裸主机名 / IPv4 / 方括号 IPv6。
+
+        上游代理 URL 是 f-string 拼出来的(proxy_store.proxy_url →
+        `http://{host}:{port}`,凭据版为 `http://u:p@{host}:{port}`),所以
+        '@' '/' ':' 这类字符会改写实际连接的上游(把流量导向第三个主机)。
+        管理 API 的写入路径必须挡住,否则一条 POST 就是定向 SSRF/流量劫持。
+        """
+        v = v.strip()
+        if not v:
+            raise ValueError("host 不能为空")
+        if v.startswith('[') and v.endswith(']'):
+            # IPv6 字面量:方括号内只允许十六进制段与冒号。
+            inner = v[1:-1]
+            if not re.fullmatch(r"[0-9A-Fa-f:.]+", inner):
+                raise ValueError(f"host {v!r} 不是合法的 IPv6 字面量")
+            return v
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", v):
+            raise ValueError(
+                f"host {v!r} 不合法:只允许主机名 / IPv4 / [IPv6],"
+                "不接受含 scheme、端口、'@' 或 '/' 的写法(会改写上游目标)")
+        return v
+
+    @field_validator("protocol")
+    @classmethod
+    def _check_protocol(cls, v: str):
+        # ProxyInfo.protocol 全仓无消费点:声明 socks5/https 也会被当作 HTTP
+        # CONNECT 代理使用(静默错配)。与其静默误用,不如在写入点拒绝。
+        if v != "http":
+            raise ValueError(
+                f"protocol {v!r} 未实现:当前只支持 HTTP CONNECT 上游代理('http')")
+        return v
 
 
 @app.get("/health")
@@ -253,16 +293,36 @@ async def health():
 async def add_proxy(p: ProxyIn):
     if not _proxy_store:
         raise HTTPException(status_code=500, detail="proxy store not initialized")
+    if p.auth and all(v == _AUTH_MASK for v in p.auth.values()):
+        # "GET 脱敏 → 改字段 → POST 回去"是常见改配置流程,把 '***' 当真实口令
+        # 写回去会静默打坏这个节点(上游返回 407)。要求带 include_secrets 重取。
+        raise HTTPException(
+            status_code=422,
+            detail="auth 值是 GET /proxies 的脱敏占位符;请先 GET ?include_secrets=true "
+                   "取回真实凭据再提交,或整体省略 auth 字段")
     proxy = ProxyInfo(**p.model_dump())
     _proxy_store.add(proxy)
     return {"added": proxy.id}
 
 
 @app.get("/proxies", response_model=List[ProxyIn])
-async def list_proxies():
+async def list_proxies(include_secrets: bool = False):
+    """列出上游代理。默认**脱敏** `auth` 的值(保留键名,值替换为 '***')。
+
+    凭据只是"配置代理"这一必需目的的副产物,而一次 GET 就把全部上游口令
+    拖走(认证关闭时更是匿名可读),代价与收益完全不对称。保留键名让调用方
+    仍能判断"该代理是否配了认证、用的是 username/password 还是别的字段"。
+    确需读原文时显式带 ?include_secrets=true。
+    """
     if not _proxy_store:
         return []
-    return [ProxyIn(**p.model_dump()) for p in _proxy_store.list()]
+    items = []
+    for p in _proxy_store.list():
+        d = p.model_dump()
+        if not include_secrets and d.get("auth"):
+            d["auth"] = {k: _AUTH_MASK for k in d["auth"]}
+        items.append(ProxyIn(**d))
+    return items
 
 
 @app.get("/quality")

@@ -214,7 +214,7 @@ All on the management port `:18080`. `POST` bodies are JSON; unknown fields are 
 |----------|-------------|
 | `GET /` | Web UI dashboard (domain stats, default proxies, win counts, auto-refresh) |
 | `GET /health` | Health check (always open) |
-| `GET /proxies` | List configured proxies |
+| `GET /proxies` | List configured proxies (upstream `auth` values masked; `?include_secrets=true` to reveal) |
 | `POST /proxies` | Add a proxy (`ProxyIn` JSON); persisted to `proxies.yaml` |
 | `GET /stats` | `request_counts` (wins) + `attempted_counts` (total attempts) per proxy |
 | `GET /domains` | Per-domain win stats from SQLite |

@@ -214,7 +214,7 @@ config error: invalid configuration:
 |----------|-------------|
 | `GET /` | Web UI 仪表盘（域名统计、默认代理、胜出次数、自动刷新） |
 | `GET /health` | 健康检查（始终开放） |
-| `GET /proxies` | 列出已配置代理 |
+| `GET /proxies` | 列出已配置代理（上游 `auth` 值默认打码，`?include_secrets=true` 取原文） |
 | `POST /proxies` | 添加代理（`ProxyIn` JSON）；持久化到 `proxies.yaml` |
 | `GET /stats` | 每代理 `request_counts`（胜出）+ `attempted_counts`（总尝试） |
 | `GET /domains` | 每域名胜出统计（SQLite） |

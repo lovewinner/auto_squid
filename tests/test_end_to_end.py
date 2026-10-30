@@ -985,13 +985,70 @@ class TestAPI:
         assert stored is not None
         assert stored.enabled is False, f"enabled should persist, got {stored.enabled}"
         assert stored.auth == {"username": "up", "password": "secret123"}, stored.auth
-        # GET /proxies 应能回读完整字段。
+        # GET /proxies 默认脱敏:保留键名(能判断"配了哪几项凭据"),值打码。
         r2 = client.get("/proxies")
         assert r2.status_code == 200
         items = {p["id"]: p for p in r2.json()}
         assert items["auth-proxy"]["enabled"] is False
-        assert items["auth-proxy"]["auth"] == {"username": "up", "password": "secret123"}
+        assert items["auth-proxy"]["auth"] == {"username": "***", "password": "***"}
         assert items["auth-proxy"]["port"] == 6128
+
+    def test_get_proxies_include_secrets_reveals(self):
+        """显式 ?include_secrets=true 才回原文(读凭据是需要刻意表达的动作)。"""
+        proxy_store = ProxyStore()
+        mount(proxy_store, None)
+        client = TestClient(api_app)
+        proxy_store.add(ProxyInfo(id="p1", host="10.0.0.1", port=3128,
+                                  auth={"username": "u", "password": "s3cret"}))
+        assert {p["id"]: p for p in client.get("/proxies").json()}["p1"]["auth"] \
+            == {"username": "***", "password": "***"}
+        revealed = {p["id"]: p for p in
+                    client.get("/proxies", params={"include_secrets": "true"}).json()}
+        assert revealed["p1"]["auth"] == {"username": "u", "password": "s3cret"}
+        # 无凭据的节点不受影响(仍是 None,不是空 dict)。
+        proxy_store.add(ProxyInfo(id="p2", host="10.0.0.2"))
+        assert {p["id"]: p for p in client.get("/proxies").json()}["p2"]["auth"] is None
+
+    def test_post_proxy_rejects_host_that_rewrites_upstream(self):
+        """host 里的 '@' / '/' / ':' 会改写拼出来的代理 URL(定向 SSRF/流量劫持)。"""
+        proxy_store = ProxyStore()
+        mount(proxy_store, None)
+        client = TestClient(api_app)
+        for bad in ("attacker.example@10.0.0.1", "10.0.0.1:3128/evil",
+                    "http://10.0.0.1", "", "  ", "::1"):
+            r = client.post("/proxies", json={"id": "x", "host": bad})
+            assert r.status_code == 422, f"host {bad!r} accepted: {r.text}"
+        assert proxy_store.list() == []
+        # 合法形态:主机名 / IPv4 / 方括号 IPv6。
+        for ok in ("10.0.0.1", "squid.internal", "[fd00::1]"):
+            r = client.post("/proxies", json={"id": "ok-" + ok, "host": ok})
+            assert r.status_code == 200, r.text
+            assert proxy_store.get("ok-" + ok).host == ok
+
+    def test_post_proxy_rejects_bad_port_and_protocol(self):
+        """port 越界与未实现的 protocol 都拒绝(protocol 无消费点,静默当 http 用)。"""
+        proxy_store = ProxyStore()
+        mount(proxy_store, None)
+        client = TestClient(api_app)
+        assert client.post("/proxies", json={"id": "a", "host": "10.0.0.1",
+                                             "port": 0}).status_code == 422
+        assert client.post("/proxies", json={"id": "b", "host": "10.0.0.1",
+                                             "port": 70000}).status_code == 422
+        r = client.post("/proxies", json={"id": "c", "host": "10.0.0.1",
+                                          "protocol": "socks5"})
+        assert r.status_code == 422
+        assert "CONNECT" in r.text
+
+    def test_post_proxy_rejects_masked_auth_roundtrip(self):
+        """"GET 脱敏 → 回 POST"不得把 '***' 当真实口令写进 store(会打坏节点)。"""
+        proxy_store = ProxyStore()
+        mount(proxy_store, None)
+        client = TestClient(api_app)
+        r = client.post("/proxies", json={"id": "d", "host": "10.0.0.1",
+                                          "auth": {"username": "***", "password": "***"}})
+        assert r.status_code == 422, r.text
+        assert "include_secrets" in r.text
+        assert proxy_store.get("d") is None
 
 
 class TestApiAuth:
