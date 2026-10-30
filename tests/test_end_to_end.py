@@ -7492,6 +7492,51 @@ class TestTaskLifecycle:
         await asyncio.wait_for(router.stop(), timeout=30)
         assert order == ['handler_exit', 'aclose_clients'], order
 
+    @pytest.mark.asyncio
+    async def test_stop_returns_while_a_tunnel_is_still_open(self):
+        """活隧道不能让优雅关闭卡死。
+
+        Python 3.12 起 `Server.wait_closed()` 要等**全部在途 handler** 结束。旧顺序
+        是 close() → wait_closed() → 才取消 handler task,于是只要有一个客户端挂着
+        CONNECT 隧道不松手,stop() 就永远等不到它自己结束(handler 正是那个"在途"),
+        进程无法退出。修法:先取消并 gather handler,再有界地等 server 收尾。
+        """
+        up = await run_mock_proxy(HOST, 31991)
+        r = self._router(port=10826)
+        await r.start()
+        reader, writer = await asyncio.open_connection(HOST, 10826)
+        try:
+            writer.write(b"CONNECT live.example.com:443 HTTP/1.1\r\n"
+                         b"Host: live.example.com:443\r\n\r\n")
+            await writer.drain()
+            assert b'200' in await asyncio.wait_for(reader.readline(), timeout=5)
+            while True:                       # 吃掉 200 之后的空行,进入隧道态
+                line = await reader.readline()
+                if not line or line in (b"\r\n", b"\n"):
+                    break
+            assert r._running_tasks, "应有一个在途 handler task"
+            # 客户端**不关闭**:handler 只能被 stop() 取消,不会自己结束。
+            await asyncio.wait_for(r.stop(), timeout=8.0)
+        finally:
+            writer.close()
+            up.close()
+            await up.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_start_is_idempotent_and_does_not_leak_listener(self):
+        """重复 start() 不得覆盖 _server:旧 listener 仍在 accept,却再无人能 close。"""
+        r = self._router(port=10827)
+        await r.start()
+        first = r._server
+        await r.start()
+        assert r._server is first, "第二次 start() 重建了 listener,前一个成为孤儿"
+        await asyncio.wait_for(r.stop(), timeout=8.0)
+        assert r._server is None
+        # 泄漏的孤儿 listener 会继续占着端口:stop() 后必须能重新绑定。
+        probe = await asyncio.start_server(lambda *a: None, host=HOST, port=10827)
+        probe.close()
+        await probe.wait_closed()
+
 
 @pytest.mark.asyncio
 async def test_aggregation_wait_timeout_is_second_scale():

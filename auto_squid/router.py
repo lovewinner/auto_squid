@@ -4140,7 +4140,13 @@ class Router:
         (probe_interval_sec>0 时,周期对 enabled 代理做轻量 CONNECT 探活)。
         """
         self._install_loop_guard()
-        self._server = await asyncio.start_server(self.handle_client, host=self.listen_host, port=self.listen_port)
+        # 幂等:已有活的 listener 就直接复用。无条件重建会把前一个 server 变成
+        # 无人持有的孤儿 —— 它仍在 accept,但 _server 已指向新的,stop() 只关最后
+        # 一个,端口从此被占住(实测:二次 start() 后 stop(),再 bind 同端口报
+        # address already in use)。判活只用 Server 公开 API is_serving()
+        # (3.12 的 Server 既没有 closed() 也没有 is_closing())。
+        if self._server is None or not self._server.is_serving():
+            self._server = await asyncio.start_server(self.handle_client, host=self.listen_host, port=self.listen_port)
         if self._flush_task is None or self._flush_task.done():
             self._flush_task = asyncio.create_task(self._flush_loop())
         if self.probe_interval_sec > 0 and (self._probe_task is None or self._probe_task.done()):
@@ -4189,9 +4195,9 @@ class Router:
         2. **handler 先于最终 flush**。取消后它们不再写内存,残量统计才能一次
            性落盘,而不是 flush 之后又来一批"落不下去"的增量。
         """
-        if self._server:
-            self._server.close()
-            await self._server.wait_closed()
+        server, self._server = self._server, None   # 置 None:二次 stop() 幂等,
+        if server:                                   # 且允许 stop→start 重启
+            server.close()                           # 先停止接受新连接
         # 停止接受新连接后，取消仍在处理的客户端连接 task 并等待它们退出，
         # 避免在 _db.close() 之后还有在途请求尝试写库而报错。
         for t in list(self._running_tasks):
@@ -4199,6 +4205,14 @@ class Router:
         if self._running_tasks:
             await asyncio.gather(*self._running_tasks, return_exceptions=True)
             self._running_tasks.clear()
+        # 再等 listener 收尾,而且**有界**:3.12 的某些版本里 Server.wait_closed()
+        # 会一直等到全部在途 handler 结束,而挂着的 CONNECT 隧道只有客户端自己断
+        # 才结束 —— 把它放在"取消 handler 之后 + 超时兜底",优雅关闭才不会卡死。
+        if server:
+            try:
+                await asyncio.wait_for(server.wait_closed(), timeout=2.0)
+            except asyncio.TimeoutError:
+                logger.warning("listener wait_closed timed out (2s); continuing shutdown")
         # 排空竞速败者的后台清理 task:它们正在 aclose 流式 resp / 关上游裸连接,
         # 必须在 _db.close() 前完成,否则连接泄漏(ResourceWarning)。
         if self._pending_cleanups:
