@@ -540,14 +540,28 @@ class ConnectionPools:
                         logger.debug("target prewarm EXPIRED %s (%s conn(s))",
                                      key, len(stack))
                     pool.pop(key, None)
-        for w in stale:
+        await self._close_many(stale)
+
+    async def _close_many(self, writers) -> None:
+        """批量关闭一组预热连接:close() 全部先发,再并发等确认。
+
+        旧写法逐条 `close(); await wait_for(wait_closed(), 0.5)`:半预连的对端常
+        挂起等客户端数据而不回 FIN(见 _conn_pool_close_all),于是每条都要等满
+        0.5s —— 池里 64~256 条时一次 prune/stop 串行耗掉几十秒,而 refill 循环
+        正被它占着(期间不再补充也不清理)。close() 本身是非阻塞的,先全部关掉,
+        再 gather 等确认,总耗时收敛到 ~0.5s。
+        """
+        if not writers:
+            return
+        pending = []
+        for w in writers:
             try:
                 w.close()
-                # 同 _conn_pool_close_all:预热连接对端可能挂起不关,3.12 的
-                # wait_closed() 会严格等对端 FIN 而挂死,用超时保护。
-                await asyncio.wait_for(w.wait_closed(), timeout=0.5)
-            except (asyncio.TimeoutError, Exception):
+                pending.append(asyncio.wait_for(w.wait_closed(), timeout=0.5))
+            except Exception:
                 pass
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def _conn_pool_loop(self):
         """后台预热循环:周期补充到目标水位并清理过期连接。
@@ -574,6 +588,7 @@ class ConnectionPools:
         挂起等待客户端数据而不主动关闭。Python 3.12 的 StreamWriter.wait_closed()
         会严格等待对端 FIN 确认,此时会无限挂起(本地 3.11 立即返回,CI 3.12
         卡死)。故用超时保护:close() 后最多等 0.5s,超时即放弃等待,避免阻塞。
+        等待走 _close_many 并发化:逐条等会让 stop() 串行耗掉 0.5s×池内连接数。
         """
         stacks = list(self._conn_pool.values()) + list(self._target_pool.values())
         self._conn_pool.clear()
@@ -584,14 +599,7 @@ class ConnectionPools:
         self._pending_creates = 0
         self._pending_creates_by_key.clear()
         self._pending_creates_by_bucket.clear()
-        for stack in stacks:
-            for item in stack:
-                reader, writer = item
-                try:
-                    writer.close()
-                    await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
-                except (asyncio.TimeoutError, Exception):
-                    pass
+        await self._close_many([item[1] for stack in stacks for item in stack])
 
     def start(self):
         """启动后台 refill 循环(与 Router.start 协作;refill_interval<=0 不启动)。

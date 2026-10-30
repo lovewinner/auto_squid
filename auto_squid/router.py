@@ -1433,7 +1433,7 @@ class Router:
                 c_host, c_port, _PROBE_TIMEOUT,
                 phase='probe-canary', pid='-', target=target)
             c_writer.close()
-            await c_writer.wait_closed()
+            await self._close_stream_writer(c_writer)
             return True
         except (asyncio.TimeoutError, OSError, ConnectionError):
             return False
@@ -2584,11 +2584,7 @@ class Router:
         except Exception:
             pass
         if close_writer:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
+            await Router._close_stream_writer(writer)
 
     @staticmethod
     async def _write_cached_response(writer, status_code, reason_phrase, headers, body):
@@ -2627,7 +2623,7 @@ class Router:
             pass
         try:
             client_writer.close()
-            await client_writer.wait_closed()
+            await self._close_stream_writer(client_writer)
         except Exception:
             pass
 
@@ -2904,11 +2900,7 @@ class Router:
                 self.selector.record_success(pid)
                 return pid, up_reader, up_writer
             except BaseException as ex:
-                try:
-                    up_writer.close()
-                    await up_writer.wait_closed()
-                except Exception:
-                    pass
+                await self._close_stream_writer(up_writer)
                 # 池化连接失效:记 stale 观测(不喂熔断),重试一次新连接。命中条件:
                 # 首试 + 来自池 + 失效特征(空响应 / 写读被 RST,非超时)。
                 if _attempt == 0 and _used_pooled and self._is_stale_conn_error(ex):
@@ -2956,11 +2948,9 @@ class Router:
             logger.exception("error handling client")
         finally:
             self._running_tasks.discard(task)
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
+            # 有上限的确认关闭:handler 被 stop() 取消时,这里若无限等对端 FIN,
+            # stop() 排空 _running_tasks 就会一起挂着。
+            await self._close_stream_writer(writer)
 
     async def _handle_one_client_request(self, reader, writer, peer, client_ip: str) -> bool:
         """处理一条客户端请求；返回 True 表示可在同一 HTTP/1.1 连接继续读取。"""

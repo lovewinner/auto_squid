@@ -4905,6 +4905,41 @@ class TestPoolBudget:
         assert self._live_by_proxy(pools) == {}
 
 
+    @pytest.mark.asyncio
+    async def test_close_many_is_concurrent_not_serial(self):
+        """批量关闭必须并发等确认:逐条 wait_for(wait_closed(), 0.5) 会让
+        一次 prune/stop 串行耗掉 0.5s × 池内连接数,而 refill 循环正被它占着。"""
+        pools = self._pools()
+
+        class _HangWriter:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+            async def wait_closed(self):
+                await asyncio.sleep(3600)     # 半预连的对端不回 FIN
+
+            def is_closing(self):
+                return False
+
+        writers = [_HangWriter() for _ in range(50)]
+        t0 = time.monotonic()
+        await pools._close_many(writers)
+        elapsed = time.monotonic() - t0
+        assert all(w.closed for w in writers)
+        assert elapsed < 2.0, f"关闭被串行化了:50 条耗时 {elapsed:.2f}s"
+
+        # _conn_pool_close_all 走同一条路径,并要清掉每代理/在途计数。
+        pools._conn_pool['10.0.0.1:3128'] = [(object(), w) for w in writers[:10]]
+        pools._count_put('10.0.0.1:3128', 10)
+        t0 = time.monotonic()
+        await pools._conn_pool_close_all()
+        assert time.monotonic() - t0 < 2.0
+        assert pools._conn_pool == {} and pools._proxy_conn_count == {}
+
+
 class TestConnPoolIdlePause:
     """refill 空闲感知(conn_pool.refill_pause_minutes):连续 N 分钟无"密集活动"
     (窗口内 ≥ 阈值个客户端请求成簇)则挂起 refill/目标预热,避免深夜空闲期
