@@ -6228,6 +6228,46 @@ class TestConfigSchemaStrict:
         p = ProxyInfo(id="x", host="h", port=3128, future_key="whatever")
         assert p.id == "x"
 
+    def test_api_binds_loopback_by_default(self):
+        """管理 API 默认只绑回环:默认配置 + 无认证 = 匿名写路径不出本机。"""
+        from auto_squid.config_schema import APIConfig, AuthConfig
+        assert APIConfig().host == "127.0.0.1"
+        assert AuthConfig().enabled is False
+
+    def test_auth_enabled_with_empty_creds_rejected(self):
+        """enabled=true 而凭据为空必须启动即报错:空凭据会让 `Basic Og==` 通过。"""
+        from auto_squid.config_schema import AuthConfig
+        for kwargs in ({"enabled": True},
+                       {"enabled": True, "username": "u"},
+                       {"enabled": True, "password": "p"}):
+            with pytest.raises(Exception) as ei:
+                AuthConfig(**kwargs)
+            assert "username/password" in str(ei.value)
+        # 关闭认证时空凭据仍然合法(默认开放代理是既有用法)。
+        AuthConfig(enabled=False)
+
+    def test_open_proxy_startup_warning(self, caplog):
+        """非回环 + 无认证在启动日志点名;收紧到回环或开认证则静默。"""
+        from auto_squid.cli import _warn_insecure
+
+        def warnings_for(cfg, caplog):
+            with caplog.at_level(logging.WARNING, logger="auto_squid.cli"):
+                _warn_insecure(cfg)
+            return [r.getMessage() for r in caplog.records if r.name == "auto_squid.cli"]
+
+        caplog.clear()
+        msgs = warnings_for(Config(**{"listen": {"host": "0.0.0.0"},
+                                      "api": {"host": "0.0.0.0"}}), caplog)
+        assert any("proxy port" in m for m in msgs)
+        assert any("management API" in m for m in msgs)
+
+        caplog.clear()
+        strict = Config(**{"listen": {"host": "127.0.0.1"},
+                            "api": {"host": "127.0.0.1",
+                                    "auth": {"enabled": True, "username": "u",
+                                             "password": "p"}}})
+        assert warnings_for(strict, caplog) == []
+
 
 class TestCliConfigErrorExit:
     """#13: 配置加载失败(坏 YAML / 未知键)→ 打印可读错误,不抛裸 traceback。"""

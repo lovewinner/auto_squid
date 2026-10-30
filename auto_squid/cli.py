@@ -101,12 +101,37 @@ def setup_logging(cfg: Config):
 
 app = typer.Typer()
 
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def _warn_insecure(cfg: Config):
+    """把"监听面暴露但无认证"这一组合在启动日志里点名,而不是默默开网。
+
+    只做告警不硬失败:开放代理是本项目的既有合法用法(内网自用/上游只做
+    白名单校验),启动即退出会破坏现有部署。管理 API 默认已收敛到回环,
+    显式改成非回环又不开认证时同样只告警。
+    """
+    log = logging.getLogger("auto_squid.cli")
+    if cfg.listen.host not in _LOOPBACK_HOSTS and not cfg.router.auth.enabled:
+        log.warning(
+            "proxy port %s:%s listens on a non-loopback address with auth DISABLED "
+            "(open proxy: any host on this network can relay traffic through you); "
+            "set router.auth.enabled or bind listen.host to 127.0.0.1",
+            cfg.listen.host, cfg.listen.port)
+    if cfg.api.host not in _LOOPBACK_HOSTS and not cfg.api.auth.enabled:
+        log.warning(
+            "management API %s:%s listens on a non-loopback address with api.auth "
+            "DISABLED (anonymous callers can add/overwrite upstream proxies and read "
+            "their credentials); set api.auth.enabled or bind api.host to 127.0.0.1",
+            cfg.api.host, cfg.api.port)
+
 
 @app.callback(invoke_without_command=True)
 def start(config: str = "", proxies: str = "", db: str = "auto_squid.db"):
     """启动代理路由器和 API 服务。支持可选的 config.yaml / proxies.yaml 参数。"""
     cfg = _load_config(config)
     setup_logging(cfg)
+    _warn_insecure(cfg)
     # 加载上游代理列表(未指定 --proxies 时用当前目录 proxies.yaml)。
     proxy_store = ProxyStore(proxies if proxies else "proxies.yaml")
     # 构造 Router 并注入配置(#15:整块 RouterConfig 传入,内部读取,删掉手工映射)。

@@ -1,0 +1,21 @@
+# auto_squid 容器示例配置 — 由 examples/docker/docker-compose.yml 挂载到 /app/config.yaml
+#
+# 为什么需要这个文件:CLI 默认只把管理 API 绑到 127.0.0.1,而容器内的回环
+# 地址对宿主机发布的 18080 端口不可达 —— 不改绑定,`docker compose up` 之后
+# 仪表盘打不开。这里显式绑回 0.0.0.0,让端口映射继续可用。
+#
+# 代价:api.auth 关闭时,任何能访问该端口的主机都能增删上游代理、读取上游
+# 凭据、重置熔断(启动日志会打印 WARNING)。仅在可信内网/CI 环境这样用;
+# 否则取消下方 api.auth 注释并改掉口令。
+
+listen:
+  host: "0.0.0.0"
+  port: 10808
+
+api:
+  host: "0.0.0.0"
+  port: 18080
+  # auth:
+  #   enabled: true
+  #   username: "admin"
+  #   password: "change-me"

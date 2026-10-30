@@ -97,7 +97,7 @@ All configuration lives in `config.yaml`. Here is the full structure with defaul
 ```yaml
 listen:                        # host/port for the proxy port (default 0.0.0.0:10808)
 api:
-  host: "0.0.0.0"              # management API host
+  host: "127.0.0.1"            # management API host (loopback by default; bind 0.0.0.0 only with auth enabled)
   port: 18080                    # management API port
   auth:                          # optional HTTP Basic auth for the management API (off by default)
     enabled: true

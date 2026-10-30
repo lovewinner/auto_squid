@@ -35,11 +35,15 @@ class ListenConfig(ConfigBase):
 class APIConfig(ConfigBase):
     """管理 API 的监听配置(独立于代理端口,默认 18080)。
 
+    默认只绑回环:管理 API 能增删上游代理、重置熔断、导出全部客户端画像,
+    而认证默认关闭 —— 绑 0.0.0.0 等于把这条写路径开放给整个网络。需要远程
+    访问时显式配置 host(启动时会打印告警),或启用 api.auth。
+
     `auth` 复用 AuthConfig(默认关闭):开启后除 /health 外全部端点需 HTTP
     Basic 认证(经 api.py 的中间件统一校验)。注意 APIConfig 定义在 AuthConfig
     之后,故用字符串前向引用 + 模块末尾 model_rebuild() 解析。
     """
-    host: str = Field("0.0.0.0")
+    host: str = Field("127.0.0.1")
     port: int = Field(18080)
     auth: "AuthConfig" = Field(default_factory=lambda: AuthConfig(),
                                description="管理 API 的 HTTP Basic 认证配置(默认关闭)")
@@ -90,6 +94,17 @@ class AuthConfig(ConfigBase):
     enabled: bool = Field(False, description="要求 HTTP Basic 认证")
     username: str = Field("")
     password: str = Field("")
+
+    @model_validator(mode="after")
+    def _check_credentials(self):
+        # enabled=True 而凭据留空是配置事故:check_auth 会用 compare_digest("", "")
+        # 判定通过,即 `Authorization: Basic Og==`(任意人可构造)直接放行 —— 看似
+        # 开了认证,实则比不配更危险(运维以为已加固)。启动即硬报错。
+        if self.enabled and (not self.username or not self.password):
+            raise ValueError(
+                "auth.enabled=true 但 username/password 为空:空凭据会被判定为合法"
+                "(Basic Og==),请填写凭据或关闭 enabled")
+        return self
 
 
 class PolicyProxiesConfig(ConfigBase):

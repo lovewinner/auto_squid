@@ -97,7 +97,7 @@ curl -x http://127.0.0.1:10808 https://www.baidu.com
 ```yaml
 listen:                        # 代理端口 host/port（默认 0.0.0.0:10808）
 api:
-  host: "0.0.0.0"              # 管理 API host
+  host: "127.0.0.1"            # 管理 API host（默认仅回环；要绑 0.0.0.0 请先开启 auth）
   port: 18080                    # 管理 API 端口
   auth:                          # 管理 API 可选 HTTP Basic 认证（默认关闭）
     enabled: true

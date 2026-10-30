@@ -41,6 +41,10 @@ services:
     volumes:
       # SQLite 统计与日志的持久卷(compose down 保留,down -v 清空)
       - ./data:/data
+      # 管理 API 默认只绑回环,而容器内的回环对宿主机发布的 18080 不可达 ——
+      # 需按 config.yaml 显式绑 0.0.0.0。CLI 在未显式 --config 时读取工作目录
+      # 的 config.yaml,故挂载到 /app 即可生效。
+      - ./config.yaml:/app/config.yaml:ro
       # 方式 A:挂载自己的 proxies.yaml(先 mkdir -p ~/auto_squid 并复制填好)
       # - ~/auto_squid/proxies.yaml:/proxies/proxies.yaml:ro
       # 然后取消下面注释,让 CLI 指到挂载文件:
