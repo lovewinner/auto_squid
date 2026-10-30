@@ -1661,6 +1661,48 @@ async def test_upstream_client_pool_reused():
 
 
 @pytest.mark.asyncio
+async def test_relaxed_and_strict_clients_do_not_share_one_entry():
+    """relaxed(本地白名单直连)与非 relaxed(竞速/单发)必须各自一个 client。
+
+    client 只按 key 缓存一次、超时由首个创建者决定:过去 'local' 一个键被两种
+    超时共用 → 白名单直连可能拿到全局 3s(正是该功能要避免的掐断),或让本机
+    竞速拿到 relaxed 的 10s(丢掉 3s 兜底)。本测试两个方向都验,证明与创建顺序无关。
+    """
+    proxy_store = ProxyStore()
+    proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+                         enable_local_racing=True, local_direct_timeout_sec=10.0,
+                         http_read_timeout_sec=3.0,
+                         db_path=tempfile.mktemp(suffix='.db'))
+    try:
+        key = router._client_key('local', None)
+        assert key == 'local'
+        strict = await router._get_client(key, None, relaxed=False)
+        relaxed = await router._get_client(key, None, relaxed=True)
+        assert strict is not relaxed, "relaxed 与严格超时共用了同一个 client"
+        assert relaxed.timeout.read == 10.0
+        assert strict.timeout.read == 3.0
+        # 反序创建也必须拿到各自的实例(即与顺序无关)。
+        r2 = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT + 1,
+                         enable_local_racing=True, local_direct_timeout_sec=10.0,
+                         http_read_timeout_sec=3.0,
+                         db_path=tempfile.mktemp(suffix='.db'))
+        try:
+            relaxed_first = await r2._get_client(key, None, relaxed=True)
+            strict_second = await r2._get_client(key, None, relaxed=False)
+            assert relaxed_first is not strict_second
+            assert strict_second.timeout.read == 3.0
+            assert relaxed_first.timeout.read == 10.0
+            # 同档重复取用仍复用同一实例(缓存本身没被拆开)。
+            assert await r2._get_client(key, None, relaxed=True) is relaxed_first
+            assert len(r2._client_pool) == 2
+        finally:
+            await r2.stop()
+    finally:
+        await router.stop()
+
+
+@pytest.mark.asyncio
 async def test_try_http_send_failure_does_not_mask_error():
     """When client.send raises before a streaming resp is assigned, _try_http
     must re-raise the original error (not a swallowed UnboundLocalError from

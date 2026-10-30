@@ -2061,6 +2061,8 @@ class Router:
 
         local(无上游)用固定键 'local';走上游的用 proxy_url(已含凭据)。
         实际上 pid↔proxy_url 一一对应,但用 proxy_url 作键更稳健。
+
+        注意:超时档(relaxed)不在此键内,由 _get_client 追加后缀区分。
         """
         if proxy_url is None:
             return 'local'
@@ -2077,7 +2079,14 @@ class Router:
         relaxed=True:用 local_direct_timeout_sec 替代全局 _upstream_timeout
         (仅本地白名单强制直连路径传)。其余(竞速/粘性/域名缓存的 local 单发)
         保持默认 relaxed=False 用全局 3s,零行为变化。
+
+        **两种超时必须各自一个 client**:client 只按 key 缓存一次,超时由首个
+        创建者决定 —— 过去 'local' 一个键同时被"白名单直连(relaxed 10s)"和
+        "本机竞速(relaxed 0/3s)"使用,谁先来谁定:白名单直连可能拿到 3s(正是
+        该功能要避免的掐断),竞速用的 local client 可能拿到 10s(丢掉 3s 兜底)。
         """
+        if relaxed:
+            key = key + '\x00relaxed'
         client = self._client_pool.get(key)
         if client is not None and not client.is_closed:
             return client
