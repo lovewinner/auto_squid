@@ -158,6 +158,33 @@ class _UpstreamServerError(Exception):
     """单发收到 5xx 时触发重竞速，避免把故障代理继续钉在缓存路径。"""
 
 
+# 域名统计键的最大长度:DNS 主机名上限 253 字符,超出即视为伪造/垃圾输入。
+_DOMAIN_KEY_MAX_LEN = 253
+
+
+def _domain_key_from_url(url: str) -> str:
+    """域名维度(统计/粘性/缓存/meta)的键:取 URL 的 hostname。
+
+    原实现是 `urlparse(url).hostname or url`:当 URL 是 origin-form
+    (`GET /<svg onload=alert(1)> HTTP/1.1`,客户端直连本代理即可构造)时
+    hostname 为 None,整段请求行原文成了统计键,再被管理面板拼进 innerHTML
+    —— :10808 的客户端由此获得对管理员浏览器的代码执行能力,且键空间无界
+    (每个畸形路径都是一条永久条目)。
+
+    兜底不再回原文:净化到 URL 语法字符并截断,既保留"这是哪个请求"的可读
+    线索,又不让任何 HTML 元字符或超长字符串进入键。
+    """
+    try:
+        host = urllib.parse.urlparse(url).hostname
+    except ValueError:
+        host = None          # 非法 IPv6 字面量等:urlparse 直接抛
+    if host:
+        return host
+    cleaned = re.sub(r'[^A-Za-z0-9._~:/?#\[\]@!$()*+,;=%-]', '_',
+                     url)[:_DOMAIN_KEY_MAX_LEN]
+    return cleaned or 'unknown'
+
+
 def _hb(v: str) -> bytes:
     """编码一个响应头字符串为 HTTP 线上的原始字节(lossless)。
 
@@ -2578,7 +2605,7 @@ class Router:
             # 首字节计时:从发起到收到响应头。用于 EWMA 质量跟踪(竞速排序)。
             # 调用方通常已算出 domain(见 docstring),仅兜底时才 urlparse。
             if domain is None:
-                domain = urllib.parse.urlparse(url).hostname or url
+                domain = _domain_key_from_url(url)
             t0 = time.perf_counter()
             resp = await client.send(
                 client.build_request(method, url, headers=headers, content=body),
@@ -2981,7 +3008,7 @@ class Router:
         解析已在 handle_client 一次性完成并传入,此处不再重复 find+decode+split。
         body 为原始字节(未解码),保留二进制安全。
         """
-        domain = urllib.parse.urlparse(url).hostname or url
+        domain = _domain_key_from_url(url)
         # 剔除 hop-by-hop 请求头:只服务"客户端→本代理"这一跳,不透传上游。
         hdrs = {k: v for k, v in headers.items() if k.lower() not in _HOP_BY_HOP_REQUEST_HEADERS}
         body = body or None

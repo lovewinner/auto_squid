@@ -1144,6 +1144,57 @@ class TestApiAuth:
         assert TestClient(api_app).get("/stats").status_code == 200
 
 
+class TestPanelXss:
+    """管理面板不得把动态值裸拼进 innerHTML(域名/代理 id/客户端 IP)。
+
+    域名统计键的源头是客户端请求(:10808 一次 origin-form 请求即可注入),
+    渲染端再未转义就是存储型 XSS;`?default_proxy=` 是反射型。修法是双层:
+    键在生成处净化,渲染处一律过 esc()。
+    """
+
+    def test_domain_key_never_contains_html_metachars(self):
+        from auto_squid.router import _domain_key_from_url, _DOMAIN_KEY_MAX_LEN
+        payload = '/<svg onload=alert(1)>'
+        key = _domain_key_from_url(payload)
+        assert not set('<>"\'&\\') & set(key), key
+        assert len(key) <= _DOMAIN_KEY_MAX_LEN
+        # 正常 absolute-form 仍取 hostname(行为不变)。
+        assert _domain_key_from_url("http://Example.COM:8080/a?b=1") == "example.com"
+        # 非法 IPv6 字面量让 urlparse 抛 ValueError,不能冒泡到请求路径。
+        assert '<' not in _domain_key_from_url("http://[not::an::ipv6]/x")
+        assert _domain_key_from_url("") == "unknown"
+
+    @staticmethod
+    def _code_only(html: str) -> str:
+        """剥掉整行 // 注释:注释里会引用被修掉的旧写法,不该被当成回归。"""
+        return "\n".join(l for l in html.splitlines() if not l.strip().startswith("//"))
+
+    def test_panel_pages_escape_dynamic_values(self):
+        """渲染站点必须走 esc();裸 `${domain}` / `${pid}` / `${metricsDomain}` 视为回归。"""
+        client = TestClient(api_app)
+        mount(None, None)
+        js = self._code_only(client.get("/static/panel.js").text)
+        pages = {p: self._code_only(client.get(p).text) for p in
+                 ("/panel/domains", "/panel/stickiness", "/panel/metrics")}
+
+        assert "function esc(s)" in js
+        for raw in ("${domain}", "${s.client}", "${s.domain}", "${metricsDomain}",
+                    "${m.default_proxy ", "${pid}"):
+            for page, html in pages.items():
+                assert raw not in html, f"{page} 仍裸拼 {raw!r}"
+        # 内联 onclick 里拼 JS 字符串字面量的写法必须消失(改为 data-pid 委托)。
+        assert "selectProxy('${" not in pages["/panel/domains"]
+        assert "data-pid=" in pages["/panel/domains"]
+
+    def test_panel_js_reflects_default_proxy_param(self):
+        """横幅把 ?default_proxy= 反射进 innerHTML —— 渲染端必须 esc()。"""
+        client = TestClient(api_app)
+        mount(None, None)
+        html = client.get("/panel/domains").text
+        assert "esc(activeProxy)" in html
+        assert "+ activeProxy +" not in html
+
+
 # ── streaming / pooling / DB-batching tests ───────────────────────
 
 

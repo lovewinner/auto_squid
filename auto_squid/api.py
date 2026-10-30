@@ -170,6 +170,19 @@ function protoStr(hv) {
   return parts.join(' / ');
 }
 
+// ── 动态文本转义 ──
+// 面板把域名 / 代理 id / 客户端 IP 直接拼进 innerHTML,而这些字符串的来源并不
+// 可信:域名统计键取自客户端请求的 URL origin-form(`GET /<svg onload=…> HTTP/1.1`
+// 会整段成为 key),`?default_proxy=` 查询参数也会反射进横幅。未经转义的拼接就是
+// 存储型 + 反射型 XSS —— :10808 的普通客户端种一次,管理员打开面板即执行,并可借
+// 浏览器缓存的 Basic 凭据回手改配置。所有进入 HTML 的动态值必须过 esc()。
+function esc(s) {
+  if (s === null || s === undefined) return '';
+  return String(s).replace(/[&<>"']/g, function (c) {
+    return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c];
+  });
+}
+
 // ── 刷新基础设施(回调风格:每页注入自己的 refreshFn)──
 function onIntervalChange(sel, refreshFn) {
   refreshInterval = parseInt(sel.value);
@@ -729,14 +742,14 @@ function render() {
   let html = '<table><thead><tr><th onclick="sortBy(0)">Domain <span class="arrow">\\u2195</span></th>';
   html += '<th onclick="sortBy(1)">Default Proxy <span class="arrow">\\u2195</span></th>';
   html += '<th onclick="sortBy(2)">Updated At <span class="arrow">\\u2195</span></th>';
-  for (const pid of proxyIds) html += `<th onclick="sortBy(${proxyIds.indexOf(pid)+offset})">${pid} <span class="arrow">\\u2195</span></th>`;
+  for (const pid of proxyIds) html += `<th onclick="sortBy(${proxyIds.indexOf(pid)+offset})">${esc(pid)} <span class="arrow">\\u2195</span></th>`;
   html += '<th onclick="sortBy('+(proxyIds.length+offset)+')">Total <span class="arrow">\\u2195</span></th></tr></thead><tbody>';
   for (const [domain, wins] of pageEntries) {
     const m = meta[domain] || {};
     const total = Object.values(wins).reduce((a,b) => a+b, 0);
     const best = Math.max(...Object.values(wins));
-    let row = `<tr><td class="domain" title="${domain}" onclick="copyDomain(this)" style="cursor:pointer">${domain}</td>`;
-    row += `<td class="default-proxy">${m.default_proxy || '-'}</td>`;
+    let row = `<tr><td class="domain" title="${esc(domain)}" onclick="copyDomain(this)" style="cursor:pointer">${esc(domain)}</td>`;
+    row += `<td class="default-proxy">${esc(m.default_proxy || '-')}</td>`;
     row += `<td class="updated-at">${toBeijing(m.updated_at)}</td>`;
     for (const pid of proxyIds) {
       const v = wins[pid] || 0;
@@ -771,12 +784,20 @@ function renderStats() {
   const sorted = Object.entries(cnt).sort((a,b) => b[1]-a[1]);
   const total = sorted.reduce((s,[,n]) => s+n, 0);
   let html = '';
-  if (total > 0) html += `<div class="stat-card${activeProxy===null?' active':''}" title="全部域名" onclick="selectProxy('')"><div class="pid">全部</div><div class="count">${total}</div><div class="label">default proxy</div></div>`;
+  if (total > 0) html += `<div class="stat-card${activeProxy===null?' active':''}" title="全部域名" data-pid=""><div class="pid">全部</div><div class="count">${total}</div><div class="label">default proxy</div></div>`;
   for (const [pid, n] of sorted) {
-    html += `<div class="stat-card${pid===activeProxy?' active':''}" title="${pid}" onclick="selectProxy('${pid.replace(/'/g, "\\\\'")}')"><div class="pid">${pid}</div><div class="count">${n}</div><div class="label">default proxy</div></div>`;
+    html += `<div class="stat-card${pid===activeProxy?' active':''}" title="${esc(pid)}" data-pid="${esc(pid)}"><div class="pid">${esc(pid)}</div><div class="count">${n}</div><div class="label">default proxy</div></div>`;
   }
   document.getElementById('stats').innerHTML = html || '<div class="stat-card" style="color:#666;font-size:13px;padding:10px 18px">No data</div>';
 }
+
+// 事件委托代替内联 onclick:pid 曾被拼进 `selectProxy('${pid}')` 的 JS 字符串字面量,
+// 手工 replace 单引号并不能防住(反斜杠/换行同样能逃出字面量),而 dataset 读到的
+// 值是浏览器解码后的原文 —— 动态数据不该进入可执行代码位置。
+document.getElementById('stats').addEventListener('click', function (e) {
+  const card = e.target.closest('[data-pid]');
+  if (card) selectProxy(card.dataset.pid || null);
+});
 
 function selectProxy(pid) {
   activeProxy = pid || null;
@@ -812,7 +833,7 @@ function renderBanner() {
   const banner = document.getElementById('filter-banner');
   if (!activeProxy) { banner.style.display = 'none'; banner.innerHTML = ''; return; }
   banner.style.display = 'flex';
-  banner.innerHTML = '已筛选：Default Proxy 为 <strong>' + activeProxy + '</strong> 的域名（' +
+  banner.innerHTML = '已筛选：Default Proxy 为 <strong>' + esc(activeProxy) + '</strong> 的域名（' +
     Object.keys(data).filter(d => (meta[d] || {}).default_proxy === activeProxy).length + ' 个）' +
     '<button class="fb-close" onclick="clearFilter()" title="清除筛选">✕</button>';
 }
@@ -911,9 +932,9 @@ function renderStickyTable() {
   const pageEntries = sticky.slice(start, start + pageSize);
   let html = '<table><thead><tr><th>Client</th><th>Domain / Target</th><th>Sticky Proxy</th><th>Hits</th><th>Updated At</th></tr></thead><tbody>';
   for (const s of pageEntries) {
-    html += `<tr><td class="domain" title="${s.client}" style="max-width:280px;min-width:180px">${s.client}</td>`;
-    html += `<td class="domain" title="${s.domain}" style="max-width:280px;min-width:180px">${s.domain}</td>`;
-    html += `<td class="default-proxy">${s.pid}</td>`;
+    html += `<tr><td class="domain" title="${esc(s.client)}" style="max-width:280px;min-width:180px">${esc(s.client)}</td>`;
+    html += `<td class="domain" title="${esc(s.domain)}" style="max-width:280px;min-width:180px">${esc(s.domain)}</td>`;
+    html += `<td class="default-proxy">${esc(s.pid)}</td>`;
     html += `<td class="num">${s.hits}</td>`;
     html += `<td class="updated-at">${toBeijing(s.updatedAt)}</td></tr>`;
   }
@@ -981,7 +1002,7 @@ async function fetchMetrics() {
   const sel = document.getElementById('metrics-domain');
   const keys = stamp.sort();
   if (sel.options.length !== keys.length) {
-    sel.innerHTML = keys.map(k => `<option value="${k.replace(/"/g,'&quot;')}">${k}</option>`).join('');
+    sel.innerHTML = keys.map(k => `<option value="${esc(k)}">${esc(k)}</option>`).join('');
     sel.value = (metricsDomain && keys.includes(metricsDomain)) ? metricsDomain : '';
     metricsDomain = sel.value;
   }
@@ -1036,13 +1057,13 @@ function renderMetricsGlobal(wrap) {
   for (const pid of pids) {
     const m = qmeta[pid] || {};
     const c = m.cumulative || {};
-    win += `<tr><td class="default-proxy">${pid}</td>`;
+    win += `<tr><td class="default-proxy">${esc(pid)}</td>`;
     win += `<td class="metric-cell-num">${pctCell(m.ttfb)}</td>`;
     win += `<td class="metric-cell-num">${pctCell(m.ofb)}</td>`;
     win += `<td class="metric-cell-num">${fmtPct(m.window_success_rate)}</td>`;
     win += `<td class="metric-cell-num">${m.window_success_count||0}/${m.window_total||0}</td>`;
     win += `<td class="metric-cell-num err-cell">${errStr(m.errors)}</td></tr>`;
-    cum += `<tr><td class="default-proxy">${pid}</td>`;
+    cum += `<tr><td class="default-proxy">${esc(pid)}</td>`;
     cum += `<td class="metric-cell-num">${c.avg_ttfb_ms != null ? Math.round(c.avg_ttfb_ms)+'ms' : '—'}</td>`;
     cum += `<td class="metric-cell-num">${c.avg_ofb_ms != null ? Math.round(c.avg_ofb_ms)+'ms' : '—'}</td>`;
     cum += `<td class="metric-cell-num">${fmtMbps(c.throughput_mbps)}</td>`;
@@ -1072,7 +1093,7 @@ function renderMetricsDomain(wrap) {
   const per = perDest;  // perDest 已是选中域名的 {pid: ...}(fetchDomain 按需拉取)
   const pids = Object.keys(per).sort((a,b) => (per[b].total||0)-(per[a].total||0));
   if (!pids.length) { wrap.innerHTML = '<div class="no-data">该域名暂无代理指标</div>'; document.getElementById('pager').innerHTML=''; document.getElementById('footer').textContent=''; return; }
-  let banner = `<div class="filter-banner" style="display:flex"><strong>${metricsDomain}</strong>&nbsp;各代理实测指标</div>`;
+  let banner = `<div class="filter-banner" style="display:flex"><strong>${esc(metricsDomain)}</strong>&nbsp;各代理实测指标</div>`;
   let win = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 P50/P95/P99</th><th>源站首字节 P50/P95/P99</th><th>成功率(近)</th><th>成功/总数(近)</th><th>错误分类(近 256)</th></tr></thead><tbody>';
   let cum = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 均值</th><th>源站首字节 均值</th><th>吞吐 累计</th><th>成功率</th><th>总请求</th><th>累计字节</th><th>协议(累计)</th></tr></thead><tbody>';
   for (const pid of pids) {
@@ -1081,13 +1102,13 @@ function renderMetricsDomain(wrap) {
     const total = m.total || 0;
     const rate = total ? m.success / total : null;
     const c = m.cumulative || {};
-    win += `<tr><td class="default-proxy">${pid}</td>`;
+    win += `<tr><td class="default-proxy">${esc(pid)}</td>`;
     win += `<td class="metric-cell-num">${pctCell(per_t.ttfb)}</td>`;
     win += `<td class="metric-cell-num">${pctCell(per_t.ofb)}</td>`;
     win += `<td class="metric-cell-num">${fmtPct(m.window_success_rate)}</td>`;
     win += `<td class="metric-cell-num">${m.window_success_count||0}/${m.window_total||0}</td>`;
     win += `<td class="metric-cell-num err-cell">${errStr(m.errors)}</td></tr>`;
-    cum += `<tr><td class="default-proxy">${pid}</td>`;
+    cum += `<tr><td class="default-proxy">${esc(pid)}</td>`;
     cum += `<td class="metric-cell-num">${c.avg_ttfb_ms != null ? Math.round(c.avg_ttfb_ms)+'ms' : '—'}</td>`;
     cum += `<td class="metric-cell-num">${c.avg_ofb_ms != null ? Math.round(c.avg_ofb_ms)+'ms' : '—'}</td>`;
     cum += `<td class="metric-cell-num">${fmtMbps(c.throughput_mbps)}</td>`;
