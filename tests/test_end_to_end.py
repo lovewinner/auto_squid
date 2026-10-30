@@ -6605,6 +6605,81 @@ class TestResponseCacheIntegrity:
             await proxy_srv.wait_closed()
 
 
+class TestConnectTargetValidation:
+    """CONNECT target 必须校验并归一化后才能当域名键使用。
+
+    旧实现把 parts[1] 原文交给 _handle_connect:它同时是统计键、粘性键与缓存
+    二级索引键(面板渲染的输入源);而无端口写法在本机直连分支会走
+    `int(target.rsplit(':', 1)[1])` → IndexError(不在任何 except 里)。
+    """
+
+    CASES = [
+        ("example.com:443", "example.com:443"),
+        ("EXAMPLE.com:8443", "example.com:8443"),      # 主机小写化,键稳定
+        ("example.com", "example.com:443"),            # 缺省端口(CONNECT 恒为 https 权威)
+        ("[::1]:8080", "[::1]:8080"),
+        ("127.0.0.1:3128", "127.0.0.1:3128"),
+        ("::1:8080", None),                             # 裸 IPv6 必须带方括号
+        ("example.com:0", None),
+        ("example.com:65536", None),
+        ("example.com:http", None),
+        ("/<svg onload=alert(1)>", None),               # 曾经成为统计键的 payload
+        ("evil.com:443/path", None),
+        ("user@evil.com:443", None),
+        ("host HTTP/1.1", None),                        # 含空格
+        ("a b:443", None),
+        ("", None),
+        ("x" * 300 + ":443", None),                     # 超长,键空间放大
+    ]
+
+    @pytest.mark.parametrize("raw,expected", CASES)
+    def test_normalize(self, raw, expected):
+        from auto_squid.router import Router
+        assert Router._normalize_connect_target(raw) == expected, raw
+
+    @pytest.mark.asyncio
+    async def test_connect_without_port_succeeds(self):
+        """`CONNECT host`(无端口):旧实现在直连分支抛 IndexError,现在补 443。"""
+        proxy_srv = await run_mock_proxy(HOST, PROXY_PORT)
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+        router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                             db_path=tempfile.mktemp(suffix='.db'))
+        await router.start()
+        try:
+            echo = await send_connect(HOST, ROUTER_PORT, target=b"nocport.example.com")
+            assert echo == b"hello"
+            # 键是归一化后的 host:443,不是原文。
+            assert "nocport.example.com:443" in router._stats_cache
+            assert "nocport.example.com" not in router._stats_cache
+        finally:
+            await router.stop()
+            proxy_srv.close()
+            await proxy_srv.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_malformed_connect_rejected_400_and_not_keyed(self):
+        """畸形 target 回 400,并且绝不进入域名维度统计(面板输入源)。"""
+        proxy_srv = await run_mock_proxy(HOST, PROXY_PORT)
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+        router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                             db_path=tempfile.mktemp(suffix='.db'))
+        await router.start()
+        try:
+            status = await send_connect_status(
+                HOST, ROUTER_PORT, target=b"<svg onload=alert(1)>:443")
+            assert b'400' in status, status
+            status2 = await send_connect_status(HOST, ROUTER_PORT, target=b"evil.com:443/x")
+            assert b'400' in status2, status2
+            bad = [k for k in router._stats_cache if '<' in k or '/' in k or ' ' in k]
+            assert bad == [], f"畸形 CONNECT target 进了域名统计键: {bad}"
+        finally:
+            await router.stop()
+            proxy_srv.close()
+            await proxy_srv.wait_closed()
+
+
 @pytest.mark.asyncio
 async def test_aggregation_wait_timeout_is_second_scale():
     """#8: 聚合等待超时必须提升到秒级(而非 100ms 形同虚设)。

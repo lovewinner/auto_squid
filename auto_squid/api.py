@@ -2,10 +2,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field, field_validator
 from typing import Dict, List
-import re
 
 from .auth import check_auth
-from .config_schema import AuthConfig, ProxyInfo
+from .config_schema import AuthConfig, ProxyInfo, is_valid_host
 from .proxy_store import ProxyStore
 from .router import Router
 
@@ -264,7 +263,7 @@ class ProxyIn(BaseModel):
     @field_validator("host")
     @classmethod
     def _check_host(cls, v: str):
-        """host 只接受裸主机名 / IPv4 / 方括号 IPv6。
+        """host 只接受裸主机名 / IPv4 / 方括号 IPv6(见 config_schema.is_valid_host)。
 
         上游代理 URL 是 f-string 拼出来的(proxy_store.proxy_url →
         `http://{host}:{port}`,凭据版为 `http://u:p@{host}:{port}`),所以
@@ -272,15 +271,7 @@ class ProxyIn(BaseModel):
         管理 API 的写入路径必须挡住,否则一条 POST 就是定向 SSRF/流量劫持。
         """
         v = v.strip()
-        if not v:
-            raise ValueError("host 不能为空")
-        if v.startswith('[') and v.endswith(']'):
-            # IPv6 字面量:方括号内只允许十六进制段与冒号。
-            inner = v[1:-1]
-            if not re.fullmatch(r"[0-9A-Fa-f:.]+", inner):
-                raise ValueError(f"host {v!r} 不是合法的 IPv6 字面量")
-            return v
-        if not re.fullmatch(r"[A-Za-z0-9._-]+", v):
+        if not is_valid_host(v):
             raise ValueError(
                 f"host {v!r} 不合法:只允许主机名 / IPv4 / [IPv6],"
                 "不接受含 scheme、端口、'@' 或 '/' 的写法(会改写上游目标)")

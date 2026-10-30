@@ -12,7 +12,31 @@
 """
 
 from typing import Dict, List, Optional
+import re
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+# 主机形态:裸主机名 / IPv4 / 方括号 IPv6。**不含**端口、scheme、'@'、'/'。
+_HOSTNAME_RE = re.compile(r"(?:[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?\.)*"
+                          r"[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?")
+_IPV6_LITERAL_RE = re.compile(r"\[[0-9A-Fa-f:.]+\]")
+
+
+def is_valid_host(value: str) -> bool:
+    """判断字符串是否是"干净的主机"形态。
+
+    两处都需要这个判据,且理由相同 —— 主机串会被拼进更长的语法里:
+    - 上游代理 URL:`http://{host}:{port}` / `http://user:pass@{host}:{port}`
+      (proxy_store.proxy_url),host 里一个 '@' 就能把流量导向第三个主机;
+    - CONNECT target:`{host}:{port}`,它同时是域名维度的统计/缓存键的一部分。
+    空白、控制字符、scheme、端口、路径分隔符一律拒绝;IPv6 必须带方括号。
+    """
+    if not value:
+        return False
+    if _IPV6_LITERAL_RE.fullmatch(value):
+        return True
+    return bool(_HOSTNAME_RE.fullmatch(value))
 
 
 class ConfigBase(BaseModel):

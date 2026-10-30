@@ -49,7 +49,7 @@ import httpx
 from .proxy_store import ProxyStore
 from .auth import check_auth
 from .config_schema import (PolicyConfig, RouterConfig, AutoTuneConfig,
-                            router_config_from_flat)
+                            is_valid_host, router_config_from_flat)
 from .tuner import AutoTuner
 from .pools import ConnectionPools
 from .selector import (ProxySelector, _CIRCUIT_THRESHOLD, _CIRCUIT_MAX_BACKOFF,
@@ -58,7 +58,8 @@ from .selector import (ProxySelector, _CIRCUIT_THRESHOLD, _CIRCUIT_MAX_BACKOFF,
                        ERROR_TIMEOUT, ERROR_CONNECT, ERROR_HTTP_5XX, ERROR_TLS,
                        ERROR_PROTOCOL, ERROR_CANCELLED, ERROR_OTHER)
 from .http_cache import (HttpCache, CACHEABLE_STATUS, NO_BODY_STATUS,
-                       _INVALIDATING_METHODS, domain_key_from_url)
+                         DOMAIN_KEY_MAX_LEN, _INVALIDATING_METHODS,
+                         domain_key_from_url)
 from .sticky import StickyCache
 from .cluster import ClusterGraph
 import json
@@ -2643,6 +2644,44 @@ class Router:
             return target
         return target.rsplit(':', 1)[0]
 
+    @staticmethod
+    def _normalize_connect_target(raw_target: str) -> Optional[str]:
+        """校验并归一化 CONNECT 的 target;非法返回 None(调用方回 400 并关连接)。
+
+        三件事各自对应一个真实缺陷:
+        - 拒绝含空白/控制字符/HTML 元字符/'@'/路径分隔符的目标。target 同时是
+          域名维度的统计键、粘性键与缓存二级索引键(:10808 客户端完全可控),
+          原文入键即是面板渲染的输入源,也是无界键空间。
+        - 缺省端口补 443:此前 `CONNECT host HTTP/1.1`(无端口)走本机直连分支时
+          `int(target.rsplit(':', 1)[1])` 抛 **IndexError**,不在任何 except 里,
+          于是一个合法写法的请求变成 traceback + 连接重置。
+        - 主机小写化、剥离首尾空白,使白名单判定与域名缓存键和单发路径一致。
+        """
+        t = (raw_target or '').strip()
+        if not t or len(t) > DOMAIN_KEY_MAX_LEN + 8:   # host(253) + ':' + port(5)
+            return None
+        if t.startswith('['):
+            end = t.find(']')
+            if end < 2:
+                return None
+            host, rest = t[:end + 1], t[end + 1:]
+            if rest and not rest.startswith(':'):
+                return None
+            port_s = rest[1:] if rest else ''
+        elif ':' in t:
+            host, port_s = t.rsplit(':', 1)
+        else:
+            host, port_s = t, ''
+        if not is_valid_host(host):
+            return None
+        if port_s:
+            if not port_s.isdigit() or not (1 <= int(port_s) <= 65535):
+                return None
+            port = int(port_s)
+        else:
+            port = 443
+        return f"{host if host.startswith('[') else host.lower()}:{port}"
+
     async def _try_tunnel(self, pid: str, target: str, proxy_host: Optional[str], proxy_port: Optional[int], proxy_auth: Optional[dict], relaxed: bool = False, client_ip: str = ""):
         """尝试建立一条 CONNECT 隧道,作为竞速的一个候选。
 
@@ -2878,9 +2917,16 @@ class Router:
         if not parts:
             return False
         if parts[0].upper() == 'CONNECT':
-            if len(parts) < 2:
+            # 无端口写法(`CONNECT host HTTP/1.1`)与畸形目标都在这一步拦掉:
+            # 见 _normalize_connect_target(旧实现把原文当域名键,并在本机直连
+            # 分支的 rsplit 上抛 IndexError)。
+            target = self._normalize_connect_target(parts[1] if len(parts) > 1 else '')
+            if target is None:
+                await self._write_cached_response(
+                    writer, 400, 'Bad Request', {'Connection': 'close'},
+                    b'Bad Request')
                 return False
-            await self._handle_connect(parts[1], reader, writer, client_ip)
+            await self._handle_connect(target, reader, writer, client_ip)
             return False  # CONNECT 接管整个连接，隧道结束后不可复用为 HTTP。
         if len(parts) != 3:
             await self._write_cached_response(writer, 400, 'Bad Request', {}, b'Bad Request')
