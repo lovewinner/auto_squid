@@ -214,6 +214,35 @@ _api_auth: AuthConfig | None = None
 _server_stats: dict = {}
 
 
+_UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _cross_site_write(request: Request) -> bool:
+    """判断一个"会改状态"的请求是否来自别的站点(CSRF 形态)。
+
+    为什么需要:Basic 凭据一旦被浏览器按 origin 缓存,第三方页面的
+    `fetch('http://127.0.0.1:18080/proxies', {method:'POST'})` 会**自动附带**这套
+    凭据 —— 跨域请求照样发得出去(只是读不回包)。运维开着面板再点开别的网页,
+    就可能被静默改走上游代理 / 熔断 / cost 配置。而 api.auth 默认关闭,那时
+    本地任意页面更是直接可写 —— 所以这道检查与是否启用认证无关,必须前置。
+
+    判据(按可靠度):
+    - `Sec-Fetch-Site: cross-site` —— 浏览器自己给出的权威答案,直接拒;
+    - 否则比 `Origin` 与请求 host:不同则拒。Origin 缺失(curl/脚本/同源表单)
+      放行,保持命令行用法不变。
+    """
+    if request.headers.get("sec-fetch-site", "").lower() == "cross-site":
+        return True
+    origin = request.headers.get("origin")
+    if not origin or origin.lower() == "null":
+        return False
+    # 只比 host[:port]:反向代理改写了 scheme(外部 https、内部 http)时,
+    # 连 scheme 一起比会把合法的同站管理请求判成跨站。
+    host = origin.split("://", 1)[-1].rstrip("/")
+    request_host = request.url.netloc
+    return host != request_host
+
+
 @app.middleware("http")
 async def api_auth_middleware(request: Request, call_next):
     """管理 API 的 HTTP Basic 认证(经 config api.auth 开启,默认关闭)。
@@ -224,6 +253,9 @@ async def api_auth_middleware(request: Request, call_next):
     401 + WWW-Authenticate,浏览器据此弹出原生凭据框;成功后浏览器按 origin
     缓存 Basic 凭据,页面内同源 fetch 自动附带 Authorization,仪表盘无需改动。
     """
+    if request.method in _UNSAFE_METHODS and _cross_site_write(request):
+        return JSONResponse(status_code=403,
+                            content={"detail": "cross-site admin write blocked"})
     if not _api_auth or not _api_auth.enabled:
         return await call_next(request)
     if request.url.path == "/health":

@@ -1412,6 +1412,78 @@ class TestAdminPayloadLimits:
             mount(None, None)
 
 
+class TestAdminCsrfGuard:
+    """管理 API 的写操作拒绝跨站请求 —— Basic 凭据会被浏览器自动附带。
+
+    运维开着 http://127.0.0.1:18080 的面板(凭据被浏览器按 origin 缓存),再点开
+    任意网页,那个页面就能 `fetch(..., {method:'POST'})` 静默改走上游代理/熔断/
+    cost;api.auth 默认关闭时更是连凭据都不需要。故这道拦截与认证开关无关。
+    """
+
+    NEW_PROXY = {"id": "csrf", "host": "10.9.9.9", "port": 3128}
+
+    def _client(self, router=None, store=None):
+        mount(store or ProxyStore(), router)
+        return TestClient(api_app)
+
+    def test_cross_site_origin_post_is_rejected_and_not_applied(self):
+        store = ProxyStore()
+        client = self._client(store=store)
+        try:
+            r = client.post("/proxies", json=self.NEW_PROXY,
+                            headers={"Origin": "http://evil.example.com"})
+            assert r.status_code == 403, r.text
+            assert store.get("csrf") is None, "被拒的写不得产生任何效果"
+        finally:
+            mount(None, None)
+
+    def test_sec_fetch_site_cross_site_is_rejected_without_origin(self):
+        """浏览器不发 Origin 的场合(如某些导航)仍有权威判据。"""
+        client = self._client()
+        try:
+            r = client.post("/quality/reset",
+                            headers={"Sec-Fetch-Site": "cross-site"})
+            assert r.status_code == 403, r.text
+        finally:
+            mount(None, None)
+
+    def test_guard_runs_even_when_auth_disabled(self):
+        """api.auth 关闭(默认)时跨站写同样被拒:那时唯一的防线就是绑定地址。"""
+        client = self._client()
+        try:
+            assert client.get("/proxies").status_code == 200   # 未开认证,读照常
+            r = client.post("/proxies", json=self.NEW_PROXY,
+                            headers={"Origin": "http://evil.example.com"})
+            assert r.status_code == 403, r.text
+        finally:
+            mount(None, None)
+
+    def test_same_origin_and_headerless_writes_allowed(self):
+        """同源(面板自身的 fetch)与无 Origin(curl/脚本)不受影响。"""
+        store = ProxyStore()
+        client = self._client(store=store)
+        try:
+            ok = client.post("/proxies", json=self.NEW_PROXY,
+                             headers={"Origin": "http://testserver"})
+            assert ok.status_code == 200, ok.text
+            assert store.get("csrf") is not None
+            store.remove("csrf")
+            ok2 = client.post("/proxies", json=self.NEW_PROXY)   # 无 Origin
+            assert ok2.status_code == 200, ok2.text
+            assert store.get("csrf") is not None
+        finally:
+            mount(None, None)
+
+    def test_reads_from_other_site_still_allowed(self):
+        """只拦"会改状态"的方法:跨站 GET 读不到回包(CORS 缺省不放行),无需拦。"""
+        client = self._client()
+        try:
+            assert client.get("/proxies",
+                              headers={"Origin": "http://evil.example.com"}).status_code == 200
+        finally:
+            mount(None, None)
+
+
 class TestApiAuth:
     """管理 API 的 HTTP Basic 认证(api.auth,默认关闭)。
 

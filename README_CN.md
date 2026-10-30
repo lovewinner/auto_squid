@@ -352,6 +352,7 @@ CI 通过 GitHub Actions（`.github/workflows/test.yml`）在 **Python 3.10、3.
 
 - HTTP 解析为 MVP 级别；大流式响应可能存在边界情况
 - 管理 API **默认开放** —— 在可信网络外暴露 18080 端口前请启用 `api.auth`（HTTP Basic）
+- 管理 API 的写操作（POST/PUT/PATCH/DELETE）**拒绝跨站请求**（`Sec-Fetch-Site: cross-site` 或 `Origin` 与本机不符 → 403）：Basic 凭据会被浏览器按 origin 自动附带，光靠“回包读不到”挡不住请求被发出；该拦截与是否启用认证无关
 - CONNECT 隧道使用原始管道（无 TLS 拦截）
 - `http_read_timeout_sec`（默认 3 s）可能超时高延迟链路上健康但慢的源站 —— 调整前请谨慎并在生产验证 p99/fd
 - 内存表（粘性、域名缓存、HTTP 响应缓存）重启后清空；SQLite 仅持久化域名胜出次数与 t-digest 终身指标

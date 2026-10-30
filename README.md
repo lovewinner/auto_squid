@@ -352,6 +352,7 @@ Standalone routing inspector: `test_routing.py` — analyze the decision chain (
 
 - HTTP parsing is MVP-level; large streaming responses may have edge cases
 - The management API is **open by default** — enable `api.auth` (HTTP Basic) before exposing port 18080 beyond a trusted network
+- Admin writes (POST/PUT/PATCH/DELETE) **reject cross-site requests** (`Sec-Fetch-Site: cross-site`, or an `Origin` that doesn't match this host → 403): a browser re-sends cached Basic credentials automatically, so "the attacker's page can't read the response" does not stop the request from landing. The check runs regardless of whether `api.auth` is enabled
 - CONNECT tunnels use raw pipes (no TLS interception)
 - `http_read_timeout_sec` (3 s by default) may timeout slow but healthy origins over high-latency links — increase carefully and verify p99/fd before wide rollout
 - In-memory tables (stickiness, domain cache, HTTP response cache) are cleared on restart; SQLite persists domain win counts and t-digest lifetime metrics only
