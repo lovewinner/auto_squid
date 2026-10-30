@@ -252,6 +252,15 @@ class ClusterGraph:
                 self._edge_lru.pop((src, co), None)
             if not out:
                 del self._cooccur[src]
+        # 预测节流表 TTL 清扫:_last_predict 只回答"这对 (src,co) 是否还在节流窗内",
+        # 而 maybe_predict 用 `get(pair, 0.0)` 读它 —— 条目一旦老于节流窗,删掉与留着
+        # 判定结果完全一致(缺失时 now-0.0 必然 ≥ 窗,同样放行预测)。键是
+        # (src, co) 目标串对,随 URL 基数无界增长且原实现**只在 reset() 整表清空**,
+        # 于是高换手流量(广告/追踪域名每次都换)下每次 prune 之间的写入永久累积。
+        cutoff = now - self.cluster_predict_throttle_sec
+        for pair, last in list(self._last_predict.items()):
+            if last <= cutoff:
+                del self._last_predict[pair]
         # 图:LRU 上限(边数超 max_entries → 淘汰 last_seen 最旧的一条)。
         self._enforce_cap()
 

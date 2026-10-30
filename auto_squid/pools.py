@@ -21,6 +21,9 @@ from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+#: `_target_pool_cluster_ever` 的键数上限(归因探针标记位,见该字段注释)。
+_CLUSTER_EVER_MAX_KEYS = 4096
+
 
 class ConnectionPools:
     """三个 CONNECT 预热池 + 空闲暂停/refill 的统一状态与操作。#14 pools.py。
@@ -132,7 +135,13 @@ class ConnectionPools:
         self.cluster_pool_bucket_miss = 0  # miss:该桶从未有 cluster 预建(代理桶不匹配)
         self.cluster_pool_consumed_expired = 0  # 被消费后另行空转的预建被 prune 关闭(极少数)
         # 键级"该桶是否出现过 cluster 预建"的标记(诊断读,不进 snapshot)。
-        self._target_pool_cluster_ever: dict = {}
+        # 必须**有界**:键是 "proxy:port|target",cluster 开着时每个被预测过的
+        # target 都写一条,而这张表原本只在 `_conn_pool_close_all`/stop 时随池清空
+        # ——高 URL 基数(广告/追踪域每次都换)下它是纯内存泄漏,且泄漏的只是
+        # 诊断信息。超出上限即淘汰最早写入的键:被淘汰的键再次 miss 会记成
+        # bucket_miss 而非 timing_miss,宁可归因少准,不可内存无界。
+        self._target_pool_cluster_ever: "collections.OrderedDict[str, int]" = \
+            collections.OrderedDict()
         self.target_prewarm_dispatched = 0  # 后台预热协程发起次数
         self.target_prewarm_success = 0     # 预热建连成功次数
         self.target_prewarm_failed = 0      # 预热建连失败次数
@@ -150,6 +159,16 @@ class ConnectionPools:
     def _proxy_of(pool_key: str) -> str:
         """池键 → 所属代理键:第一阶段 "host:port",第二阶段 "host:port|target"。"""
         return pool_key.partition('|')[0]
+
+    def _mark_cluster_ever(self, key: str) -> None:
+        """登记"该 (proxy|target) 桶出现过 cluster 预测预建",并把表钉在有界规模内。
+
+        见 _target_pool_cluster_ever 字段注释:超出上限淘汰最早写入的键(FIFO)。
+        """
+        ever = self._target_pool_cluster_ever
+        ever[key] = 1
+        if len(ever) > _CLUSTER_EVER_MAX_KEYS:
+            ever.popitem(last=False)
 
     def _count_put(self, pool_key: str, n: int = 1) -> None:
         """记录 n 条连接落池(与 _count_take 成对;prune 传批量数量)。"""
@@ -458,7 +477,7 @@ class ConnectionPools:
                 self.cluster_pool_creates += 1
                 # 键级标记:该 (proxy|target) 桶出现过 cluster 预建。取用该键 miss
                 # 时据此分诊"时序没赶上"(标记存在)vs"代理桶不匹配"(标记缺失)。
-                self._target_pool_cluster_ever[key] = 1
+                self._mark_cluster_ever(key)
             self._target_pool.setdefault(key, []).append((reader, writer))
             self._count_put(key)
             self.target_pool_creates += 1

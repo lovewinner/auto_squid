@@ -5179,6 +5179,23 @@ class TestPoolBudget:
         assert time.monotonic() - t0 < 2.0
         assert pools._conn_pool == {} and pools._proxy_conn_count == {}
 
+    def test_cluster_ever_marker_is_bounded(self):
+        """cluster 归因标记表 _target_pool_cluster_ever 必须有界。
+
+        键是 "proxy:port|target":cluster 每预测一个 target 就写一条,而它只是诊断
+        用标记位。原实现从不清理 —— 高 URL 基数(广告/追踪域每次都换)下是一条
+        永不停止的内存泄漏路径,泄漏的还是没人看的整数。
+        """
+        from auto_squid.pools import _CLUSTER_EVER_MAX_KEYS
+        pools = self._pools()
+        cap = _CLUSTER_EVER_MAX_KEYS
+        first = "10.0.0.1:3128|t0.example.com:443"
+        for i in range(cap + 5):
+            pools._mark_cluster_ever(f"10.0.0.1:3128|t{i}.example.com:443")
+        assert len(pools._target_pool_cluster_ever) == cap, "标记表超出上限未淘汰"
+        assert first not in pools._target_pool_cluster_ever, "应淘汰最早写入的键"
+        assert f"10.0.0.1:3128|t{cap + 4}.example.com:443" in pools._target_pool_cluster_ever
+
 
 class TestConnPoolIdlePause:
     """refill 空闲感知(conn_pool.refill_pause_minutes):连续 N 分钟无"密集活动"
@@ -6193,6 +6210,34 @@ class TestClusterPredictor:
             self._learn(g, '8.8.8.8', ['c.com:443', 'd.com:443'], t0=5000.0)
             live = {(src, co) for src, out in g._cooccur.items() for co in out}
             assert set(g._edge_lru) == live
+        finally:
+            g.reset()
+
+    def test_prune_sweeps_expired_predict_throttle(self):
+        """prune 必须清扫过期节流条目:_last_predict 原只在 reset() 整表清空。
+
+        它只回答"这对 (src,co) 是否还在节流窗内",而 maybe_predict 用
+        `get(pair, 0.0)` 读 —— 条目老于节流窗后,删掉与留着判定结果完全一致,
+        留着只会随 URL 基数无界增长。清扫不得改变预测行为。
+        """
+        spawn = self._stub_spawn()
+        g = self._graph(prewarm_spawn=spawn, min_support=1, throttle_sec=30.0)
+        try:
+            self._learn(g, '7.7.7.7', ['a.com:443', 'b.com:443'], t0=10.0)
+            g.observe('7.7.7.7', 'a.com:443', 'p', now=30.0)     # 窗口开口 → 预测 b
+            assert g._last_predict, "发射预测应登记节流条目"
+            fired = g.cluster_predictions
+            g.prune(now=61.0)                                    # 距 30.0 已超 30s 节流窗
+            assert g._last_predict == {}, "过期节流条目未被清扫(内存无界)"
+            # 语义不变:条目清掉后同对再次到期应照常发射(与"留着但已过期"等价)。
+            g.observe('7.7.7.7', 'a.com:443', 'p', now=70.0)
+            assert g.cluster_predictions == fired + 1
+            # 而在节流窗内(未过期)的条目必须留着,否则 reload 会反复预建。
+            g.observe('7.7.7.7', 'a.com:443', 'p', now=80.0)     # 距 70 仅 10s < 30s
+            assert g.cluster_predictions == fired + 1, "节流窗内不应重复发射"
+            assert len(g._last_predict) == 1
+            g.prune(now=81.0)                                    # 未过期 → 不清
+            assert len(g._last_predict) == 1
         finally:
             g.reset()
 
