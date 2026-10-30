@@ -9,7 +9,8 @@
 - 质量感知降级(Goal #6):被钉住代理在"单发选择"时经 Router._single_send_degraded
   (连续失败 / EWMA 相对钉住基线恶化)判定不稳定 → 驱逐回竞速;降级计数写入
   Router 共享的 `_degraded_single_send`(与 Router 侧 remove/clear 共享同一 set)。
-- 容量硬上限(max_entries):超限先清过期条目,仍超则驱逐 updated_at 最旧一条。
+- 容量硬上限(max_entries):超限时先按时间节流清一次过期条目,仍超则驱逐
+  updated_at 最旧一条(OrderedDict 队首,O(1),不扫全表)。
 
 依赖 Router 的决策链成员(selector/策略/单发降级/质量判优)通过 `self.router`
 背引用(runtime 对象引用,非 import,避免 import 环)。本类不落盘
@@ -17,6 +18,7 @@
 """
 
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -53,7 +55,16 @@ class StickyCache:
         # 纯内存、滑动 TTL:同一客户端+域名复用上次胜出的代理,保持 egress IP
         # 稳定;粘性代理失败则驱逐并回落竞速(redispatch)。仿 Router._meta_cache
         # 模式,但不落盘(粘性是瞬态,重启即清)。
-        self._sticky_cache: dict[str, dict[str, object]] = {}
+        #
+        # 用 OrderedDict 把"最后刷新时刻"编码进键顺序:凡是写 updated_at 的入口
+        # (_record_sticky / _bump_sticky)都顺手 move_to_end,于是队首恒为
+        # updated_at 最旧的一条 → 容量驱逐 _evict_oldest_sticky 从 O(N) 全表 min()
+        # 扫描降为 O(1) 取队首(表上限 10 万条,扫描一次是毫秒级事件循环停顿,而它
+        # 原来看起来"只在超限才跑"——超限后每次新钉住都要跑,正是高基数客户端流量
+        # 下的常态)。
+        self._sticky_cache: "OrderedDict[str, dict[str, object]]" = OrderedDict()
+        # 热路径清扫节流时刻(monotonic):见 _record_sticky 容量分支的注释。
+        self._last_prune_mono: float = 0.0
         self.sticky_cache_hits = 0
         self.sticky_evictions = 0       # 粘性表驱逐次数(5xx/失败/超容量)
         # 方案C:慢探路驱逐次数。sticky 代理的域名级 EWMA 显著差于同域名最优
@@ -260,7 +271,12 @@ class StickyCache:
             return
         key = self._sticky_key(client_ip, domain)
         if key not in self._sticky_cache and len(self._sticky_cache) >= self.stickiness_max_entries:
-            self._prune_sticky()
+            # 容量满先做一次过期清扫(回收的多是死条目,不该把活会话挤掉)。但
+            # _prune_sticky 是 O(N) 全表扫描(还要逐条 proxy_store.get),表顶到
+            # 10 万条时每次新钉住都跑一遍 = 稳定的事件循环停顿。故在热路径上按
+            # _PRUNE_MIN_INTERVAL_SEC 节流:清扫主要由后台 _flush_loop 周期承担,
+            # 这里只是兜底;节流期内直接走 O(1) LRU 驱逐,容量上限依旧被钉住。
+            self._prune_sticky_throttled()
             if len(self._sticky_cache) >= self.stickiness_max_entries:
                 self._evict_oldest_sticky()
         self._sticky_cache[key] = {
@@ -272,6 +288,18 @@ class StickyCache:
             # 时是否恶化"。粘性命中(_bump_sticky)只滑动 TTL,不刷新基线。
             "ref_ewma": self.router._ref_ewma_for(domain, pid),
         }
+        # 覆盖写入(同一客户端+域名换赢家)不改变 OrderedDict 位置,显式挪到队尾。
+        self._sticky_cache.move_to_end(key)
+
+    #: 热路径容量兜底清扫的最小间隔:小于此值不重复做 O(N) 扫描(后台 _flush_loop
+    #: 的 _prune_sticky 才是真正负责的清扫者)。
+    _PRUNE_MIN_INTERVAL_SEC = 1.0
+
+    def _prune_sticky_throttled(self):
+        """按时间节流地调用 _prune_sticky(热路径兜底,避免超限后每写一次扫全表)。"""
+        if time.monotonic() - self._last_prune_mono < self._PRUNE_MIN_INTERVAL_SEC:
+            return
+        self._prune_sticky()
 
     def _bump_sticky(self, client_ip: str, domain: str, pid: str):
         """粘性命中成功:刷新 updated_at(滑动 TTL)并累加 hits(B2)。
@@ -288,6 +316,9 @@ class StickyCache:
         entry["updated_at"] = self.router._now_utc()
         entry["_updated_mono"] = time.monotonic()
         entry["hits"] = int(entry.get("hits", 0)) + 1
+        # 刷新时刻即"最近使用":挪到队尾,维持"队首 = updated_at 最旧"这一不变式
+        # (_evict_oldest_sticky 依赖它做 O(1) 驱逐)。
+        self._sticky_cache.move_to_end(key)
 
     def _evict_sticky(self, client_ip: str, domain: str):
         """驱逐客户端+域名的粘性条目(粘性代理单发失败/5xx 时调用)。"""
@@ -296,20 +327,26 @@ class StickyCache:
     def _evict_oldest_sticky(self):
         """容量保护:驱逐 updated_at 最旧的一条粘性条目(计入驱逐统计)。
 
-        ISO-8601 UTC 时间戳同格式下按字典序比较即时间序,无需解析。
+        O(1):_sticky_cache 是 OrderedDict,凡写 updated_at 的入口都会 move_to_end,
+        故队首恒为最久未刷新的一条,无需 min(全表) 扫描。表为空时静默返回。
         """
-        if not self._sticky_cache:
+        oldest_key = next(iter(self._sticky_cache), None)
+        if oldest_key is None:
             return
-        oldest_key = min(self._sticky_cache, key=lambda k: self._sticky_cache[k].get("updated_at", ""))
         self._evict_sticky_key(oldest_key)
 
     def _prune_sticky(self):
         """清扫过期/指向失效代理的粘性条目,限制内存无界增长。
 
-        由后台 Router._flush_loop 周期调用,也由 _record_sticky 在超容量时先调用。
-        粘性键集合(客户端 IP)可能远大于域名集合,若放任不管会缓慢累积;
-        过期清扫把表规模收敛到"最近 TTL 内活跃的客户端+域名"。
+        由后台 Router._flush_loop 周期调用,也由 _record_sticky 在超容量时经
+        _prune_sticky_throttled 兜底调用。粘性键集合(客户端 IP)可能远大于域名
+        集合,若放任不管会缓慢累积;过期清扫把表规模收敛到"最近 TTL 内活跃的
+        客户端+域名"。
+
+        本方法是 O(N)(逐条判 TTL + proxy_store.get),故在这里登记清扫时刻,
+        让热路径的兜底调用按 _PRUNE_MIN_INTERVAL_SEC 节流(见 _record_sticky)。
         """
+        self._last_prune_mono = time.monotonic()
         # 先做探路节流表清扫(审计 P2#3):_sticky_probe_last 只在探路间隔>0 时
         # 写入,键集合理论上随"客户端×域名"无界增长;若粘性表为空就提前返回,
         # 会连这个独立表也一起漏清,故把该清扫放在空表早退**之前**。按

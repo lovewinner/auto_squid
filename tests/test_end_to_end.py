@@ -2580,6 +2580,92 @@ async def test_stickiness_capacity_limit_evicts_oldest():
 
 
 @pytest.mark.asyncio
+async def test_stickiness_bump_refreshes_eviction_position():
+    """粘性命中(_bump_sticky)刷新时刻后必须变成"最近使用",不得再被优先驱逐。
+
+    O(1) 驱逐依赖 OrderedDict 的键顺序 = 刷新顺序这个不变式;不变式一旦破(漏了
+    move_to_end),被钉住的活跃会话会被冷条目之后优先挤掉,egress IP 抖动。
+    """
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='p1', host=HOST, port=PROXY_PORT))
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                    stickiness_enabled=True, stickiness_ttl=1800,
+                    stickiness_max_entries=2,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    try:
+        router._record_sticky('c1', 'd', 'p1')
+        router._record_sticky('c2', 'd', 'p1')
+        # c1 命中并滑动刷新 → 队尾;c2 成为最久未使用。
+        router._bump_sticky('c1', 'd', 'p1')
+        router._record_sticky('c3', 'd', 'p1')
+        assert 'c1|d' in router._sticky_cache, "刚命中的活跃会话不该被当冷条目驱逐"
+        assert 'c2|d' not in router._sticky_cache
+        assert 'c3|d' in router._sticky_cache
+    finally:
+        await router.stop()
+
+
+@pytest.mark.asyncio
+async def test_stickiness_capacity_eviction_is_o1_not_full_scan():
+    """超限驱逐不得扫全表:表上限 10 万,超限后每次新钉住都扫一遍 = 事件循环停顿。
+
+    塞一个"读值就抛"的毒条目:O(1) 取队首不会碰它;任何 min(全表, key=...get(...))
+    的实现都会立刻炸。
+    """
+    class _Poison(dict):
+        def get(self, *a, **k):
+            raise AssertionError("容量驱逐退化成全表 min() 扫描(O(N) 事件循环停顿)")
+
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='p1', host=HOST, port=PROXY_PORT))
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                    stickiness_enabled=True, stickiness_ttl=1800,
+                    stickiness_max_entries=3,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    try:
+        router._record_sticky('c1', 'd0', 'p1')
+        router._record_sticky('c1', 'd1', 'p1')
+        router._record_sticky('c1', 'd2', 'p1')
+        # 队尾条目换成毒值(内容照常可读,只有 .get() 会炸;_prune_sticky 用 [] 取值)。
+        victim = router._sticky_cache['c1|d2']
+        poisoned = _Poison(victim)
+        router._sticky_cache['c1|d2'] = poisoned
+        router._record_sticky('c2', 'dX', 'p1')   # 超容量 → 驱逐队首 c1|d0
+        assert 'c1|d0' not in router._sticky_cache
+        assert router._sticky_cache['c1|d2'] is poisoned
+    finally:
+        await router.stop()
+
+
+@pytest.mark.asyncio
+async def test_stickiness_capacity_prune_is_throttled():
+    """超容量时的兜底清扫按时间节流:不能每次钉住都跑一遍 O(N) 的 _prune_sticky。"""
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='p1', host=HOST, port=PROXY_PORT))
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                    stickiness_enabled=True, stickiness_ttl=1800,
+                    stickiness_max_entries=4,
+                    db_path=tempfile.mktemp(suffix='.db'))
+    try:
+        calls = []
+        real_prune = router.sticky._prune_sticky
+
+        def counting_prune():
+            calls.append(1)
+            return real_prune()
+
+        router.sticky._prune_sticky = counting_prune
+        # 表顶在上限后连续钉住 20 个新键:清扫至多 1 次(节流窗口内),其余靠
+        # O(1) 队首驱逐维持上限。
+        for i in range(20):
+            router._record_sticky(f'c{i}', 'example.com', 'p1')
+        assert len(calls) <= 1, f"清扫未被节流: {len(calls)} 次 O(N) 扫描"
+        assert len(router._sticky_cache) == 4, "容量上限仍须被钉住"
+    finally:
+        await router.stop()
+
+
+@pytest.mark.asyncio
 async def test_stickiness_recheck_reraces_after_hits():
     """B2:粘性命中 recheck_hits 次后触发探路重竞速,且跳过域名缓存直接竞速。
 
