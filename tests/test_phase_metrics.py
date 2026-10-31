@@ -477,20 +477,152 @@ def test_cost_sort_missing_data_neutral():
 
 
 def test_cost_sort_throughput_ignored_when_bytes_low():
-    """累计字节低于 cost_throughput_min_bytes 时吞吐项不参与(隧道零吞吐噪声防护)。"""
+    """**响应体**累计字节低于 cost_throughput_min_bytes 时吞吐项不参与。
+
+    门槛口径必须是 body_bytes,不是终身 total_bytes:隧道双向透传也能攒到 GB,
+    用 total_bytes 当门槛等于永久放行,于是"客户端把隧道 idle 多久"算出来的假
+    吞吐会经 min-max 归一化拉开满量程 0..1,真的去决定名次。
+    """
     sel = ProxySelector(_store_with("p1", "p2"), cost_throughput_min_bytes=1_000_000)
     sel.record_ttfb("p1", 0.10)
     sel.record_ttfb("p2", 0.20)
     m1 = sel._proxy_metrics["p1"]["metrics"]
     m2 = sel._proxy_metrics["p2"]["metrics"]
     # 字节不足:吞吐近 0 / 极高都应被忽略 → 两代理 cost 差仅来自延迟
-    m1.update(throughput_ewma=0.0001, total_bytes=100)
-    m2.update(throughput_ewma=5.0, total_bytes=100)
+    m1.update(throughput_ewma=0.0001, body_bytes=100)
+    m2.update(throughput_ewma=5.0, body_bytes=100)
     diff_low = sel._cost_scores(["p1", "p2"], None)
-    # 字节充足:吞吐项生效,p2 的高吞吐抵消部分延迟劣势 → 差距缩小
-    m1["total_bytes"] = m2["total_bytes"] = 2_000_000
+    # 终身转发字节攒到 GB(隧道量就能做到)但 body_bytes 仍不足 → 门槛不放行
+    m1["total_bytes"] = m2["total_bytes"] = 27_000_000_000
+    diff_tunnel = sel._cost_scores(["p1", "p2"], None)
+    assert diff_tunnel == diff_low, "隧道累计字节不该解锁吞吐项(门槛看 body_bytes)"
+    # 响应体字节充足:吞吐项生效,p2 的高吞吐抵消部分延迟劣势 → 差距缩小
+    m1["body_bytes"] = m2["body_bytes"] = 2_000_000
     diff_high = sel._cost_scores(["p1", "p2"], None)
     assert (diff_low["p2"] - diff_low["p1"]) > (diff_high["p2"] - diff_high["p1"])
+
+
+def test_tunnel_sample_never_feeds_cost_throughput():
+    """tunnel=True 的样本只进观测字段,绝不进 cost 的 throughput_ewma。
+
+    隧道速率的分母是整条隧道的墙钟寿命:心跳型长连接(alive.github.com 实测
+    1.6MB / 89,054s ≈ 18 B/s)算出来的"吞吐"编码的是客户端空闲时长,不是代理
+    中转能力。混进同一 EWMA 后经 min-max 归一化,会按"谁摊上了长寿命隧道"排序。
+    """
+    sel = ProxySelector(_store_with("p1"))
+    # 一条"活了一小时、只挪了 2MB"的心跳隧道。
+    sel.record_complete("p1", 2 * 1024 * 1024, 3600.0, tunnel=True)
+    mm = sel._proxy_metrics["p1"]["metrics"]
+    assert mm["throughput_ewma"] is None, "隧道样本不该进 cost 吞吐维度"
+    assert mm["body_bytes"] == 0, "隧道样本不该计入门槛用的响应体字节"
+    assert mm["tunnel_relay_ewma"] == pytest.approx(2.0 / 3600.0), "观测字段应记录隧道速率"
+    assert mm["total_bytes"] == 2 * 1024 * 1024, "累计转发量仍要记(报表口径)"
+    assert mm["transfer_time"] == 3600.0
+    # 真正的后果:此后该代理攒够明文 body(门槛放行),EWMA 必须是**干净的新初值**,
+    # 而不是与刚才那条 18 B/s 的隧道值做 EMA 混合后的东西。
+    sel.record_complete("p1", 2 * 1024 * 1024, 1.0)
+    assert mm["throughput_ewma"] == pytest.approx(2.0), (
+        f"隧道样本混进了 cost 吞吐 EWMA: {mm['throughput_ewma']}")
+
+
+def test_body_sample_feeds_cost_throughput_only():
+    """明文 body 样本反过来:进 throughput_ewma + body_bytes,不动观测字段。"""
+    sel = ProxySelector(_store_with("p1"))
+    sel.record_complete("p1", 5 * 1024 * 1024, 1.0)     # 5MB/s 的真实下载
+    mm = sel._proxy_metrics["p1"]["metrics"]
+    assert mm["throughput_ewma"] == pytest.approx(5.0)
+    assert mm["body_bytes"] == 5 * 1024 * 1024
+    assert mm["tunnel_relay_ewma"] is None
+
+
+def test_cost_throughput_ignores_tunnel_only_proxy():
+    """只有隧道量的代理,吞吐项必须退成中性(两代理不因隧道寿命差异被拉开)。"""
+    sel = ProxySelector(_store_with("fast_idle", "busy"),
+                        cost_throughput_min_bytes=1_000_000)
+    sel.record_ttfb("fast_idle", 0.10)
+    sel.record_ttfb("busy", 0.10)                        # 延迟完全相同
+    # 同延迟、同字节量,只有"隧道空闲时长"不同 → 旧口径下吞吐项会拉开两者。
+    sel.record_complete("fast_idle", 2 * 1024 * 1024, 3600.0, tunnel=True)
+    sel.record_complete("busy", 2 * 1024 * 1024, 0.4, tunnel=True)
+    scores = sel._cost_scores(["fast_idle", "busy"], None)
+    assert scores["fast_idle"] == pytest.approx(scores["busy"]), (
+        "隧道差异不该进入 cost(吞吐项应同为中性 0.5)")
+    detail = sel._cost_details(["fast_idle", "busy"], None)
+    for pid in ("fast_idle", "busy"):
+        assert detail[pid]["throughput"]["mbps"] is None
+        assert detail[pid]["throughput"]["norm"] == pytest.approx(0.5)
+
+
+def test_restore_quarantines_tunnel_polluted_ewma():
+    """旧 DB 行(无 body_bytes)的 throughput_ewma 是隧道喂出来的脏值:恢复即作废。
+
+    不清的话,新 body 样本进来会与脏值做 EMA(alpha=0.3),要十几轮才衰减掉,
+    而这段时间它正在参与排序。
+    """
+    sel = ProxySelector(_store_with("p1"))
+    legacy = {"ttfb_samples": [], "ofb_samples": [], "outcome_samples": [],
+              "throughput_ewma": 0.0067,      # 改动前隧道寿命算出的假吞吐
+              "success": 900, "total": 1000,
+              "errors": {}, "total_bytes": 27e9, "transfer_time": 4e6}
+    sel.set_proxy_metrics({"p1": legacy})
+    mm = sel._proxy_metrics["p1"]["metrics"]
+    assert mm["throughput_ewma"] is None, "污染的历史 EWMA 必须作废"
+    assert mm["body_bytes"] == 0.0
+    assert mm["total_bytes"] == 27e9, "累计转发量是真实数据,保留"
+    # 作废后重新积累:第一批明文 body 直接成为新初值,不与脏值混合。
+    sel.record_complete("p1", 4 * 1024 * 1024, 1.0)
+    assert mm["throughput_ewma"] == pytest.approx(4.0), "应当是干净初值而非混合值"
+
+
+def test_restore_quarantines_polluted_ewma_in_domain_buckets():
+    """域名桶同理:per-domain 排序也读 throughput_ewma。"""
+    sel = ProxySelector(_store_with("p1"))
+    legacy = {"ttfb_samples": [], "throughput_ewma": 3.9e-05, "success": 5,
+              "total": 5, "errors": {}, "total_bytes": 6.3e6, "transfer_time": 2e5}
+    sel.set_domain_metrics({"api.github.com:443": {"p1": legacy}})
+    m = sel._domain_metrics["api.github.com:443"]["p1"]["metrics"]
+    assert m["throughput_ewma"] is None
+    assert m["body_bytes"] == 0.0
+
+
+def test_quality_view_exposes_both_throughput_kinds():
+    """/quality/meta 要能同时看到"进 cost 的"和"仅观测的"两个口径,否则没法复盘。"""
+    sel = ProxySelector(_store_with("p1"))
+    sel.record_complete("p1", 1024 * 1024, 0.5)                       # 1MB/s body
+    sel.record_complete("p1", 1024 * 1024, 3600.0, domain="d:443", tunnel=True)
+    v = sel.get_pid_quality_v2()["p1"] if "p1" in sel.get_pid_quality_v2() else None
+    # 视图是"每代理一段",取全局那段(见 get_pid_quality_v2 结构)
+    flat = json.dumps(v) if v else json.dumps(sel.get_pid_quality_v2())
+    assert "throughput_ewma_mbps" in flat and "tunnel_relay_ewma_mbps" in flat
+    assert "body_bytes_transferred" in flat
+
+
+def test_cost_throughput_min_bytes_gate_still_applies_to_body():
+    """body 字节未达门槛时,即便已有 body 样本也不参与(小样本速率不可信)。"""
+    sel = ProxySelector(_store_with("p1", "p2"), cost_throughput_min_bytes=1_000_000)
+    sel.record_ttfb("p1", 0.10)
+    sel.record_ttfb("p2", 0.10)
+    sel.record_complete("p1", 10 * 1024, 0.001)      # 10KB body,速率很高但量太小
+    sel.record_complete("p2", 10 * 1024, 0.05)
+    scores = sel._cost_scores(["p1", "p2"], None)
+    assert scores["p1"] == pytest.approx(scores["p2"])
+
+
+def test_clean_body_throughput_survives_restart():
+    """作废只针对"没有 body_bytes 的旧行";改动之后攒出的干净数据必须原样恢复,
+    否则每次重启都把这一维清零,门槛永远攒不到 1MB。
+    """
+    sel = ProxySelector(_store_with("p1"))
+    sel.record_complete("p1", 4 * 1024 * 1024, 2.0)     # 2MB/s 的明文下载
+    before = flush_metric_copy(sel._proxy_metrics["p1"]["metrics"])
+    sel2 = ProxySelector(_store_with("p1"))
+    sel2.set_proxy_metrics({"p1": json.loads(json.dumps(before))})
+    mm = sel2._proxy_metrics["p1"]["metrics"]
+    assert mm["body_bytes"] == before["body_bytes"] == 4 * 1024 * 1024
+    assert mm["throughput_ewma"] == pytest.approx(2.0), "干净 EWMA 不该被作废"
+    # 门槛已达标 → 这一维在 cost 里真的参与排序
+    sel2.record_ttfb("p1", 0.10)
+    assert sel2._cost_raw_inputs_for_candidates(["p1"], None)["p1"][2] is not None
 
 
 def test_cost_latency_metric_ewma_vs_p99():

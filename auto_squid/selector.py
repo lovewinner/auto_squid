@@ -495,11 +495,16 @@ class ProxySelector:
         字段:
           ttfb_samples:  最近 _OBS_WINDOW 个隧道握手耗时(秒,代理侧),算 P50/P95/P99。
           ofb_samples:   最近 _OBS_WINDOW 个源站首字节耗时(秒,源站侧),算 P50/P95/P99。
-          throughput_ewma: 吞吐 EWMA(MB/s),初始 None。
+          throughput_ewma: 响应体吞吐 EWMA(MB/s),初始 None。**只**由明文 body 路径
+                           喂(见 record_complete 的 tunnel 参数),隧道的"寿命平均速率"
+                           不进这里,否则这一维度量的是客户端把隧道开多久。
+          body_bytes:      累计**明文响应体**字节。Cost 吞吐项的准入门槛按它算 ——
+                           用终身 total_bytes 当门槛是失效的:隧道流量一样能攒到 GB。
+          tunnel_relay_ewma: 隧道双向透传速率 EWMA(MB/s),**仅观测**,永不进 cost。
           success / total: 成功数与总尝试数(成功率 = success/total)。
           errors:        错误分类计数 {key: n}。
-          total_bytes:  累计转发 body 字节数(吞吐分母之一)。
-          transfer_time: 累计"转发 body"耗时(秒)。
+          total_bytes:  累计转发/透传 body 字节数(HTTP + 隧道,报表口径)。
+          transfer_time: 累计"转发 body / 隧道存活"耗时(秒)。
         """
         if "metrics" not in m:
             m["metrics"] = {
@@ -507,6 +512,8 @@ class ProxySelector:
                 "ofb_samples": deque([], maxlen=_OBS_WINDOW),
                 "outcome_samples": deque([], maxlen=_OBS_WINDOW),  # 窗口版 success/fail 环形缓冲(1=成功 0=失败)
                 "throughput_ewma": None,
+                "body_bytes": 0.0,
+                "tunnel_relay_ewma": None,
                 "success": 0,
                 "total": 0,
                 "errors": {k: 0 for k in _ERROR_KEYS},
@@ -710,26 +717,33 @@ class ProxySelector:
         return {}
 
     def record_complete(self, pid: str, body_bytes: int, body_duration: float,
-                        body_ttfb: float = 0.0, domain: Optional[str] = None):
-        """记录一次 **body 转发/隧道透传完成**的吞吐与累计字节(Phase 1.1)。
+                        body_ttfb: float = 0.0, domain: Optional[str] = None,
+                        tunnel: bool = False):
+        """记录一次 **body 转发 / 隧道透传完成**的吞吐与累计字节(Phase 1.1)。
 
-        HTTP:body_duration 是 body 从首个数据块到读完全部的耗时;
-        HTTPS:是整条 CONNECT 隧道的存活时长(见 router._relay_tunnel)。两者
-        都用于吞吐与累计字节——这是代理对"该 target 中转速率"的可观测量。
+        `tunnel=False`(HTTP 明文 body):body_duration 是"首个数据块→读完 body"
+        的耗时,`bytes/秒` 就是该代理的中转速率 → 进 `throughput_ewma`(cost 的
+        吞吐项唯一来源),并累计到 `body_bytes`(该项的准入门槛)。
 
-        注意:这里**不再**产生任何"完整响应耗时"分位指标。原 TTLB(body 下载
-        时间)维度已移除——它是 HTTP-only 指标,在 HTTPS 主导的负载下绝大多数
-        代理恒为 n/a;且对 CONNECT 而言"隧道寿命"受 keep-alive 影响,语义与
-        "body 下载时间"完全不同,混在一起会毁掉分位数。HTTPS 的延迟画像改由
-        隧道握手时延(TTFB,代理侧)+ 源站首字节(OFB,源站侧)两个维度刻画。
+        `tunnel=True`(CONNECT 隧道收尾):分母是**整条隧道的墙钟寿命**,里面大头是
+        客户端空闲。心跳型长连接(alive.github.com 之类)实测算出 18 B/s 量级,
+        这不是代理慢,是客户端在发呆;把它混进同一个 EWMA,再经 min-max 归一化,
+        cost 就会按"哪个代理恰好摊上了长寿命隧道"来排序(实测曾把 rank3/4 的
+        互换归因到这个假信号上)。所以隧道样本只进 `tunnel_relay_ewma`(仅观测)
+        与 `total_bytes`/`transfer_time`(累计转发量,报表口径),**不进 cost 维度**。
 
-        - body_bytes:实际转发/透传的字节数。
-        - body_ttfb:本响应的 TTFB(秒),仅用于吞吐分母修正;若调用方未提供则
-          视为 0(即吞吐 = body_bytes / body_duration)。
+        这里**不再**产生任何"完整响应耗时"分位指标。原 TTLB(body 下载时间)维度
+        已移除——它是 HTTP-only 指标,在 HTTPS 主导的负载下绝大多数代理恒为
+        n/a;且对 CONNECT 而言"隧道寿命"受 keep-alive 影响,语义与"body 下载
+        时间"完全不同,混在一起会毁掉分位数。HTTPS 的延迟画像改由隧道握手时延
+        (TTFB,代理侧)+ 源站首字节(OFB,源站侧)两个维度刻画。
+
+        - body_ttfb:本响应的 TTFB(秒),仅用于吞吐分母修正;未提供则视为 0。
 
         产出:
-          - throughput_ewma:吞吐 EWMA(MB/s)= body_bytes / body_duration。
-          - total_bytes / transfer_time:累计值(平均吞吐直接相除)。
+          - throughput_ewma / body_bytes:仅明文 body 路径。
+          - tunnel_relay_ewma:仅隧道路径,观测用。
+          - total_bytes / transfer_time:两条路径共同累计。
         """
         m = self._metrics_for(pid, domain)
         g = self._metrics_for(pid, None)
@@ -741,9 +755,13 @@ class ProxySelector:
                     transfer = max(body_duration - max(body_ttfb, 0.0), 0.0)
                     denom = transfer if transfer > 0 else body_duration
                     mbps = (body_bytes / 1024.0 / 1024.0) / denom
-                    old = sc["throughput_ewma"]
-                    sc["throughput_ewma"] = mbps if old is None else (
+                    field = "tunnel_relay_ewma" if tunnel else "throughput_ewma"
+                    old = sc.get(field)
+                    sc[field] = mbps if old is None else (
                         (1.0 - _THROUGHPUT_ALPHA) * old + _THROUGHPUT_ALPHA * mbps)
+                    if not tunnel:
+                        # cost 吞吐项的准入门槛按"实测过多少响应体字节"算。
+                        sc["body_bytes"] = sc.get("body_bytes", 0.0) + body_bytes
                 sc["total_bytes"] += body_bytes
                 sc["transfer_time"] += body_duration
 
@@ -893,6 +911,10 @@ class ProxySelector:
                 "ttfb": ProxySelector._percentiles(mm.get("ttfb_samples", [])),
                 "ofb": ProxySelector._percentiles(mm.get("ofb_samples", [])),
                 "throughput_ewma_mbps": mm.get("throughput_ewma"),
+                # 吞吐口径拆分(见 record_complete):throughput_ewma 只含明文响应体
+                # 实测速率(进 cost);隧道那条算法是"双向字节/隧道寿命",只作观测。
+                "tunnel_relay_ewma_mbps": mm.get("tunnel_relay_ewma"),
+                "body_bytes_transferred": mm.get("body_bytes", 0.0),
                 # 窗口版(近期 _OBS_WINDOW,内存中重置,跨重启清零):用于仪表盘"近期表现"列
                 "window_success_count": win_succ,
                 "window_total": win_n,
@@ -1034,6 +1056,17 @@ class ProxySelector:
             if _DERIVED_KEYS.intersection(m) or _LEGACY_KEYS.intersection(m):
                 for k in _DERIVED_KEYS | _LEGACY_KEYS:
                     m.pop(k, None)
+            # 改动前的历史行没有 body_bytes 这一键,而它的 throughput_ewma 是被
+            # **隧道寿命**喂出来的(见 record_complete 的 tunnel 参数):那个值编码
+            # 的是"客户端把隧道开了多久",不是代理速率。留着它,等新 body 样本进来
+            # 会与真值 EMA 混合,alpha=0.3 下脏值要十几轮才衰减掉 —— 与其等它衰减,
+            # 不如作废重采(门槛按 body_bytes 算,本来也要重新攒到 1MB)。
+            if "body_bytes" not in m:
+                m["throughput_ewma"] = None
+                m["body_bytes"] = 0.0
+            # tunnel_relay_ewma 为后加字段(隧道透传速率,仅观测):旧行补 None,
+            # 避免 /quality/meta 读到缺键时口径不一致。
+            m.setdefault("tunnel_relay_ewma", None)
             # ofb_samples 为后加字段(TTLB 移除后新增的源站首字节窗口):旧 DB 行
             # 没有,补空 deque,否则热路径 _append_sample 会 KeyError。
             if "ofb_samples" not in m:
@@ -1098,6 +1131,13 @@ class ProxySelector:
                 if _DERIVED_KEYS.intersection(m) or _LEGACY_KEYS.intersection(m):
                     for k in _DERIVED_KEYS | _LEGACY_KEYS:
                         m.pop(k, None)
+                # 同 set_proxy_metrics:改动前的行无 body_bytes,其 throughput_ewma
+                # 由隧道寿命喂成(脏),作废重采。域名桶同样进 cost 的 per-domain
+                # 排序,不清就会一直污染那个 target。
+                if "body_bytes" not in m:
+                    m["throughput_ewma"] = None
+                    m["body_bytes"] = 0.0
+                m.setdefault("tunnel_relay_ewma", None)
                 # 同 set_proxy_metrics:旧 DB 行补 ofb_samples 空 deque。
                 if "ofb_samples" not in m:
                     m["ofb_samples"] = deque([], maxlen=_OBS_WINDOW)
@@ -1400,8 +1440,10 @@ class ProxySelector:
             (digest 样本 >= cost_latency_min_samples);不足则回退域名/全局 EWMA
             (obs>=1);都缺则 None(中性)。
           - sr_failure: 1 - 平滑成功率(累计,域名优先)。无样本则 None。
-          - throughput: 累计 throughput_ewma,仅当 total_bytes >=
-            cost_throughput_min_bytes 才返回(防隧道零吞吐噪声);否则 None。
+          - throughput: 响应体吞吐 EWMA(MB/s),仅当**实测响应体字节**
+            (body_bytes)>= cost_throughput_min_bytes 才返回;否则 None。隧道透传
+            的"字节/隧道寿命"不进这一维(见 record_complete),它量的是客户端
+            空闲,不是代理中转速率。
         None 表示「该项无数据」,由 _cost_scores 当作中性 0.5 处理。
         """
         g = self._proxy_metrics.get(pid, {}).get("metrics")
@@ -1434,10 +1476,12 @@ class ProxySelector:
                 if tot >= 1:
                     sr_fail = 1.0 - self._smooth_rate(int(m.get("success", 0)), tot)
                     break
-        # 吞吐(仅足量字节参与)
+        # 吞吐(仅足量**响应体**字节参与)。门槛必须按 body_bytes 算而不是终身
+        # total_bytes:后者隧道流量也攒得到 10+GB,等于永久放行——把"客户端把隧道
+        #  idle 多久"算出来的假吞吐喂进 min-max 归一化,排序就会按假信号拉开 0..1。
         tp = None
         for m in (d, g):
-            if m and int(m.get("total_bytes", 0)) >= self.cost_throughput_min_bytes:
+            if m and int(m.get("body_bytes", 0)) >= self.cost_throughput_min_bytes:
                 v = m.get("throughput_ewma")
                 if v is not None:
                     tp = v

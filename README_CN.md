@@ -41,7 +41,7 @@ curl -x http://127.0.0.1:10808 https://www.baidu.com
 ## 特性
 
 - **并行竞速 + 错峰启动** —— 候选按 EWMA 排序；最优 1–2 个先发，其余以 ~250 ms 补发（RFC 8305 §5）；首个首字节成功即胜出并取消/关闭其余
-- **多目标 Cost 排序**（默认开启）—— 竞速顺序 = `w_lat·norm(延迟) + w_sr·norm(1−成功率) + w_tp·norm(1−吞吐)`，候选集内 **min–max 归一化**（权重可直接比较、与规模无关）。延迟项使用**终身 TTFB P99**（t-digest）+ EWMA 回退；成功率拉普拉斯平滑（优先域名级）；吞吐需要 1 MB 字节下限。`cost_sort_enabled: false` 一键回滚纯 EWMA 排序
+- **多目标 Cost 排序**（默认开启）—— 竞速顺序 = `w_lat·norm(延迟) + w_sr·norm(1−成功率) + w_tp·norm(1−吞吐)`，候选集内 **min–max 归一化**（权重可直接比较、与规模无关）。延迟项使用**终身 TTFB P99**（t-digest）+ EWMA 回退；成功率拉普拉斯平滑（优先域名级）；吞吐**只由明文响应体测出**——隧道的"双向字节 ÷ 隧道墙钟寿命"量的是客户端空闲而非代理速率，因此不进 Cost——并需 1 MB 实测响应体字节下限。`cost_sort_enabled: false` 一键回滚纯 EWMA 排序
 - **Cost 热更新 + 自动调参**（P1）—— `GET/POST /cost` 运行时读写全部 Cost 参数（**下一次竞速即生效，无需重启**）；`POST /tuner` 切换保守爬山自动调参器，仅在满足 ≥5% 赢家 TTFB 改善且成功率无回退时采纳，恶化时自动回滚
 - **域名缓存** —— 某个代理为某域名竞速胜出后，在 `cache_ttl` 内复用，避免每次请求都竞速
 - **会话粘性** —— 同一客户端 IP + 域名/目标复用同一代理（稳定出站 IP）；失败或返回 5xx 的粘性代理被驱逐并回落竞速（redispatch）；按 `recheck_hits` 周期探路重竞速；内存表带硬容量上限
@@ -137,7 +137,7 @@ router:
     cost_latency_metric: "p99"     # 延迟项: "p99"（尾部优先）或 "ewma"
     cost_weight_latency: 1.0
     cost_weight_success_rate: 0.6
-    cost_weight_throughput: 0.1    # 极小: 隧道流量很少产生有效体吞吐
+    cost_weight_throughput: 0.1    # 极小: 只有明文响应体会喂这一维度(隧道寿命速率不进 cost)
     cost_latency_min_samples: 1
     cost_throughput_min_bytes: 1000000
   stickiness:                    # 会话粘性（默认关闭）

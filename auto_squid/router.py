@@ -1911,6 +1911,8 @@ class Router:
                         self.single_send_degrades += 1
                         return True
                 # 吞吐下限信号(需样本 >=4):防"首字节快但下载慢"的代理被钉死。
+                # 只认**明文响应体**测出的吞吐:隧道寿命算出的速率是客户端空闲的
+                # 函数(心跳隧道实测 18 B/s),拿它当"下载慢"会误杀代理。
                 if self.single_send_degrade_min_throughput > 0 and total >= 4:
                     tp = dm.get("throughput_ewma")
                     if tp is not None and tp < self.single_send_degrade_min_throughput:
@@ -4110,10 +4112,12 @@ class Router:
                 await asyncio.gather(*pipes, return_exceptions=True)
             except (asyncio.CancelledError, Exception):
                 pass
-            # HTTPS 隧道的吞吐/累计字节:以双向透传总字节 / 隧道存活时长估算。
-            # 与 HTTP 的 body 转发耗时语义不同(此处是整条隧道寿命,而非单响应
-            # body 下载),但足以反映该代理对该 target 的真实中转速率,填补此前
-            # CONNECT 无吞吐统计的空白(吞吐/累计字节此前只对 HTTP 生效)。
+            # HTTPS 隧道的累计字节:双向透传总量 / 隧道存活时长。
+            # 这个商值**不能**当"代理中转速率"用:分母是整条隧道的墙钟寿命,大头是
+            # 客户端空闲。心跳型长连接(alive.github.com、client.wns.windows.com 这类)
+            # 实测算出 18 B/s 量级 —— 那是客户端在发呆,不是代理慢。故 tunnel=True:
+            # 只进 tunnel_relay_ewma(观测)与 total_bytes/transfer_time(累计量),
+            # 不进 cost 的吞吐维度(该维度只认明文响应体测出的速率)。
             # 源站首字节(仅新建隧道):新建隧道的首个上行字节是 TLS ServerHello,
             # 故 ofb ≈ 源站 TCP 建连 + TLS 握手首字节,是盲隧道里唯一能观测到的
             # 源站侧延迟(与 record_ttfb 的"代理侧握手"互补,覆盖整条链路)。
@@ -4124,9 +4128,10 @@ class Router:
             if pid is not None and total > 0:
                 duration = time.perf_counter() - _t0
                 if duration > 0:
-                    # 隧道寿命只用于吞吐/累计字节;不再是任何"完整响应耗时"分位
+                    # 隧道寿命只用于累计字节/观测吞吐;不再是任何"完整响应耗时"分位
                     # (原 TTLB 维度已移除,见 selector.record_complete)。
-                    self.selector.record_complete(pid, total, duration, domain=target)
+                    self.selector.record_complete(pid, total, duration,
+                                                  domain=target, tunnel=True)
             # 上游连接必须在此关闭(隧道不再归还任何池)。close 后最多等 0.5s:
             # 对端可能挂起不关,3.12 的 wait_closed() 严格等 FIN 会挂死。
             await self._close_stream_writer(up_writer)

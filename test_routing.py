@@ -601,7 +601,7 @@ def format_output(analysis: Dict[str, Any], json_output: bool = False) -> str:
             if err_str:
                 bits.append(f"错误[{err_str}]")
             if base.get('throughput_ewma') is not None:
-                bits.append(f"吞吐≈{base['throughput_ewma']:.1f}MB/s")
+                bits.append(f"响应体吞吐≈{base['throughput_ewma']:.1f}MB/s")
             if bits:
                 phase1 = "  " + "  ".join(bits)
 
@@ -749,7 +749,7 @@ def _render_per_destination_metrics(dom_metrics: Dict[str, Any], keys: List[str]
     for dkey, per in matched.items():
         lines.append(f"  ▶ 域名键: {dkey}")
         header = (f"      {'代理':<10}{'握手 p50/p95/p99':<26}{'源站首字节 p50/p95/p99':<26}"
-                  f"{'成功率(累/近)':<14}{'吞吐(累/近)':<22}{'错误分类'}")
+                  f"{'成功率(累/近)':<14}{'吞吐(累转发/近body)':<22}{'错误分类'}")
         lines.append(header)
         lines.append("      " + "-" * (len(header) - 6))
         order = sorted(per.items(), key=lambda kv: (quality.get(kv[0], {}).get("ewma_ttfb") or 1e9))

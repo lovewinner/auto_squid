@@ -429,11 +429,14 @@ class CircuitConfig(ConfigBase):
     cost_weight_latency: 延迟主项权重(默认 1.0)。
     cost_weight_success_rate: 成功率项权重(默认 0.6)。用平滑成功率的失败概率(1-rate),
                        域名级优先、缺则回退全局,避免选到最差成功率代理。
-    cost_weight_throughput: 吞吐项权重(默认 0.1)。实测隧道流量占多数时按响应体的吞吐
-                       基本测不到(近 0),故权重极低且仅当累计字节达下限才参与,否则噪声。
+    cost_weight_throughput: 吞吐项权重(默认 0.1)。这一维**只**由明文响应体测出
+                       (隧道的"双向字节/隧道寿命"编码的是客户端空闲,已排除,见
+                       selector.record_complete),因此隧道占比高的部署里它常常不参与。
     cost_latency_min_samples: P99 延迟项所需 digest 最小样本(默认 1,与 EWMA obs>=1 一致:
                        单样本延迟即计入;多样本时才是稳健尾部估计)。
-    cost_throughput_min_bytes: 吞吐项所需累计字节下限(默认 1_000_000=1MB),低于则吞吐项不参与。
+    cost_throughput_min_bytes: 吞吐项所需**响应体累计字节**(body_bytes,默认 1MB)下限,
+                       低于则该项不参与(取中性 0.5)。注意口径:不是终身转发字节
+                       total_bytes —— 隧道也能攒到 GB,用它当门槛等于永久放行。
     """
     probe_interval_sec: float = Field(30.0, description="后台探活周期(秒),0=关闭主动探活")
     probe_canary: str = Field("1.1.1.1:443", description="探活目标 host:port(单 canary;被 probe_canaries 覆盖)")
@@ -464,9 +467,9 @@ class CircuitConfig(ConfigBase):
     cost_latency_metric: str = Field("p99", description="Cost 主延迟项: p99(累积 TTFB P99,尾部优先) 或 ewma(质量 EWMA)。P99 样本不足自动回退 EWMA")
     cost_weight_latency: float = Field(1.0, description="Cost 延迟主项权重")
     cost_weight_success_rate: float = Field(0.6, description="Cost 成功率项权重(用平滑成功率的失败概率,域名级优先)")
-    cost_weight_throughput: float = Field(0.1, description="Cost 吞吐项权重(实测隧道流量占多数,按响应体吞吐近 0,故极低且仅足量字节参与)")
+    cost_weight_throughput: float = Field(0.1, description="Cost 吞吐项权重(仅明文响应体参与;隧道寿命算出的速率已排除)")
     cost_latency_min_samples: int = Field(1, description="P99 延迟项所需 digest 最小样本(默认 1,与 EWMA obs>=1 一致)")
-    cost_throughput_min_bytes: int = Field(1_000_000, description="吞吐项所需累计字节下限(默认 1MB),低于则吞吐项不参与")
+    cost_throughput_min_bytes: int = Field(1_000_000, description="吞吐项所需**响应体**累计字节(body_bytes)下限(默认 1MB),低于则该项中性 0.5;非终身 total_bytes")
 
 
 class AutoTuneConfig(ConfigBase):

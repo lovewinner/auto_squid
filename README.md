@@ -41,7 +41,7 @@ Then open the dashboard: [http://127.0.0.1:18080/](http://127.0.0.1:18080/)
 ## Features
 
 - **Parallel racing + staggered start** — candidates EWMA-sorted; best 1–2 launch first, rest refill at ~250 ms (RFC 8305 §5); first first-byte wins, losers cancelled & closed
-- **Multi-objective Cost ranking** (default on) — racing order = `w_lat·norm(latency) + w_sr·norm(1−success_rate) + w_tp·norm(1−throughput)` with **min–max normalization inside the candidate set** (weights directly comparable, scale-free). The latency term uses the **lifetime TTFB P99** (t-digest) with EWMA fallback; success rate is Laplace-smoothed (domain-level preferred); throughput needs a 1 MB byte floor. `cost_sort_enabled: false` rolls back to pure EWMA ranking instantly
+- **Multi-objective Cost ranking** (default on) — racing order = `w_lat·norm(latency) + w_sr·norm(1−success_rate) + w_tp·norm(1−throughput)` with **min–max normalization inside the candidate set** (weights directly comparable, scale-free). The latency term uses the **lifetime TTFB P99** (t-digest) with EWMA fallback; success rate is Laplace-smoothed (domain-level preferred); throughput is measured from **plaintext response bodies only** (a tunnel's bytes ÷ its wall-clock lifetime measures client idleness, not proxy speed, so it never feeds Cost) and needs a 1 MB measured-body floor. `cost_sort_enabled: false` rolls back to pure EWMA ranking instantly
 - **Cost hot-reload + auto-tuner** (P1) — `GET/POST /cost` reads/updates all cost parameters at runtime (effective on the very next race, no restart); `POST /tuner` toggles a conservative hill-climbing auto-tuner that adopts only ≥5% winner-TTFB improvements with no success-rate regression, with automatic rollback on degradation
 - **Domain cache** — once a proxy wins a race for a domain, it is reused until `cache_ttl` expires
 - **Session stickiness** — same client IP + domain/target reuses the same proxy (stable egress IP); failing or 5xx-returning sticky proxies are evicted and re-raced; periodic re-check (`recheck_hits`); in-memory table with a hard capacity cap
@@ -137,7 +137,7 @@ router:
     cost_latency_metric: "p99"     # latency term: "p99" (tail-first) or "ewma"
     cost_weight_latency: 1.0
     cost_weight_success_rate: 0.6
-    cost_weight_throughput: 0.1    # tiny: tunnel traffic rarely yields per-body throughput
+    cost_weight_throughput: 0.1    # tiny: only plaintext response bodies feed this dimension
     cost_latency_min_samples: 1
     cost_throughput_min_bytes: 1000000
   stickiness:                    # session stickiness (off by default)
