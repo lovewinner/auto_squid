@@ -27,6 +27,20 @@ logger = logging.getLogger(__name__)
 _CLUSTER_EVER_MAX_KEYS = 4096
 
 
+def _pending_bytes(reader) -> int:
+    """reader 里已到达、尚未被读走的字节数。
+
+    asyncio.StreamReader 在 3.12 上**没有**公开的"可读字节数"接口(``__len__`` 是
+    后续版本才加的),只能读它自己的 ``_buffer``(uvloop 的同名实现也有)。取不到时
+    按 0 算:那样退化成只靠 at_eof() 判活,至少不会因为版本差异把健康的池连接全判死。
+    """
+    size = getattr(reader, '__len__', None)
+    if callable(size):
+        return size()
+    buf = getattr(reader, '_buffer', None)
+    return len(buf) if buf is not None else 0
+
+
 class ConnectionPools:
     """三个 CONNECT 预热池 + 空闲暂停/refill 的统一状态与操作。#14 pools.py。
 
@@ -114,6 +128,10 @@ class ConnectionPools:
         self.conn_pool_hits = 0         # 池中取用成功次数
         self.conn_pool_misses = 0       # 取池未中需新建的次数
         self.conn_pool_expired = 0      # 空闲超时关闭次数
+        # 取用时当场识破的死连接(上游已 FIN / 有主残留字节)总数,两池合计。
+        # 与 conn_pool_expired 的区别:expired 是"到点没被用"主动关,stale 是
+        # "对端先关了我们还不知道"——后者每一次都曾浪费一个 CONNECT 往返。
+        self.pool_stale_discards = 0
         self._pool_task: Optional[asyncio.Task] = None
         # {proxy_host:port|target: [StreamWriter,...]} —— 按 CONNECT target 半预
         # 连接的"到上游代理"TCP(P2,见 _target_pool_*)。命中域名缓存/粘性的
@@ -207,9 +225,20 @@ class ConnectionPools:
         found = None
         while stack:
             item = stack.pop()
-            if item[1].is_closing():
+            reader, writer = item
+            # is_closing() 只看**本地**有没有关:上游已经发过 FIN 的连接(CLOSE_WAIT)
+            # 它仍是 False,取走再发 CONNECT 只会拿到"无响应",白烧一个 CONNECT 往返
+            # —— 生产实测 41 次/小时的 `pooled conn STALE` 全是这个形态(池的空闲超时
+            # 比上游自己的空闲关闭更长)。reader 侧才是可用性的真判据:收到过 EOF,或
+            # 在我们没发任何请求时就有主数据(消息边界已不可信),都当场丢弃并关闭。
+            if writer.is_closing() or reader.at_eof() or _pending_bytes(reader) > 0:
                 discarded += 1
-                continue  # 已关闭的废弃连接直接丢弃
+                self.pool_stale_discards += 1
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+                continue
             found = item
             break
         if discarded:

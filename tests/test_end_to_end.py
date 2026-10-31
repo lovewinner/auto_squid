@@ -5294,6 +5294,19 @@ class TestPoolBudget:
     没被检查。
     """
 
+    class _FakeReader:
+        """池里一条**可用**连接的 reader 形态:at_eof False、无残留字节。
+
+        (_pool_peek 现在要看 reader 侧的 EOF/到岸字节才能判活,裸 object() 当
+        reader 的旧替身不再够用。)
+        """
+
+        def __init__(self):
+            self._buffer = bytearray()
+
+        def at_eof(self):
+            return False
+
     class _FakeWriter:
         def __init__(self):
             self.closed = False
@@ -5322,7 +5335,7 @@ class TestPoolBudget:
 
         async def fake_open(host, port):
             await gate.wait()
-            return object(), self._FakeWriter()
+            return self._FakeReader(), self._FakeWriter()
 
         monkeypatch.setattr(asyncio, "open_connection", fake_open)
         return gate
@@ -5436,7 +5449,8 @@ class TestPoolBudget:
             async def wait_closed(self):
                 pass
 
-        pools._conn_pool[dead_key] = [(object(), _Dead()), (object(), _Dead())]
+        pools._conn_pool[dead_key] = [(self._FakeReader(), _Dead()),
+                                 (self._FakeReader(), _Dead())]
         pools._count_put(dead_key, 2)
         assert pools._proxy_conn_count.get(dead_key) == 2
         assert pools._conn_pool_peek('10.0.9.9', 3128) is None
@@ -5480,12 +5494,66 @@ class TestPoolBudget:
         assert elapsed < 2.0, f"关闭被串行化了:50 条耗时 {elapsed:.2f}s"
 
         # _conn_pool_close_all 走同一条路径,并要清掉每代理/在途计数。
-        pools._conn_pool['10.0.0.1:3128'] = [(object(), w) for w in writers[:10]]
+        pools._conn_pool['10.0.0.1:3128'] = [(self._FakeReader(), w) for w in writers[:10]]
         pools._count_put('10.0.0.1:3128', 10)
         t0 = time.monotonic()
         await pools._conn_pool_close_all()
         assert time.monotonic() - t0 < 2.0
         assert pools._conn_pool == {} and pools._proxy_conn_count == {}
+
+    def test_pool_peek_discards_half_closed_and_dirty_conns(self):
+        """取用时必须当场识破"对端已 FIN"的半关闭连接。
+
+        writer.is_closing() 只反映**本地**是否关过 socket:上游空闲关闭后我们这边
+        是 CLOSE_WAIT,它仍返回 False —— 取走发 CONNECT 只会拿到"无响应",白烧一个
+        CONNECT 往返(生产实测 41 次/小时的 `pooled conn STALE` 全是这个形态)。
+        可用性判据在 reader 侧:收到过 EOF,或没发过请求却有残留字节(消息边界已
+        不可信),都当场丢弃并关闭。
+        """
+        pools = self._pools()
+        key = '10.0.0.1:3128'
+
+        class _R:
+            """模拟 3.12 的真实 asyncio.StreamReader:有 at_eof() 与私有 _buffer,
+            **没有** __len__(那是后续版本才加的)。"""
+            def __init__(self, eof=False, buffered=0):
+                self._eof = eof
+                self._buffer = bytearray(b"x" * buffered)
+            def at_eof(self):
+                return self._eof
+
+        live, half_closed, dirty = self._FakeWriter(), self._FakeWriter(), self._FakeWriter()
+        # pop 从尾部取:把可用连接放最前,迫使 peek 先踩过两个死连接。
+        pools._conn_pool[key] = [(_R(), live), (_R(eof=True), half_closed),
+                                 (_R(buffered=5), dirty)]
+        pools._count_put(key, 3)
+
+        got = pools._conn_pool_peek('10.0.0.1', 3128)
+        assert got is not None and got[1] is live, "该取到那条活连接"
+        assert half_closed.closed and dirty.closed, "死连接必须就地关闭,不能回池"
+        assert pools.pool_stale_discards == 2
+        # 计数成对归还:3 条入池 → 全部离池(2 丢弃 + 1 取用),不留幻影占用
+        assert pools._proxy_conn_count.get(key, 0) == 0, pools._proxy_conn_count
+        assert pools._conn_pool.get(key) in (None, [])
+
+    def test_pool_peek_rejects_buffered_data_even_without_eof(self):
+        """有残留字节即视为不可信:即使还没收到 EOF,对端在我们没请求时吐了东西。"""
+        pools = self._pools()
+        key = '10.0.0.2:3128'
+
+        class _R:
+            # 没发过请求却有 17 字节到岸:消息边界已不可信(3.12 形态,只有 _buffer)
+            _buffer = bytearray(b"x" * 17)
+            def at_eof(self):
+                return False
+
+        w = self._FakeWriter()
+        pools._conn_pool[key] = [(_R(), w)]
+        pools._count_put(key, 1)
+        assert pools._conn_pool_peek('10.0.0.2', 3128) is None
+        assert w.closed is True
+        assert pools.conn_pool_misses == 1
+        assert pools._proxy_conn_count.get(key, 0) == 0
 
     def test_cluster_ever_marker_is_bounded(self):
         """cluster 归因标记表 _target_pool_cluster_ever 必须有界。

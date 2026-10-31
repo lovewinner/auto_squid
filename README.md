@@ -149,6 +149,10 @@ router:
     enabled: true
     per_proxy: 4
     total: 64
+    # idle_timeout must stay BELOW the upstream proxy's own idle close, otherwise pooled
+    # connections sit there half-closed (CLOSE_WAIT) and every reuse burns a wasted
+    # CONNECT round trip. Such conns are now detected and dropped at take time; count
+    # exposed as /metrics counter `pool_stale_discards`.
     idle_timeout: 30.0
     refill_interval: 5.0
     refill_target: 2

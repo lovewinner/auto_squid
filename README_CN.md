@@ -149,6 +149,9 @@ router:
     enabled: true
     per_proxy: 4
     total: 64
+    # 必须**低于**上游代理自己的空闲关闭:否则池里的连接被对端关掉后我们这边是
+    # CLOSE_WAIT,取走复用就白烧一个 CONNECT 往返。现在取用时当场识破并丢弃,
+    # 计数见 /metrics 的 pool_stale_discards。
     idle_timeout: 30.0
     refill_interval: 5.0
     refill_target: 2
