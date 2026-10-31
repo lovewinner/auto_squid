@@ -175,7 +175,7 @@ logging:
   backup_count: 5                # 保留 auto_squid.log.1 … .5（0 = 原地截断）
 ```
 
-**轮转的两条注意事项**
+**轮转注意事项**
 
 - **不要再给这个文件配 logrotate**。logrotate 走 rename（或 copytruncate）：rename 之后
   进程仍握着旧 inode 继续写，新文件永远是空的；copytruncate 则会在截断瞬间丢掉并发写入
@@ -184,6 +184,8 @@ logging:
 - **人工切出来的历史文件不受 `backup_count` 管理**。像 `auto_squid.log.261011` 这种
   手写后缀不在 `.1 … .N` 命名里，程序既不会复用也不会删除，要清就手动清。
 - `file` 是相对路径时按**启动时的 CWD** 解析，启动日志第一行会打印展开后的绝对路径。
+- **两个实例不要共用同一个 `logging.file`**：`RotatingFileHandler` 不是多进程安全的，
+  两边都会 rename，结果互相踩。多实例部署请各给一个文件路径（如带端口后缀）。
 
 生产就绪片段见 `examples/config.yaml` 以及下方 [速度调优](#速度调优) 一节。
 

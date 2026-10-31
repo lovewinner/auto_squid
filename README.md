@@ -176,7 +176,7 @@ logging:
   backup_count: 5                # keep auto_squid.log.1 … .5 (0 = truncate in place)
 ```
 
-**Two rotation caveats**
+**Rotation caveats**
 
 - **Do not also configure logrotate for this file.** logrotate renames the file out from
   under the process (leaving it writing to the old inode while the "new" file stays empty),
@@ -187,6 +187,9 @@ logging:
   reused and never deleted. Clean them up manually once.
 - A relative `file` is resolved against the CWD at startup; the first log line prints the
   resolved absolute path.
+- **Two instances must not share one `logging.file`.** `RotatingFileHandler` is not
+  multiprocess-safe — both would rename the same path and clobber each other's chain.
+  Give each instance its own file.
 
 For production-ready snippets, see `examples/config.yaml` and the [Speed tuning](#speed-tuning) section below.
 

@@ -78,6 +78,9 @@ class LoggingConfig(ConfigBase):
 
     轮转按大小切割(单进程 RotatingFileHandler):此前只有 FileHandler 追加模式,
     日志无限增长,磁盘满的那天就是故障当天,而且只能靠人工 mv 切断档。
+    三条使用约束:同一文件不要再配 logrotate(rename 会让进程继续写旧 inode,
+    copytruncate 会截掉并发写入的行);人工切出的历史后缀不在 .1…N 链里、程序
+    不会代删;多实例共用一个 file 不安全(RotatingFileHandler 非多进程安全)。
     """
     level: str = Field("INFO")
     file: Optional[str] = Field(None)
