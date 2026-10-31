@@ -9,6 +9,7 @@
 
 import asyncio
 import logging
+import logging.handlers
 import sys
 from pathlib import Path
 
@@ -101,10 +102,14 @@ def setup_logging(cfg: Config):
     console.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
     root.addHandler(console)
 
-    # 文件:级别随 cfg.logging.level(#13),带时间戳,追加模式。default INFO。
+    # 文件:级别随 cfg.logging.level(#13),带时间戳,追加模式 + 按大小轮转。
+    # default INFO。轮转用 RotatingFileHandler:单进程写日志,不存在多进程竞争
+    # rollover 的问题;rollover 是一次 rename + 重开,代价相对日志量可忽略。
     level = getattr(logging, cfg.logging.level.upper(), logging.INFO)
     log_path = cfg.logging.file or "auto_squid.log"
-    fh = logging.FileHandler(log_path, mode="a")
+    fh = logging.handlers.RotatingFileHandler(
+        log_path, mode="a", maxBytes=cfg.logging.max_bytes,
+        backupCount=cfg.logging.backup_count, encoding="utf-8")
     fh.setLevel(level)
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s:%(name)s:%(message)s"))
     root.addHandler(fh)

@@ -171,6 +171,8 @@ router:
 logging:
   level: INFO                    # 文件日志级别（控制台始终 WARNING+ 避免刷屏）
   file: "auto_squid.log"
+  max_bytes: 33554432            # 按大小轮转（默认 32 MiB）；此前是纯追加、永不切断
+  backup_count: 5                # 保留 auto_squid.log.1 … .5（0 = 原地截断）
 ```
 
 生产就绪片段见 `examples/config.yaml` 以及下方 [速度调优](#速度调优) 一节。

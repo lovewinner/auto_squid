@@ -74,9 +74,17 @@ class APIConfig(ConfigBase):
 
 
 class LoggingConfig(ConfigBase):
-    """日志配置。`file` 为 None 时写默认文件 `auto_squid.log`。"""
+    """日志配置。`file` 为 None 时写默认文件 `auto_squid.log`。
+
+    轮转按大小切割(单进程 RotatingFileHandler):此前只有 FileHandler 追加模式,
+    日志无限增长,磁盘满的那天就是故障当天,而且只能靠人工 mv 切断档。
+    """
     level: str = Field("INFO")
     file: Optional[str] = Field(None)
+    max_bytes: int = Field(32 * 1024 * 1024, gt=0,
+                           description="单个日志文件上限(字节),超过即轮转")
+    backup_count: int = Field(5, ge=0,
+                              description="保留的历史份数(auto_squid.log.1 … .N);0=只截不断档")
 
     # 合法级别集合(#13):把 level 拼写错误在加载期暴露,而不是静默落默认。
     _VALID_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}

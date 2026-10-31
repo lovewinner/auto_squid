@@ -8205,6 +8205,32 @@ class TestSetupLoggingLevel:
         assert "info marker should appear" in body
         self._reset_logging()
 
+    def test_log_rotates_by_size(self, tmp_path):
+        """按大小轮转:此前 FileHandler 纯追加,日志无限增长,只能靠手工 mv 断档。"""
+        from auto_squid.cli import setup_logging
+        cfg = Config(logging={"level": "INFO", "file": str(tmp_path / "rot.log"),
+                               "max_bytes": 600, "backup_count": 2})
+        self._reset_logging()
+        setup_logging(cfg)
+        try:
+            lg = logging.getLogger("auto_squid.router")
+            for i in range(60):
+                lg.info("rotation filler line %03d %s", i, "x" * 40)
+            names = sorted(q.name for q in tmp_path.iterdir()
+                           if q.name.startswith("rot.log"))
+        finally:
+            self._reset_logging()
+        assert "rot.log.1" in names, f"未发生轮转: {names}"
+        assert "rot.log.3" not in names, f"超出 backup_count=2 的份数: {names}"
+        assert (tmp_path / "rot.log").stat().st_size < 1200
+
+    def test_rotation_bounds_rejected_at_load(self):
+        from auto_squid.config_schema import LoggingConfig
+        with pytest.raises(Exception):
+            LoggingConfig(max_bytes=0)
+        with pytest.raises(Exception):
+            LoggingConfig(backup_count=-1)
+
 
 # ── local_direct_domains 白名单强制直连 ──────────────────────────
 

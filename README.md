@@ -172,6 +172,8 @@ router:
 logging:
   level: INFO                    # file-log level (console always WARNING+ to avoid spam)
   file: "auto_squid.log"
+  max_bytes: 33554432            # size-based rotation (default 32 MiB); was append-only forever
+  backup_count: 5                # keep auto_squid.log.1 … .5 (0 = truncate in place)
 ```
 
 For production-ready snippets, see `examples/config.yaml` and the [Speed tuning](#speed-tuning) section below.
