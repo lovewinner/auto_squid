@@ -152,6 +152,12 @@ router:
     # 必须**低于**上游代理自己的空闲关闭:否则池里的连接被对端关掉后我们这边是
     # CLOSE_WAIT,取走复用就白烧一个 CONNECT 往返。现在取用时当场识破并丢弃,
     # 计数见 /metrics 的 pool_stale_discards。
+    #
+    # 第一阶段桶空时,会从**同代理**的第二阶段桶借一条裸 TCP(P2 里同样是未发
+    # CONNECT 的到代理 TCP,target 只是桶键标签),避免"P2 躺着过期、别的 target 现建连"。
+    # 限幅:只从 ≥2 条的桶借(给正主留 1 条),且先借栈顶最旧的那桶。计数
+    # conn_pool_steals;口径注意:借到既不算 hit 也不算 miss,conn_pool_misses
+    # 现在专指"两池皆空、必须新建"。
     idle_timeout: 30.0
     refill_interval: 5.0
     refill_target: 2

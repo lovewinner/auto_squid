@@ -325,6 +325,8 @@ class ScenarioResult:
             # hits 高 = 预热生效省建连;misses+new_conns 高 = 池未命中需新建。
             conn_pool_group = {
                 "hits": ca.get("conn_pool_hits", 0) - cb.get("conn_pool_hits", 0),
+                # P1 落空但从同代理 P2 桶借到的次数(不算 hit 也不算 miss)。
+                "steals": ca.get("conn_pool_steals", 0) - cb.get("conn_pool_steals", 0),
                 "misses": ca.get("conn_pool_misses", 0) - cb.get("conn_pool_misses", 0),
                 "new_conns": ca.get("connect_new_conns", 0) - cb.get("connect_new_conns", 0),
                 "pool_size_end": ca.get("conn_pool_size", 0),

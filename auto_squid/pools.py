@@ -126,6 +126,8 @@ class ConnectionPools:
         self._proxy_conn_count: dict = {}
         self.conn_pool_creates = 0      # 累计预热建连次数
         self.conn_pool_hits = 0         # 池中取用成功次数
+        # "两个池都空、必须现建 TCP"的次数。注意口径:P1 落空但从 P2 桶借到
+        # (见 _steal_from_target_pool)不算 miss,算 conn_pool_steals。
         self.conn_pool_misses = 0       # 取池未中需新建的次数
         self.conn_pool_expired = 0      # 空闲超时关闭次数
         # 取用时当场识破的死连接(上游已 FIN / 有主残留字节)总数,两池合计。
@@ -137,6 +139,12 @@ class ConnectionPools:
         # 连接的"到上游代理"TCP(P2,见 _target_pool_*)。命中域名缓存/粘性的
         # target 后台预热,取用时优先于第一阶段通用池。共享 fd 预算/空闲超时。
         self._target_pool: dict = {}
+        # {代理键: set(池键 "代理键|target")} —— P2 桶的每代理倒排索引,只为
+        # "第一阶段落空时去同代理的 P2 桶借一条"(_steal_from_target_pool)服务:
+        # 按代理找 P2 桶否则要扫全表,而键随 target 基数长(生产实测 3869 个不同
+        # target)。索引与池同生命周期:落池处登记、桶空/清池处摘除,故不会比池本身大。
+        self._target_keys_by_proxy: dict = {}
+        self.conn_pool_steals = 0       # P1 落空后从同代理 P2 桶借到连接的次数
         self.target_pool_creates = 0    # 累计 target 半预建连次数
         self.target_pool_hits = 0       # target 预连接取用成功次数
         self.target_pool_misses = 0     # 取 target 池未中需新建的次数
@@ -208,6 +216,24 @@ class ConnectionPools:
         else:
             self._proxy_conn_count.pop(pk, None)
 
+    def _index_target_key(self, pool_key: str) -> None:
+        """P2 桶里有了连接 → 登记进每代理索引。"""
+        self._target_keys_by_proxy.setdefault(self._proxy_of(pool_key), set()).add(pool_key)
+
+    def _unindex_target_key(self, pool_key: str) -> None:
+        """P2 桶变空 → 从索引摘除(代理下没桶就连代理键一起删,索引不积累空壳)。
+
+        对第一阶段键("host:port",无 '|' 后缀)是安全的 no-op:discard 不存在的
+        成员,代理项只要还有别的桶就不会被删。
+        """
+        pk = self._proxy_of(pool_key)
+        keys = self._target_keys_by_proxy.get(pk)
+        if keys is None:
+            return
+        keys.discard(pool_key)
+        if not keys:
+            self._target_keys_by_proxy.pop(pk, None)
+
     def _pool_peek(self, pool: dict, key: str) -> Optional[Tuple[asyncio.StreamReader, asyncio.StreamWriter]]:
         """从预热池取一条空闲连接 (reader, writer);无则返回 None。
 
@@ -247,20 +273,63 @@ class ConnectionPools:
             self._count_take(key, 1)     # 取用即离池(调用方随后 CONNECT 占用它)
         if not stack:
             pool.pop(key, None)
+            self._unindex_target_key(key)
         return found
+
+    def _steal_from_target_pool(self, proxy_key: str) -> Optional[Tuple[asyncio.StreamReader, asyncio.StreamWriter]]:
+        """第一阶段桶空时,从**同代理**的第二阶段桶借一条裸 TCP。
+
+        依据:P2 存的同样是"到上游代理、未发 CONNECT"的 TCP(建连处只走
+        open_resolved),target 只是桶键上的标签、不是连接的属性,换别的 target
+        去 CONNECT 完全合法。所以"P2 桶里躺着等过期、同时别的 target 现建 TCP"
+        是纯浪费 —— 生产实测 P2 有 61.5%(1922/3125)的预建最终过期作废。
+
+        两条限幅,避免"借道"变成"抢头部 target 的库存":
+        - floor:只从 ≥2 条的桶借,借完该桶仍留 ≥1 条给它的正主请求;
+        - donor 顺序按"栈顶那条的年龄"从旧到新(_pool_peek 是 LIFO,栈顶才是
+          要交出去的那条):优先消耗反正最接近过期的库存,年轻库存不动。
+
+        取用复用 _pool_peek,因此半关闭/脏连接照常当场识破并计 pool_stale_discards,
+        每代理计数与空桶摘除也一并走同一段逻辑。
+        """
+        keys = self._target_keys_by_proxy.get(proxy_key)
+        if not keys:
+            return None
+        # 每代理桶数受 conn_pool_per_proxy 钳制(个位数),排序成本可忽略。
+        donors = []
+        for key in keys:
+            stack = self._target_pool.get(key)
+            if not stack or len(stack) < 2:
+                continue  # floor:单条的桶留给它自己的 target
+            donors.append((getattr(stack[-1][1], '_conn_pool_created', 0.0), key))
+        donors.sort()
+        for _, key in donors:
+            got = self._pool_peek(self._target_pool, key)
+            if got is not None:
+                self.conn_pool_steals += 1
+                logger.debug("pool STEAL %s for generic pool (steals=%d)",
+                             key, self.conn_pool_steals)
+                return got
+        return None
 
     def _conn_pool_peek(self, proxy_host: str, proxy_port: int) -> Optional[Tuple[asyncio.StreamReader, asyncio.StreamWriter]]:
         """从预热池取一条到该上游的空闲连接 (reader, writer);无则返回 None。
 
-        取用成功计 hits,需新建计 misses。连接在取用后由调用方发 CONNECT,
-        隧道结束即关闭(不归还——CONNECT 后 socket 已被隧道占用)。
+        取用成功计 hits、需新建计 misses;第一阶段桶空时先试同代理的 P2 桶
+        (计 conn_pool_steals,不算 hit 也不算 miss —— 它省下了那次新建,但
+        不是本池的功劳)。连接在取用后由调用方发 CONNECT,隧道结束即关闭
+        (不归还——CONNECT 后 socket 已被隧道占用)。
         """
-        got = self._pool_peek(self._conn_pool, f"{proxy_host}:{proxy_port}")
-        if got is None:
-            self.conn_pool_misses += 1
-        else:
+        proxy_key = f"{proxy_host}:{proxy_port}"
+        got = self._pool_peek(self._conn_pool, proxy_key)
+        if got is not None:
             self.conn_pool_hits += 1
-        return got
+            return got
+        got = self._steal_from_target_pool(proxy_key)
+        if got is not None:
+            return got
+        self.conn_pool_misses += 1
+        return None
 
     def _target_pool_peek(self, proxy_host: str, proxy_port: int, target: str) -> Optional[Tuple[asyncio.StreamReader, asyncio.StreamWriter]]:
         """从 target 半预连接池取一条到该上游的空闲连接 (reader, writer)。
@@ -515,6 +584,7 @@ class ConnectionPools:
                 # 时据此分诊"时序没赶上"(标记存在)vs"代理桶不匹配"(标记缺失)。
                 self._mark_cluster_ever(key)
             self._target_pool.setdefault(key, []).append((reader, writer))
+            self._index_target_key(key)
             self._count_put(key)
             self.target_pool_creates += 1
             self.target_prewarm_success += 1
@@ -595,6 +665,7 @@ class ConnectionPools:
                         logger.debug("target prewarm EXPIRED %s (%s conn(s))",
                                      key, len(stack))
                     pool.pop(key, None)
+                    self._unindex_target_key(key)
         await self._close_many(stale)
 
     async def _close_many(self, writers) -> None:
@@ -648,6 +719,7 @@ class ConnectionPools:
         stacks = list(self._conn_pool.values()) + list(self._target_pool.values())
         self._conn_pool.clear()
         self._target_pool.clear()
+        self._target_keys_by_proxy.clear()
         # 池整体清空:每代理计数与在途登记一起归零(留旧值会让重建后的池误判
         # "预算已被占满",从此不再预热)。
         self._proxy_conn_count.clear()

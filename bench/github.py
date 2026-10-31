@@ -281,7 +281,8 @@ def print_row(prefix: str, m: dict) -> None:
     else:
         print(f"  上游分布      : N/A (per-proxy 计数拉取失败)")
     if conn.get("hits") is not None:
-        print(f"  连接池        : hits {conn['hits']}  misses {conn['misses']}  新建 {conn['new_conns']}  "
+        print(f"  连接池        : hits {conn['hits']}  借P2 {conn.get('steals', 0)}  "
+              f"misses {conn['misses']}  新建 {conn['new_conns']}  "
               f"池末值 {conn['pool_size_end']}")
         if conn.get("target_creates") is not None:
             print(f"  target 预热   : hits {conn['target_hits']}  creates {conn['target_creates']}  "

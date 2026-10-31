@@ -153,6 +153,13 @@ router:
     # connections sit there half-closed (CLOSE_WAIT) and every reuse burns a wasted
     # CONNECT round trip. Such conns are now detected and dropped at take time; count
     # exposed as /metrics counter `pool_stale_discards`.
+    #
+    # When the Phase-1 bucket is empty, one bare TCP is borrowed from a Phase-2 bucket of
+    # the *same* proxy (Phase 2 also stores pre-CONNECT TCPs; `target` is only a bucket
+    # label). Guardrails: only buckets holding >=2 conns are robbed (1 stays for its own
+    # target), oldest-top bucket first. Counter: `conn_pool_steals`. Note the changed
+    # semantics: a steal is neither hit nor miss, so `conn_pool_misses` now means
+    # "both pools empty — had to build a fresh TCP".
     idle_timeout: 30.0
     refill_interval: 5.0
     refill_target: 2

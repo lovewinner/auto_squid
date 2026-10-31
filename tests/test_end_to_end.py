@@ -5572,6 +5572,130 @@ class TestPoolBudget:
         assert first not in pools._target_pool_cluster_ever, "应淘汰最早写入的键"
         assert f"10.0.0.1:3128|t{cap + 4}.example.com:443" in pools._target_pool_cluster_ever
 
+    # ── C:第一阶段落空时从同代理的第二阶段桶借裸 TCP ─────────────
+
+    def _seed_bucket(self, pools, key, n, born=0.0, readers=None):
+        """往 _target_pool 塞 n 条假连接(打建连时间戳 + 登记每代理索引)。"""
+        stack = []
+        for i in range(n):
+            w = self._FakeWriter()
+            w._conn_pool_created = born + i * 0.001
+            stack.append((readers[i] if readers else self._FakeReader(), w))
+        pools._target_pool[key] = stack
+        pools._count_put(key, n)
+        pools._index_target_key(key)
+        return stack
+
+    def test_generic_pool_miss_steals_from_same_proxy(self):
+        """P1 空、同代理 P2 有货 → 借一条,不算 hit 也不算 miss。
+
+        P2 存的同样是未发 CONNECT 的裸 TCP,target 只是桶键标签,换 target 用它
+        合法;生产 P2 有 61.5% 的预建最终过期作废,同时 P1 落空的请求在建新连。
+        """
+        pools = self._pools(total=16, per_proxy=8)
+        pk = '10.0.0.1:3128'
+        key = f'{pk}|hot.example.com:443'
+        stack = self._seed_bucket(pools, key, 2, born=1.0)
+        assert pools._conn_pool.get(pk) is None
+        expected = stack[-1]      # LIFO:_pool_peek 交出栈顶,取走后不在栈里了
+        got = pools._conn_pool_peek('10.0.0.1', 3128)
+        assert got is not None, "P1 落空时应从同代理 P2 桶借一条"
+        assert got is expected
+        assert pools.conn_pool_steals == 1
+        assert pools.conn_pool_hits == 0
+        assert pools.conn_pool_misses == 0, "借到即省下一次新建,不该再算 miss"
+        assert len(pools._target_pool[key]) == 1, "floor:借走仍要给正主留 ≥1 条"
+        assert pools._proxy_conn_count == self._live_by_proxy(pools)
+        assert pools._target_keys_by_proxy.get(pk) == {key}
+
+    def test_steal_leaves_single_conn_buckets_alone(self):
+        """floor:只有 1 条的桶留给它自己的 target,不借。"""
+        pools = self._pools(total=16, per_proxy=8)
+        pk = '10.0.0.1:3128'
+        self._seed_bucket(pools, f'{pk}|a:443', 1)
+        self._seed_bucket(pools, f'{pk}|b:443', 1)
+        assert pools._conn_pool_peek('10.0.0.1', 3128) is None
+        assert pools.conn_pool_steals == 0
+        assert pools.conn_pool_misses == 1
+        assert sum(len(v) for v in pools._target_pool.values()) == 2, "单条桶被掏空了"
+
+    def test_steal_prefers_bucket_closing_in_expiry(self):
+        """donor 选"栈顶最旧"的桶:_pool_peek 是 LIFO,栈顶才是要交出去的那条。"""
+        pools = self._pools(total=16, per_proxy=8)
+        pk = '10.0.0.1:3128'
+        young_key, old_key = f'{pk}|young:443', f'{pk}|old:443'
+        self._seed_bucket(pools, young_key, 2, born=100.0)
+        old = self._seed_bucket(pools, old_key, 2, born=1.0)
+        expected = old[-1]       # 栈顶且年龄最大 → 应该被交出来的那条
+        got = pools._conn_pool_peek('10.0.0.1', 3128)
+        assert got is expected, "应优先消耗最接近过期的那条,而不是年轻库存"
+        assert len(pools._target_pool[young_key]) == 2, "年轻桶不该被动"
+
+    def test_steal_does_not_scan_the_target_pool(self):
+        """借道必须走每代理索引,不许遍历整张 _target_pool。
+
+        生产 DB 里有 3869 个不同 target,任何按前缀扫全表的写法都是把
+        O(每代理桶数) 换成 O(全池桶数) —— 正是这轮 review 一路在防的那类扫描。
+        """
+        pk = '10.0.0.1:3128'
+
+        class _NoScanDict(dict):
+            def _boom(self):
+                raise AssertionError("借道不应遍历 _target_pool 全表")
+            keys = values = items = _boom
+
+        pools = self._pools(total=16, per_proxy=8)
+        pools._target_pool = _NoScanDict()
+        for i in range(200):
+            pools._target_pool[f'10.0.9.9:3128|t{i}:443'] = [
+                (self._FakeReader(), self._FakeWriter())]
+        self._seed_bucket(pools, f'{pk}|hot:443', 2)
+        assert pools._conn_pool_peek('10.0.0.1', 3128) is not None
+
+    def test_steal_skips_bucket_of_dead_conns(self):
+        """donor 桶里全是半关闭/死连接:当场丢弃,再试下一个桶,索引同步摘除。"""
+        pools = self._pools(total=16, per_proxy=8)
+        pk = '10.0.0.1:3128'
+
+        class _EofReader(TestPoolBudget._FakeReader):
+            def at_eof(self):
+                return True
+
+        dead_key, live_key = f'{pk}|dead:443', f'{pk}|live:443'
+        self._seed_bucket(pools, dead_key, 2, born=1.0,
+                          readers=[_EofReader(), _EofReader()])
+        live = self._seed_bucket(pools, live_key, 2, born=50.0)
+        expected = live[-1]
+        got = pools._conn_pool_peek('10.0.0.1', 3128)
+        assert got is expected
+        assert pools.pool_stale_discards == 2, "死 donor 应被 _pool_peek 当场丢弃"
+        assert pools.conn_pool_steals == 1
+        assert dead_key not in pools._target_pool
+        assert pools._target_keys_by_proxy.get(pk) == {live_key}, "空桶要从索引摘除"
+        assert pools._proxy_conn_count == self._live_by_proxy(pools)
+
+    def test_index_empties_when_bucket_empties(self):
+        """索引不留空壳:桶被取空 → 键消失且代理项一起删。"""
+        pools = self._pools(total=16, per_proxy=8)
+        pk = '10.0.0.1:3128'
+        key = f'{pk}|a:443'
+        self._seed_bucket(pools, key, 3)
+        assert pools._target_keys_by_proxy.get(pk) == {key}
+        assert pools._conn_pool_peek('10.0.0.1', 3128) is not None          # 3→2(借)
+        assert pools._target_pool_peek('10.0.0.1', 3128, 'a:443') is not None  # 2→1
+        assert pools._conn_pool_peek('10.0.0.1', 3128) is None              # floor 保住末条
+        assert pools._target_pool_peek('10.0.0.1', 3128, 'a:443') is not None  # 正主取走
+        assert key not in pools._target_pool
+        assert pk not in pools._target_keys_by_proxy, "代理项不留空 set"
+
+    @pytest.mark.asyncio
+    async def test_close_all_clears_index(self):
+        pools = self._pools(total=16, per_proxy=8)
+        pk = '10.0.0.1:3128'
+        self._seed_bucket(pools, f'{pk}|a:443', 2)
+        await pools._conn_pool_close_all()
+        assert pools._target_keys_by_proxy == {}
+
 
 class TestConnPoolIdlePause:
     """refill 空闲感知(conn_pool.refill_pause_minutes):连续 N 分钟无"密集活动"
