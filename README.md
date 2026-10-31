@@ -1,6 +1,6 @@
 # auto_squid
 
-A lightweight forward proxy with **parallel racing**, **multi-objective Cost ranking**, **domain caching**, an **HTTP response cache**, **session stickiness**, and **SQLite-persisted stats**. Runs on a gateway host and forwards each HTTP/HTTPS request through a pool of upstream proxies — the fastest winner takes all, losers are cancelled and released.
+A lightweight forward proxy that **races every request across a pool of upstream proxies** and keeps the fastest winner. It adds multi-objective Cost ranking, domain caching, session stickiness, an HTTP response cache, CONNECT connection pre-warming, and SQLite-persisted lifetime metrics — all behind two ports and one YAML file.
 
 > [中文说明 →](README_CN.md)
 
@@ -8,334 +8,387 @@ A lightweight forward proxy with **parallel racing**, **multi-objective Cost ran
 
 ## What this is
 
-Every client request (HTTP or `CONNECT`) is raced across upstream proxies: candidates are sorted by a weighted Cost of latency + success rate + throughput, the best 1–2 launch first (RFC 8305 §5 staggered start), and the rest refill at ~250 ms intervals. The first first-byte response wins; the rest are cancelled. The result is lower TTFB than a single proxy, built-in failover when proxies degrade, and no manual server-configuration required on the upstream side.
+A client points its system- or app-level proxy at auto_squid. Every request — plain HTTP or `CONNECT` — is dispatched to a set of upstream proxies **in parallel**: candidates are ordered by a weighted Cost, the best few launch first, the rest are refilled on a timer (RFC 8305 §5 staggered start). The first response to produce a first byte wins; the losers are cancelled and closed.
 
-Beyond racing, auto_squid gives you: domain-level caching of race winners, optional session stickiness (stable egress IP), an in-memory HTTP GET response cache, three layers of TCP connection pooling for CONNECT, a built-in management API with a dashboard, and per-proxy/per-domain **windowed (recent 256) and lifetime (t-digest) metrics** with error classification.
+You get lower TTFB than pinning one proxy, automatic failover when a proxy degrades, and no configuration changes on the upstream side.
+
+Once a race is won the result is remembered: per-domain caching, optional session stickiness (stable egress IP), pre-warmed TCP to the upstream, and per-proxy/per-domain statistics that feed the next ordering decision.
 
 ## Quickstart
 
 ```bash
-# 1. Install
-uv venv .venv --seed && uv sync          # runtime: fastapi, uvicorn[standard], httpx, pydantic, typer, pyyaml
+# 1. Install (runtime deps: fastapi, uvicorn[standard], httpx, pydantic, typer, pyyaml)
+uv venv .venv --seed && uv sync
 
-# 2. Prepare upstream proxies (see proxies.yaml for the schema)
-cp proxies.yaml examples/proxies.yaml   # placeholder — fill in your own
+# 2. Declare your upstream proxies (proxies.yaml is gitignored)
+cp examples/proxies.yaml proxies.yaml     # fill in host/port/auth
 
-# 3. Start
+# 3. Optional: tune behaviour (config.yaml is gitignored too)
+cp examples/config.yaml config.yaml
+
+# 4. Start
 python -m auto_squid.cli
-# or: auto-squid            # installed entry point (pyproject.toml)
-# Options: --proxies ./proxies.yaml --db ./auto_squid.db --config ./config.yaml
+# or: auto-squid                          # entry point registered in pyproject.toml
+# Flags: --config ./config.yaml --proxies ./proxies.yaml --db ./auto_squid.db
 
-# 4. Verify
+# 5. Verify
 curl http://127.0.0.1:18080/health        # → {"status":"ok"}
 curl http://127.0.0.1:18080/proxies
-curl http://127.0.0.1:18080/stats
-
-# 5. Use as a proxy
 curl -x http://127.0.0.1:10808 http://www.baidu.com
 curl -x http://127.0.0.1:10808 https://www.baidu.com
 ```
 
-Then open the dashboard: [http://127.0.0.1:18080/](http://127.0.0.1:18080/)
+Dashboard: <http://127.0.0.1:18080/> (redirects to `/panel/domains`).
 
-## Features
-
-- **Parallel racing + staggered start** — candidates EWMA-sorted; best 1–2 launch first, rest refill at ~250 ms (RFC 8305 §5); first first-byte wins, losers cancelled & closed
-- **Multi-objective Cost ranking** (default on) — racing order = `w_lat·norm(latency) + w_sr·norm(1−success_rate) + w_tp·norm(1−throughput)` with **min–max normalization inside the candidate set** (weights directly comparable, scale-free). The latency term uses the **lifetime TTFB P99** (t-digest) with EWMA fallback; success rate is Laplace-smoothed (domain-level preferred); throughput is measured from **plaintext response bodies only** (a tunnel's bytes ÷ its wall-clock lifetime measures client idleness, not proxy speed, so it never feeds Cost) and needs a 1 MB measured-body floor. `cost_sort_enabled: false` rolls back to pure EWMA ranking instantly
-- **Cost hot-reload + auto-tuner** (P1) — `GET/POST /cost` reads/updates all cost parameters at runtime (effective on the very next race, no restart); `POST /tuner` toggles a conservative hill-climbing auto-tuner that adopts only ≥5% winner-TTFB improvements with no success-rate regression, with automatic rollback on degradation
-- **Domain cache** — once a proxy wins a race for a domain, it is reused until `cache_ttl` expires
-- **Session stickiness** — same client IP + domain/target reuses the same proxy (stable egress IP); failing or 5xx-returning sticky proxies are evicted and re-raced; periodic re-check (`recheck_hits`); in-memory table with a hard capacity cap
-- **HTTP response cache** — idempotent `GET` responses cached in memory (TTL 60 s, respects `Cache-Control`; POST/PUT/DELETE/PATCH invalidate the domain's cached GETs)
-- **In-flight GET coalescing** — concurrent requests to the same URL share one upstream request (bounded wait, falls back to racing)
-- **Local racing** — optionally let the gateway host itself race as a proxy node (direct, no upstream)
-- **Two-layer CONNECT TCP pooling** — generic upstream pool and target half-preconnection (`target_prewarm`); plus **request-cluster predictive pre-warm** (`cluster_predict`) that pre-builds "to-upstream" TCP for targets predicted to co-occur in the next page-load window
-- **Business-aligned probing** (default off) — `probe_with_get` follows the CONNECT liveness probe with a lightweight GET against a whitelist, recording TTFB/protocol/throughput into the real domain metric buckets
-- **Observability** — per-proxy & per-domain **windowed** (last 256) **and** lifetime (t-digest, cross-restart) percentiles; error classification (timeout/connect/5xx/HTTP-status/TLS/protocol/cancelled/other); HTTP protocol-version distribution; per-proxy **Cost breakdown** showing which component dominates the ranking; Bayesian-smoothed success rates with low-confidence flags
-- **Domain stats** — per-domain win counts persisted to SQLite, survive restarts
-- **Web UI** — built-in dashboard at `/` for browsing domain stats, default proxies, and win counts with auto-refresh; click a stat card to filter domains by that proxy as Default Proxy
-- **Config-driven everything** — all knobs live in `config.yaml` (`router.circuit.*`, `router.stickiness`, `router.conn_pool`, etc.), validated at load time (`extra="forbid"`, cross-field validation, clean exit code 2 with readable messages)
-- **Client auth** — optional HTTP Basic auth on the proxy port (`:10808`) and/or the management API (`:18080`), off by default
-- **Hop-by-hop header filtering** — `proxy-authorization` is stripped before forwarding upstream (client credentials never leak); `Content-Length` is rewritten to the actual body length after stripping transfer/encoding headers
-- **Graceful shutdown** — in-flight connections cancelled and drained before the DB closes
+**Defaults are conservative.** Racing, Cost ranking, the domain cache and the HTTP response cache work out of the box; stickiness, connection pooling, active probing, cluster prediction, adaptive TTL and the auto-tuner are **off** until you switch them on. The management API binds to loopback only and is unauthenticated by default — see [Security model](#security-model).
 
 ## Ports
 
-| Port | Purpose |
-|------|---------|
-| `10808` | Proxy port — HTTP/HTTPS traffic in (`-x http://127.0.0.1:10808 ...`) |
-| `18080` | Management API + Web UI (`/health`, `/proxies`, `/metrics`, `/`) |
+| Port | Purpose | Binds by default |
+|------|---------|------------------|
+| `10808` | Proxy port — HTTP/`CONNECT` in (`-x http://127.0.0.1:10808 …`), optional client Basic auth | `0.0.0.0` |
+| `18080` | Management API + dashboard + `/docs` | `127.0.0.1` |
+
+## Features
+
+**Racing & selection**
+- **Staggered parallel racing** — a first batch of `stagger_initial` candidates, remaining candidates refilled every `stagger_interval_ms` (floor 100 ms); first first-byte wins, losers cancelled.
+- **Multi-objective Cost** — `w_lat·norm(latency) + w_sr·norm(1−success_rate) + w_tp·norm(1−throughput)`, min–max normalized *inside the candidate set* so the weights are directly comparable. Latency defaults to lifetime TTFB **P99** (t-digest) with an EWMA fallback; success rate is Laplace-smoothed and prefers the domain-level bucket. `cost_sort_enabled: false` rolls back to pure EWMA ordering instantly.
+  The throughput term is fed **only by plaintext response bodies**: a tunnel's "bytes ÷ wall-clock tunnel lifetime" measures how long the *client* idled, not how fast the proxy relays, so it never enters Cost (it stays observable as `tunnel_relay_ewma_mbps`).
+- **Least-request bias** (`lb_bias`) and a consecutive-failure penalty (`fail_penalty_weight`) steer load away from backed-up or flaky proxies.
+- **Circuit breaker + slow-start** — `circuit_threshold` consecutive transport failures open a circuit with exponential backoff up to `circuit_max_backoff`; recovery is rate-limited through slow-start. Business rejections (a non-200 answer to the upstream's `CONNECT`, HTTP 5xx) are classified separately and do **not** open a circuit.
+- **Active probing** — `probe_canary` (or a `probe_canaries` list) re-tests open circuits without waiting for client traffic. `probe_with_get` can follow the CONNECT probe with a whitelisted GET so real TTFB/body metrics keep updating.
+- **Early-warning degrade** (`single_send_degrade_*`) — unpins a sticky/cached proxy at the first sign of degradation, before the circuit would trip.
+- **Local racing / fail-open** — the gateway host can race as its own node (`enable_local_racing`); `local_direct_domains` dials origins directly, bypassing upstreams.
+
+**Caching & stickiness**
+- **Domain cache** — a race winner is reused for that domain until `cache_ttl` expires; `adaptive_ttl` grows or resets that TTL based on domain stability.
+- **Session stickiness** — `client_ip + domain` pins a proxy for a stable egress IP; failing or degraded pins are evicted and re-raced; `recheck_hits` periodically re-verifies a pin. Bounded table (`max_entries`, LRU).
+- **HTTP response cache** — idempotent `GET` bodies cached in memory (`ttl`, respects `Cache-Control`); `POST/PUT/DELETE/PATCH` invalidate that domain's cached GETs. A single response larger than `max_bytes/2` is deliberately not cached.
+- **In-flight GET coalescing** — concurrent requests for the same URL share one upstream fetch.
+
+**Connection pooling (CONNECT)**
+- **Phase 1** — a pool of idle TCP connections to each upstream proxy.
+- **Phase 2** (`target_prewarm`) — the same kind of bare TCP, bucketed by `(proxy, target)` and pre-built when a domain-cache/sticky hit or race win predicts a repeat.
+- **Cross-phase steal** — when the Phase-1 bucket is empty, a connection is borrowed from a Phase-2 bucket of the *same* proxy (the TCP is target-agnostic; `target` is only a bucket label). Guardrails: only buckets holding ≥2 connections are robbed, oldest-first, so every target keeps one for itself.
+- **Cluster prediction** (`cluster_predict`) — learns which targets co-occur inside a short page-load window and pre-warms predicted co-targets before the next request arrives.
+- **Stale detection** — a connection the peer already half-closed (CLOSE_WAIT) still looks perfectly healthy to `is_closing()`. Taking one burns a whole CONNECT round trip and returns "no response", so EOF/stray-bytes are checked on the reader side and the connection is dropped on the spot.
+
+**Operations**
+- **Management API + dashboard** — proxy list, per-domain stats, stickiness table, Cost breakdown, circuit/probe state, auto-tuner control.
+- **Runtime hot-reload** of Cost parameters (`POST /cost`) — effective on the very next race, no restart.
+- **Auto-tuner** (`auto_tune`, off by default) — conservative hill climbing that adopts a weight change only when winner TTFB improves by ≥ `hysteresis` with no success-rate regression, and rolls back when things get worse.
+- **Lifetime metrics in SQLite** — per-proxy and per-domain windowed percentiles (last 256 samples) *plus* t-digest lifetime rollups, error classification, HTTP-version distribution, and smoothed success rates with low-confidence flags.
+- **Config validated at load** — `extra="forbid"`, cross-field checks, readable message, exit code 2.
+- **Size-based log rotation**, graceful shutdown, Docker image + compose example.
 
 ## Request pipeline
 
-Every connection goes through the same decision chain (all in `auto_squid/router.py`):
+The decision chain (`auto_squid/router.py`):
 
-1. **Connection & auth** — `handle_client` reads the request head; enforces `Proxy-Authorization` (407 before any upstream work). `CONNECT` → `_handle_connect`, plain HTTP → `_handle_http_request`.
-2. **Short-circuits** — `local_direct_domains` whitelist (dial origin directly, no upstream); in-flight GET coalescing.
-3. **Dispatch decision** (`_dispatch_single`) — in priority order:
-   - **Session stickiness** → single-send on the pinned proxy (no racing)
-   - **Domain cache** → single-send on the domain's last race winner within `cache_ttl`
-   - **Racing** (`_race_staggered`) — Cost-sorted candidates, staggered start; first first-byte wins
-4. **Degradation feedback** — a failing single-send triggers `_degrade_send_proxy` so the *next* request for that domain skips stickiness/cache and re-races; immediate-degrade markers clear when a new race winner is established.
-5. **Failure accounting** — racing losers call `record_failure` per attempt, feeding the circuit breaker in `selector.py`: `circuit_threshold` consecutive failures open a circuit with exponential backoff (8 s → up to 300 s). Business rejections (`http_status`, e.g. CONNECT upstream returning non-200) do **not** trip the circuit — only proxy-quality signals do.
-6. **Connection reuse** — two pooling layers sit beneath everything: generic upstream TCP pool and target half-preconnection; stale pooled connections are detected on handshake and retried fresh without penalizing the circuit breaker.
+1. **Accept & parse** — `handle_client` reads the request head, enforces client Basic auth (`407` before any upstream work), and rejects over-limit request heads with a single INFO line instead of a traceback. `CONNECT` → `_handle_connect`; plain HTTP → `_handle_http_request`.
+2. **Short-circuits** — `local_direct_domains` (dial the origin directly), in-flight GET coalescing, HTTP response cache hit.
+3. **Dispatch** (`_dispatch_single`) — in priority order:
+   1. **session stickiness** → single-send on the pinned proxy;
+   2. **domain cache** → single-send on the last winner within its TTL;
+   3. **racing** (`_race_staggered`) → Cost-ordered candidates, staggered launch.
+4. **Connection acquisition** — an established tunnel is never reused; per request the router takes a TCP in the order **Phase 2 → Phase 1 → cross-phase steal → new connection**, then sends `CONNECT`. A stale pooled connection is detected at take time, discarded and retried fresh — and does **not** count against the circuit breaker.
+5. **Response framing** — hop-by-hop headers are stripped (`proxy-authorization` never reaches the upstream), `Content-Length` is recomputed after decoding a chunked request body, and `Transfer-Encoding` takes precedence over `Content-Length` (RFC 9112 §6.1). HTTP/1.0 clients get close-delimited bodies instead of chunked framing (RFC 9112 §2.7); `HEAD`, `204`, `304` and 1xx never carry a body. Truncated upstream responses are detected and reported rather than silently forwarded.
+6. **Feedback** — the winner updates EWMA/TTFB/OFB, protocol version, throughput (plaintext bodies) and the domain cache; failures call `record_failure`, feeding the circuit breaker in `selector.py`. A degraded single-send triggers `_degrade_send_proxy`, so the *next* request for that domain skips stickiness/cache and re-races.
 
 ### Where each knob acts
 
-| Knob | Acts at | Effect |
+| Knob | Stage | Effect |
 |---|---|---|
-| `cache_ttl` | Domain cache (step 3.2) | How long a race winner is reused |
-| `stickiness_*` | Sticky lookup (step 3.1) | Enable pinning / TTL / recheck / capacity |
-| `max_retries` | Racing (step 3.3) | Initial race fan-out width |
-| `cost_sort_enabled` | Candidate sort | Multi-objective ranking vs pure EWMA |
-| `circuit_threshold` | Failure accounting (step 5) | Consecutive failures before circuit opens |
-| `single_send_degrade_*` | Degrade gate (step 4) | Unpin a failing single-send before it breaks the circuit |
+| `stickiness.*` | dispatch 3.1 | pinning on/off, TTL, re-check cadence, capacity |
+| `cache_ttl`, `adaptive_ttl.*` | dispatch 3.2 | how long a race winner is reused |
+| `max_retries`, `stagger_initial`, `stagger_interval_ms` | racing 3.3 | fan-out width and refill cadence |
+| `cost_*` | candidate sort | multi-objective ranking vs pure EWMA |
+| `lb_bias`, `fail_penalty_weight` | candidate sort | backlog and flakiness penalties |
+| `conn_pool.*` | acquisition 4 | pool depth, idle TTL, pre-warm, prediction |
+| `circuit_threshold`, `circuit_max_backoff`, `slow_start_*` | failure accounting 5–6 | open / backoff / recovery |
+| `probe_*` | background | re-test open circuits, keep metrics warm |
+| `single_send_degrade_*` | degrade gate 6 | unpin before the breaker trips |
+| `policies` | candidate set | narrow which proxies may serve a domain |
+| `concurrency_limit.*` | admission | per-proxy adaptive in-flight cap |
 
 ## Configuration
 
-All configuration lives in `config.yaml`. Here is the full structure with defaults (the sensitive parts are omitted):
+Everything lives in `config.yaml`. Every key is optional; the values below are the **code defaults**. `examples/config.yaml` shows a production-shaped alternative.
 
 ```yaml
-listen:                        # host/port for the proxy port (default 0.0.0.0:10808)
+listen:
+  host: "0.0.0.0"                  # proxy port bind
+  port: 10808
+
 api:
-  host: "127.0.0.1"            # management API host (loopback by default; bind 0.0.0.0 only with auth enabled)
-  port: 18080                    # management API port
-  auth:                          # optional HTTP Basic auth for the management API (off by default)
-    enabled: true
-    username: "..."
-    password: "..."
+  host: "127.0.0.1"                # loopback; binding 0.0.0.0 with auth off logs a WARNING
+  port: 18080
+  auth: {enabled: false, username: "", password: ""}   # HTTP Basic on every route but /health
+
+logging:
+  level: "INFO"                    # FILE level only (console is pinned to WARNING+)
+  file: null                       # null → "auto_squid.log", resolved against the startup CWD
+  max_bytes: 33554432              # 32 MiB per file, then rotate
+  backup_count: 5                  # keep .1 … .5 (0 = truncate in place)
+
 router:
-  enable_local_racing: false     # let the gateway host race as a proxy node
-  cache_ttl: 600                 # domain cache TTL (seconds)
-  max_retries: 3                 # racing fan-out: first N candidates race in the first batch
-  stagger_start: true            # RFC 8305 staggered start (best first, refill at interval)
-  stagger_initial: 2             # initial batch size when no EWMA history (min 1, max max_retries)
-  stagger_interval_ms: 100       # RFC 8305 refill interval (ms; minimum allowed: 100)
-  local_direct_domains: []       # targets dialed directly (no upstream) — for internal services
-  circuit:                       # probe + circuit-breaker + single-send signals
-    probe_interval_sec: 20
-    probe_canary: "www.baidu.com:443"
-    circuit_threshold: 3         # consecutive failures → circuit open
-    circuit_max_backoff: 300     # exponential backoff cap (seconds)
-    slow_start_window: 60        # consecutive successes to exit slow-start
-    slow_start_success: 3
-    lb_bias: 0.5                 # how much in-flight backlog penalizes a proxy's race order
-    single_send_degrade_fail: 2      # early-warning threshold (consecutive failures; 0=off)
-    single_send_degrade_ratio: 1.5   # EWMA-degradation ratio vs pin-time baseline (0=off)
-    single_send_degrade_slack_ms: 10   # absolute floor (ms) against false positives
-    single_send_degrade_success_rate: 0.0  # domain success-rate drop → demote (needs ≥8 samples)
-    single_send_degrade_p99_ms: 0.0        # domain P99 spike → demote (needs ≥4 samples)
-    single_send_degrade_min_throughput: 0.0 # domain throughput drop → demote (needs ≥4 samples)
-    single_send_slow_log_ms: 1500  # slow single-send sampling log (ms; 0=off): logs client IP
-    connect_tunnel_timeout_sec: 3.0  # CONNECT connect/read timeout (s)
-    http_read_timeout_sec: 3.0       # HTTP single-send read timeout (s)
-    probe_with_get: false          # follow CONNECT probe with a GET (Phase 4, default off)
-    probe_get_targets: []          # whitelist of URLs for GET probing
-    probe_get_interval_sec: 60.0   # min interval per (proxy, target)
-    probe_get_timeout_sec: 5.0
-    probe_get_max_bytes: 65536
-    cost_sort_enabled: true        # multi-objective Cost ranking (false = pure EWMA)
-    cost_latency_metric: "p99"     # latency term: "p99" (tail-first) or "ewma"
-    cost_weight_latency: 1.0
-    cost_weight_success_rate: 0.6
-    cost_weight_throughput: 0.1    # tiny: only plaintext response bodies feed this dimension
-    cost_latency_min_samples: 1
-    cost_throughput_min_bytes: 1000000
-  stickiness:                    # session stickiness (off by default)
+  enable_local_racing: false
+  local_direct_domains: []         # bare host/IP (no port) — dial the origin directly
+  cache_ttl: 600
+  max_retries: 3                   # first racing batch size; also clamps stagger_initial
+  stagger_start: true
+  stagger_initial: 2               # 1..max_retries (out-of-range values are clamped)
+  stagger_interval_ms: 100         # RFC 8305 refill interval, clamped to [100, 2000]
+  auth: {enabled: false, username: "", password: ""}   # client-facing Basic auth (:10808)
+
+  policies: []                     # match{domain_suffix|domain_exact|domain_regex} → proxies{tags|ids}
+  stickiness:
     enabled: false
-    ttl: 1800
-    recheck_hits: 100
+    ttl: 1800                      # sliding on hit
+    recheck_hits: 100              # 0 = never re-race a pinned proxy
     max_entries: 100000
-  conn_pool:                     # CONNECT TCP pooling (Phase 1, default on)
+    probe_interval_sec: 0.0        # 0 = background re-probing off
+    probe_fanout: 2
+  http_cache:
     enabled: true
+    ttl: 60                        # seconds, sliding on hit
+    max_entries: 10000             # LRU
+    max_bytes: 268435456           # 256 MiB budget; a body > max_bytes/2 is never cached
+    stream_cache_limit: 1048576    # per-response buffer still eligible for caching
+  adaptive_ttl: {enabled: false, min_sec: 60.0, max_sec: 1800.0}
+  switch_damping: {enabled: false, min_wins: 2, ratio: 0.8, abs_ms: 30.0}
+  concurrency_limit: {enabled: false, min: 2, initial: 16, max: 128,
+                      add_on_success: 4, mult_on_failure: 0.5, failure_window: 20}
+  conn_pool:
+    enabled: false                 # both pools are OFF by default
     per_proxy: 4
-    total: 64
-    # idle_timeout must stay BELOW the upstream proxy's own idle close, otherwise pooled
-    # connections sit there half-closed (CLOSE_WAIT) and every reuse burns a wasted
-    # CONNECT round trip. Such conns are now detected and dropped at take time; count
-    # exposed as /metrics counter `pool_stale_discards`.
-    #
-    # When the Phase-1 bucket is empty, one bare TCP is borrowed from a Phase-2 bucket of
-    # the *same* proxy (Phase 2 also stores pre-CONNECT TCPs; `target` is only a bucket
-    # label). Guardrails: only buckets holding >=2 conns are robbed (1 stays for its own
-    # target), oldest-top bucket first. Counter: `conn_pool_steals`. Note the changed
-    # semantics: a steal is neither hit nor miss, so `conn_pool_misses` now means
-    # "both pools empty — had to build a fresh TCP".
-    idle_timeout: 30.0
-    refill_interval: 5.0
-    refill_target: 2
+    total: 64                      # fd budget shared by Phase 1 + Phase 2
+    idle_timeout: 30.0             # MUST stay below the upstream's own idle close
+    refill_interval: 5.0           # 0 = take-only, never refill
+    refill_target: 2               # Phase-1 water level per proxy (clamped to per_proxy)
     connect_timeout: 10.0
-    target_prewarm: true         # Phase 2: pre-open "upstream → target" TCP for hot targets
-    cluster_predict: false       # P3: pre-warm predicted co-targets for next page load
+    target_prewarm: false          # Phase 2; requires enabled: true
+    refill_pause_minutes: 60.0     # 0 = never pause when idle
+    refill_pause_silence_sec: 120.0      # DEPRECATED, kept for compatibility; use the two knobs below
+    refill_pause_activity_window: null   # null → max(30, refill_pause_silence_sec/4)
+    refill_pause_min_requests: 3
+    cluster_predict: false         # requires enabled: true AND target_prewarm: true
     cluster_window_sec: 2.0
     cluster_predict_topk: 3
+    cluster_predict_throttle_sec: 30.0
     cluster_min_support: 2
     cluster_graph_ttl_sec: 86400
     cluster_graph_max_entries: 100000
-    cluster_predict_throttle_sec: 30.0
-  policies: []                   # policy routing: narrow racing candidates per domain/tag
-  adaptive_ttl: {enabled: false, ...}  # per-domain TTL by stability
-  switch_damping: {enabled: false, ...}  # damp proxy switching when close
-  concurrency_limit: {enabled: false, ...}  # per-proxy adaptive concurrency cap
-logging:
-  level: INFO                    # file-log level (console always WARNING+ to avoid spam)
-  file: "auto_squid.log"
-  max_bytes: 33554432            # size-based rotation (default 32 MiB); was append-only forever
-  backup_count: 5                # keep auto_squid.log.1 … .5 (0 = truncate in place)
+    cluster_proxy_fanout: 2        # pre-warm across the N most-likely winner proxies
+    cluster_probe_decay_sec: 3600.0
+    cluster_pool_idle_timeout: 600.0    # predicted pre-warms live longer than passive ones
+  circuit:
+    probe_interval_sec: 30.0       # 0 = no active probing
+    probe_canary: "1.1.1.1:443"    # superseded by probe_canaries when that list is non-empty
+    probe_canaries: []             # [{name, target, tags}] — probe per candidate group
+    circuit_threshold: 3
+    circuit_max_backoff: 300.0
+    slow_start_window: 60.0
+    slow_start_success: 3
+    lb_bias: 1.0                   # weight = ewma × (1 + in_flight)^bias; 0 = pure EWMA
+    fail_penalty_weight: 4.0       # 0 = off
+    single_send_degrade_fail: 0    # 0 = off; sensible value = circuit_threshold - 1
+    single_send_degrade_ratio: 0.0        # also drives sticky slow-probe eviction
+    single_send_degrade_slack_ms: 10.0    # absolute floor guarding the ratio rule
+    single_send_degrade_success_rate: 0.0 # needs ≥ 8 domain samples
+    single_send_degrade_p99_ms: 0.0       # needs ≥ 4 domain samples
+    single_send_degrade_min_throughput: 0.0  # plaintext bodies only; needs ≥ 4 samples
+    single_send_slow_log_ms: 0.0   # the only log that ties a stall to a client IP
+    connect_tunnel_timeout_sec: 3.0
+    http_read_timeout_sec: 3.0
+    local_direct_timeout_sec: 10.0 # applies to the local_direct_domains path only
+    probe_with_get: false          # a no-op unless probe_get_targets is non-empty
+    probe_get_targets: []
+    probe_get_interval_sec: 60.0
+    probe_get_timeout_sec: 5.0
+    probe_get_max_bytes: 65536
+    cost_sort_enabled: true
+    cost_latency_metric: "p99"     # "p99" | "ewma"
+    cost_weight_latency: 1.0
+    cost_weight_success_rate: 0.6
+    cost_weight_throughput: 0.1
+    cost_latency_min_samples: 1
+    cost_throughput_min_bytes: 1000000   # measured RESPONSE-BODY bytes, not lifetime relay
+  auto_tune:
+    enabled: false
+    window_sec: 900.0
+    min_samples: 50
+    step: 0.25                     # ±25% per probe
+    hysteresis: 0.05               # adopt only ≥5% winner-TTFB gains
+    sr_guard: 0.005                # reject if success rate drops more than this
+    persist: true                  # state kept in SQLite (tuner_state)
 ```
 
-**Rotation caveats**
+### Load-time validation
 
-- **Do not also configure logrotate for this file.** logrotate renames the file out from
-  under the process (leaving it writing to the old inode while the "new" file stays empty),
-  or with `copytruncate` drops the lines written during the truncate race. In-app rotation
-  and external logrotate are mutually exclusive — pick one.
-- **Hand-cut history is not managed by `backup_count`.** Files with a custom suffix
-  (`auto_squid.log.261011`) are outside the `.1 … .N` rotation chain: they are never
-  reused and never deleted. Clean them up manually once.
-- A relative `file` is resolved against the CWD at startup; the first log line prints the
-  resolved absolute path.
-- **Two instances must not share one `logging.file`.** `RotatingFileHandler` is not
-  multiprocess-safe — both would rename the same path and clobber each other's chain.
-  Give each instance its own file.
+`config_schema.py` models are `extra="forbid"` (except the deliberately lenient data models `ProxyInfo` and `ProbeCanaryConfig`). Typos and cross-field violations abort startup with **exit code 2** and a readable message instead of a traceback:
 
-For production-ready snippets, see `examples/config.yaml` and the [Speed tuning](#speed-tuning) section below.
-
-## Config validation at load time
-
-`config_schema.py` defines the configuration as pydantic models with `extra="forbid"`. Typos, unknown fields, and cross-field violations are caught at load time with a readable message and **exit code 2** (no traceback):
-
-```bash
-$ python -m auto_squid.cli
+```text
 config error: invalid configuration:
   1 validation error for Config
-  router.circuit.local_direct_domains
+  router.stagger_inital
     Extra inputs are not permitted
 ```
 
-## Proxy store
+Enforced constraints: `logging.level` ∈ {DEBUG, INFO, WARNING, ERROR, CRITICAL}; `max_bytes > 0`; `backup_count ≥ 0`; an enabled `auth` block must have both username and password non-empty (otherwise `Basic Og==` would compare equal); `stagger_initial ≥ 1` and `≤ max_retries`; `adaptive_ttl.min_sec ≤ max_sec` when enabled; `concurrency_limit.min ≤ initial ≤ max` when enabled; `target_prewarm` and `cluster_predict` require `conn_pool.enabled`, and `cluster_predict` additionally requires `target_prewarm`.
 
-Upstream proxies are declared in `proxies.yaml` (a list, gitignored in production):
+Two values are **not** validated and fail quietly rather than loudly — worth knowing when a change appears to do nothing:
+
+- `circuit.cost_latency_metric` in YAML: anything other than `"p99"`/`"ewma"` is coerced to `"p99"` (the `POST /cost` API *does* reject it with 400).
+- `stagger_interval_ms`: out-of-range values are clamped into `[100, 2000]` rather than rejected.
+
+## Upstream proxy list
+
+Proxies live in a separate `proxies.yaml` (a plain list, gitignored in production):
 
 ```yaml
-- id: squid-01
-  name: beijing-01
-  host: 10.14.25.86
+- id: squid-01                 # required, unique — the key used by every metric
+  name: beijing-01             # optional display name
+  host: 10.14.25.86            # required: bare hostname / IPv4 / [IPv6] — no scheme, port, @ or /
   port: 3128
-  protocol: http              # http | https | socks5
-  auth:                        # optional; omitted = no auth
+  protocol: http               # only "http" is implemented; see the note below
+  auth:                        # optional upstream credentials
     username: "..."
     password: "..."
   enabled: true
-  tags:                        # optional, for policy routing
-    region: "cn"
+  tags: {region: cn}           # optional, consumed by router.policies
 ```
 
-The `ProxyStore` supports runtime CRUD through the management API — changes are persisted back to `proxies.yaml`.
+> **`protocol` is currently decorative.** Nothing in the codebase branches on it: every upstream is used as an HTTP/`CONNECT` proxy, and `https` or `socks5` would be silently treated as `http`. The write path (`POST /proxies`) therefore refuses anything but `http` outright so you cannot add a node that misbehaves — but a hand-edited `proxies.yaml` is not validated and will still be used as HTTP.
 
-## API Endpoints
+Nodes can be added at runtime with `POST /proxies`, which rewrites the whole bound `proxies.yaml` (comments are lost). There is **no delete or patch endpoint** — updating a node means POSTing the complete object under the same `id`.
 
-All on the management port `:18080`. `POST` bodies are JSON; unknown fields are rejected (`422`). When `api.auth` is enabled, every endpoint except `/health` requires HTTP Basic credentials (via `Authorization` or `Proxy-Authorization`).
+## Management API
 
-### Proxy & stats
+All on `:18080`. With `api.auth.enabled`, everything except `GET /health` requires HTTP Basic — accepted in either `Authorization` or `Proxy-Authorization`, compared with `hmac.compare_digest` on both fields. Failure returns `401` + `WWW-Authenticate: Basic realm="auto_squid"`.
 
-| Endpoint | Description |
-|----------|-------------|
-| `GET /` | Web UI dashboard (domain stats, default proxies, win counts, auto-refresh) |
-| `GET /health` | Health check (always open) |
-| `GET /proxies` | List configured proxies (upstream `auth` values masked; `?include_secrets=true` to reveal) |
-| `POST /proxies` | Add a proxy (`ProxyIn` JSON); writes back to the bound `proxies.yaml` (response reports `persisted`) |
-| `GET /stats` | `request_counts` (wins) + `attempted_counts` (total attempts) per proxy |
-| `GET /domains` | Per-domain win stats (top-N by wins; `?limit=`, `limit=0` = all) |
-| `GET /domains/meta` | Per-domain default proxy + last-updated time (+ TTL fields when adaptive TTL is on). Returns the N most recently updated (`?limit=`, `limit=0` = all) |
-| `GET /stickiness` | Session stickiness table (client_ip\|domain → sticky proxy). Returns the N most recently used (`?limit=`, `limit=0` = all; default 2000 — a full dump of a 100k-entry table is an O(N) copy + JSON on the event loop) |
-| `GET /policies` | Policy-routing config snapshot |
-| `GET /config` | Router config snapshot |
-
-### Metrics & quality
+### Read
 
 | Endpoint | Description |
-|----------|-------------|
-| `GET /metrics` | `request_counts`, `attempted_counts`, domain stats, server perf counters (cache hits, racing fan-out, probe counters, pool sizes, etc.) |
-| `GET /metrics/per-destination` | Per (domain, proxy) metrics: windowed percentiles, success rates, error classification, plus a `cumulative` sub-object (lifetime means, smoothed success rate, t-digest percentiles, total bytes) |
-| `GET /quality` | Per-proxy EWMA first-byte latency (s) — the legacy racing-order basis |
-| `GET /quality/meta` | Enhanced per-proxy metrics: windowed P50/P95/P99, smoothed success rate, error breakdown, HTTP protocol version counts, `cumulative` lifetime object, and a `cost_breakdown` per proxy |
-| `POST /quality/reset` | Clear all proxy EWMA quality |
-| `GET /circuit` | Circuit-breaker + probe state per proxy (`open`, backoff, `probes_sent/ok/skipped`, `single_send_degrades`, slow-send log counts) |
-| `POST /circuit/reset` | Un-break all circuits, keep EWMA quality |
-| `GET /server-stats` | Server resource sampling (CPU %, event-loop lag) filled by the bench subprocess |
+|---|---|
+| `GET /` | 307 → `/panel/domains` |
+| `GET /panel/{domains,stickiness,metrics}` | the dashboard itself; unknown view → 404 |
+| `GET /static/panel.js` | dashboard script, served from memory |
+| `GET /health` | liveness; exempt from auth |
+| `GET /proxies` | node list; `auth` values masked as `***` unless `?include_secrets=true` (the key names stay visible) |
+| `GET /stats` | `request_counts` (wins) and `attempted_counts` (attempts) per proxy |
+| `GET /domains` | per-domain win counts — top-N **by wins** (`?limit=`, default 2000, `0` = all) |
+| `GET /domains/meta` | per-domain default proxy + `updated_at` (+ TTL fields when `adaptive_ttl` is on) — top-N **most recently updated** (`?limit=`) |
+| `GET /stickiness` | pin table `client_ip|domain → proxy` — top-N **most recently used** (`?limit=`) |
+| `GET /policies` | policy-routing snapshot |
+| `GET /config` | currently only `{"enable_local_racing": …}` |
+| `GET /metrics` | `request_counts`, `attempted_counts`, **full** `domain_stats`, ~80 `counters`, `proxy_metrics` |
+| `GET /metrics/per-destination?domain=` | per `(domain, proxy)` percentiles, error classes and the lifetime `cumulative` object; omit `domain` for the whole grid (raw samples stripped), pass one for a cheap drill-down |
+| `GET /quality` | per-proxy EWMA first-byte latency (s) — the legacy ordering basis |
+| `GET /quality/meta` | per-proxy: windowed TTFB/OFB percentiles, `throughput_ewma_mbps` (bodies only), `tunnel_relay_ewma_mbps` (observation), `body_bytes_transferred`, windowed + lifetime success rates, error breakdown, HTTP-version counts, the `cumulative` lifetime object, and `cost_breakdown` |
+| `GET /circuit` | `circuit_open_count`, probe counters, `single_send_degrades`, `degraded_single_send`, and per-proxy `{open, open_until, backoff, consec_fail, slow_start}` |
+| `GET /server-stats` | CPU % and event-loop lag — only populated when run under `bench/`; `{}` for a normal CLI start |
+| `GET /cost` | current Cost parameters, auto-tuner state, safety bounds |
+| `GET /docs` | OpenAPI UI (auth-gated like everything else) |
 
-### Cost ranking & auto-tuning (P1)
+`/domains`, `/domains/meta` and `/stickiness` default to 2000 rows because those tables can hold ~100k entries and the payload is built on the same event loop that forwards your traffic. `GET /metrics` is **not** truncated.
 
-| Endpoint | Description |
-|----------|-------------|
-| `GET /cost` | Current cost parameters (7 fields), the auto-tuner state, and safety bounds |
-| `POST /cost` | Hot-update any subset of cost fields — **effective on the next race, no restart** |
-| `POST /tuner` | `{"enabled": true\|false}` — toggle the auto-tuner at runtime |
+### Write
 
-```bash
-# Which component dominates each proxy's ranking?
-curl http://127.0.0.1:18080/quality/meta | jq '.["239-192"].cost_breakdown'
-# → {"rank":2,"cost":0.31,"latency":{"contrib":0.21},
-#     "success_rate":{"contrib":0.05},"throughput":{...}}
+| Endpoint | Effect | Persists? |
+|---|---|---|
+| `POST /proxies` | add/overwrite a node by `id`; immediately raceable | rewrites `proxies.yaml`; the response reports `persisted` (+ `persist_error`) — with `persisted: false` the node serves until restart and then disappears |
+| `POST /cost` | hot-update any subset of the 7 Cost fields — effective on the next race | no (restart restores `router.circuit.cost_*`), but it also resets the tuner baseline |
+| `POST /tuner` | `{"enabled": true\|false}`; enabling restarts the evaluation loop, **disabling rolls weights back** to the last accepted baseline | no |
+| `POST /quality/reset` | clear EWMA, domain metrics, circuits, in-flight and degrade markers → everything re-races as unknown quality | **also wipes the persisted lifetime rows in SQLite** — destructive |
+| `POST /circuit/reset` | close all circuits, clear backoff and consecutive-failure counters, rearm slow-start; latency history untouched | no |
 
-# Raise the throughput weight — no restart needed
-curl -X POST http://127.0.0.1:18080/cost \
-     -H 'Content-Type: application/json' \
-     -d '{"cost_weight_throughput": 0.4}'
+Unknown JSON fields are rejected with `422` on `/cost` and `/tuner` (`extra="forbid"`), but **silently ignored** by `POST /proxies`. `POST /proxies` additionally rejects `host` values containing a scheme/port/`@`/`/`, requires `protocol == "http"`, and refuses an `auth` block whose values are all `***` — you cannot round-trip a masked GET.
 
-# Instant rollback without touching the process
-curl -X POST http://127.0.0.1:18080/cost -d '{"cost_sort_enabled": false}'
-```
+### Security model
 
-## Speed tuning
+- The proxy port binds `0.0.0.0` by default with client auth **off** — that is an open proxy for anything that can reach it. Set `router.auth.enabled`, or restrict the bind/ACL at the firewall.
+- The API binds loopback by default. A non-loopback bind with `api.auth` disabled logs a startup WARNING but does not refuse to start.
+- **Cross-site writes are blocked.** `POST/PUT/PATCH/DELETE` are checked *before* authentication, and the check applies even when `api.auth` is off: `Sec-Fetch-Site: cross-site` → `403 {"detail":"cross-site admin write blocked"}`; otherwise an `Origin` whose host doesn't match this host is rejected (the scheme is ignored so an HTTPS-terminating reverse proxy still works). A missing `Origin` (curl, scripts) and `Origin: null` are allowed. This matters because a browser re-sends cached Basic credentials automatically — "the attacker's page can't read the response" does not stop the write from landing.
+- `proxy-authorization` is stripped before forwarding, so client proxy credentials never reach the upstream.
 
-Tuning depends on your traffic. Three starting profiles (see `examples/config.yaml` for the full YAML):
+## Metrics worth watching
 
-**Stability-first** (stable egress IP, login/bot-protection-sensitive sites):
+`GET /metrics` → `counters`. The ones that actually tell you how the box is behaving:
+
+| Counter | Meaning | What healthy looks like |
+|---|---|---|
+| `http_cache_hits` / `_misses`, `domain_cache_hits`, `sticky_cache_hits` | short-circuit rates | high hit rates mean fewer races |
+| `racing_invocations`, `upstream_attempts` | racing amplification = attempts ÷ requests | ≤ ~1.5 for CONNECT-heavy traffic |
+| `conn_pool_hits` / `_misses` / `_steals` / `_expired`, `target_pool_*` | pool effectiveness — `steals` are cross-phase borrows, and `misses` now means "both pools empty → had to build a TCP" | few `expired` relative to `creates` |
+| `pool_stale_discards` | half-closed connections caught at take time | should fall together with `stale_conn_retries` once `idle_timeout` is low enough |
+| `stale_conn_retries` | `pooled conn STALE` retries, each costing a CONNECT round trip | **≈ 0**; a rising rate means the pool's idle TTL is longer than the upstream's |
+| `single_send_degrades` | early-warning unpins | low and flat |
+| `circuit_open_count`, `probes_sent/ok/skipped/failed` | breaker + probe activity | growing `probes_skipped` = the canary is unreachable through some proxy |
+| `cluster_pool_bucket_miss` / `_timing_miss` | why a prediction missed (wrong winner bucket / arrived too late) | only meaningful with `cluster_predict: true` |
+| `http_cache_evictions`, `sticky_cache_size`, `cluster_graph_size` | table pressure against their caps | steady, not pinned at the cap |
+
+Windowed values cover the last 256 samples and reset on restart; `cumulative` and the t-digest percentiles are lifetime and SQLite-backed. Don't compare the two.
+
+## Tuning
+
+Three starting profiles (full annotated version in `examples/config.yaml`):
 
 ```yaml
+# Stability first — stable egress IP, login/bot-protection sensitive
 router:
   stickiness: {enabled: true, ttl: 1800, recheck_hits: 100}
-  circuit:
-    probe_interval_sec: 30
-    single_send_degrade_fail: 2
+  circuit: {probe_interval_sec: 30, single_send_degrade_fail: 2}
 ```
 
-**Speed-first** (lowest TTFB, tolerant of egress switching):
-
 ```yaml
+# Speed first — lowest TTFB, egress switching acceptable
 router:
   cache_ttl: 900
   stagger_start: true
   stagger_initial: 1
-  stagger_interval_ms: 100   # RFC 8305 floor
+  stagger_interval_ms: 100        # RFC 8305 floor
 ```
 
-**Low-fan-out first** (CONNECT-heavy, minimize racing amplification):
-
 ```yaml
+# Fan-out first — CONNECT-heavy, minimise racing amplification
 router:
   stagger_start: true
   stagger_initial: 1
   stagger_interval_ms: 200
   circuit:
     probe_interval_sec: 30
-    single_send_degrade_fail: 1   # unpin before the circuit breaker trips
+    single_send_degrade_fail: 1   # unpin before the breaker trips
 ```
 
-> **Tuning tips**
-> - `probe_canary` must be reachable both locally and through every upstream — watch `GET /circuit` for growing `probes_skipped`.
-> - `single_send_degrade_fail` is an early warning for the circuit breaker — set it to `circuit_threshold - 1`.
-> - `single_send_slow_log_ms` (default 0=off) is the only anchor to attribute "won't open / needs refresh" stalls to a specific client IP (the success path emits no IP log).
-> - `http_read_timeout_sec` default is 3 s; before tightening further, watch p99/fd in production — see the [Limitations](#limitations) note.
-> - **Policy routing** (`router.policies`) narrows the racing candidate set per domain/tag — see `examples/config.yaml` for the shape.
-> - `conn_pool.target_prewarm` requires `conn_pool.enabled`; `conn_pool.cluster_predict` additionally requires `target_prewarm` for full effect.
-> - `conn_pool.cluster_predict` requires `conn_pool.enabled` **and** `conn_pool.target_prewarm`.
-> - **Escape corridor (fail-open):** when every external proxy is circuit-open and the domain is reachable from the host, the router silently falls back to dialing `local` directly — no config required.
+Notes that only show up in production:
 
-## Container deployment (Docker / docker compose)
+- `conn_pool.idle_timeout` must be **below the upstream proxy's own idle close**, otherwise pooled connections sit half-closed and every reuse costs a wasted CONNECT. Watch `pool_stale_discards` and `stale_conn_retries` after changing it.
+- `probe_canary` must be reachable both from the gateway and through every upstream, or whole probe rounds get counted as `probes_skipped`.
+- `single_send_slow_log_ms` (default off) is the only log line that ties a "won't open / needs refresh" stall to a specific client IP — the success path logs no IP.
+- `http_read_timeout_sec` is 3 s; before tightening further, check p99 and fd usage under real load.
+- `conn_pool.enabled` and `target_prewarm` default to **off**. Turning on `target_prewarm` without enough repeat traffic shows up as `target_pool_expired` (connections built and then retired unused) — the cross-phase steal reclaims most of that inventory, but the ratio is what to watch.
+- `conn_pool.refill_pause_minutes: 0` disables the idle pause. With bursty heartbeats (a cluster every 2–5 min) no window/threshold combination ever triggers a pause, and the idle churn is cheap enough to leave alone.
+- `cluster_predict` is off here for measured reasons, not caution: over ~4 days of production it hit only 29.5%, and 63.8% of its misses were `bucket_miss` (the predicted winner was not the actual winner). `cluster_proxy_fanout: 2` did not fix that.
+- Fail-open: if every external proxy is circuit-open and the host can reach the origin, the router silently dials `local` directly. No configuration required.
 
-A multi-stage image and a compose example let you run auto_squid in one command, with a persistent data volume and a health check:
+## Logging
+
+File logging uses a single-process `RotatingFileHandler`: `max_bytes` per file, `backup_count` history files, and a startup banner printing the resolved absolute path plus the active policy:
+
+```text
+INFO:auto_squid.cli:file log: /srv/auto_squid/auto_squid.log (level=INFO, rotate=33554432 bytes, keep=5 backups)
+```
+
+Caveats:
+
+- **Do not also run logrotate against this file.** logrotate renames it out from under the process (which keeps writing to the old inode while the "new" file stays empty) or, with `copytruncate`, discards the lines written during the race. In-app rotation and logrotate are mutually exclusive.
+- Hand-cut history (`auto_squid.log.261011`) is outside the `.1 … .N` chain — never reused, never deleted. Clean it up manually.
+- `logging.level` sets the **file** level only; the console handler is pinned to WARNING+ so forwarding volume doesn't flood it. Under systemd or Docker the stdout side is therefore small and belongs to journald / the Docker log driver.
+- `RotatingFileHandler` is not multiprocess-safe: two instances sharing one `logging.file` clobber each other's rotation chain. Give each its own path.
+
+## Container deployment
 
 ```bash
 docker compose -f examples/docker/docker-compose.yml build
@@ -344,49 +397,51 @@ curl http://127.0.0.1:18080/health
 curl -x http://127.0.0.1:10808 http://www.baidu.com
 ```
 
-- The default upstreams inside the image are placeholders for bootstrap verification — see [`examples/docker/README.md`](examples/docker/README.md) to attach real upstreams (mount your own `proxies.yaml` or inject node ids at build time).
-- SQLite stats persist in the `./data` volume. The file log rotates by size inside that same volume
-  (`logging.file: /data/auto_squid.log`) — the default relative path would land in the container's
-  writable layer, where it is lost on rebuild. `docker compose logs -f` shows only WARNING+ stdout,
-  whose size is capped separately by the compose `logging:` options.
-- The image runs as a non-root user and exposes ports `10808` and `18080`.
+Multi-stage image, non-root user, health check, and a `./data` volume for SQLite. Two log decisions matter, and `examples/docker/` makes both: point `logging.file` at `/data/…` (the default relative path lands in the container's writable layer and is lost on rebuild), and cap the **stdout** stream with the compose `logging:` options — the json-file driver is unbounded by default and `max_bytes` does not apply to it. See [`examples/docker/README.md`](examples/docker/README.md) for attaching real upstreams.
 
 ## Testing
 
 ```bash
-.venv/bin/python -m pytest -q
+uv run pytest -q --timeout=60      # 489 tests, ~85 s
 ```
 
-The suite covers HTTP/CONNECT forwarding, the HTTP response cache (LRU/eviction, in-flight coalescing), the domain cache, racing/aggregation timeouts, client auth, circuit breaker / probing / EWMA selection / in-flight weighting, session stickiness, per-domain stats + SQLite persistence, UTF-8 / binary-safe body handling, connection warm pools + idle pause, robustness (header limits, truncated responses), and the config layer (`extra="forbid"`, cross-field validation, exit code 2). The Phase-2+ metric/ranking layer has its own suites: `tests/test_phase_metrics.py` and `tests/test_tuner.py`.
+Coverage spans HTTP/`CONNECT` forwarding and framing (HTTP/1.0 downgrade, `HEAD`, truncation detection), the HTTP cache (LRU order, eviction, coalescing), the domain cache, racing and aggregation timeouts, client and API auth, the CSRF guard, circuit breaker / probing / EWMA / in-flight weighting, stickiness, per-domain stats and SQLite persistence, UTF-8 and binary-safe bodies, both pools plus the cross-phase steal, idle pause and budget accounting, config-layer validation and exit codes, and event-loop hygiene tests that fail if a background task leaves an orphan DNS future. `tests/test_phase_metrics.py` covers the metric and ranking layer, `tests/test_tuner.py` the auto-tuner.
 
-CI runs the suite on **Python 3.10, 3.11 and 3.12** via GitHub Actions (`.github/workflows/test.yml`) with a per-test 60 s timeout.
+CI runs the same suite on Python **3.10, 3.11 and 3.12** (`.github/workflows/test.yml`) with a 60 s per-test timeout; coverage (~87%) is measured on the 3.11 leg only, and there is deliberately no `fail_under` because async timing makes coverage jitter by ~0.2%.
 
-> **Python 3.12 note:** `StreamWriter.wait_closed()` and `Server.wait_closed()` are stricter in 3.12 (they wait for peer FIN). The router bounds half-open pooled connections with a short timeout; the mock upstreams close idle connections after 5 s. 3.11 passes without these.
+> **Python 3.12 note:** `StreamWriter.wait_closed()` and `Server.wait_closed()` became strict about peer FIN. The router bounds those waits; mock upstreams close idle connections after 5 s.
 
 ## Benchmarking
 
-A controlled, repeatable, attributable benchmark harness lives in `bench/`. Mock upstream proxies (configurable latency / response size / chunked / failure rate, with hit counters) eliminate real-network jitter. See [`bench/README.md`](bench/README.md) for details. Quick reference:
+`bench/` is a controlled harness: a mock upstream cluster with configurable latency/size/chunking/failure rates removes real-network jitter, and the router under test runs in its own subprocess so client work never inflates the measured server cost.
 
 ```bash
-.venv/bin/python -m bench.stress --quick            # ~10 s smoke run
-.venv/bin/python -m bench.stress --mode staircase   # concurrency staircase → saturation point
-.venv/bin/python -m bench.stress --mode soak        # stability / resource-leak check
-.venv/bin/python -m bench.stress --rounds 5         # mean ± stddev across fresh subprocesses
-.venv/bin/python -m bench.stress --profile          # cProfile → bench_profile.txt
+uv run python -m bench.stress --quick                 # ~10 s smoke
+uv run python -m bench.stress --mode staircase        # saturation point
+uv run python -m bench.stress --mode soak --duration 600 --open-loop
+uv run python -m bench.stress --mode conn-reuse       # keep-alive reuse ratio (mock only)
+uv run python -m bench.stress --upstream real --proxies proxies.yaml
+uv run python -m bench.github --mode tunnel --duration 60   # CONNECT against real targets
+uv run python -m bench.stress --rounds 5              # mean ± stddev, fresh subprocess per round
 ```
 
-Key metrics: throughput, TTFB & total at P50/P95/P99, error rate by category, **cache hit rate** and **racing amplification** (derived from server-side `/metrics` counters — unified across mock and real upstreams), plus resource samples (RSS, fd count, pool sizes, CPU %, event-loop lag). Results are written to `bench_report.json` tagged with the git revision.
+Reports print throughput, TTFB/total at P50/P95/P99, error classes, cache hit rate, racing amplification, pool hits/steals/misses, and server-side CPU and event-loop lag; `bench_report.json` is tagged with the git revision. See [`bench/README.md`](bench/README.md).
 
-Standalone routing inspector: `test_routing.py` — analyze the decision chain (sticky/domain-cache hit, policy routing, proxy ordering, circuit state) for a given URL without making real requests (`--test-request` to actually forward one).
+`test_routing.py` inspects the decision chain for a URL (sticky/domain-cache hit, policy narrowing, candidate order, circuit state) without sending traffic — `--test-request` performs one real request.
 
 ## Limitations
 
-- HTTP parsing is MVP-level; large streaming responses may have edge cases
-- The management API is **open by default** — enable `api.auth` (HTTP Basic) before exposing port 18080 beyond a trusted network
-- Admin writes (POST/PUT/PATCH/DELETE) **reject cross-site requests** (`Sec-Fetch-Site: cross-site`, or an `Origin` that doesn't match this host → 403): a browser re-sends cached Basic credentials automatically, so "the attacker's page can't read the response" does not stop the request from landing. The check runs regardless of whether `api.auth` is enabled
-- CONNECT tunnels use raw pipes (no TLS interception)
-- `http_read_timeout_sec` (3 s by default) may timeout slow but healthy origins over high-latency links — increase carefully and verify p99/fd before wide rollout
-- In-memory tables (stickiness, domain cache, HTTP response cache) are cleared on restart; SQLite persists domain win counts and t-digest lifetime metrics only
+- HTTP parsing is MVP-level: headers and framing are handled carefully, but very large streaming responses can still hit edge cases.
+- Upstream `protocol` is HTTP-only in practice (`https`/`socks5` have no implementation).
+- `CONNECT` tunnels are raw byte pipes — no TLS interception, so per-tunnel "throughput" cannot describe origin transfer speed.
+- In-memory state (stickiness, domain cache, HTTP response cache, windowed samples) is cleared on restart; only lifetime counters, t-digests and domain win counts survive in SQLite.
+- The proxy port is an **open proxy** unless you enable `router.auth` or restrict it at the network layer.
+- `POST /proxies` rewrites `proxies.yaml` in full and drops comments; there is no delete endpoint.
+- `http_read_timeout_sec` (3 s) can time out slow-but-healthy origins on high-latency links; raise deliberately and verify p99/fd.
+
+## Further reading
+
+[`docs/README.md`](docs/README.md) indexes the design, audit and post-mortem write-ups (`性能优化总纲`, `改进方案_响应速度评估`, `代码审计报告`, the 2026-09 circuit-breaker incident analysis).
 
 ## License
 
