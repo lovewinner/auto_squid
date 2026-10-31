@@ -52,6 +52,17 @@ services:
 
     restart: unless-stopped
 
+    # 容器 stdout/stderr 的落盘大小上限。docker 的 json-file 驱动默认**不限量**,
+    # 应用侧的 logging.max_bytes 只管容器内那个文件,管不到这里 —— 不写这段,
+    # 宿主机 /var/lib/docker/containers/<id>/*-json.log 会一直涨(它就是"还要不
+    # 要 logrotate"的真正答案)。WARNING+ 才走 stdout,量小,10MiB×3 足够。
+    # 用 journald 驱动的宿主可改用 `journalctl --vacuum-size` 统一回收。
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
     # 健康检查:wget 探活管理 API。首次构建后容器状态即可反映服务可用性。
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:18080/health || exit 1"]

@@ -106,7 +106,9 @@ def setup_logging(cfg: Config):
     # default INFO。轮转用 RotatingFileHandler:单进程写日志,不存在多进程竞争
     # rollover 的问题;rollover 是一次 rename + 重开,代价相对日志量可忽略。
     level = getattr(logging, cfg.logging.level.upper(), logging.INFO)
-    log_path = cfg.logging.file or "auto_squid.log"
+    # 提前展开成绝对路径:stdlib 的 FileHandler 内部也会 abspath,但横幅要打给
+    # 运维看的路径必须是"实际那个",而不是 `auto_squid.log` 这种要猜 CWD 的串。
+    log_path = str(Path(cfg.logging.file or "auto_squid.log").expanduser().absolute())
     fh = logging.handlers.RotatingFileHandler(
         log_path, mode="a", maxBytes=cfg.logging.max_bytes,
         backupCount=cfg.logging.backup_count, encoding="utf-8")
@@ -125,6 +127,13 @@ def setup_logging(cfg: Config):
     # 在 logger 层即被短路,不构造格式化参数(250 rps 下每秒数百次 log 调用的
     # 隐藏成本由此消除);配 DEBUG 则打开 per-request 调试,与文件级别一致。
     logging.getLogger("auto_squid").setLevel(level)
+
+    # 轮转生效与否只能从"下一次断档"推断,太晚;启动即写明落盘位置与上限,
+    # 改完配置重启时能立刻确认它有没有读到新的 logging 段(相对路径也在此展开,
+    # 免得运维按 CWD 猜文件在哪)。
+    logging.getLogger("auto_squid.cli").info(
+        "file log: %s (level=%s, rotate=%d bytes, keep=%d backups)",
+        log_path, cfg.logging.level, cfg.logging.max_bytes, cfg.logging.backup_count)
 
 
 app = typer.Typer()

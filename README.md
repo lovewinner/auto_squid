@@ -176,6 +176,18 @@ logging:
   backup_count: 5                # keep auto_squid.log.1 … .5 (0 = truncate in place)
 ```
 
+**Two rotation caveats**
+
+- **Do not also configure logrotate for this file.** logrotate renames the file out from
+  under the process (leaving it writing to the old inode while the "new" file stays empty),
+  or with `copytruncate` drops the lines written during the truncate race. In-app rotation
+  and external logrotate are mutually exclusive — pick one.
+- **Hand-cut history is not managed by `backup_count`.** Files with a custom suffix
+  (`auto_squid.log.261011`) are outside the `.1 … .N` rotation chain: they are never
+  reused and never deleted. Clean them up manually once.
+- A relative `file` is resolved against the CWD at startup; the first log line prints the
+  resolved absolute path.
+
 For production-ready snippets, see `examples/config.yaml` and the [Speed tuning](#speed-tuning) section below.
 
 ## Config validation at load time
@@ -323,7 +335,10 @@ curl -x http://127.0.0.1:10808 http://www.baidu.com
 ```
 
 - The default upstreams inside the image are placeholders for bootstrap verification — see [`examples/docker/README.md`](examples/docker/README.md) to attach real upstreams (mount your own `proxies.yaml` or inject node ids at build time).
-- SQLite stats persist in the `./data` volume; logs go to stdout (`docker compose logs -f`).
+- SQLite stats persist in the `./data` volume. The file log rotates by size inside that same volume
+  (`logging.file: /data/auto_squid.log`) — the default relative path would land in the container's
+  writable layer, where it is lost on rebuild. `docker compose logs -f` shows only WARNING+ stdout,
+  whose size is capped separately by the compose `logging:` options.
 - The image runs as a non-root user and exposes ports `10808` and `18080`.
 
 ## Testing

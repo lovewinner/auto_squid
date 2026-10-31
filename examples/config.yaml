@@ -225,6 +225,10 @@ logging:
   file: "auto_squid.log"
   max_bytes: 33554432        # 单文件上限(字节),默认 32MiB;超过即轮转
   backup_count: 5            # 保留 .1 … .5 共 5 份历史(0 = 只截不断档)
+  # 用应用内轮转就**不要**再给这个文件配 logrotate:logrotate 的 rename 会让进程
+  # 继续写旧 inode(新文件一直空),copytruncate 又会截掉并发写入的几行。
+  # 人工切出来的历史文件(如 auto_squid.log.261011)不在 .1…N 链里,程序不会代删。
+  # file 为相对路径时按启动 CWD 解析,启动日志第一行打印展开后的绝对路径。
 
 # 上游代理列表请放独立文件,通过 --proxies examples/proxies.yaml 加载
 # (见 examples/proxies.yaml,结构与 ProxyInfo 模型一致;ProxyInfo.tags 可给代理

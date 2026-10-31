@@ -8231,6 +8231,42 @@ class TestSetupLoggingLevel:
         with pytest.raises(Exception):
             LoggingConfig(backup_count=-1)
 
+    def test_relative_log_path_is_pinned_absolute(self, tmp_path, monkeypatch):
+        """启动横幅写明"实际落盘的那个绝对路径"+ 轮转上限。
+
+        运维改完 logging 段重启,不能靠"过些天看有没有断档"来确认配置生效了。
+        """
+        import logging as _l
+        from auto_squid.cli import setup_logging
+        cfg = Config(logging={"level": "INFO", "file": "rel.log"})
+        self._reset_logging()
+        monkeypatch.chdir(tmp_path)
+        try:
+            setup_logging(cfg)
+            handler_paths = [h.baseFilename for h in _l.getLogger().handlers
+                             if isinstance(h, _l.FileHandler)]
+            assert handler_paths == [str(tmp_path / "rel.log")], handler_paths
+            # 横幅要落到那个文件本身(_reset_logging 摘掉了 pytest 的采集 handler,
+            # 而运维读的是文件,断言文件才对应真实诉求)。
+            body = (tmp_path / "rel.log").read_text()
+            banner = [ln for ln in body.splitlines() if "file log:" in ln]
+            assert len(banner) == 1, f"启动横幅缺失或重复: {body!r}"
+            assert str(tmp_path / "rel.log") in banner[0], banner[0]
+            assert "rotate=33554432 bytes" in banner[0], banner[0]
+            assert "keep=5 backups" in banner[0], banner[0]
+            # 换 CWD 后继续写:仍落在同一个文件,不会在新目录长出第二个日志。
+            other = tmp_path / "elsewhere"
+            other.mkdir()
+            monkeypatch.chdir(other)
+            _l.getLogger("auto_squid.router").info("after chdir marker")
+            assert "after chdir marker" in (tmp_path / "rel.log").read_text()
+            assert not (other / "rel.log").exists()
+        finally:
+            for h in list(_l.getLogger().handlers):
+                if isinstance(h, _l.FileHandler):
+                    h.close()
+            self._reset_logging()
+
 
 # ── local_direct_domains 白名单强制直连 ──────────────────────────
 

@@ -175,6 +175,16 @@ logging:
   backup_count: 5                # 保留 auto_squid.log.1 … .5（0 = 原地截断）
 ```
 
+**轮转的两条注意事项**
+
+- **不要再给这个文件配 logrotate**。logrotate 走 rename（或 copytruncate）：rename 之后
+  进程仍握着旧 inode 继续写，新文件永远是空的；copytruncate 则会在截断瞬间丢掉并发写入
+  的几行。应用内轮转与外部 logrotate 只能二选一。宿主机侧要统一回收的话，就把
+  `logging.file` 设成 `/dev/null` 之类并只留 stdout，交给 logrotate/journald。
+- **人工切出来的历史文件不受 `backup_count` 管理**。像 `auto_squid.log.261011` 这种
+  手写后缀不在 `.1 … .N` 命名里，程序既不会复用也不会删除，要清就手动清。
+- `file` 是相对路径时按**启动时的 CWD** 解析，启动日志第一行会打印展开后的绝对路径。
+
 生产就绪片段见 `examples/config.yaml` 以及下方 [速度调优](#速度调优) 一节。
 
 ## 加载时配置校验

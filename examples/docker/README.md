@@ -63,7 +63,17 @@ build:
 
 - SQLite 统计(`auto_squid.db`)持久化在 `./data` 挂载卷,`docker compose down`
   不会删除;`docker compose down -v` 才会清空。
-- 容器内日志走 stdout/stderr,`docker compose logs -f` 查看。
+- **日志有两条路,都要限大小**:
+  - 文件:本示例的 `config.yaml` 把 `logging.file` 指到 `/data/auto_squid.log`
+    (挂载卷上),并按 `logging.max_bytes`/`backup_count` 自动轮转。不改这一项,
+    默认相对路径 `auto_squid.log` 会按 WORKDIR 落到**容器可写层**(`/app`):
+    重建即丢,且计入容器读写层大小。
+  - stdout:`docker compose logs -f` 看的是这条,只有 WARNING 及以上(控制台 handler
+    刻意压低,避免转发刷屏)。它由 docker 的 json-file 驱动落盘,应用侧的
+    `max_bytes` **管不到**,所以 compose 里另配了 `logging.options.max-size/max-file`
+    —— 没有这段,宿主机 `/var/lib/docker/containers/*-json.log` 会无限涨。
+- 已用应用内轮转,**不要**再对 `auto_squid.log` 配 logrotate:rename 会让进程继续写
+  旧 inode(新文件一直空),`copytruncate` 会截掉并发写入的行。
 
 ## 与真实 Squid 集成
 

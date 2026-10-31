@@ -19,3 +19,12 @@ api:
   #   enabled: true
   #   username: "admin"
   #   password: "change-me"
+
+# 日志落到 /data(挂载卷)。默认值 auto_squid.log 是相对路径,会按 WORKDIR
+# 写到 /app —— 那是容器的可写层:`docker compose down` + 重建即丢,且计入容器
+# 读写层大小(撑爆 docker daemon 的 disk 配额)。
+logging:
+  level: "INFO"
+  file: "/data/auto_squid.log"
+  max_bytes: 33554432        # 32MiB 一切
+  backup_count: 5            # 卷上最多占 ~192MB,再涨不动
