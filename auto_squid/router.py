@@ -137,6 +137,16 @@ _IMMEDIATE_DEGRADE_TTL = 60.0
 # 标记表的最大条目数:超过则先清已到期、再按最早到期剔除(防域名基数无界)。
 _IMMEDIATE_DEGRADE_MAX_ENTRIES = 4096
 
+# 目标级不可达判定(见 Router._note_target_race_failure)的三个固定量:
+#   _DEAD_TARGET_MIN_FAILS —— 需要连续几次"全体候选失败"才认定,1 次不认(单次
+#     全失败可能是本机瞬时抖动);
+#   _DEAD_TARGET_PROVE_WINDOW —— 计数窗口,同时也是"该目标最近是否被成功服务过"
+#     的证据窗口(秒)。窗口内有过成功观测就说明目标可达,只是这轮候选不行。
+#   _DEAD_TARGET_MAX_ENTRIES —— 表容量,与 _IMMEDIATE_DEGRADE 同量级。
+_DEAD_TARGET_MIN_FAILS = 2
+_DEAD_TARGET_PROVE_WINDOW = 60.0
+_DEAD_TARGET_MAX_ENTRIES = 4096
+
 # 错峰启动(staggered start,RFC 8305 §5)的配置下限。
 # 默认间隔 100ms,下限 100ms(绝对值下限 10ms,防止丢包率高时拥塞崩溃),上限 2s。
 # stagger_interval 由 __init__ 钳制到此区间,配置传 0/负值时落到默认。
@@ -288,6 +298,7 @@ class Router:
         single_send_degrade_p99_ms = cc.single_send_degrade_p99_ms
         single_send_degrade_min_throughput = cc.single_send_degrade_min_throughput
         single_send_slow_log_ms = cc.single_send_slow_log_ms
+        dead_target_ttl_sec = cc.dead_target_ttl_sec
         # ── Phase 2: 多目标 Cost 排序 ──
         cost_sort_enabled = cc.cost_sort_enabled
         cost_latency_metric = cc.cost_latency_metric
@@ -487,6 +498,19 @@ class Router:
         self.local_direct_hits = 0        # 白名单命中(强制本机直连)次数
         self.local_direct_failures = 0    # 白名单直连失败(回 502)次数
         self.local_direct_circuit_short = 0  # 白名单命中但 local 熔断短路次数
+        # ── 目标级"谁也到不了"快速失败(见 _note_target_race_failure)──
+        # 熔断器按(代理)记账,但有一类失败的责任在【目标】:浏览器会持续重试一个
+        # 全局到不了的地址(内网里不存在的 IP、境内不可达的 Google 域名),每次都要
+        # 付满 max_retries × connect_tunnel_timeout_sec 的等待,并把整池代理一起熔断。
+        # 判定证据是"每轮候选全试过且这个目标从没被成功服务过",不是"目标属于私网段"
+        # ——本部署的上游代理就坐在局域网里,RFC1918 目标绝大多数是正常业务流量
+        # (192.168.8.228 单域名累计 4.8 万次胜出)。见 config_schema 同名字段说明。
+        self.dead_target_ttl_sec = max(0.0, float(dead_target_ttl_sec))
+        # target → {"fails": 连续全失败轮数, "prove_until": 证据窗口到期,
+        #           "deadline": 快速失败到期(0 表示尚未判定)};ttl_sec=0 时整表不用。
+        self._dead_target: dict = {}
+        self.dead_target_marked = 0     # 判定为不可达的次数(arming)
+        self.dead_target_fastfails = 0  # 因命中判定而直接 502、未发上游的请求数
         # 缓存已启用的代理 host 集合及其对应的 proxy_store 版本,避免每请求重复创建 frozenset
         self._proxy_hosts_cache: tuple[int, frozenset] = (-1, frozenset())
         # "降级中"代理集合(可观测,非门控):被单发降级判定命中的代理记录于此。
@@ -1160,6 +1184,8 @@ class Router:
             return  # 阻尼拦截:保持旧赢家,不替换
         # 方向 A:竞速赢家显著差于当前最优代理 → 不钉进域名缓存,继续竞速。
         # (慢代理偶发胜出时,回填会把劣质赢家钉住导致"钉住→降级→回填"循环。)
+        # 但目标级"不可达"判定必须先解除:这里已经证明目标可达,只是赢家不够好。
+        self._clear_dead_target(domain)
         if self._worse_than_best(domain, pid):
             return
         self._meta_cache[domain] = {
@@ -1705,6 +1731,10 @@ class Router:
             "local_direct_hits": self.local_direct_hits,
             "local_direct_failures": self.local_direct_failures,
             "local_direct_circuit_short": self.local_direct_circuit_short,
+            "dead_target_ttl_sec": self.dead_target_ttl_sec,
+            "dead_target_marked": self.dead_target_marked,
+            "dead_target_fastfails": self.dead_target_fastfails,
+            "dead_targets": self._snapshot_dead_targets(),
             "connect_tunnel_timeout_sec": self.connect_tunnel_timeout_sec,
             "http_read_timeout_sec": self.http_read_timeout_sec,
             "domain_ttl_grows": self.domain_ttl_grows,
@@ -1728,11 +1758,13 @@ class Router:
 
         RFC 8305 §4:历史 RTT 数据不可跨网络接口使用,换网络后应清空重学。
         熔断/慢启动状态一并清空(旧网络的连续失败对当前网络无意义);
-        单发降级失效集合一并清空(旧网络的降级标记不可沿用)。
+        单发降级失效集合一并清空(旧网络的降级标记不可沿用);
+        目标不可达判定同样清空(旧网络里"谁也到不了"的目标,换网络后未必到不了)。
         """
         self.selector.reset_quality()
         self._degraded_single_send.clear()
         self._immediate_degraded.clear()
+        self._dead_target.clear()
 
     def reset_proxy_circuits(self):
         """手动解除全部代理熔断并清空连续失败计数(运维介入后调用)。
@@ -1955,6 +1987,96 @@ class Router:
             oldest = sorted(self._immediate_degraded.items(), key=lambda kv: kv[1])
             for k, _ in oldest[:overflow]:
                 del self._immediate_degraded[k]
+
+    def _dead_target_active(self, domain: str) -> bool:
+        """该目标是否处于"谁也到不了"快速失败窗口内。
+
+        条目有两种状态,不能混:只有 `deadline > 0` 才是"已判定"。证据积累中的条目
+        (fails=1、deadline=0)必须原样留着——把它当"到期僵尸"删掉会让失败计数永远
+        从 1 重新开始,判定再也达不成。
+        """
+        if self.dead_target_ttl_sec <= 0.0 or not domain:
+            return False
+        ent = self._dead_target.get(domain)
+        if ent is None:
+            return False
+        now = time.monotonic()
+        if ent["deadline"] > now:
+            return True
+        if ent["deadline"]:
+            # 窗口已过:目标可能恢复,判定与证据一起重来(再失败两轮才重新判定)。
+            ent["deadline"] = 0.0
+            ent["fails"] = 0
+        if now > ent["prove_until"]:
+            del self._dead_target[domain]    # 证据窗口也过期 → 没人再提它,清掉
+        return False
+
+    def _note_target_race_failure(self, domain: str) -> None:
+        """一次竞速全体候选失败:累计该目标的证据,够格则进入快速失败窗口。
+
+        为什么要这一层:熔断/质量都按【代理】记账,但"目标本身到不了"的失败在代理
+        视角与"代理坏了"完全同形。浏览器对 dead.example.com 的持续重试会每轮付满
+        max_retries × 3s,并且一次全失败就给 3 个候选各记 3 次连续失败——正好等于
+        circuit_threshold,整池瞬间熔断,后续健康请求跟着 502(生产 2026-11-03
+        14:49:24 六个代理在 400ms 内一起熔断,触发者是 csp.withgoogle.com)。
+
+        门控用两条独立证据,避免把"只是这轮候选不行"误判成"目标不可达":
+          1) 连续 _DEAD_TARGET_MIN_FAILS 轮全失败(单轮抖动不认);
+          2) _DEAD_TARGET_PROVE_WINDOW 内该目标【没有】任何成功观测——有观测就说明
+             目标可达。这条是关键:本部署 192.168.8.228 全靠 239-101(累计 4.6 万次
+             胜出),若该代理暂时熔断,其余候选必然全失败,此时不能把 228 打成死目标。
+        """
+        if self.dead_target_ttl_sec <= 0.0 or not domain:
+            return
+        now = time.monotonic()
+        # 证据 2:该目标近期有过成功观测 → 可达,本轮失败只是候选不行,清零证据。
+        if self.selector.last_domain_success_ts(domain) > now - _DEAD_TARGET_PROVE_WINDOW:
+            self._dead_target.pop(domain, None)
+            return
+        ent = self._dead_target.get(domain)
+        if ent is None or now > ent["prove_until"]:
+            ent = {"fails": 0, "prove_until": now + _DEAD_TARGET_PROVE_WINDOW,
+                   "deadline": 0.0}
+            self._dead_target[domain] = ent
+        ent["fails"] += 1
+        ent["prove_until"] = now + _DEAD_TARGET_PROVE_WINDOW
+        if ent["fails"] < _DEAD_TARGET_MIN_FAILS:
+            return
+        ent["deadline"] = now + self.dead_target_ttl_sec
+        self.dead_target_marked += 1
+        logger.info("target DEAD domain=%s fails=%d fast-fail for %.0fs (no upstream fan-out)",
+                    domain, ent["fails"], self.dead_target_ttl_sec)
+        if len(self._dead_target) > _DEAD_TARGET_MAX_ENTRIES:
+            # 可回收 = 窗口已过期的判定,或证据窗口已断档的条目(证据从头再来无损失)。
+            expired = [d for d, e in self._dead_target.items()
+                       if (e["deadline"] and e["deadline"] <= now)
+                       or e["prove_until"] <= now]
+            for d in expired:
+                del self._dead_target[d]
+            overflow = len(self._dead_target) - _DEAD_TARGET_MAX_ENTRIES
+            if overflow > 0:   # 仍超则按证据窗口最早到期收缩(表必须有界)
+                oldest = sorted(self._dead_target.items(), key=lambda kv: kv[1]["prove_until"])
+                for d, _ in oldest[:overflow]:
+                    del self._dead_target[d]
+
+    def _clear_dead_target(self, domain: str) -> None:
+        """目标被成功服务 → 它是可达的,抹掉判定与证据(下一次失败重新计数)。"""
+        if domain and domain in self._dead_target:
+            del self._dead_target[domain]
+
+    def _snapshot_dead_targets(self, limit: int = 200) -> dict:
+        """当前处于快速失败窗口的目标 {domain: 剩余秒数},按剩余时间倒序取前 limit。
+
+        只给前 limit 条:表上限 4096,整表 JSON 化会在转发流量那个事件循环上跑,
+        而运维真正要的是"此刻谁被判死了"的头几行(与 /domains 默认 2000 同理)。
+        """
+        if not self._dead_target:
+            return {}
+        now = time.monotonic()
+        live = [(d, e["deadline"] - now) for d, e in self._dead_target.items()
+                if e["deadline"] > now]
+        live.sort(key=lambda kv: -kv[1])
+        return {d: round(sec, 1) for d, sec in live[:limit]}
 
     def _is_send_degraded(self, pid: str, domain: str) -> bool:
         """该 (代理, 域名) 是否仍在即时降级期内;到期则顺手解除。"""
@@ -3631,6 +3753,23 @@ class Router:
           (sticky_cache_hits/_bump_sticky/_spawn_sticky_probe/_record_sticky)与 200-
           透传在此完成。返回 None(隧道结束即返回)。
         """
+        # 0) 目标级不可达快速失败:近 60s 内两轮"全体候选失败"、且该目标从未被成功
+        #    服务过 →
+        #    这个目标谁也到不了(内网里不存在的 IP / 境内不可达的境外域名)。直接回
+        #    502,不再扇出、也不再给候选代理记失败。放在粘性/缓存【之前】:被钉住的
+        #    死目标同样每轮付满 3s 并触发 _degrade_send_proxy,那部分开销也要省。
+        #    见 _note_target_race_failure 的门控与依据。
+        if self._dead_target_active(domain_key):
+            self.dead_target_fastfails += 1
+            logger.info("dead target FAST-FAIL %s request %s (skipped fan-out)",
+                        proto, target or url)
+            if proto == 'http':
+                await self._write_cached_response(writer, 502, 'Bad Gateway',
+                                                  {'Content-Type': 'text/plain'}, b'Bad Gateway')
+            else:
+                await self._write_connect_502(client_writer)
+            return None
+
         # 1) 会话粘性:同一客户端+domain 复用上次胜出的代理单发(滑动 TTL)。
         #    失败则驱逐该条目,回落到域名缓存/竞速。HTTP 单发 5xx 也驱逐(A2);
         #    CONNECT 隧道无状态码,跳过该专有分支。
@@ -3820,6 +3959,9 @@ class Router:
         if proto == 'tunnel':
             self.cluster.observe(client_ip, target, None)
         logger.error("all proxies failed for %s request %s", proto, target or url)
+        # 目标级证据累计:达到门控后,后续对该目标请求直接 502,不再付满扇出超时、
+        # 不再把整池代理连着熔断(见 _note_target_race_failure)。
+        self._note_target_race_failure(domain_key)
         if proto == 'http':
             await self._write_cached_response(writer, 502, 'Bad Gateway', {'Content-Type': 'text/plain'}, b'Bad Gateway')
         else:

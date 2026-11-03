@@ -414,6 +414,16 @@ class CircuitConfig(ConfigBase):
                        单发命中才是感知瓶颈的主要路径,这里补一条带 IP 的观测。
                        单发失败(建连超时/握手失败)同样按此阈值记 `slow single send
                        FAILED`(计入 single_send_fail_logged),补上失败型卡顿的 IP 归因。
+    dead_target_ttl_sec: "目标本身不可达"快速失败窗口(秒,默认 15,0=关闭)。同一目标
+                       在 60s 内连续 2 次竞速**全体候选失败**、且该目标近 60s 内没有任何
+                       胜出记录 → 判定"这个目标谁也到不了",在 TTL 内直接回 502,不再
+                       扇出竞速。依据:目标是变量、代理是常量——browser 会持续重试
+                       一个根本不通的地址(内网打印机/被墙的 Google 域名),每次都要
+                       付满 max_retries × 3s 的等待,并把 3 次连续失败记到每个候选代理
+                       头上,一次全失败就把整池熔断(circuit_threshold 默认 3)。
+                       注意不能按"目标是私网地址"判定:本部署的上游代理就在局域网里
+                       (192.168.8.228 经 239-101 累计胜出 4.6 万次),RFC1918 目标是
+                       正常业务;"全池都试过了且都没赢过"才是可达性的直接证据。
     connect_tunnel_timeout_sec: CONNECT 隧道建连/读响应超时(秒,默认 3.0)。_try_tunnel
                        向源站 CONNECT 的 open_connection 与等 200 的统一上限,防某代理
                        egress→源站建连/握手偶发卡死把请求拖成 10s+(原硬编码 15s)。
@@ -459,6 +469,9 @@ class CircuitConfig(ConfigBase):
     probe_get_timeout_sec: float = Field(5.0, description="GET 探活超时(秒)")
     probe_get_max_bytes: int = Field(65536, description="GET 探活最多读取的响应体字节数(够算吞吐即可,避免大文件下载)")
     single_send_slow_log_ms: float = Field(0.0, description="慢单发采样日志阈值(毫秒),0=关闭")
+    dead_target_ttl_sec: float = Field(15.0, description=(
+        "目标不可达快速失败窗口(秒),0=关闭:同一目标 60s 内 2 次全候选竞速失败且"
+        "近 60s 无胜出记录,则该目标在窗口内直接 502,不再扇出、不再污染代理熔断计数"))
     connect_tunnel_timeout_sec: float = Field(3.0, description="CONNECT 隧道建连/读响应超时(秒):_try_tunnel 向源站 CONNECT 的 open_connection 与等 200 的统一上限,防某代理 egress→源站建连/握手偶发卡死把请求拖成 10s+。原硬编码 15s。测得的 CDN 首字节实际 0.6s,3s 给 5 倍余量。")
     http_read_timeout_sec: float = Field(3.0, description="HTTP 单发读首字节超时(秒):_upstream_timeout.read,防某被钉代理转发 HTTP 首字节偶发卡死。原 10s。注意 router.py:480-483 记载收紧 header 等待曾非净赢(引爆 soak p99+fd 堆积)已回退,故本值生产灰度须盯 p99/fd。")
     local_direct_timeout_sec: float = Field(10.0, description="本地域名白名单(local_direct_domains)强制直连的超时(秒):白名单目标的 HTTP read 与 CONNECT 建连/读响应用该值,而非全局 http_read_timeout_sec/connect_tunnel_timeout_sec(默认 3s)。本地回环/内网链路不需要 3s 那么紧——生产本机管理面板(10.14.25.86:20128)过载时被全局 3s 掐断、页面半截。默认 10s 给 4 倍余量(过载实测 ttfb 1.7-2.4s)。仅影响白名单强制路径;竞速/粘性 local 仍走全局 3s。")
@@ -631,6 +644,7 @@ _FLAT_TO_CONFIG_PATH: dict[str, str] = {
     "cost_weight_latency": "circuit.cost_weight_latency",
     "cost_weight_success_rate": "circuit.cost_weight_success_rate",
     "cost_weight_throughput": "circuit.cost_weight_throughput",
+    "dead_target_ttl_sec": "circuit.dead_target_ttl_sec",
     "enable_http_cache": "http_cache.enabled",
     "enable_local_racing": "enable_local_racing",
     "fail_penalty_weight": "circuit.fail_penalty_weight",

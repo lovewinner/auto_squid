@@ -89,6 +89,8 @@ curl -x http://127.0.0.1:10808 https://www.baidu.com
 1. **接入与解析** — `handle_client` 读取请求头,先执行客户端 Basic 鉴权(在任何上游动作之前返回 `407`),请求头超限则只打一行 INFO 而不是抛 traceback。`CONNECT` → `_handle_connect`;明文 HTTP → `_handle_http_request`。
 2. **短路** — `local_direct_domains`(直连源站)、在途 GET 合并、HTTP 响应缓存命中。
 3. **派发**(`_dispatch_single`)— 按优先级:
+   0. **死目标闸门** → 同一目标连续两轮"全体候选失败"、且近 60s 内没有任何成功观测 →
+      在 `dead_target_ttl_sec` 秒内直接回 502,完全不碰代理池(见[调优](#调优));
    1. **会话粘性** → 在钉选的代理上单发;
    2. **域名缓存** → 在 TTL 内的上次胜者上单发;
    3. **竞速**(`_race_staggered`)→ Cost 排序候选,交错发射。
@@ -100,6 +102,7 @@ curl -x http://127.0.0.1:10808 https://www.baidu.com
 
 | 旋钮 | 作用阶段 | 效果 |
 |---|---|---|
+| `dead_target_ttl_sec` | 派发 3.0 | 对"谁也到不了"的目标不再扇出 |
 | `stickiness.*` | 派发 3.1 | 是否钉选、TTL、复核节奏、容量 |
 | `cache_ttl`、`adaptive_ttl.*` | 派发 3.2 | 竞速胜者被复用多久 |
 | `max_retries`、`stagger_initial`、`stagger_interval_ms` | 竞速 3.3 | 扇出宽度与补位节奏 |
@@ -200,6 +203,7 @@ router:
     single_send_degrade_p99_ms: 0.0       # 需要 ≥ 4 个域名样本
     single_send_degrade_min_throughput: 0.0  # 只算明文响应体;需要 ≥ 4 个样本
     single_send_slow_log_ms: 0.0   # 唯一能把卡顿对应到客户端 IP 的日志
+    dead_target_ttl_sec: 15.0      # 目标谁也到不了 → 不扇出直接 502(0=关闭)
     connect_tunnel_timeout_sec: 3.0
     http_read_timeout_sec: 3.0
     local_direct_timeout_sec: 10.0 # 只作用于 local_direct_domains 路径
@@ -325,6 +329,7 @@ config error: invalid configuration:
 | `pool_stale_discards` | 取回时抓到的半关闭连接 | `idle_timeout` 调低后,应与 `stale_conn_retries` 一起下降 |
 | `stale_conn_retries` | `pooled conn STALE` 重试,每次代价一个 CONNECT 往返 | **≈ 0**;持续上升说明池的空闲 TTL 比上游的更长 |
 | `single_send_degrades` | 预警解钉次数 | 低位、平稳 |
+| `dead_target_marked`、`dead_target_fastfails`、`dead_targets` | 被判为不可达的目标数、因此省掉的请求数,以及当前名单与剩余时间(`/circuit` 也有) | 绝大多数时刻 `dead_targets` 应为空;某条持续挂几小时 = 客户端在死磕一个真已经不存在的目标 |
 | `circuit_open_count`、`probes_sent/ok/skipped/failed` | 熔断 + 探测活动 | `probes_skipped` 不断增长 = 某个代理走 canary 不通 |
 | `cluster_pool_bucket_miss` / `_timing_miss` | 预测为何落空(预测胜者不是实际胜者 / 到得太晚) | 只在 `cluster_predict: true` 时有意义 |
 | `http_cache_evictions`、`sticky_cache_size`、`cluster_graph_size` | 表相对各自上限的压力 | 稳定,而不是顶格 |
@@ -364,6 +369,7 @@ router:
 
 只有在生产环境才会暴露出来的几条:
 
+- 谁都到不了的目标(已下线的内网 IP、边境被墙的域名)每轮要付 `max_retries × connect_tunnel_timeout_sec`,并且把每个候选都记一次失败——一轮全失败正好等于 `circuit_threshold`,整池同时跳闸,健康请求跟着 502。`dead_target_ttl_sec` 让这类目标改由闸门直接回 502。刻意**不按地址段判定**:上游代理就在你的局域网里时,RFC1918 目标就是正常业务流量——本部署的内网目标累计有约 6 万次成功请求,且几乎全靠某一个代理。
 - `conn_pool.idle_timeout` 必须**低于上游代理自身的空闲关闭**,否则池里的连接会半关闭躺在那儿,每次复用都白付一个 CONNECT 往返。改完之后盯 `pool_stale_discards` 与 `stale_conn_retries`。
 - `probe_canary` 必须既能从网关本机到达、也能通过每个上游到达,否则整轮探测都被计入 `probes_skipped`。
 - `single_send_slow_log_ms`(默认关)是唯一能把"打不开/要刷新"的卡顿对应到具体客户端 IP 的日志行 —— 成功路径不记录 IP。
@@ -402,7 +408,7 @@ curl -x http://127.0.0.1:10808 http://www.baidu.com
 ## 测试
 
 ```bash
-uv run pytest -q --timeout=60      # 489 项,约 85 秒
+uv run pytest -q --timeout=60      # 500 项,约 90 秒
 ```
 
 覆盖范围包括 HTTP/`CONNECT` 转发与成帧(HTTP/1.0 降级、`HEAD`、截断检测)、HTTP 缓存(LRU 顺序、驱逐、合并)、域名缓存、竞速与聚合超时、客户端与 API 鉴权、CSRF 防护、熔断/探测/EWMA/在途加权、粘性、按域名统计与 SQLite 持久化、UTF-8 与二进制安全响应体、两个池加跨阶段借用、空闲挂起与预算记账、配置层校验与退出码,以及事件循环卫生测试(后台任务留下孤儿 DNS future 就会失败)。`tests/test_phase_metrics.py` 覆盖指标与排序层,`tests/test_tuner.py` 覆盖自动调参器。

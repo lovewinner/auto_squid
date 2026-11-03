@@ -18,7 +18,7 @@ from auto_squid.selector import _ERROR_KEYS, ERROR_HTTP_STATUS
 from auto_squid.router import (
     Router, ProxySelector, _hb, make_router,
     _MAX_REQUEST_HEADER_LINES, _MAX_REQUEST_HEADER_BYTES,
-    _AGG_WAIT_TIMEOUT,
+    _AGG_WAIT_TIMEOUT, _DEAD_TARGET_MAX_ENTRIES,
 )
 from auto_squid.cluster import ClusterGraph
 from auto_squid.config_schema import (
@@ -9943,3 +9943,186 @@ class TestDnsOrphanFuture:
                 await r.stop()
 
         self._run_under_uvloop(scenario)
+
+
+class TestDeadTargetFastFail:
+    """目标级"谁也到不了"快速失败(dead target fast-fail)。
+
+    起因(生产 2026-11-03 日志):浏览器持续重试一个全局到不了的地址
+    (192.168.16.168 / 被墙的 Google 域名),每一轮都要付满
+    max_retries × connect_tunnel_timeout_sec(实测 elapsed=3003ms × N),并把 3 次
+    连续失败记到每个候选代理头上——一次全失败正好等于 circuit_threshold=3,
+    整池瞬间熔断(14:49:24 六个代理在 400ms 内一起熔断),后续健康请求跟着 502。
+
+    判据不是"目标属于私网段":本部署的上游代理就在局域网里,RFC1918 目标 90% 是
+    正常业务(192.168.8.228 经 239-101 累计胜出 4.6 万次)。真正的证据是
+    「连续两轮全体候选失败」+「该目标近 60s 内没有任何成功观测」。
+    """
+
+    DEAD = 'dead-target.invalid:443'
+
+    def _router(self, **kw):
+        ps = ProxyStore()
+        # 两个端口都无人监听 → 每次竞速必然"全体候选失败"(refused,瞬时返回)。
+        ps.add(ProxyInfo(id='p1', host=HOST, port=31991))
+        ps.add(ProxyInfo(id='p2', host=HOST, port=31992))
+        kw.setdefault('dead_target_ttl_sec', 15.0)
+        kw.setdefault('max_retries', 2)
+        kw.setdefault('stagger_interval_ms', 100)
+        return make_router(ps, listen_host=HOST, listen_port=10897,
+                           db_path=tempfile.mktemp(suffix='.db'), **kw)
+
+    def _spy(self, router):
+        """包一层 _race_staggered:保留真实行为,只数"扇出了几次"。"""
+        calls = []
+        real = router._race_staggered
+
+        async def spy(places, **kw):
+            calls.append(len(places))
+            return await real(places, **kw)
+
+        router._race_staggered = spy
+        return calls
+
+    async def _connect(self, router, domain):
+        cw = _FakeConnectWriter()
+        await router._dispatch_single(
+            None, '', '', None, None, domain,
+            proto='tunnel', target=domain,
+            client_reader=_FakeConnectReader(), client_writer=cw, client_ip='10.0.0.9')
+        return bytes(cw.buf)
+
+    async def test_first_two_rounds_fan_out_third_round_does_not(self):
+        """两轮全失败后进入窗口:第三轮完全不碰上游,直接 502。"""
+        r = self._router()
+        calls = self._spy(r)
+
+        for _ in range(2):
+            out = await self._connect(r, self.DEAD)
+            assert out.startswith(b"HTTP/1.1 502"), out[:60]
+        assert len(calls) == 2, f"前两轮应各自扇出,实际 {calls}"
+        assert r.dead_target_marked == 1
+
+        before = r.dead_target_fastfails
+        out = await self._connect(r, self.DEAD)
+        assert len(calls) == 2, f"已判定不可达却仍扇出: {calls}"
+        assert out.startswith(b"HTTP/1.1 502"), out[:60]
+        assert r.dead_target_fastfails == before + 1
+
+    async def test_one_round_alone_does_not_arm(self):
+        """单轮全失败不认定:可能是本机瞬时抖动,下一轮照常竞速。"""
+        r = self._router()
+        calls = self._spy(r)
+        await self._connect(r, self.DEAD)
+        assert r.dead_target_marked == 0
+        assert await self._connect(r, self.DEAD) is not None
+        assert len(calls) == 2, "第二轮仍须扇出"
+
+    async def test_recent_success_observation_blocks_arming(self):
+        """该目标近 60s 内有成功观测 → 目标可达,失败只怪候选,不快速失败。
+
+        这是保护 192.168.8.228 这类"只有某一个代理能到"的业务目标的关键门控:
+        那个代理临时熔断时,其余候选必然全失败,但目标绝不能被判死。
+        """
+        r = self._router()
+        calls = self._spy(r)
+        await self._connect(r, self.DEAD)
+        r.selector.record_ttfb('p1', 0.05, domain=self.DEAD)   # 一次成功观测
+        await self._connect(r, self.DEAD)
+        assert r.dead_target_marked == 0, "有成功观测仍被判定不可达"
+        await self._connect(r, self.DEAD)
+        assert r.dead_target_marked == 0
+        assert len(calls) == 3, f"每轮都该照常扇出,实际 {calls}"
+
+    async def test_win_clears_the_mark(self):
+        """判定后若真出现赢家(_record_win_meta),立即解除窗口,不等 TTL。"""
+        r = self._router()
+        calls = self._spy(r)
+        await self._connect(r, self.DEAD)
+        await self._connect(r, self.DEAD)
+        assert r._dead_target_active(self.DEAD)
+        r._record_win_meta(self.DEAD, 'p1')
+        assert not r._dead_target_active(self.DEAD)
+        assert self.DEAD not in r._dead_target
+        await self._connect(r, self.DEAD)
+        assert len(calls) == 3, "解除后应恢复扇出"
+
+    async def test_window_expiry_restores_fan_out(self):
+        """TTL 到期后恢复竞速,且判定与证据一起归零(残留会让下一轮立即再判死)。"""
+        r = self._router()
+        calls = self._spy(r)
+        await self._connect(r, self.DEAD)
+        await self._connect(r, self.DEAD)
+        r._dead_target[self.DEAD]["deadline"] = time.monotonic() - 1.0
+        await self._connect(r, self.DEAD)
+        assert len(calls) == 3, "窗口到期后必须重新试探目标"
+        ent = r._dead_target[self.DEAD]
+        # 窗口结束后判定归零、证据从头再攒:第三轮的失败只算第 1 次,不能凭残留的
+        # fails=2 立即重新判死(否则"判 15s → 试一轮 → 再判 15s"几乎不再试探)。
+        assert ent["deadline"] == 0.0 and ent["fails"] == 1, f"结束后证据须重来: {ent}"
+
+    async def test_ttl_zero_disables_the_feature(self):
+        """dead_target_ttl_sec=0 完全关闭:永远照常扇出,零行为变化。"""
+        r = self._router(dead_target_ttl_sec=0.0)
+        calls = self._spy(r)
+        for _ in range(4):
+            await self._connect(r, self.DEAD)
+        assert len(calls) == 4
+        assert r.dead_target_marked == 0 and r._dead_target == {}
+
+    async def test_sticky_pinned_dead_target_skips_single_send(self):
+        """判定放在粘性单发【之前】:被钉住的死目标也不再付那 3s 单发超时。"""
+        r = self._router(stickiness_enabled=True)
+        await self._connect(r, self.DEAD)
+        await self._connect(r, self.DEAD)
+        assert r._dead_target_active(self.DEAD)
+        r.sticky._record_sticky('10.0.0.9', self.DEAD, 'p1')
+
+        async def boom(*a, **kw):
+            raise AssertionError("命中判定后不应再发单发请求")
+
+        r._connect_single_send = boom
+        out = await self._connect(r, self.DEAD)
+        assert out.startswith(b"HTTP/1.1 502"), out[:60]
+
+    async def test_other_targets_are_not_blocked(self):
+        """判定按目标隔离:死目标进窗口,健康目标照常竞速。"""
+        r = self._router()
+        calls = self._spy(r)
+        await self._connect(r, self.DEAD)
+        await self._connect(r, self.DEAD)
+        healthy = 'other-target.invalid:443'
+        n = len(calls)
+        await self._connect(r, healthy)
+        assert len(calls) == n + 1, "别的目标被误伤"
+        assert r.dead_target_fastfails == 0
+
+    async def test_marker_table_stays_bounded(self):
+        """目标基数无界时表须有界(与 _immediate_degraded 同一容量纪律)。"""
+        r = self._router()
+        for i in range(_DEAD_TARGET_MAX_ENTRIES + 500):
+            d = f"t{i}.invalid:443"
+            r._note_target_race_failure(d)   # 第 1 次:只记证据
+            r._note_target_race_failure(d)   # 第 2 次:进窗口
+        assert len(r._dead_target) <= _DEAD_TARGET_MAX_ENTRIES
+        assert r.dead_target_marked > _DEAD_TARGET_MAX_ENTRIES
+
+    async def test_counters_and_ops_view(self):
+        """/metrics 与 /circuit 要能区分"代理坏了"和"目标死了"。"""
+        r = self._router(dead_target_ttl_sec=30.0)
+        await self._connect(r, self.DEAD)
+        await self._connect(r, self.DEAD)
+        snap = r.snapshot_counters()
+        assert snap['dead_target_ttl_sec'] == 30.0
+        assert snap['dead_target_marked'] == 1
+        view = r._snapshot_dead_targets()
+        assert self.DEAD in view and 0 < view[self.DEAD] <= 30.0
+
+    async def test_quality_reset_clears_the_verdict(self):
+        """换网络/换代理分组后旧判定不可沿用(与 _immediate_degraded 同一纪律)。"""
+        r = self._router()
+        await self._connect(r, self.DEAD)
+        await self._connect(r, self.DEAD)
+        assert r._dead_target_active(self.DEAD)
+        r.reset_proxy_quality()
+        assert r._dead_target == {} and not r._dead_target_active(self.DEAD)

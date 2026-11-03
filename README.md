@@ -89,6 +89,9 @@ The decision chain (`auto_squid/router.py`):
 1. **Accept & parse** — `handle_client` reads the request head, enforces client Basic auth (`407` before any upstream work), and rejects over-limit request heads with a single INFO line instead of a traceback. `CONNECT` → `_handle_connect`; plain HTTP → `_handle_http_request`.
 2. **Short-circuits** — `local_direct_domains` (dial the origin directly), in-flight GET coalescing, HTTP response cache hit.
 3. **Dispatch** (`_dispatch_single`) — in priority order:
+   0. **dead-target gate** → if two consecutive races for this target failed on *every*
+      candidate and the target has no success observation in the last 60 s, answer 502
+      for `dead_target_ttl_sec` seconds without touching the pool (see [Tuning](#tuning));
    1. **session stickiness** → single-send on the pinned proxy;
    2. **domain cache** → single-send on the last winner within its TTL;
    3. **racing** (`_race_staggered`) → Cost-ordered candidates, staggered launch.
@@ -100,6 +103,7 @@ The decision chain (`auto_squid/router.py`):
 
 | Knob | Stage | Effect |
 |---|---|---|
+| `dead_target_ttl_sec` | dispatch 3.0 | stop fanning out to a target no proxy can reach |
 | `stickiness.*` | dispatch 3.1 | pinning on/off, TTL, re-check cadence, capacity |
 | `cache_ttl`, `adaptive_ttl.*` | dispatch 3.2 | how long a race winner is reused |
 | `max_retries`, `stagger_initial`, `stagger_interval_ms` | racing 3.3 | fan-out width and refill cadence |
@@ -200,6 +204,7 @@ router:
     single_send_degrade_p99_ms: 0.0       # needs ≥ 4 domain samples
     single_send_degrade_min_throughput: 0.0  # plaintext bodies only; needs ≥ 4 samples
     single_send_slow_log_ms: 0.0   # the only log that ties a stall to a client IP
+    dead_target_ttl_sec: 15.0      # target unreachable → answer 502 without fan-out (0=off)
     connect_tunnel_timeout_sec: 3.0
     http_read_timeout_sec: 3.0
     local_direct_timeout_sec: 10.0 # applies to the local_direct_domains path only
@@ -325,6 +330,7 @@ Unknown JSON fields are rejected with `422` on `/cost` and `/tuner` (`extra="for
 | `pool_stale_discards` | half-closed connections caught at take time | should fall together with `stale_conn_retries` once `idle_timeout` is low enough |
 | `stale_conn_retries` | `pooled conn STALE` retries, each costing a CONNECT round trip | **≈ 0**; a rising rate means the pool's idle TTL is longer than the upstream's |
 | `single_send_degrades` | early-warning unpins | low and flat |
+| `dead_target_marked`, `dead_target_fastfails`, `dead_targets` | targets written off as unreachable (2 rounds, every candidate failed, no success in 60 s), requests saved, and the live list with remaining TTL (`/circuit` too) | `dead_targets` empty almost always; one entry pinned non-empty for hours = a client hammering something that is really gone |
 | `circuit_open_count`, `probes_sent/ok/skipped/failed` | breaker + probe activity | growing `probes_skipped` = the canary is unreachable through some proxy |
 | `cluster_pool_bucket_miss` / `_timing_miss` | why a prediction missed (wrong winner bucket / arrived too late) | only meaningful with `cluster_predict: true` |
 | `http_cache_evictions`, `sticky_cache_size`, `cluster_graph_size` | table pressure against their caps | steady, not pinned at the cap |
@@ -364,6 +370,7 @@ router:
 
 Notes that only show up in production:
 
+- A target nobody can reach (a decommissioned intranet IP, a domain blocked at the border) costs `max_retries × connect_tunnel_timeout_sec` **per round** and charges every candidate — one all-fail round equals `circuit_threshold`, so the whole pool trips at once and healthy requests 502 behind it. `dead_target_ttl_sec` answers 502 from the gate instead. Deliberately **not** keyed on address ranges: where the upstream proxies sit inside your LAN, RFC1918 targets are ordinary business traffic — in this deployment private-IP targets account for ~60,000 successful requests, mostly via one proxy).
 - `conn_pool.idle_timeout` must be **below the upstream proxy's own idle close**, otherwise pooled connections sit half-closed and every reuse costs a wasted CONNECT. Watch `pool_stale_discards` and `stale_conn_retries` after changing it.
 - `probe_canary` must be reachable both from the gateway and through every upstream, or whole probe rounds get counted as `probes_skipped`.
 - `single_send_slow_log_ms` (default off) is the only log line that ties a "won't open / needs refresh" stall to a specific client IP — the success path logs no IP.
@@ -402,7 +409,7 @@ Multi-stage image, non-root user, health check, and a `./data` volume for SQLite
 ## Testing
 
 ```bash
-uv run pytest -q --timeout=60      # 489 tests, ~85 s
+uv run pytest -q --timeout=60      # 500 tests, ~90 s
 ```
 
 Coverage spans HTTP/`CONNECT` forwarding and framing (HTTP/1.0 downgrade, `HEAD`, truncation detection), the HTTP cache (LRU order, eviction, coalescing), the domain cache, racing and aggregation timeouts, client and API auth, the CSRF guard, circuit breaker / probing / EWMA / in-flight weighting, stickiness, per-domain stats and SQLite persistence, UTF-8 and binary-safe bodies, both pools plus the cross-phase steal, idle pause and budget accounting, config-layer validation and exit codes, and event-loop hygiene tests that fail if a background task leaves an orphan DNS future. `tests/test_phase_metrics.py` covers the metric and ranking layer, `tests/test_tuner.py` the auto-tuner.

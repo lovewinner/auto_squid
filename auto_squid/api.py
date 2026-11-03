@@ -457,6 +457,13 @@ async def circuit():
         "probes_failed": _router.probes_failed,
         "single_send_degrades": _router.single_send_degrades,
         "degraded_single_send": _router.get_degraded_single_send(),
+        # 目标级不可达判定:熔断按代理记账,但"目标谁也到不了"的失败会把整池一起
+        # 打黑(RFC1918 目标在本部署里是正常业务,故判据是"全池试过且目标无成功观测",
+        # 不是地址段)。这里给出窗口内的目标,便于区分"代理坏了" vs "目标死了"。
+        "dead_target_ttl_sec": _router.dead_target_ttl_sec,
+        "dead_target_marked": _router.dead_target_marked,
+        "dead_target_fastfails": _router.dead_target_fastfails,
+        "dead_targets": _router._snapshot_dead_targets(),
         "proxies": _router.selector.get_circuit_state(),
     }
 

@@ -346,6 +346,23 @@ class ProxySelector:
         """返回当前每代理并发上限快照 {pid: limit}(供 /metrics / 仪表盘)。"""
         return {pid: int(s["limit"]) for pid, s in self._conc.items()}
 
+    def last_domain_success_ts(self, domain: str) -> float:
+        """该域名最近一次【成功首字节观测】的单调时刻(跨代理取最大),从未成功返回 0.0。
+
+        `record_ttfb` 只在成功路径写 `ts`,所以这是"这个目标本身可达"最直接的证据。
+        比 _meta_cache 的钉住时刻强:粘性/域名缓存命中的成功并不回写 meta(只有竞速
+        赢家回写),只看 meta 会把"一直被粘性正常服务"的域名误判成没有成功记录。
+        """
+        per_pid = self._domain_quality.get(domain)
+        if not per_pid:
+            return 0.0
+        ts = 0.0
+        for q in per_pid.values():
+            t = q.get("ts", 0.0)
+            if t > ts:
+                ts = t
+        return ts
+
     def record_ttfb(self, pid: str, ttfb: float, domain: Optional[str] = None):
         """记录一次成功请求的首字节耗时(秒),更新该代理的 EWMA。
 
