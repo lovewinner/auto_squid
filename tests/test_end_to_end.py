@@ -10126,3 +10126,53 @@ class TestDeadTargetFastFail:
         assert r._dead_target_active(self.DEAD)
         r.reset_proxy_quality()
         assert r._dead_target == {} and not r._dead_target_active(self.DEAD)
+
+
+@pytest.mark.asyncio
+async def test_connect_racing_is_counted_too():
+    """CONNECT 竞速同样计入 racing_invocations。
+
+    回归:该计数原本只记 HTTP(照搬旧 _handle_connect 口径),而生产流量 95%+ 是
+    隧道 —— 于是"竞速还在发生吗、每轮扇出多大"这两个主问题恰好没有答案
+    (2026-11-03 线上 /metrics:racing_invocations=0,同期 upstream_attempts=874)。
+    """
+    proxy_srv = await run_mock_proxy(HOST, PROXY_PORT)
+    proxy_store = ProxyStore()
+    proxy_store.add(ProxyInfo(id='mock1', host=HOST, port=PROXY_PORT))
+    router = make_router(proxy_store, listen_host=HOST, listen_port=ROUTER_PORT,
+                         max_retries=1, db_path=tempfile.mktemp(suffix='.db'))
+    await router.start()
+    try:
+        before = router.snapshot_counters()
+        await send_connect(HOST, ROUTER_PORT, target=b"race-cnt-tunnel.example.com:443")
+        after = router.snapshot_counters()
+        assert after["racing_invocations"] - before["racing_invocations"] >= 1, \
+            "CONNECT 竞速未被计入 racing_invocations"
+        assert after["upstream_attempts"] - before["upstream_attempts"] >= 1
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_connect_fallback_round_also_counted():
+    """兜底批也算一轮:HTTP 分支一直如此,CONNECT 分支过去漏记(两分支须对称)。"""
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='p1', host=HOST, port=31991))
+    ps.add(ProxyInfo(id='p2', host=HOST, port=31992))
+    r = make_router(ps, listen_host=HOST, listen_port=10896, max_retries=1,
+                    stagger_start=False, dead_target_ttl_sec=0.0,
+                    db_path=tempfile.mktemp(suffix='.db'))
+
+    async def lose():
+        raise ConnectionRefusedError("upstream down")
+
+    r._make_race_task = lambda place, method, url, headers, body, domain=None: \
+        asyncio.create_task(lose())
+    await r._dispatch_single(
+        None, '', '', None, None, 'fallback-round.example.com:443', proto='tunnel',
+        target='fallback-round.example.com:443', client_reader=_FakeConnectReader(),
+        client_writer=_FakeConnectWriter(), client_ip='10.0.0.9')
+    assert r.snapshot_counters()['racing_invocations'] == 2, \
+        "首批 + 兜底批应各计一轮"

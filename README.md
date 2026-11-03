@@ -325,7 +325,7 @@ Unknown JSON fields are rejected with `422` on `/cost` and `/tuner` (`extra="for
 | Counter | Meaning | What healthy looks like |
 |---|---|---|
 | `http_cache_hits` / `_misses`, `domain_cache_hits`, `sticky_cache_hits` | short-circuit rates | high hit rates mean fewer races |
-| `racing_invocations`, `upstream_attempts` | racing amplification = attempts ÷ requests | ≤ ~1.5 for CONNECT-heavy traffic |
+| `racing_invocations`, `upstream_attempts` | race **rounds** (initial + fallback, HTTP **and** CONNECT — CONNECT was not counted until now) vs total attempts; amplification = attempts ÷ requests, fan-out = attempts ÷ rounds | amplification ≤ ~1.5 on CONNECT-heavy traffic; and > 0 whenever racing is genuinely happening (it used to read 0 on a CONNECT-only box) |
 | `conn_pool_hits` / `_misses` / `_steals` / `_expired`, `target_pool_*` | pool effectiveness — `steals` are cross-phase borrows, and `misses` now means "both pools empty → had to build a TCP" | few `expired` relative to `creates` |
 | `pool_stale_discards` | half-closed connections caught at take time | should fall together with `stale_conn_retries` once `idle_timeout` is low enough |
 | `stale_conn_retries` | `pooled conn STALE` retries, each costing a CONNECT round trip | **≈ 0**; a rising rate means the pool's idle TTL is longer than the upstream's |

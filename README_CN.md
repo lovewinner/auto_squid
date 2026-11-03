@@ -324,7 +324,7 @@ config error: invalid configuration:
 | 计数器 | 含义 | 健康的样子 |
 |---|---|---|
 | `http_cache_hits` / `_misses`、`domain_cache_hits`、`sticky_cache_hits` | 短路命中率 | 命中率高意味着竞速次数少 |
-| `racing_invocations`、`upstream_attempts` | 竞速放大 = 尝试数 ÷ 请求数 | CONNECT 为主的流量下 ≤ ~1.5 |
+| `racing_invocations`、`upstream_attempts` | 竞速**轮次**(首批 + 兜底批,HTTP 与 CONNECT 都计——CONNECT 过去不计)对尝试总数;放大比 = 尝试 ÷ 请求,扇出 = 尝试 ÷ 轮次 | CONNECT 为主的流量下放大比 ≤ ~1.5;而且在真正发生竞速的机器上必须 > 0(以前全隧道流量时它读 0) |
 | `conn_pool_hits` / `_misses` / `_steals` / `_expired`、`target_pool_*` | 池有效性 —— `steals` 是跨阶段借用,`misses` 现在的语义是"两个池都空 → 只能新建 TCP" | `expired` 相对 `creates` 很少 |
 | `pool_stale_discards` | 取回时抓到的半关闭连接 | `idle_timeout` 调低后,应与 `stale_conn_retries` 一起下降 |
 | `stale_conn_retries` | `pooled conn STALE` 重试,每次代价一个 CONNECT 往返 | **≈ 0**;持续上升说明池的空闲 TTL 比上游的更长 |

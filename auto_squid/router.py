@@ -562,7 +562,7 @@ class Router:
         self.http_cache_hits = 0       # 响应缓存命中(完全不经上游)
         self.http_cache_misses = 0     # 进入 HTTP 处理但未命中响应缓存
         self.domain_cache_hits = 0     # 域名缓存命中(单发上游,跳过竞速)
-        self.racing_invocations = 0    # 触发竞速的请求数(含首批 + 兜底批)
+        self.racing_invocations = 0    # 竞速轮次(首批 + 兜底批;HTTP 与 CONNECT 都计)
         self.upstream_attempts = 0     # 竞速扇出总尝试数(每个 _try_http/_try_tunnel +1)
 
         # ── 上游连接池 ──────────────────────────────────────────
@@ -3877,11 +3877,12 @@ class Router:
                 await self._write_connect_502(client_writer)
             return None
 
-        # 计数:进入竞速(首批)。兜底批单独再 +1,故 invocations 可能 > 请求数。
-        # CONNECT 不记 racing_invocations(与旧 _handle_connect 一致,经 /metrics
-        # 仅统计 HTTP 竞速),HTTP 记。
-        if proto == 'http':
-            self.racing_invocations += 1
+        # 计数:进入竞速(首批)。兜底批单独再 +1,故 invocations 是"竞速轮次"而非
+        # 请求数,可能 > 请求数。两个协议都记——这里原本只记 HTTP(照搬旧 _handle_connect
+        # 的口径),而生产流量 95%+ 是 CONNECT,于是该计数恒为 0,"竞速还在发生吗、
+        # 每轮扇出多大"这两个主问题恰好无解(2026-11-03 /metrics:racing_invocations=0,
+        # 同期 upstream_attempts=874)。
+        self.racing_invocations += 1
 
         if proto == 'http':
             if self.stagger_start:
@@ -3916,6 +3917,7 @@ class Router:
                 winner = await self._race(tasks, cleanup=race_cleanup)
                 # 首批全失败且代理数超过 max_retries:对剩余代理再竞速兜底。
                 if not winner and len(proxies) > self.max_retries:
+                    self.racing_invocations += 1   # 兜底批同样算一轮(与 HTTP 分支一致)
                     remaining = proxies[self.max_retries:]
                     places = self._build_racing_tasks_connect(remaining, target)
                     tasks = {self._make_race_task(p, '', '', None, None) for p in places}
