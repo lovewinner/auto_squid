@@ -451,6 +451,10 @@ async def circuit():
         return {}
     return {
         "circuit_open_count": _router.selector.circuit_open_count,
+        # 被归因到"目标不可达"而没有加重于代理的失败数:整池同时跳闸时,这个数
+        # 与 circuit_open_count 的比例就是"目标问题 vs 代理问题"的分界线。
+        "failures_target_level": _router.selector.failures_target_level,
+        "target_attribution_domains": len(_router.selector._domain_fail),
         "probes_sent": _router.probes_sent,
         "probes_ok": _router.probes_ok,
         "probes_skipped": _router.probes_skipped,

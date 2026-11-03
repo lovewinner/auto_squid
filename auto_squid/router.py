@@ -1675,6 +1675,7 @@ class Router:
             "proxy_quality": self.selector.get_quality(),
             "proxy_in_flight": self.selector.get_in_flight(),
             "stale_conn_retries": self.selector.stale_conn_retries,
+            "failures_target_level": self.selector.failures_target_level,
             "max_in_flight": self.selector.max_in_flight,
             "proxy_concurrency_limits": self.selector.get_concurrency_limits(),
             "concurrency_limit_enabled": self.selector.concurrency_enabled,

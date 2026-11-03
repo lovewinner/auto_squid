@@ -20,7 +20,8 @@ from auto_squid.digest import TDigest
 from auto_squid.proxy_store import ProxyInfo, ProxyStore
 from auto_squid.router import Router
 from auto_squid.selector import (ProxySelector, flush_metric_copy, _OBS_WINDOW,
-                                 ERROR_HTTP_STATUS)
+                                 ERROR_HTTP_STATUS, _TARGET_DEAD_WINDOW,
+                                 _TARGET_FAIL_MAX_DOMAINS)
 
 
 # ── t-digest ────────────────────────────────────────────
@@ -1005,3 +1006,120 @@ def test_global_window_success_tolerates_entries_without_metrics():
     sel._proxy_metrics["ghost"] = {}                  # 无 "metrics" 键
     sel._proxy_metrics["empty"] = {"metrics": {}}     # 有 metrics 但无 outcome_samples
     assert sel.global_window_success() == (1, 1)
+
+
+# ── 目标级失败归因(熔断责任划分)──────────────────────────────
+def _sel3(**kw):
+    """三条代理,熔断阈值 3(与默认一致),用于"整池扑在同一目标上"的场景。"""
+    kw.setdefault('circuit_threshold', 3)
+    return ProxySelector(_store_with("p1", "p2", "p3"), **kw)
+
+
+def _consec(sel, pid):
+    return int(sel._circuit.get(pid, {}).get("consec_fail", 0))
+
+
+def test_pool_wide_failure_on_dead_domain_does_not_trip_circuits():
+    """3 个不同代理在同一死域名上各失败一次 → 谁都不该被熔断。
+
+    一轮竞速恰好 3 个候选、circuit_threshold 恰好 3:不区分责任的话,"目标到不了"
+    与"这批代理各坏了"在记账上完全同形,一个死域名就能把整池各熔断一次。
+    """
+    sel = _sel3()
+    for pid in ("p1", "p2", "p3"):
+        sel.record_failure(pid, "timeout", domain="dead.example.com:443")
+    assert sel.circuit_open_count == 0, "目标级失败连带熔断整池"
+    assert sel.failures_target_level == 1, "第三次失败应被归因到目标"
+    # 前两次到达时只有 1-2 个代理失败,证据不足,仍按代理故障累加(不豁免)。
+    assert _consec(sel, "p1") == 1 and _consec(sel, "p2") == 1
+    assert _consec(sel, "p3") == 0, "被归因到目标的失败不该加重于该代理"
+
+
+def test_single_proxy_failing_across_domains_still_trips():
+    """反向守卫:一条代理在三个不同域名上失败 → 真故障,必须熔断。
+
+    归因判据是横向的(同目标多代理),所以恒坏代理不会被别的死目标"掩护"。
+    熔断开启后 consec_fail 归零(selector.record_failure 既有语义),故断言看
+    circuit_open_count 而不是残余计数。
+    """
+    sel = _sel3()
+    for dom in ("a.com:443", "b.com:443", "c.com:443"):
+        sel.record_ttfb("p2", 0.05, domain=dom)     # 其他代理在这些域名上成功过
+        sel.record_failure("p1", "timeout", domain=dom)
+    assert sel.circuit_open_count == 1, "真坏代理被漏判"
+    assert sel.is_circuit_open("p1") is True or sel._circuit["p1"]["open_until"] > time.monotonic()
+    assert sel.failures_target_level == 0
+
+
+def test_recent_success_on_domain_blocks_attribution():
+    """同目标窗口内有成功观测 → 目标可达,三个代理的失败要如实记账。"""
+    sel = _sel3()
+    for _ in range(3):     # 三轮,让每个代理各攒满 circuit_threshold 次
+        sel.record_ttfb("p2", 0.05, domain="flaky.example.com:443")   # 目标一直可达
+        for pid in ("p1", "p2", "p3"):
+            sel.record_failure(pid, "timeout", domain="flaky.example.com:443")
+    assert sel.failures_target_level == 0, "有成功记录却被归因成目标问题"
+    assert sel.circuit_open_count >= 1, "整池真故障时不该被归因表挡住熔断"
+
+
+def test_two_proxies_alone_cannot_shield_each_other():
+    """门槛取 3 而非 2:只有两条代理反复在同一冷门上失败时,必须互相不能挡枪。"""
+    sel = _sel3()
+    for _ in range(3):
+        sel.record_failure("p1", "connect", domain="cold.example.com:443")
+        sel.record_failure("p2", "connect", domain="cold.example.com:443")
+    assert sel.failures_target_level == 0
+    assert sel.circuit_open_count >= 2, f"两条恒坏代理被互相豁免: {sel.get_circuit_state()}"
+
+
+def test_business_rejects_do_not_feed_attribution():
+    """业务拒绝(http_status)不进归因表:否则死域名上的 403 洪峰会替真故障代理脱罪。"""
+    sel = _sel3()
+    for pid in ("p1", "p2", "p3"):
+        sel.record_failure(pid, ERROR_HTTP_STATUS, domain="blocked.example.com:443")
+    assert sel._domain_fail == {}, "业务拒绝被写进了目标级归因表"
+    assert sel.failures_target_level == 0
+
+
+def test_attribution_expires_and_charging_resumes():
+    """窗口过后同一目标不再算"多代理同时失败"(代理并非永远同步扑街)。"""
+    sel = _sel3()
+    for pid in ("p1", "p2", "p3"):
+        sel.record_failure(pid, "timeout", domain="dead.example.com:443")
+    assert sel.failures_target_level == 1
+    stale = sel._domain_fail["dead.example.com:443"]
+    for k in list(stale):
+        stale[k] -= _TARGET_DEAD_WINDOW * 2       # 把记录推到窗口之外
+    sel.record_failure("p3", "timeout", domain="dead.example.com:443")
+    assert sel.failures_target_level == 1, "过期记录仍参与归因判定"
+    assert _consec(sel, "p3") == 1
+
+
+def test_exempted_failure_still_recorded_in_metrics():
+    """豁免只作用于熔断:错误分类/total/成功率口径必须不变(否则成功率被美化)。"""
+    sel = _sel3()
+    for pid in ("p1", "p2", "p3"):
+        sel.record_failure(pid, "timeout", domain="dead.example.com:443")
+    row = sel.get_domain_metrics(domain="dead.example.com:443")["dead.example.com:443"]["p3"]
+    assert row["errors"]["timeout"] == 1
+    assert row["total"] == 1 and row["success"] == 0
+
+
+def test_attribution_table_is_bounded():
+    """归因表按域名有硬上限(域名基数无界时的内存纪律)。"""
+    sel = _sel3()
+    for i in range(_TARGET_FAIL_MAX_DOMAINS + 600):
+        d = f"d{i}.example.com:443"
+        for pid in ("p1", "p2", "p3"):
+            sel.record_failure(pid, "timeout", domain=d)
+    assert len(sel._domain_fail) <= _TARGET_FAIL_MAX_DOMAINS
+
+
+def test_reset_quality_clears_attribution():
+    """换网络后旧的"目标不可达"证据不可沿用(与熔断状态同一纪律)。"""
+    sel = _sel3()
+    for pid in ("p1", "p2", "p3"):
+        sel.record_failure(pid, "timeout", domain="dead.example.com:443")
+    assert sel._domain_fail
+    sel.reset_quality()
+    assert sel._domain_fail == {}

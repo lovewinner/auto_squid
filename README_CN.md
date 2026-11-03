@@ -96,7 +96,7 @@ curl -x http://127.0.0.1:10808 https://www.baidu.com
    3. **竞速**(`_race_staggered`)→ Cost 排序候选,交错发射。
 4. **连接获取** — 已建立的隧道绝不复用;每次请求按 **第二阶段 → 第一阶段 → 跨阶段借用 → 新建连接** 的顺序取一条 TCP,然后发送 `CONNECT`。取回时若发现连接已陈旧,立即丢弃并重开新连接——且**不**计入熔断。
 5. **响应成帧** — 逐跳头部被剥离(`proxy-authorization` 绝不会漏到上游),请求体为 chunked 时先解码再重算 `Content-Length`,`Transfer-Encoding` 优先于 `Content-Length`(RFC 9112 §6.1)。HTTP/1.0 客户端拿到 close 定界而非 chunked 成帧(RFC 9112 §2.7);`HEAD`、`204`、`304`、1xx 一律不带响应体。上游响应被截断时会被检测并上报,而不是静默转发。
-6. **反馈** — 胜者更新 EWMA/TTFB/OFB、协议版本、吞吐(明文响应体)和域名缓存;失败调用 `record_failure`,喂给 `selector.py` 里的熔断器。退化的单发触发 `_degrade_send_proxy`,让该域名的*下一个*请求跳过粘性/缓存直接重新竞速。
+6. **反馈** — 胜者更新 EWMA/TTFB/OFB、协议版本、吞吐(明文响应体)和域名缓存;失败调用 `record_failure`,喂给 `selector.py` 里的熔断器。有两类失败**不计到代理头上**:业务拒绝(`http_status`)与**目标级失败**——同一目标在 10s 内被 ≥3 个不同代理失败、且窗口内无人成功过,说明是目标到不了,不是这批代理都坏了(一轮竞速恰好 `max_retries` = `circuit_threshold`,不加区分时一个死域名就能把参与的每个候选各熔断一次)。退化的单发触发 `_degrade_send_proxy`,让该域名的*下一个*请求跳过粘性/缓存直接重新竞速。
 
 ### 各旋钮作用在哪
 
@@ -291,7 +291,7 @@ config error: invalid configuration:
 | `GET /metrics/per-destination?domain=` | 按 `(domain, proxy)` 的分位数、错误分类与终身 `cumulative` 对象;省略 `domain` 返回整张网格(剥掉原始样本),带上则是一次便宜的钻取 |
 | `GET /quality` | 每代理 EWMA 首字节延迟(秒)—— 历史遗留的排序依据 |
 | `GET /quality/meta` | 每代理:窗口 TTFB/OFB 分位数、`throughput_ewma_mbps`(仅响应体)、`tunnel_relay_ewma_mbps`(仅供观测)、`body_bytes_transferred`、窗口 + 终身成功率、错误分解、HTTP 版本计数、`cumulative` 终身对象,以及 `cost_breakdown` |
-| `GET /circuit` | `circuit_open_count`、探测计数、`single_send_degrades`、`degraded_single_send`,以及每代理 `{open, open_until, backoff, consec_fail, slow_start}` |
+| `GET /circuit` | `circuit_open_count`、`failures_target_level`、`target_attribution_domains`、探测计数、`single_send_degrades`、`degraded_single_send`、死目标名单,以及每代理 `{open, open_until, backoff, consec_fail, slow_start}` |
 | `GET /server-stats` | CPU% 与事件循环延迟 —— 仅在 `bench/` 下运行时填充;普通 CLI 启动返回 `{}` |
 | `GET /cost` | 当前 Cost 参数、自动调参器状态、安全边界 |
 | `GET /docs` | OpenAPI UI(和其他接口一样受鉴权) |
@@ -329,6 +329,7 @@ config error: invalid configuration:
 | `pool_stale_discards` | 取回时抓到的半关闭连接 | `idle_timeout` 调低后,应与 `stale_conn_retries` 一起下降 |
 | `stale_conn_retries` | `pooled conn STALE` 重试,每次代价一个 CONNECT 往返 | **≈ 0**;持续上升说明池的空闲 TTL 比上游的更长 |
 | `single_send_degrades` | 预警解钉次数 | 低位、平稳 |
+| `failures_target_level` | 被归因到目标、没有加重于代理的失败数(与 `circuit_open_count` 的比例就是"目标问题 vs 代理问题"的分界) | 有被墙/不可达域名被反复重试时呈脉冲式非零 |
 | `dead_target_marked`、`dead_target_fastfails`、`dead_targets` | 被判为不可达的目标数、因此省掉的请求数,以及当前名单与剩余时间(`/circuit` 也有) | 绝大多数时刻 `dead_targets` 应为空;某条持续挂几小时 = 客户端在死磕一个真已经不存在的目标 |
 | `circuit_open_count`、`probes_sent/ok/skipped/failed` | 熔断 + 探测活动 | `probes_skipped` 不断增长 = 某个代理走 canary 不通 |
 | `cluster_pool_bucket_miss` / `_timing_miss` | 预测为何落空(预测胜者不是实际胜者 / 到得太晚) | 只在 `cluster_predict: true` 时有意义 |

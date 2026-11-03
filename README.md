@@ -97,7 +97,7 @@ The decision chain (`auto_squid/router.py`):
    3. **racing** (`_race_staggered`) → Cost-ordered candidates, staggered launch.
 4. **Connection acquisition** — an established tunnel is never reused; per request the router takes a TCP in the order **Phase 2 → Phase 1 → cross-phase steal → new connection**, then sends `CONNECT`. A stale pooled connection is detected at take time, discarded and retried fresh — and does **not** count against the circuit breaker.
 5. **Response framing** — hop-by-hop headers are stripped (`proxy-authorization` never reaches the upstream), `Content-Length` is recomputed after decoding a chunked request body, and `Transfer-Encoding` takes precedence over `Content-Length` (RFC 9112 §6.1). HTTP/1.0 clients get close-delimited bodies instead of chunked framing (RFC 9112 §2.7); `HEAD`, `204`, `304` and 1xx never carry a body. Truncated upstream responses are detected and reported rather than silently forwarded.
-6. **Feedback** — the winner updates EWMA/TTFB/OFB, protocol version, throughput (plaintext bodies) and the domain cache; failures call `record_failure`, feeding the circuit breaker in `selector.py`. A degraded single-send triggers `_degrade_send_proxy`, so the *next* request for that domain skips stickiness/cache and re-races.
+6. **Feedback** — the winner updates EWMA/TTFB/OFB, protocol version, throughput (plaintext bodies) and the domain cache; failures call `record_failure`, feeding the circuit breaker in `selector.py`. Two failure classes are *not* charged to a proxy: business rejections (`http_status`) and **target-level** failures — when ≥3 distinct proxies fail the *same* target inside 10 s with no success on it in that window, the target is unreachable, not the pool (one race is exactly `max_retries` = `circuit_threshold`, so without this a single dead domain trips every candidate). A degraded single-send triggers `_degrade_send_proxy`, so the *next* request for that domain skips stickiness/cache and re-races.
 
 ### Where each knob acts
 
@@ -292,7 +292,7 @@ All on `:18080`. With `api.auth.enabled`, everything except `GET /health` requir
 | `GET /metrics/per-destination?domain=` | per `(domain, proxy)` percentiles, error classes and the lifetime `cumulative` object; omit `domain` for the whole grid (raw samples stripped), pass one for a cheap drill-down |
 | `GET /quality` | per-proxy EWMA first-byte latency (s) — the legacy ordering basis |
 | `GET /quality/meta` | per-proxy: windowed TTFB/OFB percentiles, `throughput_ewma_mbps` (bodies only), `tunnel_relay_ewma_mbps` (observation), `body_bytes_transferred`, windowed + lifetime success rates, error breakdown, HTTP-version counts, the `cumulative` lifetime object, and `cost_breakdown` |
-| `GET /circuit` | `circuit_open_count`, probe counters, `single_send_degrades`, `degraded_single_send`, and per-proxy `{open, open_until, backoff, consec_fail, slow_start}` |
+| `GET /circuit` | `circuit_open_count`, `failures_target_level`, `target_attribution_domains`, probe counters, `single_send_degrades`, `degraded_single_send`, dead-target list, and per-proxy `{open, open_until, backoff, consec_fail, slow_start}` |
 | `GET /server-stats` | CPU % and event-loop lag — only populated when run under `bench/`; `{}` for a normal CLI start |
 | `GET /cost` | current Cost parameters, auto-tuner state, safety bounds |
 | `GET /docs` | OpenAPI UI (auth-gated like everything else) |
@@ -330,6 +330,7 @@ Unknown JSON fields are rejected with `422` on `/cost` and `/tuner` (`extra="for
 | `pool_stale_discards` | half-closed connections caught at take time | should fall together with `stale_conn_retries` once `idle_timeout` is low enough |
 | `stale_conn_retries` | `pooled conn STALE` retries, each costing a CONNECT round trip | **≈ 0**; a rising rate means the pool's idle TTL is longer than the upstream's |
 | `single_send_degrades` | early-warning unpins | low and flat |
+| `failures_target_level` | failures attributed to the target instead of the proxy (ratio against `circuit_open_count` = "target problem vs proxy problem") | nonzero in bursts when a blocked/unreachable domain is being retried |
 | `dead_target_marked`, `dead_target_fastfails`, `dead_targets` | targets written off as unreachable (2 rounds, every candidate failed, no success in 60 s), requests saved, and the live list with remaining TTL (`/circuit` too) | `dead_targets` empty almost always; one entry pinned non-empty for hours = a client hammering something that is really gone |
 | `circuit_open_count`, `probes_sent/ok/skipped/failed` | breaker + probe activity | growing `probes_skipped` = the canary is unreachable through some proxy |
 | `cluster_pool_bucket_miss` / `_timing_miss` | why a prediction missed (wrong winner bucket / arrived too late) | only meaningful with `cluster_predict: true` |

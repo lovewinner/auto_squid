@@ -37,6 +37,18 @@ _CIRCUIT_BACKOFF_BASE = 1.0
 _SLOW_START_WINDOW = 60.0
 _SLOW_START_SUCCESS = 3
 
+# ── 目标级失败归因(见 ProxySelector._is_target_level_failure)──
+# 熔断按【代理】累计连续失败,但"某目标在极短窗口内被多个不同代理一起失败"描述的
+# 是目标不可达,不是这批代理同时坏了。默认 3 个不同代理:正好等于一批竞速的候选数
+# (max_retries 默认 3),也正好等于 circuit_threshold —— 于是一轮全失败就能把参与
+# 的每个代理各熔断一次,而它们只是"比目标先到达现场"。
+# 取 3 而非 2 是为了不出现"两条真坏代理互相挡枪":只有两条代理反复在同一冷门上
+# 失败时,不构成目标级证据。
+_TARGET_DEAD_WINDOW = 10.0
+_TARGET_DEAD_MIN_PROXIES = 3
+# 归因表的域名容量上限:与 router._IMMEDIATE_DEGRADE_MAX_ENTRIES 同纪律,防域名基数无界。
+_TARGET_FAIL_MAX_DOMAINS = 4096
+
 # 加权 least-request 的在途积压惩罚指数(bias,默认 1.0)。
 # 排序权重 = ewma × (1 + active)^bias,即分析 doc 2.2 的 "peak EWMA"(最近 RTT ×
 # 在途数):在途积压多的代理即使延迟历史最快,有效权重也被抬高、排序靠后,竞速选批
@@ -248,6 +260,12 @@ class ProxySelector:
         # 静默关闭,握手即"no response"。这类失败是连接池问题而非代理故障,故只
         # 计数重试、不喂熔断、不计入成功率。供 /metrics 观察陈旧连接规模。
         self.stale_conn_retries = 0
+        # 目标级失败归因表 {domain: {pid: 最近一次失败单调时刻}},由 record_failure
+        # 逐次写入。判定见 _is_target_level_failure:它让"整池扑在同一死目标上"
+        # 不再被读成"这批代理各失败了一次"。
+        self._domain_fail: dict[str, dict[str, float]] = {}
+        # 因归因到目标而跳过熔断累加的失败次数(仍照常计入错误分类与成功率口径)。
+        self.failures_target_level = 0
 
         # ── Cost 排序与候选评分缓存 ────────────────────────────
         # 1) _cost_raw_cache: 针对每个 domain 缓存 _cost_raw_inputs(三维原始指标值),
@@ -1042,6 +1060,8 @@ class ProxySelector:
         self._circuit.clear()
         self._in_flight.clear()
         self._conc.clear()
+        # 目标级归因表同样作废:旧网络里"整池失败于同一目标"的记录不跨网络沿用。
+        self._domain_fail.clear()
         self._proxy_metrics.clear()
         self._domain_metrics.clear()
         self._dirty_metric_keys.clear()  # 清空脏对;置全量重写,下轮 flush 清表
@@ -1206,6 +1226,47 @@ class ProxySelector:
             self._circuit[pid] = s
         return s
 
+    def _is_target_level_failure(self, pid: str, domain: str, now: float) -> bool:
+        """本次失败应归因到【目标】还是到这台代理?同时把本次失败记进归因表。
+
+        三条同时成立才算目标级:
+          1. 该 domain 在 _TARGET_DEAD_WINDOW 内已被 >= _TARGET_DEAD_MIN_PROXIES 个
+             **不同代理**失败(含本次)——单条代理失败永远不够;
+          2. 同一窗口内没有任何代理在该 domain 上成功过(有成功就等于"目标可达",
+             这批失败只能算各代理各自的问题);
+          3. 调用方已排除业务拒绝(http_status 有自己的豁免)。
+
+        返回 True 时调用方跳过 consec_fail/熔断,但错误分类、total、成功率口径照记
+        ——失败确实发生了,只是不构成"这条代理不可用"的证据。
+
+        与 record_stale_conn(池连接陈旧)、http_status(目标端拒绝)同一条思路:
+        失败先问责任在谁,不是所有失败都是代理质量信号。
+        """
+        per_pid = self._domain_fail.setdefault(domain, {})
+        # 窗口外的旧失败既不再为本次作保,也不该替本次背书 → 先丢档。
+        for stale in [p for p, t in per_pid.items() if now - t > _TARGET_DEAD_WINDOW]:
+            del per_pid[stale]
+        per_pid[pid] = now
+        if len(per_pid) < _TARGET_DEAD_MIN_PROXIES:
+            return False
+        if self.last_domain_success_ts(domain) > now - _TARGET_DEAD_WINDOW:
+            return False
+        if len(self._domain_fail) > _TARGET_FAIL_MAX_DOMAINS:
+            self._prune_domain_fail(now)
+        return True
+
+    def _prune_domain_fail(self, now: float) -> None:
+        """归因表容量保护:先清全部门面已过期的域名,仍超上限则按最旧活动收缩。"""
+        for d in [d for d, per_pid in self._domain_fail.items()
+                  if not per_pid or max(per_pid.values()) <= now - _TARGET_DEAD_WINDOW]:
+            del self._domain_fail[d]
+        overflow = len(self._domain_fail) - _TARGET_FAIL_MAX_DOMAINS
+        if overflow > 0:
+            oldest = sorted(self._domain_fail.items(),
+                            key=lambda kv: max(kv[1].values()) if kv[1] else 0.0)
+            for d, _ in oldest[:overflow]:
+                del self._domain_fail[d]
+
     def record_failure(self, pid: str, error_type: Optional[str] = None,
                        domain: Optional[str] = None):
         """记录一次上游失败(连接失败/超时/5xx)。连续失败达阈值即熔断。
@@ -1225,9 +1286,22 @@ class ProxySelector:
         外部代理全部熔断(backoff 300s),造成"全代理失败/全站瘫痪"(09-15 事故)。
         此处对 error_type='http_status' 跳过 consec_fail 累加与熔断,但仍计
         total/errors/outcome/cum_failure_transport 以维持成功率口径一致。
+
+        **目标级失败同样不熔断**(见 _is_target_level_failure):与 http_status 靠
+        错误类别判定不同,这里的证据是横向的——同一目标在极短窗口内被多个不同代理
+        一起失败、且期间无人成功。生产实测一轮全失败恰好等于 circuit_threshold,
+        于是一个死域名就能把参与竞速的每个代理各熔断一次(2026-11-03 14:49:24,
+        六个代理在 400ms 内一起 open,触发者是 csp.withgoogle.com / apis.google.com)。
         """
         etype = error_type if error_type in _ERROR_KEYS else ERROR_OTHER
         bypass_circuit = (etype == ERROR_HTTP_STATUS)
+        if not bypass_circuit and domain:
+            # 目标级归因:多个不同代理在极短窗口内一起失败于同一目标、且该目标无人
+            # 成功过 → 这是"目标到不了",不是"这批代理同时坏了"。跳过熔断累加,
+            # metrics 照记(见 _is_target_level_failure)。
+            if self._is_target_level_failure(pid, domain, time.monotonic()):
+                bypass_circuit = True
+                self.failures_target_level += 1
         self._circuit_version += 1
         s = self._circuit_state(pid) if not bypass_circuit else None
         in_backoff = bool(s) and s.get("open_until", 0.0) > time.monotonic()
