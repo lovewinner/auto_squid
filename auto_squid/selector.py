@@ -11,9 +11,10 @@
 
 状态全部由事件循环单线程读写(Router 的 _try_http/_try_tunnel 在竞速与单发
 两条路径经 _inflight_start/_inflight_finish 增减在途数)。本模块完全自包含:
-只依赖 ProxyStore(类型 import)、random、time 与下列常量,零 Router 引用。
+只依赖 ProxyStore(类型 import)、heapq、random、time 与下列常量,零 Router 引用。
 """
 
+import heapq
 import logging
 import random
 import time
@@ -240,10 +241,16 @@ class ProxySelector:
         # 表),为域名串表示域名桶(domain_metrics 表)。incremental 差分只在
         # <domain, pid> 粒度上写,每次 flush 经 consume_dirty_metric_keys 取走即清,
         # 配合落盘只写这份差分,消除每 5s 全表重写(实测 830ms/5s → 稳态近零)。
-        # 不变式:incremental 差分无法感知"行被删除"——任何删除 metric 条目的代码
-        # (目前仅 reset_quality / prune_domain_metrics)必须置 _metrics_full_rewrite,
-        # 让下一次 flush 走 DELETE+全量重写以保持 DB 与内存一致。
+        # 不变式:incremental 差分只表达"这个键的最新值",不表达"这个键没了"。所以
+        # 删行的两条路各自有交代:
+        #   - reset_quality(整表作废)→ 置 _metrics_full_rewrite,下轮 DELETE+全量重插;
+        #   - prune_domain_metrics(容量淘汰若干行)→ 把被删的 (domain|None, pid) 记进
+        #     _metric_delete_keys,下轮只补这些定向 DELETE。
+        # 淘汰原先也走全量重写,代价被实测过:满 10,000 行时 flush_metric_copy 要在
+        # 事件循环上遍历 ~9,965 条(13.9MB payload)约 91ms,期间所有在途隧道停摆,
+        # 而生产约一天淘汰一次 —— 省掉的正是这一段(改进方案 (b))。
         self._dirty_metric_keys: "set[tuple[Optional[str], str]]" = set()
+        self._metric_delete_keys: "set[tuple[Optional[str], str]]" = set()
         self._metrics_full_rewrite: bool = False
         # 每代理熔断/慢启动状态(与 _quality 分开维护,含未观测过的新代理):
         #   {pid: {"consec_fail": int, "open_until": float(monotonic 秒), "backoff": float}}
@@ -575,12 +582,16 @@ class ProxySelector:
             per = self._domain_metrics.setdefault(domain, {})
             self._domain_metrics_dirty(per)
             self._dirty_metric_keys.add((domain, pid))
+            # 新写入即"该行的最新真相":先前淘汰留下的定向 DELETE 作废,否则同一
+            # 轮里先删后插,插进去的是刚清零的桶(历史白丢一次)。
+            self._metric_delete_keys.discard((domain, pid))
             return self._ensure_metrics(per.setdefault(pid, {}))
         # 全局桶(domain=None)同样要让 _metrics_version 前进:cost 缓存的 state_key
         # 用它判新鲜(见 _cost_scores),而探活与非域名流量只写全局桶 —— 不 bump
         # 会让 ordered_proxies 在"只有探活写入"的时段一直按陈旧的全局 p99/成功率排序。
         self._metrics_version += 1
         self._dirty_metric_keys.add((None, pid))
+        self._metric_delete_keys.discard((None, pid))
         return self._ensure_metrics(self._proxy_metrics.setdefault(pid, {}))
 
     def _domain_metrics_dirty(self, _scope: dict) -> None:
@@ -597,13 +608,23 @@ class ProxySelector:
 
         返回 (metrics_full_rewrite: bool, dirty_keys: set[(domain|None, pid)])。
         domain 为 None 的键 -> proxy_metrics 表;为域名串的键 -> domain_metrics 表。
-        full_rewrite 只在删行路径(reset_quality / prune_domain_metrics)置位,此时
-        dirty_keys 为空集,Router 应全量重写。必须在事件循环线程调用(返回的集合
-        随后用于 collect_metric_payloads 的 in-place 取数)。
+        full_rewrite 只在整表作废路径(reset_quality)置位,此时 dirty_keys 为空集,
+        Router 应全量重写。必须在事件循环线程调用(返回的集合随后用于
+        collect_metric_payloads 的 in-place 取数)。
         """
         keys, self._dirty_metric_keys = self._dirty_metric_keys, set()
         full, self._metrics_full_rewrite = self._metrics_full_rewrite, False
         return full, keys
+
+    def consume_metric_delete_keys(self) -> set:
+        """取走并清空"待定向删除"的键(容量淘汰掉的行),供 Router 补 DELETE。
+
+        与 consume_dirty_metric_keys 成对:前者说"这些行的最新值",这里说"这些行
+        没了"。两者都必须在事件循环线程调用,且与 full_rewrite 互斥——整表重做时
+        定向删除已被 DELETE FROM 覆盖,Router 会跳过。
+        """
+        keys, self._metric_delete_keys = self._metric_delete_keys, set()
+        return keys
 
     def collect_metric_payloads(self, full_rewrite: bool, dirty_keys: set) -> tuple[list, list]:
         """把 (全量 or 脏差分的) 内存指标转成可 JSON 序列化的落盘行(事件循环线程执行)。
@@ -991,11 +1012,19 @@ class ProxySelector:
         return succ, total
 
     def prune_domain_metrics(self, max_entries: int = 10_000):
-        """域名级指标表容量保护:条目超上限按字典序淘汰最旧域名(不排序,由
-        domain_metrics 本身按域名字典序;保守额度保守,不被常用)。
+        """域名级指标表容量保护:条目超上限时按**最近观测 ts** 淘汰最旧条目。
 
-        目前域名级指标与 _domain_quality 同规模,由 _flush_loop 经
-        prune_domain_quality 一并治理;此处提供独立清理入口,防阶段性超量。
+        淘汰原先按 dict 插入序砍(见 git blame 前的版本),方向是反的:插入位置只在
+        首次观测时确定,更新不搬位置 —— 于是"最早见过"的条目(往往正是最老的、最
+        常赢的域名)排在被淘汰的第一批。被砍掉的 (域名,代理) 会连带丢掉终身 t-digest
+        与累计成功率,下次观测只能从零重学,而 Cost 排序的延迟项恰恰吃这个口径。
+        现按 _domain_quality 的观测时间排序(无观测时间的按插入序垫底),用
+        heapq.nsmallest 取前 to_free 个:全表 10,000 条目里通常只淘汰几十个,
+        O(n log k) 而不是全表排序,因为这个函数跑在事件循环线程上。
+
+        删的行登记进 _metric_delete_keys,由 Router 落成定向 DELETE —— 不再触发
+        全表 DELETE+重插(实测满表时那一下要在事件循环上花 ~91ms,期间所有在途
+        隧道停摆,而生产约一天一次)。
         """
         if max_entries <= 0:
             self._domain_metrics.clear()
@@ -1005,24 +1034,29 @@ class ProxySelector:
         total = sum(len(per_pid) for per_pid in self._domain_metrics.values())
         if total <= max_entries:
             return
-        # 均匀地删:按域名遍历砍掉多余条目(简单、无偏的容量保护)。
         to_free = total - max_entries
-        pruned = False
-        for d, per_pid in list(self._domain_metrics.items()):
-            if to_free <= 0:
-                break
-            drop = min(len(per_pid), to_free)
-            for pid in list(per_pid.keys())[:drop]:
-                per_pid.pop(pid, None)
-                self._domain_quality.get(d, {}).pop(pid, None)
-            to_free -= drop
-            pruned = True
+        # 元素 (ts, domain, pid):ts 缺失(从未成功观测过)记 -1.0 打在最前;ts 相同
+        # 时由 domain 串定序,保证同轮淘汰集合可复现(测试要断言具体删了谁)。
+        cand = []
+        for d, per_pid in self._domain_metrics.items():
+            q = self._domain_quality.get(d) or {}
+            for pid in per_pid:
+                ts = q.get(pid, {}).get("ts")
+                cand.append((-1.0 if ts is None else ts, d, pid))
+        for _, d, pid in heapq.nsmallest(to_free, cand):
+            per_pid = self._domain_metrics.get(d)
+            if per_pid is None or pid not in per_pid:
+                continue          # 已被同一轮的前面几步删掉
+            del per_pid[pid]
+            self._metric_delete_keys.add((d, pid))
+            q = self._domain_quality.get(d)
+            if q is not None:
+                q.pop(pid, None)
+            self._dirty_metric_keys.discard((d, pid))   # 行都没了,别再 UPSERT
             if not per_pid:
                 self._domain_metrics.pop(d, None)
                 self._domain_quality.pop(d, None)
-        if pruned:
-            self._metrics_version += 1  # 删除了域名指标条目,缓存失效
-            self._metrics_full_rewrite = True  # 删行,差分无法感知,须全量重写
+        self._metrics_version += 1  # 删除了域名指标条目,缓存失效
 
     def prune_domain_quality(self, max_entries: int = 10_000):
         """域名级质量表容量保护:条目超上限时按最近观测 ts 淘汰最旧条目。
@@ -1065,6 +1099,7 @@ class ProxySelector:
         self._proxy_metrics.clear()
         self._domain_metrics.clear()
         self._dirty_metric_keys.clear()  # 清空脏对;置全量重写,下轮 flush 清表
+        self._metric_delete_keys.clear()  # 全量重写含 DELETE 全表,待删键作废
         self._metrics_full_rewrite = True  # 删行,差分无法感知,须全量重写
         self._metrics_version += 1  # 清空域名指标,使 get_domain_metrics 缓存失效
         self._domain_snapshot_cache = (None, None)

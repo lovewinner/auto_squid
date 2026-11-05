@@ -9,6 +9,8 @@
 
 import asyncio
 import json
+import sqlite3
+import tempfile
 import time
 from unittest import mock
 
@@ -18,7 +20,7 @@ import pytest
 from auto_squid.config_schema import CircuitConfig, RouterConfig
 from auto_squid.digest import TDigest
 from auto_squid.proxy_store import ProxyInfo, ProxyStore
-from auto_squid.router import Router
+from auto_squid.router import Router, make_router
 from auto_squid.selector import (ProxySelector, flush_metric_copy, _OBS_WINDOW,
                                  ERROR_HTTP_STATUS, _TARGET_DEAD_WINDOW,
                                  _TARGET_FAIL_MAX_DOMAINS)
@@ -896,7 +898,7 @@ def test_dirty_tracking_tracks_write_keys():
 
 
 def test_consume_dirty_metric_keys_clear_and_flags():
-    """consume 取走并清空脏键集;reset_quality/prune_domain_metrics 置全量重写。"""
+    """consume 取走并清空脏键集;只有 reset_quality 置全量重写(淘汰走定向 DELETE)。"""
     sel = _selector()
     sel.record_ttfb("p1", 0.10, domain="a:443")
     full, keys = sel.consume_dirty_metric_keys()
@@ -913,14 +915,17 @@ def test_consume_dirty_metric_keys_clear_and_flags():
     full, keys = sel.consume_dirty_metric_keys()
     assert full is True and keys == set()  # 纯 reset:只有 full_rewrite,无脏键
 
-    # prune_domain_metrics 实际删行 → full_rewrite;未删行 → 不置位
-    _fill_domains(sel, ("a", "b"))
+    # prune_domain_metrics 删行 → 不置 full_rewrite,改登记定向删除键
+    _fill_domains(sel, ("a", "b"))                 # reset 后表为空,现有 2 条
     sel.consume_dirty_metric_keys()                # 先消费 _fill 产生的脏键
-    sel.prune_domain_metrics(1)                    # 3 条→1,确实删除
+    sel.prune_domain_metrics(1)                    # 2 条→1,确实删除一行
     full, keys = sel.consume_dirty_metric_keys()
-    assert full is True and keys == set()          # 只置 full_rewrite,无新增脏键
-    sel.prune_domain_metrics(10)                   # 超量不足 → no-op(不置位)
+    assert full is False and keys == set(), "容量淘汰不得触发全表重做"
+    deleted = sel.consume_metric_delete_keys()
+    assert len(deleted) == 1 and next(iter(deleted))[1] == "p1"
+    sel.prune_domain_metrics(10)                   # 超量不足 → no-op(两边都不置位)
     assert sel.consume_dirty_metric_keys() == (False, set())
+    assert sel.consume_metric_delete_keys() == set()
 
 
 def test_collect_metric_payloads_incremental_and_full():
@@ -1123,3 +1128,141 @@ def test_reset_quality_clears_attribution():
     assert sel._domain_fail
     sel.reset_quality()
     assert sel._domain_fail == {}
+
+
+# ── 容量淘汰改差分落盘(不再触发全表 DELETE+重插)────────────────
+def test_prune_registers_targeted_deletes_not_full_rewrite():
+    """淘汰若干行 → 只登记定向 DELETE,不再置 full_rewrite。
+
+    回归的是这个不变式:full_rewrite 会在事件循环上重做整表(满 10,000 行时实测
+    ~91ms,生产约一天一次),而差分 UPSERT 表达不了"行没了",所以要单独的待删键。
+    """
+    sel = _selector()
+    _fill_domains(sel, ("a", "b", "c"))
+    sel.consume_dirty_metric_keys()
+    sel._metric_delete_keys.clear()
+    sel.prune_domain_metrics(1)                        # 3 条 → 1,删 2 行
+    assert sel.consume_dirty_metric_keys() == (False, set()), "淘汰不该触发全表重做"
+    deleted = sel.consume_metric_delete_keys()
+    assert len(deleted) == 2, f"应登记 2 个定向删除键,实际 {deleted}"
+    assert all(isinstance(k, tuple) and len(k) == 2 for k in deleted)
+    assert sel.consume_metric_delete_keys() == set(), "取走须即清"
+
+
+def test_prune_evicts_least_recently_observed_not_insertion_order():
+    """淘汰顺序按最近观测 ts,而不是"最早见过"。
+
+    旧实现按 dict 插入序砍:插入位置只在首次观测时定,更新不搬位置 → 最老、最常赢
+    的域名反而第一批被淘汰,连带丢掉终身 t-digest(Cost 的延迟项就吃这个口径)。
+    """
+    sel = _selector()
+    _fill_domains(sel, ("hot.test:443", "cold.test:443"))   # hot 先插入
+    # hot 是最老的插入,但刚刚被观测过;cold 反之。
+    sel._domain_quality["hot.test:443"]["p1"]["ts"] = 900.0
+    sel._domain_quality["cold.test:443"]["p1"]["ts"] = 100.0
+    sel.prune_domain_metrics(1)
+    assert "hot.test:443" in sel._domain_metrics, "老而常用者被误汰"
+    assert "cold.test:443" not in sel._domain_metrics, "久未观测者应优先淘汰"
+    assert ("cold.test:443", "p1") in sel._metric_delete_keys
+    # 无观测记录(ts 缺失)一律排在最前:从未成功过的行最先让位。
+    sel2 = _selector()
+    _fill_domains(sel2, ("x.test:443",))
+    sel2._domain_quality["x.test:443"]["p1"]["ts"] = None
+    _fill_domains(sel2, ("y.test:443",))
+    sel2.prune_domain_metrics(1)
+    assert "x.test:443" not in sel2._domain_metrics
+
+
+def test_reobserve_cancels_pending_delete():
+    """被淘汰的键若在下一次 flush 前又被观测到 → 待删 DELETE 作废。
+
+    否则同一轮里先删后插,插进去的是刚清零的桶,历史白丢一次。
+    """
+    sel = _selector()
+    _fill_domains(sel, ("a", "b"))
+    sel.prune_domain_metrics(1)
+    deleted = sel._metric_delete_keys
+    assert deleted
+    dom, pid = next(iter(deleted))
+    sel.record_ttfb(pid, 0.03, domain=dom)             # 该键重新有值
+    assert (dom, pid) not in sel._metric_delete_keys, "待删键未随新写入作废"
+    assert (dom, pid) in sel._dirty_metric_keys
+
+
+def test_global_bucket_eviction_not_possible_but_deletes_are_scoped():
+    """待删键按 (domain|None, pid) 分表:域名键不会漏进 proxy_metrics。"""
+    sel = _selector()
+    _fill_domains(sel, ("a", "b", "c"))
+    sel.prune_domain_metrics(1)
+    assert all(d is not None for d, _ in sel._metric_delete_keys), \
+        "domain_metrics 的淘汰不该产生全局桶删除键"
+
+
+def test_reset_quality_clears_pending_deletes():
+    """整表重做已含 DELETE 全表 → 待删键作废(否则下一轮补一次无意义的定向删除)。"""
+    sel = _selector()
+    _fill_domains(sel, ("a", "b"))
+    sel.prune_domain_metrics(1)
+    assert sel._metric_delete_keys
+    sel.reset_quality()
+    assert sel._metric_delete_keys == set()
+
+
+def test_flush_deletes_only_the_evicted_rows(tmp_path=None):
+    """端到端:prune → flush 后,库里的兄弟行必须原样保留(时间戳不变)。
+
+    这是最硬的一条:旧实现下淘汰一行 = 整表 DELETE + 重插,所有行的 updated_at
+    都被刷成同一时刻;改成定向 DELETE 后,未动的行保持原值。
+    """
+    db = tempfile.mktemp(suffix='.db')
+    store = ProxyStore()
+    store.add(ProxyInfo(id='p1', host='h', port=3128))
+    r = make_router(store, listen_host='127.0.0.1', listen_port=10899, db_path=db)
+    try:
+        sel = r.selector
+        rows = ('keep.test:443', 'drop.test:443', 'quiet.test:443')
+        for dom in rows:
+            sel.record_ttfb('p1', 0.02, domain=dom)
+        r._flush_to_db()
+        q = lambda: dict(sqlite3.connect(db).execute(
+            'select domain || "|" || proxy_id, updated_at from domain_metrics'))
+        before = q()
+        assert set(before) == {f'{d}|p1' for d in rows}, before
+        # 观测时间决定去留:keep 最新、quiet 次新、drop 最旧 → 只淘汰 drop
+        sel._domain_quality['keep.test:443']['p1']['ts'] = 300.0
+        sel._domain_quality['quiet.test:443']['p1']['ts'] = 200.0
+        sel._domain_quality['drop.test:443']['p1']['ts'] = 100.0
+        sel.record_ttfb('p1', 0.01, domain='keep.test:443')   # keep 置脏(理应重写)
+        sel.prune_domain_metrics(2)
+        assert ('drop.test:443', 'p1') in sel._metric_delete_keys
+        r._flush_to_db()
+        after = q()
+        assert 'drop.test:443|p1' not in after, "淘汰行未从库中删除"
+        assert set(after) == {'keep.test:443|p1', 'quiet.test:443|p1'}
+        # 关键:既没被淘汰、本轮也没被观测的行,updated_at 必须原封不动 ——
+        # 旧实现是全表 DELETE+重插,三行会被刷成同一时刻。
+        assert after['quiet.test:443|p1'] == before['quiet.test:443|p1'], \
+            "定向删除退化成了全表重写"
+    finally:
+        r.stop_flush() if hasattr(r, 'stop_flush') else None
+        sqlite3.connect(db).close()
+        for suf in ('', '-wal', '-shm'):
+            try:
+                import os
+                os.unlink(db + suf)
+            except OSError:
+                pass
+
+
+def test_prune_cost_is_not_a_full_sort():
+    """淘汰用 nsmallest(k),不在事件循环上全表排序。"""
+    import heapq
+    sel = _selector()
+    for i in range(40):
+        sel.record_ttfb('p1', 0.01, domain=f"d{i}.test:443")
+        sel._domain_quality[f"d{i}.test:443"]['p1']['ts'] = float(i)
+    sel.prune_domain_metrics(10)                        # 淘汰 30 条
+    assert len(sel._domain_metrics) == 10
+    kept = {d for d in sel._domain_metrics}
+    # 保留的必须是 ts 最大的 10 个(d30..d39)
+    assert kept == {f"d{i}.test:443" for i in range(30, 40)}, f"淘汰集合不对: {sorted(kept)[:4]}"

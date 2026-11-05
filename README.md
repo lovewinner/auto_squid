@@ -443,6 +443,7 @@ Reports print throughput, TTFB/total at P50/P95/P99, error classes, cache hit ra
 - Upstream `protocol` is HTTP-only in practice (`https`/`socks5` have no implementation).
 - `CONNECT` tunnels are raw byte pipes — no TLS interception, so per-tunnel "throughput" cannot describe origin transfer speed.
 - In-memory state (stickiness, domain cache, HTTP response cache, windowed samples) is cleared on restart; only lifetime counters, t-digests and domain win counts survive in SQLite.
+- Per-(domain, proxy) **lifetime metrics are capped at 10,000 rows** (`prune_domain_metrics`, not a config knob); eviction takes the least-recently-observed first, so a long-absent domain coming back has one request with no P99/success-rate history. Lifetime history is a window over the busiest pairs, not a full archive.
 - The proxy port is an **open proxy** unless you enable `router.auth` or restrict it at the network layer.
 - `POST /proxies` rewrites `proxies.yaml` in full and drops comments; there is no delete endpoint.
 - `http_read_timeout_sec` (3 s) can time out slow-but-healthy origins on high-latency links; raise deliberately and verify p99/fd.

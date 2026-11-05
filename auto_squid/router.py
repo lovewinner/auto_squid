@@ -1227,13 +1227,16 @@ class Router:
         deque→list),返回的载荷即可安全交给 to_thread 的序列化/写库线程,避免
         跨线程迭代 deque 的 RuntimeError 竞态。
 
-        返回 (stats_rows, meta_rows, full_rewrite, proxy_rows, domain_rows):
+        返回 (stats_rows, meta_rows, full_rewrite, proxy_rows, domain_rows,
+              proxy_deletes, domain_deletes):
           stats_rows  = [(domain, proxy_id, wins)], meta_rows = [(domain, default_proxy,
             updated_at, ref_ewma)] —— 各自仅在对应 _dirty 时非空(全量覆盖)。
           proxy_rows  = [(pid, flush_metric_copy(m), ...)], domain_rows = [(domain, pid,
             flush_metric_copy(m)), ...] —— 差分只含脏键;full_rewrite 时含全部
-            (reset_quality / prune_domain_metrics 双清)。
-        取走快照即原位清零 dirty/脏键,后续新观测重新置脏,下一轮补采。
+            (只有 reset_quality 整表作废会走这条路)。
+          proxy_deletes / domain_deletes —— 容量淘汰(prune_domain_metrics)掉的行,
+            落成定向 DELETE;full_rewrite 时清空(整表 DELETE 已覆盖)。
+        取走快照即原位清零 dirty/脏键/待删键,后续新观测重新置脏,下一轮补采。
         """
         stats_rows: list = []
         if self._stats_dirty:
@@ -1246,25 +1249,37 @@ class Router:
                          for d, m in self._meta_cache.items()]
             self._meta_dirty = False
         full_rewrite, dirty_keys = self.selector.consume_dirty_metric_keys()
+        delete_keys = self.selector.consume_metric_delete_keys()
         proxy_rows: list = []
         domain_rows: list = []
         if full_rewrite or dirty_keys:
             proxy_rows, domain_rows = self.selector.collect_metric_payloads(
                 full_rewrite, dirty_keys)
-        return (stats_rows, meta_rows, full_rewrite, proxy_rows, domain_rows)
+        # 整表重做已含 DELETE,定向删除键此时多余(且它们的行若又被重建,已由
+        # collect 的最新值覆盖)→ 与 full_rewrite 互斥,避免同一轮里自相矛盾的写。
+        if full_rewrite:
+            delete_keys = set()
+        proxy_deletes = sorted(pid for domain, pid in delete_keys if domain is None)
+        domain_deletes = sorted((domain, pid) for domain, pid in delete_keys
+                                if domain is not None)
+        return (stats_rows, meta_rows, full_rewrite, proxy_rows, domain_rows,
+                proxy_deletes, domain_deletes)
 
     def _persist_flush_state(self, payload):
         """把 _snapshot_flush_state 的载荷写入 DB(可在工作线程执行,只碰快照数据)。
 
         持 _db_lock 单事务:stats/meta 全量覆盖(DELETE 后重插),监控指标差分 UPSERT
-        /全量重写,详见 _flush_to_db 注释。载荷全空时直接返回,连 commit 都不做。
+        + 定向 DELETE 淘汰行,详见 _flush_to_db 注释。载荷全空时直接返回,连 commit
+        都不做。
 
         任何一步失败都 **rollback**:python-sqlite 默认 is_level=autocommit off,
         DELETE 已经开了事务,若让它保持打开,下一次 commit()(本函数的成功路径或
         tuner._save_state)就会把"删了一半"的中间状态固化进库。
         """
-        stats_rows, meta_rows, full_rewrite, proxy_rows, domain_rows = payload
-        if not (full_rewrite or stats_rows or meta_rows or proxy_rows or domain_rows):
+        stats_rows, meta_rows, full_rewrite, proxy_rows, domain_rows, \
+            proxy_deletes, domain_deletes = payload
+        if not (full_rewrite or stats_rows or meta_rows or proxy_rows or domain_rows
+                or proxy_deletes or domain_deletes):
             return
         now = datetime.now(timezone.utc).isoformat()
         with self._db_lock:
@@ -1285,6 +1300,17 @@ class Router:
                 if full_rewrite:
                     self._db.execute("DELETE FROM proxy_metrics")
                     self._db.execute("DELETE FROM domain_metrics")
+                # 容量淘汰掉的行:定向删除,排在 UPSERT 之前。差分 UPSERT 只能表达
+                # "这行的最新值",淘汰必须显式删,否则 DB 与内存永久背离(旧实现为此
+                # 每次都全表重做,满表 10,000 行时事件循环上要付 ~91ms)。
+                if proxy_deletes:
+                    self._db.executemany(
+                        "DELETE FROM proxy_metrics WHERE proxy_id = ?",
+                        [(pid,) for pid in proxy_deletes])
+                if domain_deletes:
+                    self._db.executemany(
+                        "DELETE FROM domain_metrics WHERE domain = ? AND proxy_id = ?",
+                        domain_deletes)
                 if proxy_rows:
                     self._db.executemany(
                         "INSERT INTO proxy_metrics (proxy_id, metrics_json, updated_at)"
@@ -1312,9 +1338,11 @@ class Router:
         收尾调用与测试直接调用(本函数同步快照+同步写库,保证调用方线程可见)。
         幂等性:stats/meta 仍是全量覆盖(内存权威源);监控指标改为**脏差分 UPSERT**
         ——只写上次 flush 以来被观察写入的 (domain,pid) 键,稳态下每 5s 成本近零
-        (prior:无条件 DELETE+重插 5688 行/14MB/830ms)。全量重写保留:reset_quality
-        / prune_domain_metrics 删行后置 _metrics_full_rewrite,据此 DELETE+全量重插
-        (见 selector._dirty_metric_keys 不变式注释)。
+        (prior:无条件 DELETE+重插 5688 行/14MB/830ms)。淘汰行走**定向 DELETE**
+        (prune_domain_metrics 登记 _metric_delete_keys),不再触发全表重做——满表
+        10,000 行时那一下要在事件循环上付 ~91ms(实测 13.9MB payload),生产约一天
+        一次。全量重写只剩 reset_quality(整表作废)一条路。见 selector 的
+        _dirty_metric_keys / _metric_delete_keys 不变式注释。
         """
         self._persist_flush_state(self._snapshot_flush_state())
 
