@@ -147,6 +147,14 @@ _DEAD_TARGET_MIN_FAILS = 2
 _DEAD_TARGET_PROVE_WINDOW = 60.0
 _DEAD_TARGET_MAX_ENTRIES = 4096
 
+# 升级中继(见 _handle_ws_upgrade)的响应头读取上限:沿用请求头那两个量级,
+# 防坏上游用无限 header 行把内存吃掉。
+_WS_HEAD_MAX_LINES = _MAX_REQUEST_HEADER_LINES
+_WS_HEAD_MAX_BYTES = _MAX_REQUEST_HEADER_BYTES
+# 升级被拒(非 101)时最多替客户端搬的响应体字节。中继不解析分块框架,超限只能
+# 断开(客户端看到截断),不能无界缓冲。
+_WS_REJECT_BODY_MAX = 1024 * 1024
+
 # 错峰启动(staggered start,RFC 8305 §5)的配置下限。
 # 默认间隔 100ms,下限 100ms(绝对值下限 10ms,防止丢包率高时拥塞崩溃),上限 2s。
 # stagger_interval 由 __init__ 钳制到此区间,配置传 0/负值时落到默认。
@@ -180,6 +188,29 @@ _HOP_BY_HOP_RESPONSE_HEADERS = frozenset({
     'transfer-encoding', 'content-length', 'connection', 'keep-alive',
     'proxy-connection', 'te', 'trailer', 'upgrade',
 })
+
+# 升级请求转发时**只**剔除这两个头。与 _HOP_BY_HOP_REQUEST_HEADERS 相反:
+# connection/upgrade 就是握手本身,剔除后上游必然回 400(JumpServer 的
+# "连接通道异常"即此);而 proxy-authorization 是客户端访问本代理的凭据,
+# proxy-connection 是非标准跳用头,都不该透传上游。
+_WS_RELAY_STRIPPED_HEADERS = frozenset({'proxy-authorization', 'proxy-connection'})
+
+
+def _is_upgrade_request(method: str, headers: dict) -> bool:
+    """请求是否为协议升级握手(WebSocket 客户端走 HTTP 代理的标准写法)。
+
+    RFC 6455 §4.1 的判据是"GET + Upgrade + Connection 含 upgrade 记号",三者缺一
+    不是握手。Connection 可以是多记号(C Chrome 发 "keep-alive, Upgrade"),故按
+    逗号分词再匹配,而不是子串判断(否则 "cupgradex" 之类也算命中)。
+    """
+    if method.upper() != 'GET':
+        return False
+    if not (headers.get('upgrade') or '').strip():
+        return False
+    tokens = {t.strip().lower()
+              for t in headers.get('connection', '').replace(';', ',').split(',')
+              if t.strip()}
+    return 'upgrade' in tokens
 
 
 class _UpstreamServerError(Exception):
@@ -564,6 +595,10 @@ class Router:
         self.domain_cache_hits = 0     # 域名缓存命中(单发上游,跳过竞速)
         self.racing_invocations = 0    # 竞速轮次(首批 + 兜底批;HTTP 与 CONNECT 都计)
         self.upstream_attempts = 0     # 竞速扇出总尝试数(每个 _try_http/_try_tunnel +1)
+        # ── 协议升级(WebSocket)中继:见 _handle_ws_upgrade ──
+        self.ws_upgrades = 0           # 收到并接管的升级握手数
+        self.ws_upgrade_rejected = 0   # 畸形目标(绝对 URL 解不出 host)被 400 的握手数
+        self.ws_upgrade_failed = 0     # 全部候选都打不开 → 502 的握手数
 
         # ── 上游连接池 ──────────────────────────────────────────
         # 每个"代理标识"维护一个长驻 httpx.AsyncClient,跨请求复用 keep-alive
@@ -1760,6 +1795,9 @@ class Router:
             "local_direct_hits": self.local_direct_hits,
             "local_direct_failures": self.local_direct_failures,
             "local_direct_circuit_short": self.local_direct_circuit_short,
+            "ws_upgrades": self.ws_upgrades,
+            "ws_upgrade_rejected": self.ws_upgrade_rejected,
+            "ws_upgrade_failed": self.ws_upgrade_failed,
             "dead_target_ttl_sec": self.dead_target_ttl_sec,
             "dead_target_marked": self.dead_target_marked,
             "dead_target_fastfails": self.dead_target_fastfails,
@@ -3240,6 +3278,13 @@ class Router:
             req_headers['content-length'] = str(len(body))
         else:
             body = await asyncio.wait_for(reader.readexactly(content_length), timeout=_CLIENT_BODY_TIMEOUT) if content_length else b''
+        if _is_upgrade_request(method, req_headers):
+            # 升级握手接管整条连接(101 之后是裸帧,没有"下一个请求"),所以这里
+            # 必须直接返回 False,不能让外层按 keep-alive 继续 readline —— 那会把
+            # WebSocket 帧当请求行解析。拦截点在缓存/聚合/竞速三层之前:握手既不
+            # 可缓存也不该被去重聚合(见 _handle_ws_upgrade)。
+            await self._handle_ws_upgrade(url, req_headers, reader, writer, client_ip)
+            return False
         await self._handle_http_request(method, url, req_headers, body, writer, client_ip)
         connection = {v.strip().lower() for v in req_headers.get('connection', '').split(',')}
         return version.upper() == 'HTTP/1.1' and 'close' not in connection
@@ -3447,6 +3492,241 @@ class Router:
                                             entry['headers'], entry['content']))
                     else:
                         agg_fut.set_result(None)
+
+    # ── 协议升级(WebSocket)中继 ──────────────────────────────────
+
+    def _ws_candidate_pids(self, domain: str, client_ip: str = "") -> List[str]:
+        """升级握手的候选顺序:粘性 → 域名缓存 → 该域名的 Cost 排序(串行,不竞速)。
+
+        优先级与决策链一致(粘性 > 缓存 > 竞速),因为长通道必须落在客户端本次会话
+        一直在用的那个出口 IP 上,否则源站侧的 session 与通道会分到两台机器 —— 表现
+        又是"连接通道异常"。_get_sticky_proxy 自带熔断/策略/TTL/驱逐判定,粘性未启用
+        时它一次布尔比较就返回 None,不额外花钱。这里只**跟随**钉选,不回填 hits:
+        握手的重连节奏不该去扰动 recheck_hits 的探路节律(那由普通请求维护)。
+        """
+        if self._host_in_local_direct(domain) or self._is_internal_target(domain):
+            # 远端上游坐在另一张网上,绕过去多半打不回这个 host;本机直连才是对的
+            # 路径(与 CONNECT / 普通 HTTP 的同款判定)。
+            self.local_direct_hits += 1
+            return ['local']
+        pids: List[str] = []
+        for pid in (self.sticky._get_sticky_proxy(client_ip, domain),
+                    self._get_fresh_proxy(domain)):
+            if pid and pid not in pids and (pid == 'local' or self.proxy_store.get(pid)):
+                pids.append(pid)
+        for pid in self._policy_candidate_pids(
+                domain, self.selector.ordered_for_domain(domain)):
+            if pid not in pids:
+                pids.append(pid)
+        if self.enable_local_racing and 'local' not in pids:
+            pids.append('local')
+        return pids
+
+    @staticmethod
+    def _ws_request_head(request_line: str, headers: dict,
+                         auth_hdr: Optional[str] = None) -> Optional[bytes]:
+        """拼出发给上游的升级握手请求头;含 CR/LF 的头值返回 None(拒绝)。
+
+        请求行由调用方决定形式(绝对 URL 给上游代理 / origin-form 给源站)。头名
+        在 handle_client 已统一小写、值由 readline+splitlines 切出,理论上不含
+        CR/LF;这里仍然逐值检查 —— 本函数刻意**不**剔除 connection/upgrade(它们
+        就是握手内容),等于把客户端可控字符串原样写上另一条 TCP,请求行注入的
+        收益远大于成本,值得挡一道。
+        """
+        out = [request_line]
+        for k, v in headers.items():
+            if k in _WS_RELAY_STRIPPED_HEADERS:
+                continue
+            if '\r' in v or '\n' in v:
+                return None
+            out.append(f"{k}: {v}\r\n")
+        if auth_hdr:
+            out.append(auth_hdr)
+        out.append("\r\n")
+        # 头值是 latin-1 解出来的(码点必 ≤255),回编码无损,与 _hb 同理。
+        return ''.join(out).encode('latin-1')
+
+    async def _read_ws_head(self, reader) -> Tuple[str, bytes]:
+        """读上游的握手响应头,返回 (状态码字符串, 含结尾空行的原始头字节)。
+
+        行/字节上限沿用请求头那两个量级:超限抛 ConnectionError,由调用方按"这
+        个候选不行"处理。状态码解析精确到 `HTTP/1.x <code>`(同 _try_tunnel 的
+        P3#7 教训:子串匹配会把 2000/原因短语里的 200 读成成功)。
+        """
+        raw = bytearray()
+        lines = 0
+        while True:
+            h = await asyncio.wait_for(reader.readline(), timeout=self._http_read_timeout_sec)
+            if not h:
+                raise ConnectionError('no response from upstream')
+            raw.extend(h)
+            lines += 1
+            if lines > _WS_HEAD_MAX_LINES or len(raw) > _WS_HEAD_MAX_BYTES:
+                raise ConnectionError('upgrade response header limit exceeded')
+            if h in (b"\r\n", b"\n"):
+                break
+        first = raw.decode('latin-1').split('\n', 1)[0]
+        parts = first.split(' ', 2)
+        code = parts[1] if len(parts) >= 2 and parts[0].startswith('HTTP/') else ''
+        return code, bytes(raw)
+
+    async def _write_ws_reject(self, writer, up_reader, raw_head: bytes) -> None:
+        """升级被拒(非 101):按普通响应把上游回包搬回客户端,随后两侧断开。
+
+        响应头**原样**透传(不改框架),body 有 Content-Length 就精确读那么多、
+        没有就读到 EOF,两者都受 _WS_REJECT_BODY_MAX 约束。裸中继不解析分块编码,
+        所以 chunked 与 1xx 后紧跟的真响应都落在"读到 EOF"分支里,字节流依然正确,
+        只是可能提前触顶截断 —— 诚实截断优于无界缓冲。
+        """
+        writer.write(raw_head)
+        await writer.drain()
+        cl = re.search(r'^content-length: *(\d+)',
+                       raw_head.decode('latin-1').lower(), re.M)
+        remaining = int(cl.group(1)) if cl else -1
+        sent = 0
+        try:
+            while True:
+                want = 65536 if remaining < 0 else min(65536, remaining)
+                if want == 0:
+                    break
+                chunk = await asyncio.wait_for(up_reader.read(want),
+                                               timeout=self._http_read_timeout_sec)
+                if not chunk:
+                    break
+                writer.write(chunk)
+                await writer.drain()
+                sent += len(chunk)
+                if remaining >= 0:
+                    remaining -= len(chunk)
+                elif sent >= _WS_REJECT_BODY_MAX:
+                    break
+        except (asyncio.TimeoutError, OSError, ConnectionError) as e:
+            logger.debug("ws reject relay ended early: %s", type(e).__name__)
+
+    async def _handle_ws_upgrade(self, url: str, headers: dict, client_reader, writer,
+                                 client_ip: str = "") -> None:
+        """中继一个协议升级握手(WebSocket):原样转发请求头,101 后双向裸管道。
+
+        为什么不能走既有 HTTP 路径:httpx 不承载 101(Switching Protocols 之后
+        连接归上层,没有 body 语义),而 hop-by-hop 剔除会删掉 `Connection` 与
+        `Upgrade`(见 _HOP_BY_HOP_REQUEST_HEADERS)—— 那是为"这一跳的连接管理"
+        设计的规则,套到握手上就是"上游收到一个没有 Upgrade 的普通 GET",回 400。
+        JumpServer 的"连接通道异常"即此:通道建不起来,时不时整页中断。
+
+        形态(RFC 6455 §1.6.1):
+        - 上游代理:拨**代理自己的** host:port,请求行用客户端给的绝对形式,跳用
+          凭据换成该上游的 Proxy-Authorization。不用 CONNECT —— 上游常按 ACL 只
+          放行 CONNECT 到 443,7777 这类端口会被拒;绝对形式 GET 才是它最本职的
+          转发,也与 httpx 走 http:// 目标时的报文完全一致(今天能用的上游,这里
+          就能用)。
+        - 本机直连(白名单/内网目标):拨源站,请求行换成 origin-form(源站不认
+          绝对形式)。
+
+        不竞速:升级是长连接,并行 N 个握手会在源站生成 N 个会话(浏览器只认第一
+        个),余下的是没人关闭的幽灵 session。候选只能串行试,代价是一次握手 TTFB,
+        换来的是上游侧只有一次真实会话。
+
+        101 → 握手响应原样回写客户端,随后复用 CONNECT 的 _relay_tunnel 双向透传
+        (字节/吞吐/OFB 统计同隧道);非 101 → 按普通响应回写后断开,这**不是**代理
+        故障,不喂熔断。全候选失败 → 502(并交给目标级不可达判定)。
+        """
+        self.ws_upgrades += 1
+        try:
+            parts = urllib.parse.urlsplit(url)
+            host = parts.hostname or ''
+            port = parts.port or (443 if parts.scheme in ('https', 'wss') else 80)
+        except ValueError:
+            host, port = '', 0
+        domain = domain_key_from_url(url)
+        if not host:
+            # 解不出主机就没有可拨的目标(origin-form 请求行、非法 IPv6 字面量):
+            # 回 400 关连接,不猜。
+            self.ws_upgrade_rejected += 1
+            await self._write_cached_response(writer, 400, 'Bad Request',
+                                              {'Connection': 'close'}, b'Bad Request')
+            return
+        if self._dead_target_active(domain):
+            self.dead_target_fastfails += 1
+            logger.info("dead target FAST-FAIL ws request %s", url)
+            await self._write_cached_response(writer, 502, 'Bad Gateway',
+                                              {'Connection': 'close'}, b'Bad Gateway')
+            return
+        path = parts.path or '/'
+        if parts.query:
+            path = f"{path}?{parts.query}"
+        pids = self._ws_candidate_pids(domain, client_ip)
+        last_err: Optional[BaseException] = None
+        for pid in pids:
+            proxy = None if pid == 'local' else self.proxy_store.get(pid)
+            auth_hdr = None
+            if proxy is None:
+                request_line = f"GET {path} HTTP/1.1\r\n"
+            else:
+                request_line = f"GET {url} HTTP/1.1\r\n"
+                if proxy.auth:
+                    raw = (f"{proxy.auth.get('username', '')}:"
+                           f"{proxy.auth.get('password', '')}")
+                    auth_hdr = ("Proxy-Authorization: Basic "
+                                f"{base64.b64encode(raw.encode()).decode()}\r\n")
+            head = self._ws_request_head(request_line, headers, auth_hdr)
+            if head is None:
+                self.ws_upgrade_rejected += 1
+                logger.info("ws upgrade REJECT url=%s via=%s (CR/LF in header value)",
+                            url, pid)
+                await self._write_cached_response(writer, 400, 'Bad Request',
+                                                  {'Connection': 'close'}, b'Bad Request')
+                return
+            self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
+            self.upstream_attempts += 1
+            t0 = time.perf_counter()
+            up_reader = up_writer = None
+            try:
+                up_reader, up_writer = await self._open_resolved(
+                    (proxy.host if proxy else host),
+                    (proxy.port if proxy else port),
+                    self._tunnel_timeout_sec if proxy else self._local_direct_timeout,
+                    phase='ws-upgrade', pid=pid, target=domain)
+                up_writer.write(head)
+                await up_writer.drain()
+                code, raw_head = await self._read_ws_head(up_reader)
+            except (asyncio.TimeoutError, OSError, ConnectionError, ValueError) as e:
+                await self._close_stream_writer(up_writer)
+                if proxy is not None:
+                    # local 直连失败不喂熔断(同 _forward_local_direct_http 的约定:
+                    # 本机网络的问题不该让某个候选背熔断计数)。
+                    self.selector.record_failure(pid, self._classify_error(e), domain)
+                self._log_attempt_failure(client_ip, domain, domain, pid, e, t0)
+                last_err = e
+                continue
+            ttfb = time.perf_counter() - t0
+            self.selector.record_ttfb(pid, ttfb, domain)
+            if code != '101':
+                # 升级被拒/上游没按握手理解这个请求:普通响应回写,代理无罪。
+                logger.info("ws upgrade NOT-SWITCHED url=%s via=%s code=%s", url, pid, code or '-')
+                await self._write_ws_reject(writer, up_reader, raw_head)
+                await self._close_stream_writer(up_writer)
+                return
+            self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
+            self.selector.record_success(pid)
+            self._record_attempt(domain, pid)
+            self._record_win_meta(domain, pid)
+            writer.write(raw_head)
+            await writer.drain()
+            logger.info("ws upgrade OK url=%s via=%s ttfb=%.0fms", url, pid, ttfb * 1000)
+            await self._relay_tunnel(client_reader, up_writer, up_reader, writer,
+                                     proxy.host if proxy else None,
+                                     proxy.port if proxy else None,
+                                     domain, pid=pid)
+            return
+        self.ws_upgrade_failed += 1
+        logger.info("ws upgrade FAILED url=%s candidates=%s err=%s", url,
+                    ','.join(pids) or '-', type(last_err).__name__ if last_err else '-')
+        if pids and last_err is not None:
+            # 每个候选都在传输层失败 → 责任更可能在目标(端口没监听/防火墙挡了),
+            # 交给目标级不可达判定:两轮同样的失败后直接 502,不再白烧握手。
+            self._note_target_race_failure(domain)
+        await self._write_cached_response(writer, 502, 'Bad Gateway',
+                                          {'Connection': 'close'}, b'Bad Gateway')
 
     def _observe_single_send(self, client_ip: str, domain: str, target: str, pid: str,
                              perf_t0: float) -> None:

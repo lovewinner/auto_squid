@@ -67,6 +67,12 @@ Dashboard: <http://127.0.0.1:18080/> (redirects to `/panel/domains`).
 - **HTTP response cache** — idempotent `GET` bodies cached in memory (`ttl`, respects `Cache-Control`); `POST/PUT/DELETE/PATCH` invalidate that domain's cached GETs. A single response larger than `max_bytes/2` is deliberately not cached.
 - **In-flight GET coalescing** — concurrent requests for the same URL share one upstream fetch.
 
+**Protocol upgrades (WebSocket)**
+- **Raw upgrade relay** — a `GET` carrying `Upgrade` + a `Connection: upgrade` token bypasses httpx, the response cache and the race entirely (`_handle_ws_upgrade`; a sticky pin is still followed, see below). Two reasons: httpx cannot carry `101 Switching Protocols`, and the ordinary hop-by-hop rules would delete `Connection`/`Upgrade` — i.e. hand the origin a plain GET, which is why web terminals reported "channel error" and dropped every few minutes.
+- **Forwarded verbatim** — every client header reaches the upstream except `proxy-authorization` / `proxy-connection`; the request line is absolute-form to an upstream proxy (RFC 6455 §1.6.1 — no `CONNECT`, so upstream ACLs that only tunnel `:443` don't sink `:7777`) and origin-form when dialing the origin directly.
+- **Sequential candidates, never a race** — a race would fire N handshakes and leave N sessions at the origin, only one of which the client ever owns. Order follows the decision chain (sticky pin → domain cache → Cost order, narrowed by `policies`) so a long channel stays on the egress IP the rest of the session uses; after `101` the connection becomes a raw bidirectional pipe (`_relay_tunnel`, same byte/throughput accounting as a tunnel).
+- **A rejected upgrade is not a proxy failure** — a non-`101` answer is relayed back as an ordinary response (headers untouched, body bounded) and charges nothing to the circuit breaker. Counters: `ws_upgrades`, `ws_upgrade_rejected`, `ws_upgrade_failed`.
+
 **Connection pooling (CONNECT)**
 - **Phase 1** — a pool of idle TCP connections to each upstream proxy.
 - **Phase 2** (`target_prewarm`) — the same kind of bare TCP, bucketed by `(proxy, target)` and pre-built when a domain-cache/sticky hit or race win predicts a repeat.
@@ -86,17 +92,19 @@ Dashboard: <http://127.0.0.1:18080/> (redirects to `/panel/domains`).
 
 The decision chain (`auto_squid/router.py`):
 
-1. **Accept & parse** — `handle_client` reads the request head, enforces client Basic auth (`407` before any upstream work), and rejects over-limit request heads with a single INFO line instead of a traceback. `CONNECT` → `_handle_connect`; plain HTTP → `_handle_http_request`.
+1. **Accept & parse** — `handle_client` reads the request head, enforces client Basic auth (`407` before any upstream work), and rejects over-limit request heads with a single INFO line instead of a traceback. `CONNECT` → `_handle_connect`; plain HTTP → `_handle_http_request`. One exception is intercepted before either: an upgrade handshake (`GET` + `Upgrade` + `Connection: upgrade`) goes straight to `_handle_ws_upgrade` and takes the connection over, so steps 2–6 never see it.
 2. **Short-circuits** — `local_direct_domains` (dial the origin directly), in-flight GET coalescing, HTTP response cache hit.
 3. **Dispatch** (`_dispatch_single`) — in priority order:
    0. **dead-target gate** → if two consecutive races for this target failed on *every*
       candidate and the target has no success observation in the last 60 s, answer 502
       for `dead_target_ttl_sec` seconds without touching the pool (see [Tuning](#tuning));
+      the upgrade relay of step 1 shares this gate, so an unreachable target doesn't pay
+      a fresh handshake on every client retry;
    1. **session stickiness** → single-send on the pinned proxy;
    2. **domain cache** → single-send on the last winner within its TTL;
    3. **racing** (`_race_staggered`) → Cost-ordered candidates, staggered launch.
 4. **Connection acquisition** — an established tunnel is never reused; per request the router takes a TCP in the order **Phase 2 → Phase 1 → cross-phase steal → new connection**, then sends `CONNECT`. A stale pooled connection is detected at take time, discarded and retried fresh — and does **not** count against the circuit breaker.
-5. **Response framing** — hop-by-hop headers are stripped (`proxy-authorization` never reaches the upstream), `Content-Length` is recomputed after decoding a chunked request body, and `Transfer-Encoding` takes precedence over `Content-Length` (RFC 9112 §6.1). HTTP/1.0 clients get close-delimited bodies instead of chunked framing (RFC 9112 §2.7); `HEAD`, `204`, `304` and 1xx never carry a body. Truncated upstream responses are detected and reported rather than silently forwarded.
+5. **Response framing** — hop-by-hop headers are stripped (`proxy-authorization` never reaches the upstream; upgrade handshakes are the deliberate exception, see step 1), `Content-Length` is recomputed after decoding a chunked request body, and `Transfer-Encoding` takes precedence over `Content-Length` (RFC 9112 §6.1). HTTP/1.0 clients get close-delimited bodies instead of chunked framing (RFC 9112 §2.7); `HEAD`, `204`, `304` and 1xx never carry a body. Truncated upstream responses are detected and reported rather than silently forwarded.
 6. **Feedback** — the winner updates EWMA/TTFB/OFB, protocol version, throughput (plaintext bodies) and the domain cache; failures call `record_failure`, feeding the circuit breaker in `selector.py`. Two failure classes are *not* charged to a proxy: business rejections (`http_status`) and **target-level** failures — when ≥3 distinct proxies fail the *same* target inside 10 s with no success on it in that window, the target is unreachable, not the pool (one race is exactly `max_retries` = `circuit_threshold`, so without this a single dead domain trips every candidate). A degraded single-send triggers `_degrade_send_proxy`, so the *next* request for that domain skips stickiness/cache and re-races.
 
 ### Where each knob acts
@@ -288,7 +296,7 @@ All on `:18080`. With `api.auth.enabled`, everything except `GET /health` requir
 | `GET /stickiness` | pin table `client_ip|domain → proxy` — top-N **most recently used** (`?limit=`) |
 | `GET /policies` | policy-routing snapshot |
 | `GET /config` | currently only `{"enable_local_racing": …}` |
-| `GET /metrics` | `request_counts`, `attempted_counts`, **full** `domain_stats`, ~80 `counters`, `proxy_metrics` |
+| `GET /metrics` | `request_counts`, `attempted_counts`, **full** `domain_stats`, ~90 `counters`, `proxy_metrics` |
 | `GET /metrics/per-destination?domain=` | per `(domain, proxy)` percentiles, error classes and the lifetime `cumulative` object; omit `domain` for the whole grid (raw samples stripped), pass one for a cheap drill-down |
 | `GET /quality` | per-proxy EWMA first-byte latency (s) — the legacy ordering basis |
 | `GET /quality/meta` | per-proxy: windowed TTFB/OFB percentiles, `throughput_ewma_mbps` (bodies only), `tunnel_relay_ewma_mbps` (observation), `body_bytes_transferred`, windowed + lifetime success rates, error breakdown, HTTP-version counts, the `cumulative` lifetime object, and `cost_breakdown` |
@@ -325,6 +333,7 @@ Unknown JSON fields are rejected with `422` on `/cost` and `/tuner` (`extra="for
 | Counter | Meaning | What healthy looks like |
 |---|---|---|
 | `http_cache_hits` / `_misses`, `domain_cache_hits`, `sticky_cache_hits` | short-circuit rates | high hit rates mean fewer races |
+| `ws_upgrades` / `ws_upgrade_failed` / `ws_upgrade_rejected` | handshakes relayed as raw pipes, handshakes with no reachable candidate (502), malformed targets (400) | `failed`/`rejected` ≈ 0; if a web terminal drops while `ws_upgrades` keeps climbing, the proxy carried the channel and the origin closed it |
 | `racing_invocations`, `upstream_attempts` | race **rounds** (initial + fallback, HTTP **and** CONNECT — CONNECT was not counted until now) vs total attempts; amplification = attempts ÷ requests, fan-out = attempts ÷ rounds | amplification ≤ ~1.5 on CONNECT-heavy traffic; and > 0 whenever racing is genuinely happening (it used to read 0 on a CONNECT-only box) |
 | `conn_pool_hits` / `_misses` / `_steals` / `_expired`, `target_pool_*` | pool effectiveness — `steals` are cross-phase borrows, and `misses` now means "both pools empty → had to build a TCP" | few `expired` relative to `creates` |
 | `pool_stale_discards` | half-closed connections caught at take time | should fall together with `stale_conn_retries` once `idle_timeout` is low enough |
@@ -410,7 +419,7 @@ Multi-stage image, non-root user, health check, and a `./data` volume for SQLite
 ## Testing
 
 ```bash
-uv run pytest -q --timeout=60      # 500 tests, ~90 s
+uv run pytest -q --timeout=60      # 527 tests, ~90 s
 ```
 
 Coverage spans HTTP/`CONNECT` forwarding and framing (HTTP/1.0 downgrade, `HEAD`, truncation detection), the HTTP cache (LRU order, eviction, coalescing), the domain cache, racing and aggregation timeouts, client and API auth, the CSRF guard, circuit breaker / probing / EWMA / in-flight weighting, stickiness, per-domain stats and SQLite persistence, UTF-8 and binary-safe bodies, both pools plus the cross-phase steal, idle pause and budget accounting, config-layer validation and exit codes, and event-loop hygiene tests that fail if a background task leaves an orphan DNS future. `tests/test_phase_metrics.py` covers the metric and ranking layer, `tests/test_tuner.py` the auto-tuner.
@@ -440,6 +449,7 @@ Reports print throughput, TTFB/total at P50/P95/P99, error classes, cache hit ra
 ## Limitations
 
 - HTTP parsing is MVP-level: headers and framing are handled carefully, but very large streaming responses can still hit edge cases.
+- WebSocket relaying is **byte-level, not protocol-aware**: the handshake is forwarded verbatim (extension negotiation stays the origin's business), candidates are tried one at a time — an upgrade never benefits from racing, so a dead first candidate costs a full handshake timeout — and a *rejected* upgrade's body is relayed up to 1 MiB without re-framing. Once `101` is issued the pipe inherits the tunnel's 300 s idle read timeout (`_pipe`), not `http_read_timeout_sec`: a channel that stays silent for 5 minutes is closed on both sides.
 - Upstream `protocol` is HTTP-only in practice (`https`/`socks5` have no implementation).
 - `CONNECT` tunnels are raw byte pipes — no TLS interception, so per-tunnel "throughput" cannot describe origin transfer speed.
 - In-memory state (stickiness, domain cache, HTTP response cache, windowed samples) is cleared on restart; only lifetime counters, t-digests and domain win counts survive in SQLite.

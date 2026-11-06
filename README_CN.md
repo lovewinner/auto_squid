@@ -67,6 +67,12 @@ curl -x http://127.0.0.1:10808 https://www.baidu.com
 - **HTTP 响应缓存** — 幂等 `GET` 的响应体缓存在内存(`ttl`,遵循 `Cache-Control`);`POST/PUT/DELETE/PATCH` 会失效该域名已缓存的 GET。单个响应体超过 `max_bytes/2` 会被刻意跳过缓存。
 - **在途 GET 合并** — 同一 URL 的并发请求共享一次上游取回。
 
+**协议升级(WebSocket)**
+- **裸中继升级握手** — 带 `Upgrade` 且 `Connection` 含 `upgrade` 记号的 `GET` 完全绕开 httpx、响应缓存与竞速三层(`_handle_ws_upgrade`;粘性钉选只被跟随,见下)。原因有二:httpx 承载不了 `101 Switching Protocols`;而常规的逐跳头规则会把 `Connection`/`Upgrade` 一并剥掉,等于给源站发一个普通 GET —— 这正是 Web 终端"连接通道异常"、隔几分钟整页断线的根因。
+- **原样转发** — 除 `proxy-authorization` / `proxy-connection` 外,客户端的每个头都原序送到上游;请求行按路径分两种形式:走上游代理时用客户端给的绝对形式(RFC 6455 §1.6.1 —— 不用 `CONNECT`,因此只放行 443 隧道端口的上游 ACL 不会把 7777 这类端口拒掉),本机直连源站时换成 origin-form(源站不认绝对形式)。
+- **候选串行,绝不竞速** — 竞速会同时发起 N 次握手,在源站生成 N 个会话,而客户端只认第一个,剩下的是没人关闭的幽灵连接。顺序沿用决策链(粘性钉选 → 域名缓存 → Cost 排序,并同样受 `policies` 收窄),让长通道落在本次会话一直在用的那个出口 IP 上;拿到 `101` 之后这条连接就是裸双向管道(复用 `_relay_tunnel`,字节/吞吐/OFB 口径与隧道一致)。
+- **升级被拒不等于代理故障** — 非 `101` 的答复按普通响应原样回写(不改成帧,body 有上限),不给熔断记一笔。计数:`ws_upgrades`、`ws_upgrade_rejected`、`ws_upgrade_failed`。
+
 **连接池(CONNECT)**
 - **第一阶段** — 到每个上游代理的空闲 TCP 连接池。
 - **第二阶段**(`target_prewarm`)— 同类裸 TCP,按 `(proxy, target)` 分桶,在域名缓存/粘性命中或竞速胜出预示"还会再来"时提前建好。
@@ -86,16 +92,17 @@ curl -x http://127.0.0.1:10808 https://www.baidu.com
 
 决策链(`auto_squid/router.py`):
 
-1. **接入与解析** — `handle_client` 读取请求头,先执行客户端 Basic 鉴权(在任何上游动作之前返回 `407`),请求头超限则只打一行 INFO 而不是抛 traceback。`CONNECT` → `_handle_connect`;明文 HTTP → `_handle_http_request`。
+1. **接入与解析** — `handle_client` 读取请求头,先执行客户端 Basic 鉴权(在任何上游动作之前返回 `407`),请求头超限则只打一行 INFO 而不是抛 traceback。`CONNECT` → `_handle_connect`;明文 HTTP → `_handle_http_request`。只有一个例外会在这两步之前被截走:升级握手(`GET` + `Upgrade` + `Connection: upgrade`)直接进 `_handle_ws_upgrade` 并接管整条连接,第 2~6 步完全看不到它。
 2. **短路** — `local_direct_domains`(直连源站)、在途 GET 合并、HTTP 响应缓存命中。
 3. **派发**(`_dispatch_single`)— 按优先级:
    0. **死目标闸门** → 同一目标连续两轮"全体候选失败"、且近 60s 内没有任何成功观测 →
-      在 `dead_target_ttl_sec` 秒内直接回 502,完全不碰代理池(见[调优](#调优));
+      在 `dead_target_ttl_sec` 秒内直接回 502,完全不碰代理池(见[调优](#调优));第 1 步的
+      升级中继共用这道闸门 —— 一个到不了的目标不该让每次重试都白烧一轮握手;
    1. **会话粘性** → 在钉选的代理上单发;
    2. **域名缓存** → 在 TTL 内的上次胜者上单发;
    3. **竞速**(`_race_staggered`)→ Cost 排序候选,交错发射。
 4. **连接获取** — 已建立的隧道绝不复用;每次请求按 **第二阶段 → 第一阶段 → 跨阶段借用 → 新建连接** 的顺序取一条 TCP,然后发送 `CONNECT`。取回时若发现连接已陈旧,立即丢弃并重开新连接——且**不**计入熔断。
-5. **响应成帧** — 逐跳头部被剥离(`proxy-authorization` 绝不会漏到上游),请求体为 chunked 时先解码再重算 `Content-Length`,`Transfer-Encoding` 优先于 `Content-Length`(RFC 9112 §6.1)。HTTP/1.0 客户端拿到 close 定界而非 chunked 成帧(RFC 9112 §2.7);`HEAD`、`204`、`304`、1xx 一律不带响应体。上游响应被截断时会被检测并上报,而不是静默转发。
+5. **响应成帧** — 逐跳头部被剥离(`proxy-authorization` 绝不会漏到上游;升级握手是刻意例外,见第 1 步),请求体为 chunked 时先解码再重算 `Content-Length`,`Transfer-Encoding` 优先于 `Content-Length`(RFC 9112 §6.1)。HTTP/1.0 客户端拿到 close 定界而非 chunked 成帧(RFC 9112 §2.7);`HEAD`、`204`、`304`、1xx 一律不带响应体。上游响应被截断时会被检测并上报,而不是静默转发。
 6. **反馈** — 胜者更新 EWMA/TTFB/OFB、协议版本、吞吐(明文响应体)和域名缓存;失败调用 `record_failure`,喂给 `selector.py` 里的熔断器。有两类失败**不计到代理头上**:业务拒绝(`http_status`)与**目标级失败**——同一目标在 10s 内被 ≥3 个不同代理失败、且窗口内无人成功过,说明是目标到不了,不是这批代理都坏了(一轮竞速恰好 `max_retries` = `circuit_threshold`,不加区分时一个死域名就能把参与的每个候选各熔断一次)。退化的单发触发 `_degrade_send_proxy`,让该域名的*下一个*请求跳过粘性/缓存直接重新竞速。
 
 ### 各旋钮作用在哪
@@ -287,7 +294,7 @@ config error: invalid configuration:
 | `GET /stickiness` | 钉选表 `client_ip|domain → proxy` —— 取 **最近使用** Top-N(`?limit=`) |
 | `GET /policies` | 策略路由快照 |
 | `GET /config` | 目前只有 `{"enable_local_racing": …}` |
-| `GET /metrics` | `request_counts`、`attempted_counts`、**全量** `domain_stats`、约 80 项 `counters`、`proxy_metrics` |
+| `GET /metrics` | `request_counts`、`attempted_counts`、**全量** `domain_stats`、约 90 项 `counters`、`proxy_metrics` |
 | `GET /metrics/per-destination?domain=` | 按 `(domain, proxy)` 的分位数、错误分类与终身 `cumulative` 对象;省略 `domain` 返回整张网格(剥掉原始样本),带上则是一次便宜的钻取 |
 | `GET /quality` | 每代理 EWMA 首字节延迟(秒)—— 历史遗留的排序依据 |
 | `GET /quality/meta` | 每代理:窗口 TTFB/OFB 分位数、`throughput_ewma_mbps`(仅响应体)、`tunnel_relay_ewma_mbps`(仅供观测)、`body_bytes_transferred`、窗口 + 终身成功率、错误分解、HTTP 版本计数、`cumulative` 终身对象,以及 `cost_breakdown` |
@@ -324,6 +331,7 @@ config error: invalid configuration:
 | 计数器 | 含义 | 健康的样子 |
 |---|---|---|
 | `http_cache_hits` / `_misses`、`domain_cache_hits`、`sticky_cache_hits` | 短路命中率 | 命中率高意味着竞速次数少 |
+| `ws_upgrades` / `ws_upgrade_failed` / `ws_upgrade_rejected` | 被接管的 WebSocket 握手数、找不到任何可达候选的握手数(502)、目标写法畸形的握手数(400) | `failed`/`rejected` ≈ 0;`ws_upgrades` 持续上涨而 `failed` 不动,说明通道是本机搬的、被源站关掉的 |
 | `racing_invocations`、`upstream_attempts` | 竞速**轮次**(首批 + 兜底批,HTTP 与 CONNECT 都计——CONNECT 过去不计)对尝试总数;放大比 = 尝试 ÷ 请求,扇出 = 尝试 ÷ 轮次 | CONNECT 为主的流量下放大比 ≤ ~1.5;而且在真正发生竞速的机器上必须 > 0(以前全隧道流量时它读 0) |
 | `conn_pool_hits` / `_misses` / `_steals` / `_expired`、`target_pool_*` | 池有效性 —— `steals` 是跨阶段借用,`misses` 现在的语义是"两个池都空 → 只能新建 TCP" | `expired` 相对 `creates` 很少 |
 | `pool_stale_discards` | 取回时抓到的半关闭连接 | `idle_timeout` 调低后,应与 `stale_conn_retries` 一起下降 |
@@ -409,7 +417,7 @@ curl -x http://127.0.0.1:10808 http://www.baidu.com
 ## 测试
 
 ```bash
-uv run pytest -q --timeout=60      # 500 项,约 90 秒
+uv run pytest -q --timeout=60      # 527 项,约 90 秒
 ```
 
 覆盖范围包括 HTTP/`CONNECT` 转发与成帧(HTTP/1.0 降级、`HEAD`、截断检测)、HTTP 缓存(LRU 顺序、驱逐、合并)、域名缓存、竞速与聚合超时、客户端与 API 鉴权、CSRF 防护、熔断/探测/EWMA/在途加权、粘性、按域名统计与 SQLite 持久化、UTF-8 与二进制安全响应体、两个池加跨阶段借用、空闲挂起与预算记账、配置层校验与退出码,以及事件循环卫生测试(后台任务留下孤儿 DNS future 就会失败)。`tests/test_phase_metrics.py` 覆盖指标与排序层,`tests/test_tuner.py` 覆盖自动调参器。
@@ -439,6 +447,7 @@ uv run python -m bench.stress --rounds 5              # 均值 ± 标准差,每�
 ## 局限
 
 - HTTP 解析属于 MVP 级别:头部与成帧处理得相当小心,但极大的流式响应仍可能踩到边界情况。
+- WebSocket 中继是**字节级、不感知协议**的:握手原样转发(扩展协商归源站管),候选只能串行尝试 —— 升级从不受益于竞速,因此第一个候选不通时要付满一次握手超时;被拒的升级其响应体最多搬运 1 MiB 且不重新成帧。而一旦 `101` 发出,这条管道吃的是隧道的 300s 空闲读超时(`_pipe`),不是 `http_read_timeout_sec`:静默 5 分钟的通道会被两侧关闭。
 - 上游 `protocol` 实际上只支持 HTTP(`https`/`socks5` 没有实现)。
 - `CONNECT` 隧道是原始字节管道 —— 不做 TLS 中间人,因此按隧道的"吞吐"无法描述源站的传输速度。
 - 内存态数据(粘性、域名缓存、HTTP 响应缓存、窗口样本)重启即清空;只有终身计数、t-digest 和域名胜出数在 SQLite 里存活。

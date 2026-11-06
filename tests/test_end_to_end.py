@@ -10176,3 +10176,317 @@ async def test_connect_fallback_round_also_counted():
         client_writer=_FakeConnectWriter(), client_ip='10.0.0.9')
     assert r.snapshot_counters()['racing_invocations'] == 2, \
         "首批 + 兜底批应各计一轮"
+
+
+# ── 协议升级(WebSocket)中继 ────────────────────────────────────
+
+WS_UP_PORT = 31998       # 假上游代理
+WS_ORIGIN_PORT = 31999   # 假源站(本机直连分支)
+WS_ROUTER_PORT = 10898
+
+WS_HANDSHAKE = (
+    b"GET http://ws.test.example:31998/echo?x=1 HTTP/1.1\r\n"
+    b"Host: ws.test.example:31998\r\n"
+    b"Connection: keep-alive, Upgrade\r\n"
+    b"Upgrade: websocket\r\n"
+    b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    b"Sec-WebSocket-Version: 13\r\n"
+    b"Origin: http://ws.test.example\r\n"
+    b"X-Marker: keepme\r\n"
+    b"Proxy-Authorization: Basic Y2xpZW50OnNlY3JldA==\r\n"
+    b"\r\n"
+)
+
+
+async def _run_ws_upstream(port, seen, *, mode='switch', guard_upgrade=True):
+    """假上游/假源站:读到请求头即记进 seen,按 mode 回包,然后当 echo 管道。
+
+    mode='switch' 且 guard_upgrade=True 时,**只有真的看到 Upgrade 头**才回 101:
+    这样"hop-by-hop 规则把握手删空"的老 bug 会当场变成 400,测试必然失败。
+    """
+    async def handle(reader, writer):
+        try:
+            line = await asyncio.wait_for(reader.readline(), timeout=5)
+            if not line:
+                writer.close()
+                return
+            head = [line]
+            while True:
+                h = await asyncio.wait_for(reader.readline(), timeout=5)
+                head.append(h)
+                if not h or h in (b"\r\n", b"\n") or not h.strip():
+                    break
+            text = b"".join(head).decode('latin-1')
+            seen.append(text)
+            low = text.lower()
+            conn_value = next((ln.split(':', 1)[1].lower()
+                               for ln in text.split('\r\n')[1:]
+                               if ln.lower().startswith('connection:')), '')
+            if mode == 'reject':
+                writer.write(b"HTTP/1.1 400 Bad Request\r\n")
+                writer.write(b"Content-Length: 5\r\nConnection: close\r\n\r\n")
+                writer.write(b"nope!")
+                await writer.drain()
+                writer.close()
+                return
+            if guard_upgrade and ('upgrade: websocket' not in low
+                                  or 'upgrade' not in conn_value):
+                writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+                writer.close()
+                return
+            writer.write(b"HTTP/1.1 101 Switching Protocols\r\n")
+            writer.write(b"Upgrade: websocket\r\nConnection: Upgrade\r\n")
+            writer.write(b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n")
+            await writer.drain()
+            while True:
+                data = await asyncio.wait_for(reader.read(4096), timeout=5)
+                if not data:
+                    break
+                writer.write(b"echo:" + data)
+                await writer.drain()
+            writer.close()
+        except Exception:
+            try:
+                writer.close()
+            except Exception:
+                pass
+    return await asyncio.start_server(handle, host=HOST, port=port)
+
+
+async def _read_head(reader):
+    """读客户端侧的响应状态行 + 头,返回 (status_line, 头字节)。"""
+    status = await asyncio.wait_for(reader.readline(), timeout=5)
+    lines = []
+    while True:
+        h = await asyncio.wait_for(reader.readline(), timeout=5)
+        if not h or h in (b"\r\n", b"\n"):
+            break
+        lines.append(h)
+    return status, b"".join(lines)
+
+
+async def _ws_client(url_line: bytes = WS_HANDSHAKE, port=WS_ROUTER_PORT):
+    """连上 router、发出握手,返回 (reader, writer, status, head_bytes)。"""
+    reader, writer = await asyncio.open_connection(HOST, port)
+    writer.write(url_line)
+    await writer.drain()
+    status, head = await _read_head(reader)
+    return reader, writer, status, head
+
+
+class TestWebSocketUpgradeRelay:
+    """HTTP 路径上的协议升级握手必须原样中继,101 之后走裸管道。
+
+    起因:内网 Web 终端(JumpServer)的 ws:// 长通道由浏览器按普通 GET + Upgrade
+    头发给 HTTP 代理。旧实现把它交给 httpx(不承载 101)并按 hop-by-hop 规则删掉
+    Connection/Upgrade(见 _HOP_BY_HOP_REQUEST_HEADERS),上游只看到一个没有握手
+    信息的普通 GET → 400。表现就是"连接通道异常"、终端时不时整页断线。
+    """
+
+    def _router(self, **kw):
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='ws1', host=HOST, port=WS_UP_PORT))
+        kw.setdefault('listen_port', WS_ROUTER_PORT)
+        return make_router(ps, listen_host=HOST, db_path=tempfile.mktemp(suffix='.db'), **kw)
+
+    async def test_handshake_reaches_upstream_and_101_becomes_raw_pipe(self):
+        seen = []
+        srv = await _run_ws_upstream(WS_UP_PORT, seen)
+        r = self._router()
+        await r.start()
+        try:
+            reader, writer, status, head = await _ws_client()
+            assert status.startswith(b"HTTP/1.1 101"), status
+            assert b"sec-websocket-accept" in head.lower(), head
+            assert len(seen) == 1, seen
+            got = seen[0].lower()
+            # 握手的两个命门:头没被 hop-by-hop 规则删掉,且请求行是绝对形式。
+            assert "upgrade: websocket" in got, seen
+            assert "connection: keep-alive, upgrade" in got, seen
+            assert "x-marker: keepme" in got, seen
+            assert 'get http://ws.test.example:31998/echo?x=1 http/1.1' in got, seen
+            # 客户端访问本代理的凭据绝不透传上游。
+            assert "proxy-authorization" not in got, seen
+            # 101 之后是裸管道:客户端发的帧要能到达上游,回帧要能到达客户端。
+            writer.write(b"ping")
+            await writer.drain()
+            echo = await asyncio.wait_for(reader.readexactly(9), timeout=5)
+            assert echo == b"echo:ping", echo
+            counters = r.snapshot_counters()
+            assert counters['ws_upgrades'] == 1
+            assert counters['ws_upgrade_failed'] == 0
+            # 握手绝不进响应缓存/在途聚合(入口就绕开了三层决策链)。
+            assert r.http_cache_misses == 0
+        finally:
+            writer.close()
+            await r.stop()
+            srv.close()
+            await srv.wait_closed()
+
+    async def test_upstream_credentials_replaced_on_tunnel_head(self):
+        """经上游代理时必须换上该上游自己的 Proxy-Authorization,而不是客户端的。"""
+        seen = []
+        srv = await _run_ws_upstream(WS_UP_PORT, seen)
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='ws1', host=HOST, port=WS_UP_PORT,
+                         auth={'username': 'upuser', 'password': 'upass'}))
+        r = make_router(ps, listen_host=HOST, listen_port=WS_ROUTER_PORT,
+                        db_path=tempfile.mktemp(suffix='.db'))
+        await r.start()
+        try:
+            reader, writer, status, _ = await _ws_client()
+            assert status.startswith(b"HTTP/1.1 101"), status
+        finally:
+            writer.close()
+            await r.stop()
+            srv.close()
+            await srv.wait_closed()
+        expect = base64.b64encode(b"upuser:upass").decode()
+        assert f"proxy-authorization: basic {expect}".lower() in seen[0].lower(), seen
+        assert "Y2xpZW50OnNlY3JldA==" not in seen[0], seen
+
+    async def test_upgrade_never_races(self):
+        """升级不竞速:两个候选只应产生一次真实握手(源站侧不留幽灵会话)。"""
+        seen_a, seen_b = [], []
+        sa = await _run_ws_upstream(WS_UP_PORT, seen_a)
+        sb = await _run_ws_upstream(WS_UP_PORT + 1, seen_b)
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='a', host=HOST, port=WS_UP_PORT))
+        ps.add(ProxyInfo(id='b', host=HOST, port=WS_UP_PORT + 1))
+        r = make_router(ps, listen_host=HOST, listen_port=WS_ROUTER_PORT,
+                        max_retries=2, db_path=tempfile.mktemp(suffix='.db'))
+        raced = []
+        real_race = r._race_staggered
+
+        async def spy(places, **kw):
+            raced.append(len(places))
+            return await real_race(places, **kw)
+        r._race_staggered = spy
+        await r.start()
+        try:
+            reader, writer, status, _ = await _ws_client()
+            assert status.startswith(b"HTTP/1.1 101"), status
+            assert not raced, f"升级握手不应进入竞速: {raced}"
+            assert len(seen_a) + len(seen_b) == 1, (seen_a, seen_b)
+            assert sum(r.snapshot_counters()['attempted_counts'].values()) == 1
+        finally:
+            writer.close()
+            await r.stop()
+            for s in (sa, sb):
+                s.close()
+                await s.wait_closed()
+
+    async def test_rejected_upgrade_returns_plain_response_without_blaming_proxy(self):
+        """非 101(上游拒绝升级)按普通响应回写,且不算代理故障。"""
+        seen = []
+        srv = await _run_ws_upstream(WS_UP_PORT, seen, mode='reject')
+        r = self._router()
+        await r.start()
+        try:
+            reader, writer, status, head = await _ws_client()
+            assert status.startswith(b"HTTP/1.1 400"), status
+            assert b"Content-Length: 5" in head, head
+            body = await asyncio.wait_for(reader.readexactly(5), timeout=5)
+            assert body == b"nope!", body
+            assert r.snapshot_counters()['ws_upgrade_failed'] == 0
+            st = r.selector.get_circuit_state().get('ws1')
+            assert st is None or st.get('consec_fail') == 0, \
+                "上游拒绝升级不是代理故障,不该累加熔断证据"
+        finally:
+            writer.close()
+            await r.stop()
+            srv.close()
+            await srv.wait_closed()
+
+    async def test_internal_target_uses_local_direct_origin_form(self):
+        """目标是上游自身 host 时本机直连源站,请求行必须是 origin-form。"""
+        origin, up_seen = [], []
+        srv_origin = await _run_ws_upstream(WS_ORIGIN_PORT, origin)
+        srv_up = await _run_ws_upstream(WS_UP_PORT, up_seen)
+        ps = ProxyStore()
+        # 127.0.0.1 既是某 enabled 代理的 host,又是目标 → _is_internal_target。
+        ps.add(ProxyInfo(id='ws1', host=HOST, port=WS_UP_PORT))
+        r = make_router(ps, listen_host=HOST, listen_port=WS_ROUTER_PORT,
+                        db_path=tempfile.mktemp(suffix='.db'))
+        await r.start()
+        try:
+            reader, writer, status, _ = await _ws_client(
+                WS_HANDSHAKE.replace(b"ws.test.example:31998",
+                                     b"127.0.0.1:31999"))
+            assert status.startswith(b"HTTP/1.1 101"), status
+        finally:
+            writer.close()
+            await r.stop()
+            for s in (srv_origin, srv_up):
+                s.close()
+                await s.wait_closed()
+        assert len(origin) == 1 and not up_seen, (origin, up_seen)
+        assert origin[0].startswith("GET /echo?x=1 HTTP/1.1"), origin
+        assert r.snapshot_counters()['local_direct_hits'] == 1
+
+    async def test_all_candidates_unreachable_returns_502(self):
+        """候选全打不开 → 502,并计数(不能静默挂住客户端连接)。"""
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='dead1', host=HOST, port=31991))
+        ps.add(ProxyInfo(id='dead2', host=HOST, port=31992))
+        r = make_router(ps, listen_host=HOST, listen_port=WS_ROUTER_PORT,
+                        db_path=tempfile.mktemp(suffix='.db'))
+        await r.start()
+        try:
+            reader, writer, status, head = await _ws_client()
+            assert status.startswith(b"HTTP/1.1 502"), status
+            assert r.snapshot_counters()['ws_upgrade_failed'] == 1
+        finally:
+            writer.close()
+            await r.stop()
+
+    def test_candidate_order_follows_sticky_then_domain_cache(self):
+        """长通道要跟着本次会话一直在用的出口 IP:粘性 → 域名缓存 → Cost 排序。"""
+        ps = ProxyStore()
+        for pid in ('a', 'b', 'c'):
+            ps.add(ProxyInfo(id=pid, host=HOST, port=PROXY_PORT))
+        r = make_router(ps, listen_host=HOST, listen_port=WS_ROUTER_PORT,
+                        stickiness_enabled=True, db_path=tempfile.mktemp(suffix='.db'))
+        dom = 'wsorder.test'
+        assert set(r._ws_candidate_pids(dom, '10.0.0.1')) == {'a', 'b', 'c'}
+        r.sticky._record_sticky('10.0.0.1', dom, 'b')
+        r._meta_cache[dom] = {'default_proxy': 'c', 'updated_at': r._now_utc(),
+                              '_updated_mono': time.monotonic()}
+        assert r._ws_candidate_pids(dom, '10.0.0.1')[:2] == ['b', 'c'], \
+            "钉选代理必须排在域名缓存之前(同一条会话同一个出口)"
+        # 别的客户端不该继承这条钉选;域名缓存是全客户端共享的,所以它仍在最前。
+        other = r._ws_candidate_pids(dom, '10.0.0.9')
+        assert other[0] == 'c' and 'b' not in other[:1], other
+
+    def test_upgrade_predicate_requires_all_three_signals(self):
+        """判据 = GET + Upgrade 头 + Connection 里的 upgrade 记号,缺一不算握手。"""
+        from auto_squid.router import _is_upgrade_request
+        ws = {'upgrade': 'websocket', 'connection': 'keep-alive, Upgrade'}
+        assert _is_upgrade_request('GET', ws)
+        assert not _is_upgrade_request('POST', dict(ws))
+        assert not _is_upgrade_request('GET', {'connection': 'Upgrade'})
+        assert not _is_upgrade_request('GET', {'upgrade': 'websocket'})
+        # Connection 只写 keep-alive 的普通 GET:不是握手(否则一切请求都会走中继)。
+        assert not _is_upgrade_request('GET', {'upgrade': 'websocket',
+                                               'connection': 'keep-alive'})
+        # 记号按逗号分词,不做子串匹配。
+        assert not _is_upgrade_request('GET', {'upgrade': 'x',
+                                               'connection': 'cupgradez'})
+
+    def test_request_head_keeps_upgrade_and_drops_proxy_credentials(self):
+        from auto_squid.router import Router as _R
+        head = _R._ws_request_head(
+            "GET /p HTTP/1.1\r\n",
+            {'host': 'h', 'connection': 'Upgrade', 'upgrade': 'websocket',
+             'proxy-authorization': 'Basic xx', 'proxy-connection': 'keep-alive'},
+            "Proxy-Authorization: Basic yy\r\n")
+        assert head is not None
+        text = head.decode('latin-1').lower()
+        assert "upgrade: websocket" in text and "connection: upgrade" in text
+        assert "proxy-connection" not in text
+        assert text.count("proxy-authorization") == 1
+        assert text.endswith("proxy-authorization: basic yy\r\n\r\n"), head
+        # 头值里的 CR/LF 会变成请求行注入 → 整个请求拒绝,不写出半个报文。
+        assert _R._ws_request_head("GET /p HTTP/1.1\r\n",
+                                   {'x': "a\r\nInjected: 1"}) is None
