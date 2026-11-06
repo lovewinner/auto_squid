@@ -1052,8 +1052,8 @@ class Router:
             return False
         return self._norm_host(host) in self._local_direct_domains
 
-    def _proxy_hosts_idx(self) -> frozenset:
-        """构建 enabled 上游代理的 host 集合(用于内网目标识别)。带版本缓存。
+    def _proxy_endpoints_idx(self) -> frozenset:
+        """构建 enabled 上游代理的 **(host, port)** 端点集合。带版本缓存。
 
         代理表在运行时基本静态(静态 proxies.yaml/极少热更),以 proxy_store.version
         做 O(1) 缓存失效判断,避免每个请求重建 frozenset。
@@ -1061,23 +1061,44 @@ class Router:
         store_ver = getattr(self.proxy_store, 'version', 0)
         if self._proxy_hosts_cache[0] == store_ver:
             return self._proxy_hosts_cache[1]
-        hosts = frozenset(self._norm_host(p.host) for p in self.proxy_store.list() if p.enabled)
-        self._proxy_hosts_cache = (store_ver, hosts)
-        return hosts
+        endpoints = frozenset((self._norm_host(p.host), int(p.port))
+                              for p in self.proxy_store.list() if p.enabled)
+        self._proxy_hosts_cache = (store_ver, endpoints)
+        return endpoints
 
-    def _is_internal_target(self, host: str) -> bool:
-        """目标 host 是否是某上游代理自身的 host/IP(内网目标判定)。
+    def _is_internal_target(self, host: str, port: int) -> bool:
+        """目标是否**正好是**某 enabled 上游代理自己的端点(host+port 都相等)。
 
-        客户端 CONNECT 目标命中某 enabled 代理自身的 IP/域名 → 属"代理侧内网
-        服务"。此时经任何远端代理绕行大多连不上(远端 socket 打不回该内网,
-        transport 失败),本机直连(能直接到代理 IP,说明本机可达该内网)通常
-        更强。当前实现:精确匹配代理 host(与 local_direct_domains 白名单互补;
-        走 _local_direct_connect 复用统一直连/熔断/失败回退)。local 无 host 跳过。
+        这一判定只回答一个问题:"隧道绕回去就是绕到代理自己"——那种情况下经上游
+        转发是死循环,本机直连才对。
+
+        早先的版本只比 host(34a5bd5,依据是 211.82.239.101:443 绕行上游 transport
+        96% 失败)。那只在一个端口上成立,把它推广成了整台机器的规则,而实测正好
+        相反:同一台 211.82.239.101,:443 本机 EHOSTUNREACH、6 个上游也一律 503/502
+        (两条路都死,规则帮不上);:7777 本机通、6 个上游**全部**回 200 Connection
+        established(规则纯粹添乱——它被强制本机直连后,我们向一台明文 nginx 发出
+        CONNECT,对方回 405 Not Allowed,通道必挂)。"这台机器是某上游的宿主"根本
+        不是"上游打不回来"的证据;能证明的只有"这就是那个代理端点本身"。
         """
         if not host:
             return False
-        h = self._norm_host(host)
-        return h in self._proxy_hosts_idx()
+        return (self._norm_host(host), int(port)) in self._proxy_endpoints_idx()
+
+    def _url_is_proxy_endpoint(self, url: str) -> bool:
+        """明文 HTTP 请求的目标是否正好是某上游代理自己的端点。
+
+        域名键(domain_key_from_url)只有 host,而判定需要端口,所以这里再解一次
+        URL。没有 enabled 上游时先短路返回 —— 别让每个请求都付一次 urlparse。
+        """
+        if not self._proxy_endpoints_idx():
+            return False
+        try:
+            parts = urllib.parse.urlsplit(url)
+            host = parts.hostname
+            port = parts.port or (443 if parts.scheme in ('https', 'wss') else 80)
+        except ValueError:
+            return False
+        return bool(host) and self._is_internal_target(host, port)
 
     def _record_attempt(self, domain: str, pid: str):
         """记录一次"代理 pid 对域名 domain 的尝试"(竞速扇出统计)。
@@ -3434,12 +3455,12 @@ class Router:
         #      502 不绕远端(用户决策)。位置在缓存检查之后、在途聚合注册之前:
         #      (a) 白名单请求仍可命中直连写入的缓存; (b) 白名单请求不注册在途
         #      聚合,waiter 也不会落入 _dispatch_single 的远端竞速(跨路径坑)。
-        #      同时命中上游代理自身 IP/域名的 HTTP 目标(P0)也判为内网直连:
-        #      远端代理绕行打不回该内网,本机直连更能成功(与 CONNECT 同规则)。
-        if self._host_in_local_direct(domain) or self._is_internal_target(domain):
+        #      另一条只保留"目标就是某上游代理自己的端点"(host+port 全等):那才是
+        #      绕回代理自己,必须本机直连。判据详见 _is_internal_target。
+        internal = self._url_is_proxy_endpoint(url)
+        if self._host_in_local_direct(domain) or internal:
             self.local_direct_hits += 1
-            logger.debug("local-direct HTTP %s %s (internal=%s)", method, url,
-                         self._is_internal_target(domain))
+            logger.debug("local-direct HTTP %s %s (internal=%s)", method, url, internal)
             await self._forward_local_direct_http(writer, method, url, hdrs, body, domain, client_ip)
             return
 
@@ -3495,7 +3516,7 @@ class Router:
 
     # ── 协议升级(WebSocket)中继 ──────────────────────────────────
 
-    def _ws_candidate_pids(self, domain: str, client_ip: str = "") -> List[str]:
+    def _ws_candidate_pids(self, domain: str, client_ip: str, port: int) -> List[str]:
         """升级握手的候选顺序:粘性 → 域名缓存 → 该域名的 Cost 排序(串行,不竞速)。
 
         优先级与决策链一致(粘性 > 缓存 > 竞速),因为长通道必须落在客户端本次会话
@@ -3504,9 +3525,9 @@ class Router:
         时它一次布尔比较就返回 None,不额外花钱。这里只**跟随**钉选,不回填 hits:
         握手的重连节奏不该去扰动 recheck_hits 的探路节律(那由普通请求维护)。
         """
-        if self._host_in_local_direct(domain) or self._is_internal_target(domain):
-            # 远端上游坐在另一张网上,绕过去多半打不回这个 host;本机直连才是对的
-            # 路径(与 CONNECT / 普通 HTTP 的同款判定)。
+        if self._host_in_local_direct(domain) or self._is_internal_target(domain, port):
+            # 白名单是用户显式授权直连;"host+port 正好是某上游自己"则是绕回代理自己。
+            # 其余目标(包括恰好与某上游同 IP 的其他端口)一律走池 —— 见 _is_internal_target。
             self.local_direct_hits += 1
             return ['local']
         pids: List[str] = []
@@ -3667,7 +3688,7 @@ class Router:
             await self._write_cached_response(writer, 400, 'Bad Request',
                                               {'Connection': 'close'}, b'Bad Request')
             return
-        pids = self._ws_candidate_pids(domain, client_ip)
+        pids = self._ws_candidate_pids(domain, client_ip, port)
         last_err: Optional[BaseException] = None
         for pid in pids:
             proxy = None if pid == 'local' else self.proxy_store.get(pid)
@@ -4656,13 +4677,14 @@ class Router:
         失败回 502 不绕远端——用户决策)。认证已在 handle_client 完成。
         """
         # 0) 本地白名单强制直连(CONNECT 无在途聚合,位置无跨路径约束)。
-        #    再加 P0:命中上游代理自身 IP/域名的内网目标也强制直连——远端代理
-        #    绕行打不回内网(transport 96% 失败实测),本机直连更能连上。
-        host = self._try_tunnel_host(target)
-        if self._host_in_local_direct(host) or self._is_internal_target(host):
+        #    另一条只剩"目标正好是某上游代理自己的端点"(host+port 全等)——那等于
+        #    隧道绕回代理自己。判据不再按 host 猜测,理由见 _is_internal_target。
+        #    target 已由 _normalize_connect_target 保证带端口,解析不会失败。
+        host, tport = self._parse_target(target)
+        internal = self._is_internal_target(host, tport)
+        if self._host_in_local_direct(host) or internal:
             self.local_direct_hits += 1
-            logger.debug("local-direct CONNECT %s (internal=%s)",
-                         target, self._is_internal_target(host))
+            logger.debug("local-direct CONNECT %s (internal=%s)", target, internal)
             await self._local_direct_connect(target, client_reader, client_writer, client_ip)
             return
         await self._dispatch_single(

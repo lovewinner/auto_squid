@@ -8567,35 +8567,63 @@ async def test_local_direct_http_circuit_recovers_after_backoff():
         await local_srv.wait_closed()
 
 
-# ── P0(内网目标识别):CONNECT 目标是上游代理自身 IP → 强制本机直连 ─────
+# ── 内网目标识别:只有"目标正好是某上游代理自己的端点"才本机直连 ─────────
 
 @pytest.mark.asyncio
-async def test_internal_proxy_host_target_direct_connect():
-    """客户端 CONNECT 目标是某上游代理自身的 IP 时走本地直连,不绕行竞速。
+async def test_internal_proxy_endpoint_target_direct_connect():
+    """CONNECT 目标正好是某上游代理自己的端点(host+port 全等)→ 本机直连。
 
-    复现生产 `211.82.239.101:443`:客户端访问代理侧内网服务,远端代理(socket
-    打不回该内网)绕行 transport 96% 失败。改判:目标 host == enabled 代理的
-    host → _is_internal_target 命中 → _local_direct_connect(本地 mock CONNECT
-    服务回 200 echo),不再经上游竞速 mock(proxy_srv)转一圈。
+    这条判定唯一站得住的理由是"隧道绕回去就是绕到代理自己"。生产对应
+    211.82.239.101:6128 —— 上游 239-101 本身就是那个端口。
     """
-    # local 侧"内网目标服务":一个监听 LOCAL_HTTP_PORT 的 mock CONNECT(回 200+echo)
-    local_tunnel_srv = await run_mock_proxy(HOST, LOCAL_HTTP_PORT)
-    # 上游竞速 mock:若误入竞速路径会走它(记录命中证明未走)。
     proxy_hits = []
     proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=proxy_hits)
     ps = ProxyStore()
-    ps.add(ProxyInfo(id='inexternal', host=HOST, port=PROXY_PORT))  # host==HOST
+    ps.add(ProxyInfo(id='inexternal', host=HOST, port=PROXY_PORT))
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                    enable_http_cache=False, db_path=tempfile.mktemp(suffix='.db'))
+    raced = []
+    real_race = router._race_staggered
+
+    async def spy(places, **kw):
+        raced.append(len(places))
+        return await real_race(places, **kw)
+    router._race_staggered = spy
+    await router.start()
+    try:
+        echo = await send_connect(HOST, ROUTER_PORT,
+                                  target=f"{HOST}:{PROXY_PORT}".encode())
+        assert echo == b"hello", f"expected relayed echo, got {echo!r}"
+        assert router.snapshot_counters()['local_direct_hits'] >= 1
+        assert not raced, f"目标就是代理自己,不该再进竞速: {raced}"
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_same_proxy_host_other_port_uses_pool():
+    """与上游同 IP 但端口不同 → 不再误判内网,照常走池(生产 :7777 的形状)。
+
+    旧判定只比 host,于是 211.82.239.101 上每个端口都被拽去本机直连;而对明文
+    nginx 发 CONNECT 只会换回 405 Not Allowed。实测 6 个上游对该端口全部愿意建隧道。
+    """
+    local_tunnel_srv = await run_mock_proxy(HOST, LOCAL_HTTP_PORT)
+    proxy_hits = []
+    proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=proxy_hits)
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='inexternal', host=HOST, port=PROXY_PORT))  # host 相同,端口不同
     router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
                     enable_http_cache=False, db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
     try:
-        # 目标是 HOST(== 代理自身的 host),应直连 local_tunnel_srv(200),不碰 proxy_srv。
         echo = await send_connect(HOST, ROUTER_PORT,
                                   target=f"{HOST}:{LOCAL_HTTP_PORT}".encode())
         assert echo == b"hello", f"expected relayed echo, got {echo!r}"
-        counters = router.snapshot_counters()
-        assert counters['local_direct_hits'] >= 1, f"expected a local-direct hit, got {counters}"
-        assert proxy_hits == [], f"internal target should not race upstream, got {proxy_hits}"
+        assert proxy_hits, "同 IP 不同端口必须经上游建隧道"
+        assert router.snapshot_counters()['local_direct_hits'] == 0, \
+            "host 相同不构成本机直连的理由"
     finally:
         await router.stop()
         local_tunnel_srv.close()
@@ -8605,22 +8633,74 @@ async def test_internal_proxy_host_target_direct_connect():
 
 
 @pytest.mark.asyncio
-async def test_internal_proxy_host_http_direct():
-    """HTTP 目标 host == 上游代理自身 IP → 本地直连(同样不走上游竞速)。"""
+async def test_internal_target_predicate_is_port_aware():
+    """判定层的契约:只有 host+port 全等才算"上游自己";URL 侧要自己解出端口。"""
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='p1', host='10.14.25.88', port=6128))
+    ps.add(ProxyInfo(id='p2', host='211.82.239.101', port=6128))
+    ps.add(ProxyInfo(id='off', host='10.0.0.9', port=3128, enabled=False))
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                         db_path=tempfile.mktemp(suffix='.db'))
+    assert router._is_internal_target('211.82.239.101', 6128)
+    assert not router._is_internal_target('211.82.239.101', 7777), \
+        "同 IP 的其他端口是普通源站,不是代理自己"
+    assert not router._is_internal_target('10.0.0.9', 3128), "disabled 代理不算"
+    # 大小写/尾点归一后照样命中。
+    assert router._is_internal_target('211.82.239.101.', 6128)
+    assert router._url_is_proxy_endpoint('http://10.14.25.88:6128/api')
+    assert not router._url_is_proxy_endpoint('http://10.14.25.88:7777/ws/')
+    # 明文 HTTP 默认端口 80 与代理端口不等 → 不误判。
+    assert not router._url_is_proxy_endpoint('http://211.82.239.101/whatever')
+    assert not router._url_is_proxy_endpoint('/origin-form-is-not-a-target')
+
+
+@pytest.mark.asyncio
+async def test_internal_proxy_endpoint_http_direct():
+    """HTTP 目标正好是某上游代理端点 → 本机直连,不进竞速。"""
+    proxy_srv = await run_mock_proxy(HOST, PROXY_PORT)
+    ps = ProxyStore()
+    ps.add(ProxyInfo(id='ptarget', host=HOST, port=PROXY_PORT))
+    router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
+                    enable_http_cache=False, db_path=tempfile.mktemp(suffix='.db'))
+    raced = []
+    real_race = router._race_staggered
+
+    async def spy(places, **kw):
+        raced.append(len(places))
+        return await real_race(places, **kw)
+    router._race_staggered = spy
+    await router.start()
+    try:
+        body = await send_http_get(HOST, ROUTER_PORT,
+                                   url=f"http://{HOST}:{PROXY_PORT}/".encode())
+        # 直连拨到的就是那个 mock 自身,它普通 GET 回 proxied。
+        assert b'proxied' in body, f"expected proxied body, got {body!r}"
+        assert router.snapshot_counters()['local_direct_hits'] == 1
+        assert not raced, raced
+    finally:
+        await router.stop()
+        proxy_srv.close()
+        await proxy_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_same_proxy_host_http_other_port_uses_pool():
+    """HTTP 目标与上游同 IP、不同端口 → 走上游代理,不再误判内网直连。"""
     local_srv = await run_local_http_server(HOST, LOCAL_HTTP_PORT)
     hit = []
     proxy_srv = await run_mock_proxy(HOST, PROXY_PORT, hit_counter=hit)
     ps = ProxyStore()
-    ps.add(ProxyInfo(id='ptarget', host=HOST, port=PROXY_PORT))  # host==HOST
+    ps.add(ProxyInfo(id='ptarget', host=HOST, port=PROXY_PORT))
     router = make_router(ps, listen_host=HOST, listen_port=ROUTER_PORT,
                     enable_http_cache=False, db_path=tempfile.mktemp(suffix='.db'))
     await router.start()
     try:
-        url = f"http://{HOST}:{LOCAL_HTTP_PORT}/".encode()
-        body = await send_http_get(HOST, ROUTER_PORT, url=url)
-        assert b'local-response' in body, f"expected local body, got {body!r}"
-        # 走上游 mock 代理的录入 0(本地直连不经它)。
-        assert router.request_counts.get('ptarget', 0) == 0, "internal target should not race upstream"
+        body = await send_http_get(HOST, ROUTER_PORT,
+                                   url=f"http://{HOST}:{LOCAL_HTTP_PORT}/".encode())
+        # 上游 mock 对普通 GET 回 proxied;本机直连才会拿到 local-response。
+        assert b'proxied' in body, f"expected upstream-proxied body, got {body!r}"
+        assert router.snapshot_counters()['local_direct_hits'] == 0
+        assert router.request_counts.get('ptarget', 0) >= 1
     finally:
         await router.stop()
         local_srv.close()
@@ -10392,7 +10472,7 @@ class TestWebSocketUpgradeRelay:
         r = make_router(ps, listen_host=HOST, listen_port=WS_ROUTER_PORT,
                         circuit_threshold=1, db_path=tempfile.mktemp(suffix='.db'))
         # 钉死顺序:先试被 ACL 拒的那个,再试可用的那个。
-        r._ws_candidate_pids = lambda domain, client_ip='': ['blocked', 'usable']
+        r._ws_candidate_pids = lambda domain, client_ip, port: ['blocked', 'usable']
         await r.start()
         try:
             reader, writer, status, _ = await _ws_client()
@@ -10475,15 +10555,78 @@ class TestWebSocketUpgradeRelay:
                 s.close()
                 await s.wait_closed()
 
-    async def test_internal_target_uses_local_direct_origin_form(self):
-        """目标是上游自身 host 时本机直连源站:不发 CONNECT,请求行 origin-form。"""
+    async def test_proxy_host_other_port_goes_through_pool(self):
+        """与某上游同 IP、不同端口的目标不再被强制本机直连,而是正常走池。
+
+        这就是生产 211.82.239.101:7777 的形状:该 IP 同时是上游 239-101 的 host,
+        旧判定只比 host,于是这台机器上的**每个端口**都被拽去本机直连 —— 而对明文
+        nginx 发 CONNECT 只会换回 405。实测 6 个上游对该端口全部回 200 Connection
+        established,所以正确做法是按 host+port 精确判定"是不是代理自己"。
+        """
         origin, up_seen = [], []
         srv_origin = await _run_ws_upstream(WS_ORIGIN_PORT, origin)
         srv_up = await _run_ws_upstream(WS_UP_PORT, up_seen)
         ps = ProxyStore()
-        # 127.0.0.1 既是某 enabled 代理的 host,又是目标 → _is_internal_target。
+        # 上游在 127.0.0.1:31998;目标是 127.0.0.1:31999 —— 同 IP、不同端口。
         ps.add(ProxyInfo(id='ws1', host=HOST, port=WS_UP_PORT))
         r = make_router(ps, listen_host=HOST, listen_port=WS_ROUTER_PORT,
+                        db_path=tempfile.mktemp(suffix='.db'))
+        await r.start()
+        try:
+            reader, writer, status, _ = await _ws_client(
+                WS_HANDSHAKE.replace(b"ws.test.example:31998",
+                                      b"127.0.0.1:31999"))
+            assert status.startswith(b"HTTP/1.1 101"), status
+        finally:
+            writer.close()
+            await r.stop()
+            for s in (srv_origin, srv_up):
+                s.close()
+                await s.wait_closed()
+        counters = r.snapshot_counters()
+        assert counters['local_direct_hits'] == 0, \
+            "只是同 IP 不构成直连理由(旧判定在此处误伤)"
+        assert len(up_seen) == 2, f"应由上游建隧道: {up_seen}"
+        assert up_seen[0].upper().startswith('CONNECT 127.0.0.1:31999'), up_seen
+        assert not origin, f"目标端口不该被本机直连拨到: {origin}"
+
+    async def test_proxy_own_endpoint_target_uses_local_direct(self):
+        """目标正好是某上游代理自己的端点 → 握手不绕回它自己,本机直连。
+
+        (与上一条成对:同 IP 时,只有端口也相等才算"就是代理本身"。)
+        """
+        up_seen = []
+        srv_up = await _run_ws_upstream(WS_UP_PORT, up_seen)
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='ws1', host=HOST, port=WS_UP_PORT))
+        r = make_router(ps, listen_host=HOST, listen_port=WS_ROUTER_PORT,
+                        db_path=tempfile.mktemp(suffix='.db'))
+        await r.start()
+        try:
+            reader, writer, status, _ = await _ws_client(
+                WS_HANDSHAKE.replace(b"ws.test.example:31998", b"127.0.0.1:31998"))
+            assert status.startswith(b"HTTP/1.1 101"), status
+        finally:
+            writer.close()
+            await r.stop()
+            srv_up.close()
+            await srv_up.wait_closed()
+        assert len(up_seen) == 1, up_seen
+        assert up_seen[0].startswith('GET /echo?x=1 HTTP/1.1'), \
+            f"应当是 origin-form 直连,不该出现 CONNECT: {up_seen[0]}"
+        counters = r.snapshot_counters()
+        assert counters['local_direct_hits'] == 1
+        assert counters['ws_upgrade_failed'] == 0
+
+    async def test_whitelisted_target_uses_local_direct_origin_form(self):
+        """白名单目标仍然本机直连源站:不发 CONNECT,请求行 origin-form。"""
+        origin, up_seen = [], []
+        srv_origin = await _run_ws_upstream(WS_ORIGIN_PORT, origin)
+        srv_up = await _run_ws_upstream(WS_UP_PORT, up_seen)
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='ws1', host=HOST, port=WS_UP_PORT))
+        r = make_router(ps, listen_host=HOST, listen_port=WS_ROUTER_PORT,
+                        local_direct_domains=[HOST],
                         db_path=tempfile.mktemp(suffix='.db'))
         await r.start()
         try:
@@ -10546,14 +10689,14 @@ class TestWebSocketUpgradeRelay:
         r = make_router(ps, listen_host=HOST, listen_port=WS_ROUTER_PORT,
                         stickiness_enabled=True, db_path=tempfile.mktemp(suffix='.db'))
         dom = 'wsorder.test'
-        assert set(r._ws_candidate_pids(dom, '10.0.0.1')) == {'a', 'b', 'c'}
+        assert set(r._ws_candidate_pids(dom, '10.0.0.1', 80)) == {'a', 'b', 'c'}
         r.sticky._record_sticky('10.0.0.1', dom, 'b')
         r._meta_cache[dom] = {'default_proxy': 'c', 'updated_at': r._now_utc(),
                               '_updated_mono': time.monotonic()}
-        assert r._ws_candidate_pids(dom, '10.0.0.1')[:2] == ['b', 'c'], \
+        assert r._ws_candidate_pids(dom, '10.0.0.1', 80)[:2] == ['b', 'c'], \
             "钉选代理必须排在域名缓存之前(同一条会话同一个出口)"
         # 别的客户端不该继承这条钉选;域名缓存是全客户端共享的,所以它仍在最前。
-        other = r._ws_candidate_pids(dom, '10.0.0.9')
+        other = r._ws_candidate_pids(dom, '10.0.0.9', 80)
         assert other[0] == 'c' and 'b' not in other[:1], other
 
     def test_upgrade_predicate_requires_all_three_signals(self):
