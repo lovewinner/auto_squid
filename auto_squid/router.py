@@ -3523,15 +3523,14 @@ class Router:
         return pids
 
     @staticmethod
-    def _ws_request_head(request_line: str, headers: dict,
-                         auth_hdr: Optional[str] = None) -> Optional[bytes]:
-        """拼出发给上游的升级握手请求头;含 CR/LF 的头值返回 None(拒绝)。
+    def _ws_request_head(request_line: str, headers: dict) -> Optional[bytes]:
+        """把客户端的握手请求头拼成发给源站的报文;含 CR/LF 的头值返回 None(拒绝)。
 
-        请求行由调用方决定形式(绝对 URL 给上游代理 / origin-form 给源站)。头名
-        在 handle_client 已统一小写、值由 readline+splitlines 切出,理论上不含
-        CR/LF;这里仍然逐值检查 —— 本函数刻意**不**剔除 connection/upgrade(它们
-        就是握手内容),等于把客户端可控字符串原样写上另一条 TCP,请求行注入的
-        收益远大于成本,值得挡一道。
+        上游凭据不在这层:它由 CONNECT 携带(见 _try_tunnel),隧道里的请求头属于
+        源站,再挂一个 Proxy-Authorization 反而是越权头。头名在 handle_client 已
+        统一小写、值由 readline+splitlines 切出,理论上不含 CR/LF;这里仍逐值检查
+        —— 本函数刻意**不**剔除 connection/upgrade(它们就是握手内容),等于把客
+        户端可控字符串原样写上另一条 TCP,请求行注入的收益远大于成本,值得挡一道。
         """
         out = [request_line]
         for k, v in headers.items():
@@ -3540,8 +3539,6 @@ class Router:
             if '\r' in v or '\n' in v:
                 return None
             out.append(f"{k}: {v}\r\n")
-        if auth_hdr:
-            out.append(auth_hdr)
         out.append("\r\n")
         # 头值是 latin-1 解出来的(码点必 ≤255),回编码无损,与 _hb 同理。
         return ''.join(out).encode('latin-1')
@@ -3613,14 +3610,20 @@ class Router:
         设计的规则,套到握手上就是"上游收到一个没有 Upgrade 的普通 GET",回 400。
         JumpServer 的"连接通道异常"即此:通道建不起来,时不时整页中断。
 
-        形态(RFC 6455 §1.6.1):
-        - 上游代理:拨**代理自己的** host:port,请求行用客户端给的绝对形式,跳用
-          凭据换成该上游的 Proxy-Authorization。不用 CONNECT —— 上游常按 ACL 只
-          放行 CONNECT 到 443,7777 这类端口会被拒;绝对形式 GET 才是它最本职的
-          转发,也与 httpx 走 http:// 目标时的报文完全一致(今天能用的上游,这里
-          就能用)。
-        - 本机直连(白名单/内网目标):拨源站,请求行换成 origin-form(源站不认
-          绝对形式)。
+        形态(两条都必须走 origin-form,区别只在隧道):
+        - 上游代理:先请该上游 **CONNECT** 到 host:port,隧道建立后在隧道里发
+          origin-form 握手。这是本池唯一全都认的形态 —— 实测 6 个上游对
+          :7777 一律回 200 Connection Established,而 211.82.239.182:26561 是个
+          "只做隧道"的节点,收到绝对形式明文 GET 直接 `501 plain http proxy not
+          yet supported`。早先按 RFC 6455 §1.6.1 发绝对形式(怕上游 ACL 只放行
+          443)正是踩了它:串行循环遇到第一个非 101 就返回,于"这个候选排在第
+          几位"决定通道活不活 —— 又变成"时不时中断"。改走隧道后这个歧义消失:
+          隧道里的答复必然来自源站,非 101 就是源站的决定,可以立刻回写客户端。
+        - 本机直连(白名单/内网目标):直接拨源站发 origin-form(源站不认绝对
+          形式,也不会接受 CONNECT)。
+        CONNECT 被拒的候选按 _try_tunnel 既有口径记账(非 200 属业务拒绝,不喂
+        熔断),然后换下一个候选 —— 不退回绝对形式:那种形态的答复分不清是代理
+        拒转还是源站拒绝,正是上面那个坑。
 
         不竞速:升级是长连接,并行 N 个握手会在源站生成 N 个会话(浏览器只认第一
         个),余下的是没人关闭的幽灵 session。候选只能串行试,代价是一次握手 TTFB,
@@ -3654,62 +3657,67 @@ class Router:
         path = parts.path or '/'
         if parts.query:
             path = f"{path}?{parts.query}"
+        # CONNECT 目标与 wss:// 的写法一致(IPv6 必须带方括号),域名桶则用裸 host。
+        target = f"[{host}]:{port}" if ':' in host else f"{host}:{port}"
+        head = self._ws_request_head(f"GET {path} HTTP/1.1\r\n", headers)
+        if head is None:
+            # 客户端给了含 CR/LF 的头值:整个请求拒绝,不写出半个报文。
+            self.ws_upgrade_rejected += 1
+            logger.info("ws upgrade REJECT url=%s (CR/LF in header value)", url)
+            await self._write_cached_response(writer, 400, 'Bad Request',
+                                              {'Connection': 'close'}, b'Bad Request')
+            return
         pids = self._ws_candidate_pids(domain, client_ip)
         last_err: Optional[BaseException] = None
         for pid in pids:
             proxy = None if pid == 'local' else self.proxy_store.get(pid)
-            auth_hdr = None
             if proxy is None:
-                request_line = f"GET {path} HTTP/1.1\r\n"
-            else:
-                request_line = f"GET {url} HTTP/1.1\r\n"
-                if proxy.auth:
-                    raw = (f"{proxy.auth.get('username', '')}:"
-                           f"{proxy.auth.get('password', '')}")
-                    auth_hdr = ("Proxy-Authorization: Basic "
-                                f"{base64.b64encode(raw.encode()).decode()}\r\n")
-            head = self._ws_request_head(request_line, headers, auth_hdr)
-            if head is None:
-                self.ws_upgrade_rejected += 1
-                logger.info("ws upgrade REJECT url=%s via=%s (CR/LF in header value)",
-                            url, pid)
-                await self._write_cached_response(writer, 400, 'Bad Request',
-                                                  {'Connection': 'close'}, b'Bad Request')
-                return
-            self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
-            self.upstream_attempts += 1
+                # 本机直连没有 _try_tunnel 那样的现成记账点,尝试数自己补齐。
+                self.attempted_counts[pid] = self.attempted_counts.get(pid, 0) + 1
+                self.upstream_attempts += 1
             t0 = time.perf_counter()
             up_reader = up_writer = None
             try:
-                up_reader, up_writer = await self._open_resolved(
-                    (proxy.host if proxy else host),
-                    (proxy.port if proxy else port),
-                    self._tunnel_timeout_sec if proxy else self._local_direct_timeout,
-                    phase='ws-upgrade', pid=pid, target=domain)
+                if proxy is None:
+                    up_reader, up_writer = await self._open_resolved(
+                        host, port, self._local_direct_timeout,
+                        phase='ws-upgrade', pid=pid, target=target)
+                else:
+                    # 隧道交给 _try_tunnel:池复用、陈旧重试、超时与全部记账都在它
+                    # 那里,与 wss:// 走 CONNECT 同源,不会多记一次尝试或成功观测。
+                    _, up_reader, up_writer = await self._try_tunnel(
+                        pid, target, proxy.host, proxy.port, proxy.auth,
+                        client_ip=client_ip)
                 up_writer.write(head)
                 await up_writer.drain()
                 code, raw_head = await self._read_ws_head(up_reader)
-            except (asyncio.TimeoutError, OSError, ConnectionError, ValueError) as e:
+            except (asyncio.TimeoutError, OSError, ConnectionError, ValueError,
+                    RuntimeError) as e:
                 await self._close_stream_writer(up_writer)
-                if proxy is not None:
+                if proxy is None:
                     # local 直连失败不喂熔断(同 _forward_local_direct_http 的约定:
-                    # 本机网络的问题不该让某个候选背熔断计数)。
-                    self.selector.record_failure(pid, self._classify_error(e), domain)
-                self._log_attempt_failure(client_ip, domain, domain, pid, e, t0)
+                    # 本机网络的问题不该让某个候选背熔断计数),但要留下 per-attempt
+                    # 日志。经上游的失败与日志 _try_tunnel 已经记过,不重复。
+                    self._log_attempt_failure(client_ip, domain, domain, pid, e, t0)
                 last_err = e
                 continue
             ttfb = time.perf_counter() - t0
-            self.selector.record_ttfb(pid, ttfb, domain)
+            if proxy is None:
+                self.selector.record_ttfb(pid, ttfb, domain)
             if code != '101':
-                # 升级被拒/上游没按握手理解这个请求:普通响应回写,代理无罪。
+                # 隧道里的答复必然来自源站(不像绝对形式那样分不清代理拒转还是源站
+                # 拒绝):非 101 就是源站不接受这次升级,按普通响应回写,代理无罪。
                 logger.info("ws upgrade NOT-SWITCHED url=%s via=%s code=%s", url, pid, code or '-')
                 await self._write_ws_reject(writer, up_reader, raw_head)
                 await self._close_stream_writer(up_writer)
                 return
-            self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
-            self.selector.record_success(pid)
-            self._record_attempt(domain, pid)
+            # CONNECT 成功时 _try_tunnel 已记 request_counts/record_success/尝试统计,
+            # 这里只补域名缓存钉住(让同域名其余明文请求也走这个出口 IP)。
             self._record_win_meta(domain, pid)
+            if proxy is None:
+                self.request_counts[pid] = self.request_counts.get(pid, 0) + 1
+                self.selector.record_success(pid)
+                self._record_attempt(domain, pid)
             writer.write(raw_head)
             await writer.drain()
             logger.info("ws upgrade OK url=%s via=%s ttfb=%.0fms", url, pid, ttfb * 1000)
@@ -3722,8 +3730,8 @@ class Router:
         logger.info("ws upgrade FAILED url=%s candidates=%s err=%s", url,
                     ','.join(pids) or '-', type(last_err).__name__ if last_err else '-')
         if pids and last_err is not None:
-            # 每个候选都在传输层失败 → 责任更可能在目标(端口没监听/防火墙挡了),
-            # 交给目标级不可达判定:两轮同样的失败后直接 502,不再白烧握手。
+            # 每个候选都在传输层/隧道层失败 → 责任更可能在目标(端口没监听/防火墙
+            # 挡了),交给目标级不可达判定:两轮同样的失败后直接 502,不再白烧握手。
             self._note_target_race_failure(domain)
         await self._write_cached_response(writer, 502, 'Bad Gateway',
                                           {'Connection': 'close'}, b'Bad Gateway')

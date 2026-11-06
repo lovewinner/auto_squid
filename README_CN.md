@@ -69,7 +69,8 @@ curl -x http://127.0.0.1:10808 https://www.baidu.com
 
 **协议升级(WebSocket)**
 - **裸中继升级握手** — 带 `Upgrade` 且 `Connection` 含 `upgrade` 记号的 `GET` 完全绕开 httpx、响应缓存与竞速三层(`_handle_ws_upgrade`;粘性钉选只被跟随,见下)。原因有二:httpx 承载不了 `101 Switching Protocols`;而常规的逐跳头规则会把 `Connection`/`Upgrade` 一并剥掉,等于给源站发一个普通 GET —— 这正是 Web 终端"连接通道异常"、隔几分钟整页断线的根因。
-- **原样转发** — 除 `proxy-authorization` / `proxy-connection` 外,客户端的每个头都原序送到上游;请求行按路径分两种形式:走上游代理时用客户端给的绝对形式(RFC 6455 §1.6.1 —— 不用 `CONNECT`,因此只放行 443 隧道端口的上游 ACL 不会把 7777 这类端口拒掉),本机直连源站时换成 origin-form(源站不认绝对形式)。
+- **原样转发** — 除 `proxy-authorization` / `proxy-connection` 外,客户端的每个头都原序送到源站;握手本身一字不动(把握手删成普通 GET 正是故障根因)。上游凭据只挂在 `CONNECT` 上,不进隧道内的请求。
+- **先 CONNECT 隧道,再 origin-form** —— 这是实测结论,不是推理:`211.82.239.182:26561` 只做隧道,收到绝对形式的明文 `GET` 直接回 `501 plain http proxy not yet supported`;而池里每个节点都乐意给 `:7777` 建隧道。先前发绝对形式,等于让"这个候选排在第几位"决定通道活不活。隧道内的非 `101` 答复必然来自源站(是源站的决定);`CONNECT` 被拒则是上游的决定,换下一个候选即可,且按业务拒绝分类不喂熔断。白名单/内网目标跳过隧道,直接以 origin-form 拨源站。
 - **候选串行,绝不竞速** — 竞速会同时发起 N 次握手,在源站生成 N 个会话,而客户端只认第一个,剩下的是没人关闭的幽灵连接。顺序沿用决策链(粘性钉选 → 域名缓存 → Cost 排序,并同样受 `policies` 收窄),让长通道落在本次会话一直在用的那个出口 IP 上;拿到 `101` 之后这条连接就是裸双向管道(复用 `_relay_tunnel`,字节/吞吐/OFB 口径与隧道一致)。
 - **升级被拒不等于代理故障** — 非 `101` 的答复按普通响应原样回写(不改成帧,body 有上限),不给熔断记一笔。计数:`ws_upgrades`、`ws_upgrade_rejected`、`ws_upgrade_failed`。
 
@@ -417,7 +418,7 @@ curl -x http://127.0.0.1:10808 http://www.baidu.com
 ## 测试
 
 ```bash
-uv run pytest -q --timeout=60      # 527 项,约 90 秒
+uv run pytest -q --timeout=60      # 529 项,约 90 秒
 ```
 
 覆盖范围包括 HTTP/`CONNECT` 转发与成帧(HTTP/1.0 降级、`HEAD`、截断检测)、HTTP 缓存(LRU 顺序、驱逐、合并)、域名缓存、竞速与聚合超时、客户端与 API 鉴权、CSRF 防护、熔断/探测/EWMA/在途加权、粘性、按域名统计与 SQLite 持久化、UTF-8 与二进制安全响应体、两个池加跨阶段借用、空闲挂起与预算记账、配置层校验与退出码,以及事件循环卫生测试(后台任务留下孤儿 DNS future 就会失败)。`tests/test_phase_metrics.py` 覆盖指标与排序层,`tests/test_tuner.py` 覆盖自动调参器。

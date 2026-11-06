@@ -69,7 +69,8 @@ Dashboard: <http://127.0.0.1:18080/> (redirects to `/panel/domains`).
 
 **Protocol upgrades (WebSocket)**
 - **Raw upgrade relay** — a `GET` carrying `Upgrade` + a `Connection: upgrade` token bypasses httpx, the response cache and the race entirely (`_handle_ws_upgrade`; a sticky pin is still followed, see below). Two reasons: httpx cannot carry `101 Switching Protocols`, and the ordinary hop-by-hop rules would delete `Connection`/`Upgrade` — i.e. hand the origin a plain GET, which is why web terminals reported "channel error" and dropped every few minutes.
-- **Forwarded verbatim** — every client header reaches the upstream except `proxy-authorization` / `proxy-connection`; the request line is absolute-form to an upstream proxy (RFC 6455 §1.6.1 — no `CONNECT`, so upstream ACLs that only tunnel `:443` don't sink `:7777`) and origin-form when dialing the origin directly.
+- **Forwarded verbatim** — every client header reaches the origin except `proxy-authorization` / `proxy-connection`; the handshake itself is untouched (deleting `Connection`/`Upgrade` is exactly what broke it). Upstream credentials ride the `CONNECT`, never the inner request.
+- **CONNECT tunnel, then origin-form** — measured, not guessed: `211.82.239.182:26561` implements tunnels only and answers an absolute-form cleartext `GET` with `501 plain http proxy not yet supported`, while every node in the pool happily tunnels `:7777`. Sending absolute-form instead made the *candidate order* decide whether the channel lived. Inside a tunnel a non-`101` is unambiguously the origin's decision; a refused `CONNECT` is the upstream's, so the next candidate is tried (and, being a business rejection, charges nothing to the breaker). Whitelisted/internal targets skip the tunnel and dial the origin with an origin-form request line.
 - **Sequential candidates, never a race** — a race would fire N handshakes and leave N sessions at the origin, only one of which the client ever owns. Order follows the decision chain (sticky pin → domain cache → Cost order, narrowed by `policies`) so a long channel stays on the egress IP the rest of the session uses; after `101` the connection becomes a raw bidirectional pipe (`_relay_tunnel`, same byte/throughput accounting as a tunnel).
 - **A rejected upgrade is not a proxy failure** — a non-`101` answer is relayed back as an ordinary response (headers untouched, body bounded) and charges nothing to the circuit breaker. Counters: `ws_upgrades`, `ws_upgrade_rejected`, `ws_upgrade_failed`.
 
@@ -419,7 +420,7 @@ Multi-stage image, non-root user, health check, and a `./data` volume for SQLite
 ## Testing
 
 ```bash
-uv run pytest -q --timeout=60      # 527 tests, ~90 s
+uv run pytest -q --timeout=60      # 529 tests, ~90 s
 ```
 
 Coverage spans HTTP/`CONNECT` forwarding and framing (HTTP/1.0 downgrade, `HEAD`, truncation detection), the HTTP cache (LRU order, eviction, coalescing), the domain cache, racing and aggregation timeouts, client and API auth, the CSRF guard, circuit breaker / probing / EWMA / in-flight weighting, stickiness, per-domain stats and SQLite persistence, UTF-8 and binary-safe bodies, both pools plus the cross-phase steal, idle pause and budget accounting, config-layer validation and exit codes, and event-loop hygiene tests that fail if a background task leaves an orphan DNS future. `tests/test_phase_metrics.py` covers the metric and ranking layer, `tests/test_tuner.py` the auto-tuner.

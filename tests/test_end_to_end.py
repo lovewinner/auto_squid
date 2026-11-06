@@ -10180,8 +10180,8 @@ async def test_connect_fallback_round_also_counted():
 
 # ── 协议升级(WebSocket)中继 ────────────────────────────────────
 
-WS_UP_PORT = 31998       # 假上游代理
-WS_ORIGIN_PORT = 31999   # 假源站(本机直连分支)
+WS_UP_PORT = 31998       # 假上游代理(会先接受 CONNECT)
+WS_ORIGIN_PORT = 31999   # 假源站(本机直连分支,不经 CONNECT)
 WS_ROUTER_PORT = 10898
 
 WS_HANDSHAKE = (
@@ -10198,55 +10198,74 @@ WS_HANDSHAKE = (
 )
 
 
-async def _run_ws_upstream(port, seen, *, mode='switch', guard_upgrade=True):
-    """假上游/假源站:读到请求头即记进 seen,按 mode 回包,然后当 echo 管道。
+async def _run_ws_upstream(port, seen, *, connect_ok=True, reject=False,
+                           guard_upgrade=True):
+    """假"上游代理 + 源站"二合一,按请求行形态分派,并把每个请求头记进 seen。
 
-    mode='switch' 且 guard_upgrade=True 时,**只有真的看到 Upgrade 头**才回 101:
-    这样"hop-by-hop 规则把握手删空"的老 bug 会当场变成 400,测试必然失败。
+    - `CONNECT host:port` → 隧道:回 200 后继续读**隧道里的** origin-form 握手。
+      connect_ok=False 时回 403(模拟只放行特定端口的上游 ACL)。
+    - 绝对形式 `GET http://…` → 回 501 "plain http proxy not yet supported"。
+      这一条是照抄生产里 211.82.239.182:26561 的行为:它只做隧道。留着它,任何
+      "退回绝对形式"的改动都会让测试当场拿到 501 而不是 101。
+    - origin-form `GET /path`(无 CONNECT)→ 直接当源站应答:本机直连分支用。
+
+    guard_upgrade=True 时**只有真的看到 Upgrade 头**才回 101,所以"hop-by-hop
+    规则把握手删空"的老 bug 会立刻变成 400。
     """
     async def handle(reader, writer):
         try:
-            line = await asyncio.wait_for(reader.readline(), timeout=5)
-            if not line:
-                writer.close()
-                return
-            head = [line]
             while True:
-                h = await asyncio.wait_for(reader.readline(), timeout=5)
-                head.append(h)
-                if not h or h in (b"\r\n", b"\n") or not h.strip():
+                line = await asyncio.wait_for(reader.readline(), timeout=5)
+                if not line:
                     break
-            text = b"".join(head).decode('latin-1')
-            seen.append(text)
-            low = text.lower()
-            conn_value = next((ln.split(':', 1)[1].lower()
-                               for ln in text.split('\r\n')[1:]
-                               if ln.lower().startswith('connection:')), '')
-            if mode == 'reject':
-                writer.write(b"HTTP/1.1 400 Bad Request\r\n")
-                writer.write(b"Content-Length: 5\r\nConnection: close\r\n\r\n")
-                writer.write(b"nope!")
-                await writer.drain()
-                writer.close()
-                return
-            if guard_upgrade and ('upgrade: websocket' not in low
-                                  or 'upgrade' not in conn_value):
-                writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
-                await writer.drain()
-                writer.close()
-                return
-            writer.write(b"HTTP/1.1 101 Switching Protocols\r\n")
-            writer.write(b"Upgrade: websocket\r\nConnection: Upgrade\r\n")
-            writer.write(b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n")
-            await writer.drain()
-            while True:
-                data = await asyncio.wait_for(reader.read(4096), timeout=5)
-                if not data:
+                head = [line]
+                while True:
+                    h = await asyncio.wait_for(reader.readline(), timeout=5)
+                    head.append(h)
+                    if not h or h in (b"\r\n", b"\n"):
+                        break
+                text = b"".join(head).decode('latin-1')
+                seen.append(text)
+                first = text.split('\r\n', 1)[0]
+                low = text.lower()
+                conn_value = next((ln.split(':', 1)[1].lower()
+                                   for ln in text.split('\r\n')[1:]
+                                   if ln.lower().startswith('connection:')), '')
+                if first.upper().startswith('CONNECT'):
+                    if not connect_ok:
+                        writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                        await writer.drain()
+                        break
+                    writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    await writer.drain()
+                    continue          # 隧道建立,接着读隧道内的握手
+                if low.startswith('get http://') or low.startswith('get https://'):
+                    writer.write(b"HTTP/1.1 501 Not Implemented\r\n")
+                    writer.write(b"Content-Length: 34\r\nConnection: close\r\n\r\n")
+                    writer.write(b"plain http proxy not yet supported")
+                    await writer.drain()
                     break
-                writer.write(b"echo:" + data)
+                if reject or ('upgrade: websocket' not in low
+                              or 'upgrade' not in conn_value):
+                    writer.write(b"HTTP/1.1 400 Bad Request\r\n")
+                    writer.write(b"Content-Length: 5\r\nConnection: close\r\n\r\n")
+                    writer.write(b"nope!")
+                    await writer.drain()
+                    break
+                writer.write(b"HTTP/1.1 101 Switching Protocols\r\n")
+                writer.write(b"Upgrade: websocket\r\nConnection: Upgrade\r\n")
+                writer.write(b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n")
                 await writer.drain()
-            writer.close()
+                while True:           # 101 之后是裸管道:原样回显
+                    data = await asyncio.wait_for(reader.read(4096), timeout=5)
+                    if not data:
+                        break
+                    writer.write(b"echo:" + data)
+                    await writer.drain()
+                break
         except Exception:
+            pass
+        finally:
             try:
                 writer.close()
             except Exception:
@@ -10281,7 +10300,7 @@ class TestWebSocketUpgradeRelay:
     起因:内网 Web 终端(JumpServer)的 ws:// 长通道由浏览器按普通 GET + Upgrade
     头发给 HTTP 代理。旧实现把它交给 httpx(不承载 101)并按 hop-by-hop 规则删掉
     Connection/Upgrade(见 _HOP_BY_HOP_REQUEST_HEADERS),上游只看到一个没有握手
-    信息的普通 GET → 400。表现就是"连接通道异常"、终端时不时整页断线。
+    信息的普通 GET → 400/404。表现就是"连接通道异常"、终端时不时整页断线。
     """
 
     def _router(self, **kw):
@@ -10290,7 +10309,7 @@ class TestWebSocketUpgradeRelay:
         kw.setdefault('listen_port', WS_ROUTER_PORT)
         return make_router(ps, listen_host=HOST, db_path=tempfile.mktemp(suffix='.db'), **kw)
 
-    async def test_handshake_reaches_upstream_and_101_becomes_raw_pipe(self):
+    async def test_handshake_is_tunnelled_and_101_becomes_raw_pipe(self):
         seen = []
         srv = await _run_ws_upstream(WS_UP_PORT, seen)
         r = self._router()
@@ -10299,16 +10318,21 @@ class TestWebSocketUpgradeRelay:
             reader, writer, status, head = await _ws_client()
             assert status.startswith(b"HTTP/1.1 101"), status
             assert b"sec-websocket-accept" in head.lower(), head
-            assert len(seen) == 1, seen
-            got = seen[0].lower()
-            # 握手的两个命门:头没被 hop-by-hop 规则删掉,且请求行是绝对形式。
-            assert "upgrade: websocket" in got, seen
-            assert "connection: keep-alive, upgrade" in got, seen
-            assert "x-marker: keepme" in got, seen
-            assert 'get http://ws.test.example:31998/echo?x=1 http/1.1' in got, seen
-            # 客户端访问本代理的凭据绝不透传上游。
-            assert "proxy-authorization" not in got, seen
-            # 101 之后是裸管道:客户端发的帧要能到达上游,回帧要能到达客户端。
+            assert len(seen) == 2, f"应只有一次 CONNECT + 一次隧道内握手: {seen}"
+            connect_head, inner_head = seen[0].lower(), seen[1].lower()
+            assert connect_head.startswith('connect ws.test.example:31998 http/1.1'), seen
+            # 命门一:握手信息必须原样到达源站(hop-by-hop 规则在这里是错的)。
+            assert "upgrade: websocket" in inner_head, seen
+            assert "connection: keep-alive, upgrade" in inner_head, seen
+            assert "x-marker: keepme" in inner_head, seen
+            # 命门二:隧道内的请求行是 origin-form(源站不认绝对形式),而绝不
+            # 能退回"给上游发绝对形式明文 GET"——池里 211.82.239.182 那种节点会
+            # 直接 501,谁排在前面就决定通道活不活。
+            assert inner_head.startswith('get /echo?x=1 http/1.1'), seen
+            # 客户端访问本代理的凭据绝不透传(CONNECT 头里也不许出现)。
+            assert "proxy-authorization" not in inner_head, seen
+            assert "Y2xpZW50OnNlY3JldA==" not in seen[0], seen
+            # 101 之后是裸管道:客户端发的帧要能到达源站,回帧要能到达客户端。
             writer.write(b"ping")
             await writer.drain()
             echo = await asyncio.wait_for(reader.readexactly(9), timeout=5)
@@ -10316,6 +10340,9 @@ class TestWebSocketUpgradeRelay:
             counters = r.snapshot_counters()
             assert counters['ws_upgrades'] == 1
             assert counters['ws_upgrade_failed'] == 0
+            # 胜出的出口被钉进域名缓存:同域名后续的明文请求走同一条路,不再换 IP。
+            assert r._meta_cache['ws.test.example']['default_proxy'] == 'ws1', \
+                r._meta_cache
             # 握手绝不进响应缓存/在途聚合(入口就绕开了三层决策链)。
             assert r.http_cache_misses == 0
         finally:
@@ -10324,8 +10351,8 @@ class TestWebSocketUpgradeRelay:
             srv.close()
             await srv.wait_closed()
 
-    async def test_upstream_credentials_replaced_on_tunnel_head(self):
-        """经上游代理时必须换上该上游自己的 Proxy-Authorization,而不是客户端的。"""
+    async def test_upstream_credentials_stay_on_connect_head(self):
+        """上游凭据只挂在 CONNECT 上;隧道内的握手对源站是"无凭据"的普通请求。"""
         seen = []
         srv = await _run_ws_upstream(WS_UP_PORT, seen)
         ps = ProxyStore()
@@ -10343,8 +10370,44 @@ class TestWebSocketUpgradeRelay:
             srv.close()
             await srv.wait_closed()
         expect = base64.b64encode(b"upuser:upass").decode()
-        assert f"proxy-authorization: basic {expect}".lower() in seen[0].lower(), seen
-        assert "Y2xpZW50OnNlY3JldA==" not in seen[0], seen
+        # base64 大小写敏感,这里必须拿原文比,不能整体 lower()。
+        assert f"Proxy-Authorization: Basic {expect}" in seen[0], seen
+        assert "proxy-authorization" not in seen[1].lower(), seen
+        assert "Y2xpZW50OnNlY3JldA==" not in "".join(seen), seen
+
+    async def test_candidate_refusing_connect_is_skipped_not_fatal(self):
+        """某个上游拒绝为该端口建隧道(ACL)时,换下一个候选,通道照样成。
+
+        这就是生产实测出来的坑的对偶:211.82.239.182:26561 只做隧道,对绝对形式
+        回 501;若反过来用"绝对形式优先 + 首个非 101 即返回",命中它就只能把 501
+        交给客户端。隧道形态下 CONNECT 被拒属于 _try_tunnel 既有的分类,回 403 的
+        候选不会把熔断计数累起来。
+        """
+        good, bad = [], []
+        sg = await _run_ws_upstream(WS_UP_PORT, good)
+        sb = await _run_ws_upstream(WS_UP_PORT + 1, bad, connect_ok=False)
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='blocked', host=HOST, port=WS_UP_PORT + 1))
+        ps.add(ProxyInfo(id='usable', host=HOST, port=WS_UP_PORT))
+        r = make_router(ps, listen_host=HOST, listen_port=WS_ROUTER_PORT,
+                        circuit_threshold=1, db_path=tempfile.mktemp(suffix='.db'))
+        # 钉死顺序:先试被 ACL 拒的那个,再试可用的那个。
+        r._ws_candidate_pids = lambda domain, client_ip='': ['blocked', 'usable']
+        await r.start()
+        try:
+            reader, writer, status, _ = await _ws_client()
+            assert status.startswith(b"HTTP/1.1 101"), status
+        finally:
+            writer.close()
+            await r.stop()
+            for s in (sg, sb):
+                s.close()
+                await s.wait_closed()
+        assert len(bad) == 1 and bad[0].upper().startswith('CONNECT'), bad
+        assert len(good) == 2, good
+        assert r.snapshot_counters()['circuit_open_count'] == 0, \
+            "上游拒绝 CONNECT 是业务判定,不该熔断它"
+        assert r.snapshot_counters()['ws_upgrade_failed'] == 0
 
     async def test_upgrade_never_races(self):
         """升级不竞速:两个候选只应产生一次真实握手(源站侧不留幽灵会话)。"""
@@ -10368,7 +10431,7 @@ class TestWebSocketUpgradeRelay:
             reader, writer, status, _ = await _ws_client()
             assert status.startswith(b"HTTP/1.1 101"), status
             assert not raced, f"升级握手不应进入竞速: {raced}"
-            assert len(seen_a) + len(seen_b) == 1, (seen_a, seen_b)
+            assert len(seen_a) + len(seen_b) == 2, (seen_a, seen_b)
             assert sum(r.snapshot_counters()['attempted_counts'].values()) == 1
         finally:
             writer.close()
@@ -10378,10 +10441,19 @@ class TestWebSocketUpgradeRelay:
                 await s.wait_closed()
 
     async def test_rejected_upgrade_returns_plain_response_without_blaming_proxy(self):
-        """非 101(上游拒绝升级)按普通响应回写,且不算代理故障。"""
-        seen = []
-        srv = await _run_ws_upstream(WS_UP_PORT, seen, mode='reject')
-        r = self._router()
+        """源站拒绝升级(非 101)按普通响应回写:不算代理故障,也不换候选。
+
+        两个候选都装成"隧道建成但源站拒绝",这样"把 400 当候选失败继续试下一个"
+        的改动会立刻多出一批 CONNECT + 握手(源站侧凭空多一个会话)。
+        """
+        seen_a, seen_b = [], []
+        sa = await _run_ws_upstream(WS_UP_PORT, seen_a, reject=True)
+        sb = await _run_ws_upstream(WS_UP_PORT + 1, seen_b, reject=True)
+        ps = ProxyStore()
+        ps.add(ProxyInfo(id='ws1', host=HOST, port=WS_UP_PORT))
+        ps.add(ProxyInfo(id='ws2', host=HOST, port=WS_UP_PORT + 1))
+        r = make_router(ps, listen_host=HOST, listen_port=WS_ROUTER_PORT,
+                        db_path=tempfile.mktemp(suffix='.db'))
         await r.start()
         try:
             reader, writer, status, head = await _ws_client()
@@ -10389,18 +10461,22 @@ class TestWebSocketUpgradeRelay:
             assert b"Content-Length: 5" in head, head
             body = await asyncio.wait_for(reader.readexactly(5), timeout=5)
             assert body == b"nope!", body
+            assert len(seen_a) + len(seen_b) == 2, \
+                f"源站已明确拒绝,不该再试别的候选: {len(seen_a)}/{len(seen_b)}"
             assert r.snapshot_counters()['ws_upgrade_failed'] == 0
-            st = r.selector.get_circuit_state().get('ws1')
-            assert st is None or st.get('consec_fail') == 0, \
-                "上游拒绝升级不是代理故障,不该累加熔断证据"
+            for pid in ('ws1', 'ws2'):
+                st = r.selector.get_circuit_state().get(pid)
+                assert st is None or st.get('consec_fail') == 0, \
+                    "上游拒绝升级不是代理故障,不该累加熔断证据"
         finally:
             writer.close()
             await r.stop()
-            srv.close()
-            await srv.wait_closed()
+            for s in (sa, sb):
+                s.close()
+                await s.wait_closed()
 
     async def test_internal_target_uses_local_direct_origin_form(self):
-        """目标是上游自身 host 时本机直连源站,请求行必须是 origin-form。"""
+        """目标是上游自身 host 时本机直连源站:不发 CONNECT,请求行 origin-form。"""
         origin, up_seen = [], []
         srv_origin = await _run_ws_upstream(WS_ORIGIN_PORT, origin)
         srv_up = await _run_ws_upstream(WS_UP_PORT, up_seen)
@@ -10413,7 +10489,7 @@ class TestWebSocketUpgradeRelay:
         try:
             reader, writer, status, _ = await _ws_client(
                 WS_HANDSHAKE.replace(b"ws.test.example:31998",
-                                     b"127.0.0.1:31999"))
+                                      b"127.0.0.1:31999"))
             assert status.startswith(b"HTTP/1.1 101"), status
         finally:
             writer.close()
@@ -10440,6 +10516,27 @@ class TestWebSocketUpgradeRelay:
         finally:
             writer.close()
             await r.stop()
+
+    async def test_dead_target_gate_applies_to_upgrades_too(self):
+        """判定为不可达的目标,握手也不再付一次 CONNECT + 握手。"""
+        seen = []
+        srv = await _run_ws_upstream(WS_UP_PORT, seen)
+        r = self._router(dead_target_ttl_sec=15.0)
+        dom = 'ws.test.example'
+        for _ in range(2):
+            r._note_target_race_failure(dom)   # 两轮"全体候选失败"
+        assert r._dead_target_active(dom)
+        await r.start()
+        try:
+            reader, writer, status, _ = await _ws_client()
+            assert status.startswith(b"HTTP/1.1 502"), status
+        finally:
+            writer.close()
+            await r.stop()
+            srv.close()
+            await srv.wait_closed()
+        assert not seen, f"已判定不可达却仍去建隧道: {seen}"
+        assert r.snapshot_counters()['dead_target_fastfails'] == 1
 
     def test_candidate_order_follows_sticky_then_domain_cache(self):
         """长通道要跟着本次会话一直在用的出口 IP:粘性 → 域名缓存 → Cost 排序。"""
@@ -10479,14 +10576,14 @@ class TestWebSocketUpgradeRelay:
         head = _R._ws_request_head(
             "GET /p HTTP/1.1\r\n",
             {'host': 'h', 'connection': 'Upgrade', 'upgrade': 'websocket',
-             'proxy-authorization': 'Basic xx', 'proxy-connection': 'keep-alive'},
-            "Proxy-Authorization: Basic yy\r\n")
+             'proxy-authorization': 'Basic xx', 'proxy-connection': 'keep-alive'})
         assert head is not None
         text = head.decode('latin-1').lower()
+        assert text.startswith('get /p http/1.1\r\n'), head
         assert "upgrade: websocket" in text and "connection: upgrade" in text
-        assert "proxy-connection" not in text
-        assert text.count("proxy-authorization") == 1
-        assert text.endswith("proxy-authorization: basic yy\r\n\r\n"), head
+        # 隧道内的请求对源站就是普通请求:代理跳用头(含凭据)一个都不留。
+        assert "proxy-authorization" not in text and "proxy-connection" not in text
+        assert text.endswith("\r\n\r\n"), head
         # 头值里的 CR/LF 会变成请求行注入 → 整个请求拒绝,不写出半个报文。
         assert _R._ws_request_head("GET /p HTTP/1.1\r\n",
                                    {'x': "a\r\nInjected: 1"}) is None
