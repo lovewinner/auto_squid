@@ -89,6 +89,86 @@ tr.cum-row td{font-size:11px;color:#888;padding-top:0;padding-bottom:8px;font-va
 .metrics-pane .pane-title{margin:0 0 8px;font-size:13px;color:#a8d8ea;font-weight:500;text-align:center}
 .metrics-table{table-layout:fixed;width:100%}
 .metrics-table th:first-child,.metrics-table td:first-child{width:90px;min-width:90px;max-width:90px}
+/* 监控指标页专用(深色仪表盘):body.panel-dark 作用域,不影响其它两页 */
+body.panel-dark{background:radial-gradient(1100px 520px at 18% -8%,#182331 0,#0b0f16 58%) fixed #0b0f16;color:#c9d1d9;max-width:1400px}
+body.panel-dark h1{color:#e6edf3;font-size:20px;font-weight:600}
+body.panel-dark .nav a{background:#111823;border-color:#263041;color:#9fb0c3;border-radius:6px}
+body.panel-dark .nav a.active{background:#1b2636;border-color:#4c9aff;color:#dbe9ff}
+body.panel-dark .toolbar select{background:#111823;border-color:#263041;color:#c9d1d9}
+body.panel-dark .toolbar button{background:#1f6feb}
+body.panel-dark .toolbar button:hover{background:#2b7fff}
+.panel-dark .metrics-tabs .view-btn{background:#111823;border:1px solid #263041;color:#9fb0c3;border-radius:6px;padding:6px 14px}
+.panel-dark .metrics-tabs .view-btn.active{background:#1b2636;border-color:#4c9aff;color:#dbe9ff}
+.panel-dark .status-panel{display:flex;align-items:stretch;gap:18px;background:linear-gradient(180deg,#141c28,#101722);border:1px solid #263041;border-radius:8px;padding:14px 18px;margin-bottom:16px;box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}
+.panel-dark .status-main{display:flex;align-items:center;gap:12px;min-width:240px;padding-right:18px;border-right:1px solid #263041}
+.panel-dark .status-dot{width:11px;height:11px;border-radius:50%;flex:0 0 auto}
+.panel-dark .status-panel.ok .status-dot{background:#3fb950;box-shadow:0 0 0 4px rgba(63,185,80,.14),0 0 16px rgba(63,185,80,.5)}
+.panel-dark .status-panel.warn .status-dot{background:#d29922;box-shadow:0 0 0 4px rgba(210,153,34,.14),0 0 16px rgba(210,153,34,.45)}
+.panel-dark .status-panel.bad .status-dot{background:#f85149;box-shadow:0 0 0 4px rgba(248,81,73,.14),0 0 16px rgba(248,81,73,.5)}
+.panel-dark .status-text{font-size:16px;font-weight:600;color:#e6edf3}
+.panel-dark .status-sub{font-size:11px;color:#8b98a9;margin-top:3px}
+.panel-dark .kpi-grid{display:grid;grid-template-columns:repeat(6,minmax(86px,1fr));flex:1}
+.panel-dark .kpi{padding:0 14px;border-left:1px solid #1f2937}
+.panel-dark .kpi:first-child{border-left:0;padding-left:2px}
+.panel-dark .kpi .k{font-size:11px;color:#8b98a9;white-space:nowrap}
+.panel-dark .kpi .v{font-size:19px;font-weight:650;margin-top:4px;font-variant-numeric:tabular-nums;color:#e6edf3}
+.panel-dark .kpi.ok .v{color:#3fb950}
+.panel-dark .kpi.warn .v{color:#d29922}
+.panel-dark .kpi.bad .v{color:#f85149}
+.panel-dark #table-wrap{background:#111823;border:1px solid #263041;border-radius:8px;overflow:hidden}
+.panel-dark th{background:#0f1620;color:#8b98a9;font-size:11px;font-weight:600;letter-spacing:.3px;border-bottom:1px solid #263041;padding:11px 12px}
+.panel-dark th:hover{background:#131c29}
+.panel-dark td{border-bottom:1px solid #1a2331;padding:11px 12px;font-variant-numeric:tabular-nums}
+.panel-dark tr:hover td{background:#151f2d}
+.panel-dark tr.node-bad td{background:rgba(248,81,73,.055)}
+.panel-dark .pill{display:inline-flex;align-items:center;gap:6px;padding:2px 9px;border-radius:6px;font-size:11px;border:1px solid transparent;white-space:nowrap}
+.panel-dark .pill.ok{color:#3fb950;background:rgba(63,185,80,.10);border-color:rgba(63,185,80,.28)}
+.panel-dark .pill.warn{color:#d29922;background:rgba(210,153,34,.10);border-color:rgba(210,153,34,.30)}
+.panel-dark .pill.bad{color:#f85149;background:rgba(248,81,73,.10);border-color:rgba(248,81,73,.30)}
+.panel-dark .pill .dot{width:6px;height:6px;margin:0}
+.panel-dark .dot.ok{background:#3fb950}
+.panel-dark .dot.warn{background:#d29922}
+.panel-dark .dot.bad{background:#f85149}
+.panel-dark .node-note{display:block;font-size:11px;color:#7b8798;margin-top:4px}
+.panel-dark .sec-title{margin:18px 0 8px;font-size:12px;color:#8b98a9;font-weight:600;letter-spacing:.4px}
+.panel-dark .sys-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-bottom:14px}
+.panel-dark .sys-card{background:linear-gradient(180deg,#141c28,#101722);border:1px solid #263041;border-radius:8px;padding:14px}
+.panel-dark .sys-card h4{margin:0 0 8px;font-size:12px;color:#9fb0c3;font-weight:600}
+.panel-dark .sys-card .row{display:flex;justify-content:space-between;font-size:12px;padding:5px 0;border-bottom:1px dashed #1d2735;color:#9fb0c3}
+.panel-dark .sys-card .row:last-child{border-bottom:0}
+.panel-dark .sys-card .row b{color:#dbe4ee;font-weight:600;font-variant-numeric:tabular-nums}
+.panel-dark .meter{height:4px;background:#1d2735;border-radius:1px;overflow:hidden;margin:4px 0 2px}
+.panel-dark .meter i{display:block;height:100%;border-radius:1px;background:#3fb950}
+.panel-dark .meter i.warn{background:#d29922}
+.panel-dark .meter i.bad{background:#f85149}
+.panel-dark .footer{color:#6b7787}
+/* 域名统计 / 会话粘性:与监控页共用同一套视觉 */
+body.panel-dark .toolbar input{background:#111823;border-color:#263041;color:#c9d1d9}
+body.panel-dark .toolbar input:focus{border-color:#4c9aff}
+body.panel-dark .autorefresh-label{color:#6b7787}
+body.panel-dark .stat-card{background:linear-gradient(180deg,#141c28,#101722);border:1px solid #263041;border-radius:8px;padding:10px 18px}
+body.panel-dark .stat-card:hover{border-color:#4c9aff;transform:none}
+body.panel-dark .stat-card.active{border-color:#4c9aff;background:#16233a}
+body.panel-dark .stat-card .pid{color:#dbe9ff}
+body.panel-dark .stat-card .count{color:#4c9aff}
+body.panel-dark .stat-card .label{color:#8b98a9}
+body.panel-dark .stat-card.active .pid,body.panel-dark .stat-card.active .count{color:#fff}
+body.panel-dark .filter-banner{background:#111823;border-color:#263041;color:#c9d1d9}
+body.panel-dark .filter-banner .fb-close{color:#f85149}
+body.panel-dark td.domain{color:#a9c1e0}
+body.panel-dark td.best{color:#4c9aff}
+body.panel-dark td.default-proxy{color:#4c9aff}
+body.panel-dark .pager button{background:#111823;border-color:#263041;color:#9fb0c3}
+body.panel-dark .pager button:hover{border-color:#4c9aff}
+body.panel-dark .pager button.active{background:#1f6feb;border-color:#1f6feb;color:#fff}
+body.panel-dark .pager span{color:#6b7787}
+body.panel-dark .no-data{color:#6b7787}
+body.panel-dark .low-conf{color:#d29922}
+body.panel-dark .ewma-sub{color:#7b8798}
+body.panel-dark tr.cum-row td{color:#7b8798}
+body.panel-dark .metrics-pane .pane-title{color:#8b98a9}
+body.panel-dark td.err-cell{color:#9fb0c3}
+@media (max-width:900px){.panel-dark .status-panel{flex-direction:column}.panel-dark .status-main{border-right:0;padding-right:0}.panel-dark .kpi-grid{grid-template-columns:repeat(3,1fr);gap:10px}.panel-dark .kpi{border-left:0;padding:0}}
 """
 
 _PANEL_JS = """\
@@ -744,7 +824,7 @@ _PANEL_SHELL = """\
 {css}
 </style>
 </head>
-<body>
+<body{class_attr}>
 <h1>auto_squid 管理面板</h1>
 {nav}
 {toolbar}
@@ -949,6 +1029,7 @@ onIntervalChange(document.getElementById('interval'), doRefresh);
 """
     return _PANEL_SHELL.format(
         title="域名统计",
+        class_attr=' class="panel-dark"',
         css=_PANEL_CSS,
         nav=_panel_nav("domains"),
         toolbar=_panel_toolbar("Filter domains...", show_filter=True),
@@ -1048,6 +1129,7 @@ onIntervalChange(document.getElementById('interval'), doRefresh);
 """
     return _PANEL_SHELL.format(
         title="会话粘性",
+        class_attr=' class="panel-dark"',
         css=_PANEL_CSS,
         nav=_panel_nav("stickiness"),
         toolbar=_panel_toolbar("Filter client|domain / proxy...", show_filter=True),
@@ -1067,23 +1149,47 @@ def _panel_metrics_html() -> str:
 <button id="metricsub-domain" class="view-btn" onclick="setMetricsSub('domain')">域名详情</button>
 </div>
 <select id="metrics-domain" style="display:none" onchange="metricsDomain = this.value; renderMetrics();"></select>
+<div id="health"></div>
 <div id="table-wrap"></div>
+<div id="sys-title" class="sec-title" style="display:none">系统运行</div>
+<div id="systems"></div>
 <div id="pager" class="pager"></div>
 <div id="footer" class="footer"></div>"""
     script = """\
 let metricsSub = 'global';
 let metricsDomain = '';
-let qmeta = {}, perDest = {};
+let qmeta = {}, perDest = {}, circ = {}, counters = {}, counts = {}, attempts = {};
+let enabledIds = [];
+let _lastCountersAt = 0, _prevWin = null, _prevWinAt = 0;
 
 function doRefresh() { fetchMetrics(); }
 
 // 全局概览:只需 /quality/meta(每代理增强指标,轻量)。域名下拉的 keys 来自
 // /domains(域名统计,60KB),不拉全量 /metrics/per-destination(1175 域名 6.7MB)。
 // 域名明细在切到域名 tab / 选中域名时才按需 /metrics/per-destination?domain=X 拉单域名。
+// 系统卡片需要 counters(/metrics 394KB、89ms),按 2 分钟节流 —— 每 30s 全量重算/
+// 序列化 4k 域名统计会在事件循环上造成周期性停顿。
 async function fetchMetrics() {
-  const [r1, r2] = await Promise.all([fetch('/quality/meta'), fetch('/domains')]);
+  const [r1, r2, r3, r4, r5] = await Promise.all([
+    fetch('/quality/meta'), fetch('/domains'), fetch('/circuit'),
+    fetch('/stats'), fetch('/proxies')]);
   qmeta = await r1.json();
   const stamp = Object.keys((await r2.json()) || {});
+  circ = (await r3.json()) || {};
+  const st = (await r4.json()) || {};
+  counts = st.request_counts || {};
+  attempts = st.attempted_counts || {};
+  try {
+    const px = await r5.json();
+    enabledIds = (px || []).filter(p => p && p.enabled).map(p => p.id || p.name);
+  } catch (e) { enabledIds = []; }
+  if (Date.now() - _lastCountersAt > 120000 || counters.conn_pool_creates == null) {
+    try {
+      const rm = await fetch('/metrics');
+      counters = ((await rm.json()) || {}).counters || {};
+      _lastCountersAt = Date.now();
+    } catch (e) { /* 保留上一次 counters */ }
+  }
   const sel = document.getElementById('metrics-domain');
   const keys = stamp.sort();
   if (sel.options.length !== keys.length) {
@@ -1116,7 +1222,11 @@ async function fetchDomain(domain) {
 async function renderMetrics() {
   const wrap = document.getElementById('table-wrap');
   document.getElementById('pager').innerHTML = '';
-  if (metricsSub === 'global') { renderMetricsGlobal(wrap); return; }
+  const isGlobal = metricsSub === 'global';
+  document.getElementById('health').style.display = isGlobal ? '' : 'none';
+  document.getElementById('sys-title').style.display = isGlobal ? '' : 'none';
+  document.getElementById('systems').style.display = isGlobal ? '' : 'none';
+  if (isGlobal) { renderMetricsGlobal(wrap); return; }
   // 域名明细:timer 内已有缓存则直接用;否则按需拉单域名
   if (window._metricFetchT.need(metricsDomain)) {
     await fetchDomain(metricsDomain);
@@ -1133,39 +1243,145 @@ function setMetricsSub(s) {
   renderMetrics();
 }
 
+// ── P0:健康条 / 上游节点表 / 系统运行 ──────────────────────────
+// 口径:成功率与失败来自窗口 outcome(0/1),不含竞速取消(CancelledError
+// 由调用方跳过,不进样本);探活 skip 单列,不进成功率分母。
+function msPair(pr) {
+  if (!pr || pr.p50 == null) return '—';
+  return Math.round(pr.p50 * 1000) + '/' + Math.round((pr.p95 != null ? pr.p95 : pr.p50) * 1000) + 'ms';
+}
+
+function nodeState(pid) {
+  const s = (circ.proxies || {})[pid] || {};
+  const m = qmeta[pid] || {};
+  if (s.open) return {cls:'bad', label:'熔断', note:'退避 ' + Math.round(s.backoff || 0) + 's · 连续失败 ' + (s.consec_fail || 0)};
+  if ((s.consec_fail || 0) > 0) return {cls:'warn', label:'抖动', note:'连续失败 ' + s.consec_fail};
+  const wr = m.window_success_rate, n = m.window_total || 0;
+  if (wr != null && n >= 20 && wr < 0.9) return {cls:'warn', label:'质量差', note:'近窗成功率 ' + fmtPct(wr)};
+  return {cls:'ok', label:'在线', note:''};
+}
+
+function renderHealth() {
+  const el = document.getElementById('health');
+  const enabled = enabledIds.length ? enabledIds : Object.keys(qmeta).filter(p => p !== 'local');
+  const open = enabled.filter(p => ((circ.proxies || {})[p] || {}).open);
+  const okN = circ.probes_ok || 0, failN = circ.probes_failed || 0, skipN = circ.probes_skipped || 0;
+  const prb = (okN + failN) ? okN / (okN + failN) : null;
+  let wf = 0, wt = 0;
+  for (const pid of Object.keys(qmeta)) {
+    const m = qmeta[pid] || {};
+    wt += m.window_total || 0;
+    wf += (m.window_total || 0) - (m.window_success_count || 0);
+  }
+  const biz = wt ? wf / wt : null;
+  let cls = 'ok';
+  if (open.length > 1 || (prb != null && prb < 0.9)) cls = 'bad';
+  else if (open.length === 1 || (prb != null && prb < 0.99) || (biz != null && biz > 0.02)) cls = 'warn';
+  const title = cls === 'bad' ? '运行异常' : (cls === 'warn' ? '部分降级' : '运行正常');
+  const sub = enabled.length + ' 台上游 · ' + (open.length ? open.length + ' 台熔断（' + open.map(esc).join('、') + '）' : '全部可用')
+            + ' · 数据截止 ' + new Date().toLocaleTimeString();
+  const kpi = (k, v, c) => '<div class="kpi ' + (c || '') + '"><div class="k">' + k + '</div><div class="v">' + v + '</div></div>';
+  const availCls = open.length === 0 ? 'ok' : (open.length <= 1 ? 'warn' : 'bad');
+  const prbCls = prb == null ? '' : (prb >= 0.99 ? 'ok' : (prb >= 0.95 ? 'warn' : 'bad'));
+  const bizCls = biz == null ? '' : (biz <= 0.02 ? 'ok' : (biz <= 0.1 ? 'warn' : 'bad'));
+  el.innerHTML = '<div class="status-panel ' + cls + '">'
+    + '<div class="status-main"><span class="status-dot"></span><div>'
+      + '<div class="status-text">' + title + '</div>'
+      + '<div class="status-sub">' + sub + '</div></div></div>'
+    + '<div class="kpi-grid">'
+      + kpi('可用上游', (enabled.length - open.length) + ' / ' + enabled.length, availCls)
+      + kpi('熔断中', open.length, availCls === 'ok' ? 'ok' : 'bad')
+      + kpi('探活成功率', fmtPct(prb), prbCls)
+      + kpi('近窗业务失败', wf + ' / ' + wt, bizCls)
+      + kpi('探活跳过', skipN, skipN ? '' : 'ok')
+      + kpi('WS 握手', (counters.ws_upgrades || 0) + (counters.ws_upgrade_failed ? ' / 失败 ' + counters.ws_upgrade_failed : ''), '')
+    + '</div></div>';
+}
+
+function sysRow(k, v) { return '<div class="row"><span>' + k + '</span><b>' + v + '</b></div>'; }
+
+function renderSystems() {
+  const el = document.getElementById('systems');
+  const c = counters || {};
+  const ratio = (a, b) => (a != null && b) ? fmtPct(a / b) : '—';
+  const meter = (p, goodHigh) => {
+    if (p == null) return '';
+    const cls = goodHigh ? (p >= 0.7 ? 'ok' : (p >= 0.5 ? 'warn' : 'bad'))
+                         : (p < 0.5 ? 'ok' : (p < 0.7 ? 'warn' : 'bad'));
+    return '<div class="meter"><i class="' + cls + '" style="width:' + Math.round(Math.min(1, Math.max(0, p)) * 100) + '%"></i></div>';
+  };
+  const hitP = (c.conn_pool_hits != null && (c.conn_pool_hits + c.conn_pool_misses))
+    ? c.conn_pool_hits / (c.conn_pool_hits + c.conn_pool_misses) : null;
+  const expP = (c.conn_pool_expired != null && c.conn_pool_creates)
+    ? c.conn_pool_expired / c.conn_pool_creates : null;
+  let winN = 0, atN = 0;
+  for (const pid of Object.keys(counts)) winN += counts[pid] || 0;
+  for (const pid of Object.keys(attempts)) atN += attempts[pid] || 0;
+  const now = Date.now();
+  let rps = null;
+  if (_prevWin != null && now > _prevWinAt) {
+    const dt = (now - _prevWinAt) / 1000;
+    if (dt >= 1) rps = Math.max(0, (winN - _prevWin) / dt);
+  }
+  _prevWin = winN; _prevWinAt = now;
+  const fanout = (winN && atN) ? (atN / winN).toFixed(2) + '×' : '—';
+  el.innerHTML = '<div class="sys-grid">'
+    + '<div class="sys-card"><h4>探活（累计）</h4>'
+      + sysRow('已发 / 成功', (circ.probes_sent || 0) + ' / ' + (circ.probes_ok || 0))
+      + sysRow('失败 / 跳过', (circ.probes_failed || 0) + ' / ' + (circ.probes_skipped || 0))
+      + sysRow('熔断开启次数', c.circuit_open_count != null ? c.circuit_open_count : '—') + '</div>'
+    + '<div class="sys-card"><h4>目标侧</h4>'
+      + sysRow('目标级失败', circ.failures_target_level != null ? circ.failures_target_level : '—')
+      + sysRow('归因域名', circ.target_attribution_domains != null ? circ.target_attribution_domains : '—')
+      + sysRow('死目标 / 快速失败', Object.keys(circ.dead_targets || {}).length + ' / ' + (circ.dead_target_fastfails || 0)) + '</div>'
+    + '<div class="sys-card"><h4>连接池</h4>'
+      + sysRow('命中率', ratio(c.conn_pool_hits, (c.conn_pool_hits || 0) + (c.conn_pool_misses || 0))) + meter(hitP, true)
+      + sysRow('过期率', ratio(c.conn_pool_expired, c.conn_pool_creates)) + meter(expP, false)
+      + sysRow('steal / stale 丢弃', (c.conn_pool_steals != null ? c.conn_pool_steals : '—') + ' / ' + (c.pool_stale_discards != null ? c.pool_stale_discards : '—'))
+      + sysRow('池大小（连接 / 目标）', (c.conn_pool_size != null ? c.conn_pool_size : '—') + ' / ' + (c.target_pool_size != null ? c.target_pool_size : '—')) + '</div>'
+    + '<div class="sys-card"><h4>通道与降级</h4>'
+      + sysRow('WS 升级 / 失败 / 拒绝', (c.ws_upgrades || 0) + ' / ' + (c.ws_upgrade_failed || 0) + ' / ' + (c.ws_upgrade_rejected || 0))
+      + sysRow('本机直连 成功 / 失败', (c.local_direct_hits != null ? c.local_direct_hits : '—') + ' / ' + (c.local_direct_failures != null ? c.local_direct_failures : '—'))
+      + sysRow('单发降级（累计）', c.single_send_degrades != null ? c.single_send_degrades : '—') + '</div>'
+    + '<div class="sys-card"><h4>流量</h4>'
+      + sysRow('获胜请求 / 尝试', winN + ' / ' + atN)
+      + sysRow('扇出比', fanout)
+      + sysRow('获胜速率', rps == null ? '—' : rps.toFixed(1) + ' req/s') + '</div>'
+    + '</div>';
+}
+
 function renderMetricsGlobal(wrap) {
-  const pids = Object.keys(qmeta).sort();
-  if (!pids.length) { wrap.innerHTML = '<div class="no-data">No data</div>'; document.getElementById('pager').innerHTML=''; document.getElementById('footer').textContent=''; return; }
+  const pids = Object.keys(qmeta);
+  if (!pids.length) { wrap.innerHTML = '<div class="no-data">No data</div>'; document.getElementById('footer').textContent=''; return; }
   page = 0;
-  let win = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 P50/P95/P99</th><th>源站首字节 P50/P95/P99</th><th>成功率(近)</th><th>成功/总数(近)</th><th>错误分类(近 256)</th></tr></thead><tbody>';
-  let cum = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 均值</th><th>源站首字节 均值</th><th>成功率</th><th>成功/总数</th><th>累计字节</th><th>协议(累计)</th></tr></thead><tbody>';
-  for (const pid of pids) {
+  renderHealth();
+  renderSystems();
+  const order = {bad: 0, warn: 1, ok: 2};
+  const rows = pids.map(pid => ({pid: pid, st: nodeState(pid)}))
+    .sort((a, b) => (order[a.st.cls] - order[b.st.cls]) || a.pid.localeCompare(b.pid));
+  let t = '<table class="metrics-table"><thead><tr><th>状态</th><th>代理</th><th>握手 P50/P95</th><th>首字节 P50/P95</th><th>成功率（近）</th><th>成功/失败（近）</th><th>累计请求</th><th>累计字节</th><th>协议</th></tr></thead><tbody>';
+  for (const r of rows) {
+    const pid = r.pid, st = r.st;
     const m = qmeta[pid] || {};
     const c = m.cumulative || {};
-    win += `<tr><td class="default-proxy">${esc(pid)}</td>`;
-    win += `<td class="metric-cell-num">${pctCell(m.ttfb)}</td>`;
-    win += `<td class="metric-cell-num">${pctCell(m.ofb)}</td>`;
-    win += `<td class="metric-cell-num">${fmtPct(m.window_success_rate)}</td>`;
-    win += `<td class="metric-cell-num">${m.window_success_count||0}/${m.window_total||0}</td>`;
-    win += `<td class="metric-cell-num err-cell">${errStr(m.errors)}</td></tr>`;
-    cum += `<tr><td class="default-proxy">${esc(pid)}</td>`;
-    cum += `<td class="metric-cell-num">${c.avg_ttfb_ms != null ? Math.round(c.avg_ttfb_ms)+'ms' : '—'}</td>`;
-    cum += `<td class="metric-cell-num">${c.avg_ofb_ms != null ? Math.round(c.avg_ofb_ms)+'ms' : '—'}</td>`;
-    cum += `<td class="metric-cell-num">${fmtPct(c.success_rate)}</td>`;
-    cum += `<td class="metric-cell-num">${c.success||0}/${c.samples||0}</td>`;
-    cum += `<td class="metric-cell-num">${fmtBytes(c.total_bytes || 0)}</td>`;
-    cum += `<td class="metric-cell-num">${protoStr(m.http_versions)}</td></tr>`;
-    const lp = lifePctLine(c);
-    if (lp) cum += `<tr class="cum-row"><td colspan="7">${lp}</td></tr>`;
+    const tot = m.window_total || 0, succ = m.window_success_count || 0;
+    t += '<tr class="' + (st.cls === 'bad' ? 'node-bad' : '') + '">';
+    t += '<td><span class="pill ' + st.cls + '"><span class="dot ' + st.cls + '"></span>' + st.label + '</span>'
+       + (st.note ? '<span class="node-note">' + st.note + '</span>' : '') + '</td>';
+    t += '<td class="default-proxy">' + esc(pid) + '</td>';
+    t += '<td class="metric-cell-num">' + msPair(m.ttfb) + '</td>';
+    t += '<td class="metric-cell-num">' + msPair(m.ofb) + '</td>';
+    t += '<td class="metric-cell-num" title="' + errStr(m.errors) + '">' + fmtPct(m.window_success_rate) + '</td>';
+    t += '<td class="metric-cell-num">' + succ + '/' + (tot - succ) + '</td>';
+    t += '<td class="metric-cell-num">' + (c.samples != null ? c.samples : (m.total_attempts || 0)) + '</td>';
+    t += '<td class="metric-cell-num">' + fmtBytes(c.total_bytes || m.total_bytes_transferred || 0) + '</td>';
+    t += '<td class="metric-cell-num">' + protoStr(m.http_versions) + '</td></tr>';
   }
-  win += '</tbody></table>';
-  cum += '</tbody></table>';
-  let html = '<div class="metrics-split">'
-           + '<div class="metrics-pane"><h3 class="pane-title">窗口(近期 _OBS_WINDOW=256 · 用于路由决策)</h3>' + win + '</div>'
-           + '<div class="metrics-pane"><h3 class="pane-title">累计(永久值,跨重启 · 历史可追溯)</h3>' + cum + '</div>'
-           + '</div>';
-  wrap.innerHTML = html;
-  document.getElementById('footer').textContent = pids.length + ' proxies · 全局每代理概览(跨域名聚合)';
+  t += '</tbody></table>';
+  wrap.innerHTML = t;
+  document.getElementById('footer').textContent =
+    pids.length + ' 个代理 · 窗口=近 256 样本（路由决策口径），累计=跨重启 · 失败不含竞速取消 · 数据截止 ' +
+    new Date().toLocaleTimeString();
 }
 
 function renderMetricsDomain(wrap) {
@@ -1218,6 +1434,7 @@ onIntervalChange(document.getElementById('interval'), doRefresh);
 """
     return _PANEL_SHELL.format(
         title="监控指标",
+        class_attr=' class="panel-dark"',
         css=_PANEL_CSS,
         nav=_panel_nav("metrics"),
         toolbar=_panel_toolbar("", show_filter=False),
