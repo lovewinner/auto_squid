@@ -110,7 +110,6 @@ const ERR_LABELS = {timeout:'超时', connect:'连接', http_5xx:'5xx', http_sta
 // ── 格式化工具(纯函数,所有页共用)──
 function fmtPct(p) { return p == null ? '—' : (p * 100).toFixed(1) + '%'; }
 function fmtMs(v) { return v == null ? '—' : Math.round(v * 1000) + 'ms'; }
-function fmtMbps(v) { return v == null ? '—' : v.toFixed(2) + ' MB/s'; }
 function fmtBytes(b) {
   if (b == null) return '—';
   if (b >= 1e9) return (b/1e9).toFixed(2) + ' GB';
@@ -1139,7 +1138,7 @@ function renderMetricsGlobal(wrap) {
   if (!pids.length) { wrap.innerHTML = '<div class="no-data">No data</div>'; document.getElementById('pager').innerHTML=''; document.getElementById('footer').textContent=''; return; }
   page = 0;
   let win = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 P50/P95/P99</th><th>源站首字节 P50/P95/P99</th><th>成功率(近)</th><th>成功/总数(近)</th><th>错误分类(近 256)</th></tr></thead><tbody>';
-  let cum = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 均值</th><th>源站首字节 均值</th><th>吞吐 累计</th><th>成功率</th><th>成功/总数</th><th>累计字节</th><th>协议(累计)</th></tr></thead><tbody>';
+  let cum = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 均值</th><th>源站首字节 均值</th><th>成功率</th><th>成功/总数</th><th>累计字节</th><th>协议(累计)</th></tr></thead><tbody>';
   for (const pid of pids) {
     const m = qmeta[pid] || {};
     const c = m.cumulative || {};
@@ -1152,13 +1151,12 @@ function renderMetricsGlobal(wrap) {
     cum += `<tr><td class="default-proxy">${esc(pid)}</td>`;
     cum += `<td class="metric-cell-num">${c.avg_ttfb_ms != null ? Math.round(c.avg_ttfb_ms)+'ms' : '—'}</td>`;
     cum += `<td class="metric-cell-num">${c.avg_ofb_ms != null ? Math.round(c.avg_ofb_ms)+'ms' : '—'}</td>`;
-    cum += `<td class="metric-cell-num">${fmtMbps(c.throughput_mbps)}</td>`;
     cum += `<td class="metric-cell-num">${fmtPct(c.success_rate)}</td>`;
     cum += `<td class="metric-cell-num">${c.success||0}/${c.samples||0}</td>`;
     cum += `<td class="metric-cell-num">${fmtBytes(c.total_bytes || 0)}</td>`;
     cum += `<td class="metric-cell-num">${protoStr(m.http_versions)}</td></tr>`;
     const lp = lifePctLine(c);
-    if (lp) cum += `<tr class="cum-row"><td colspan="8">${lp}</td></tr>`;
+    if (lp) cum += `<tr class="cum-row"><td colspan="7">${lp}</td></tr>`;
   }
   win += '</tbody></table>';
   cum += '</tbody></table>';
@@ -1181,7 +1179,7 @@ function renderMetricsDomain(wrap) {
   if (!pids.length) { wrap.innerHTML = '<div class="no-data">该域名暂无代理指标</div>'; document.getElementById('pager').innerHTML=''; document.getElementById('footer').textContent=''; return; }
   let banner = `<div class="filter-banner" style="display:flex"><strong>${esc(metricsDomain)}</strong>&nbsp;各代理实测指标</div>`;
   let win = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 P50/P95/P99</th><th>源站首字节 P50/P95/P99</th><th>成功率(近)</th><th>成功/总数(近)</th><th>错误分类(近 256)</th></tr></thead><tbody>';
-  let cum = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 均值</th><th>源站首字节 均值</th><th>吞吐 累计</th><th>成功率</th><th>总请求</th><th>累计字节</th><th>协议(累计)</th></tr></thead><tbody>';
+  let cum = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 均值</th><th>源站首字节 均值</th><th>成功率</th><th>总请求</th><th>累计字节</th><th>协议(累计)</th></tr></thead><tbody>';
   for (const pid of pids) {
     const m = per[pid] || {};
     const per_t = m.percentiles || {};
@@ -1197,13 +1195,12 @@ function renderMetricsDomain(wrap) {
     cum += `<tr><td class="default-proxy">${esc(pid)}</td>`;
     cum += `<td class="metric-cell-num">${c.avg_ttfb_ms != null ? Math.round(c.avg_ttfb_ms)+'ms' : '—'}</td>`;
     cum += `<td class="metric-cell-num">${c.avg_ofb_ms != null ? Math.round(c.avg_ofb_ms)+'ms' : '—'}</td>`;
-    cum += `<td class="metric-cell-num">${fmtMbps(c.throughput_mbps)}</td>`;
     cum += `<td class="metric-cell-num">${fmtPct(c.success_rate)}</td>`;
     cum += `<td class="metric-cell-num">${c.samples||0}</td>`;
     cum += `<td class="metric-cell-num">${fmtBytes(c.total_bytes || 0)}</td>`;
     cum += `<td class="metric-cell-num">${protoStr(m.http_versions)}</td></tr>`;
     const lp = lifePctLine(c);
-    if (lp) cum += `<tr class="cum-row"><td colspan="8">${lp}</td></tr>`;
+    if (lp) cum += `<tr class="cum-row"><td colspan="7">${lp}</td></tr>`;
   }
   win += '</tbody></table>';
   cum += '</tbody></table>';
