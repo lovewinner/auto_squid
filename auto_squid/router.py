@@ -43,6 +43,7 @@ import sqlite3
 import threading
 import time
 import urllib.parse
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Any, Dict, Tuple
 import httpx
@@ -426,6 +427,17 @@ class Router:
         self.probes_ok = 0
         self.probes_skipped = 0  # 因本机→canary 不可达(环境原因)而跳过的探活次数
         self.probes_failed = 0   # 经上游 CONNECT 失败的探活次数(上游侧真故障)
+        # 每代理探活快照:最后一次成功/失败/跳过的时刻、阶段、耗时与错误名。
+        # /circuit 用它与熔断态并排展示"这台上游最后一次探活到底怎么了"。
+        self._probe_state: Dict[str, Dict[str, Any]] = {}
+        # 每代理最近一次业务失败(不含竞速取消),供面板定位"最近一次坏在哪"。
+        self._last_failure: Dict[str, Dict[str, Any]] = {}
+        # 分钟级趋势环形缓冲(默认 180 点 ≈ 3 小时),_trend_loop 周期写入。
+        # 每桶存的是"该周期内的增量",不是累计值 —— 累计值画不出趋势。
+        self.trend_interval_sec = 60.0
+        self._trend = deque(maxlen=180)
+        self._trend_task: Optional[asyncio.Task] = None
+        self._trend_prev: Optional[Dict[str, Any]] = None
         # ── 探测对齐(Phase 4):CONNECT 之外的轻量 GET 探活 ──────────
         # 纯 CONNECT 只验证"上游存活",其延迟(建连+握手)与业务 TTFB/吞吐并不同构,
         # 故可选对白名单 URL 追加一次轻量 GET,把探活数据对齐到业务指标维度。
@@ -1449,6 +1461,46 @@ class Router:
         except asyncio.CancelledError:
             pass
 
+    async def _trend_loop(self):
+        """周期采集一分钟级趋势桶(增量口径),供 /metrics/trend 与面板折线。
+
+        存增量而不是累计:累计曲线永远是单调上升的,看不出"这一分钟是否恶化"。
+        进程重启后缓冲清空 —— 这是观测数据,不落盘。
+        """
+        try:
+            while True:
+                await asyncio.sleep(self.trend_interval_sec)
+                try:
+                    self._record_trend_bucket()
+                except Exception:
+                    logger.exception("trend bucket failed")
+        except asyncio.CancelledError:
+            pass
+
+    def _record_trend_bucket(self) -> None:
+        succ, total = self.selector.global_cumulative()
+        cur = {
+            "probe_ok": self.probes_ok,
+            "probe_fail": self.probes_failed,
+            "probe_skip": self.probes_skipped,
+            "biz_ok": succ,
+            "biz_fail": total - succ,
+            "requests": sum(self.request_counts.values()),
+            "circuit_opens": self.selector.circuit_open_count,
+        }
+        prev = self._trend_prev
+        bucket: Dict[str, Any] = {"ts": round(time.time(), 3)}
+        for k, v in cur.items():
+            bucket[k] = v - (prev.get(k, v) if prev else v)
+        bucket["circuit_open_now"] = sum(
+            1 for s in self.selector.get_circuit_state().values() if s.get("open"))
+        self._trend.append(bucket)
+        self._trend_prev = cur
+
+    def trend_snapshot(self) -> List[Dict[str, Any]]:
+        """近 N 个周期的趋势桶(旧→新),只读副本。"""
+        return list(self._trend)
+
     @staticmethod
     def _parse_target(target: str) -> Tuple[str, int]:
         """解析 "host:port" / "[ipv6]:port" 为目标 (host, port)。"""
@@ -1542,6 +1594,23 @@ class Router:
                            "circuit recovery may be stale until next round",
                            _PROBE_ROUND_TIMEOUT, len(proxies))
 
+    def _note_probe(self, pid: str, **fields) -> None:
+        """记录一台上游最近一次探活结果(供 /circuit 与面板展示)。"""
+        st = self._probe_state.setdefault(pid, {})
+        st.update(fields)
+        st["at"] = round(time.time(), 3)
+
+    def probe_state_snapshot(self) -> Dict[str, Dict[str, Any]]:
+        """每代理探活快照(只读副本;at 为 epoch 秒,latency 为毫秒)。"""
+        return {pid: dict(st) for pid, st in self._probe_state.items()}
+
+    def last_failure_snapshot(self, pid: Optional[str] = None):
+        """每代理最近一次业务失败(不含竞速取消):{at, err, domain}。"""
+        if pid is not None:
+            st = self._last_failure.get(pid)
+            return dict(st) if st else None
+        return {k: dict(v) for k, v in self._last_failure.items()}
+
     async def _probe_proxy(self, proxy):
         """对单个代理发起一次 CONNECT 探活:经该上游 CONNECT 到其 canary 后关闭。
 
@@ -1559,6 +1628,7 @@ class Router:
         canary = self._canary_for_proxy(proxy)
         if not await self._canary_reachable(canary):
             self.probes_skipped += 1
+            self._note_probe(proxy.id, ok=None, stage='skip', err='canary_unreachable')
             return
         self.probes_sent += 1
         t0 = time.perf_counter()
@@ -1578,6 +1648,7 @@ class Router:
                         type(e).__name__, e)
             self.selector.record_failure(proxy.id)
             self.probes_failed += 1
+            self._note_probe(proxy.id, ok=False, stage='connect', err=type(e).__name__)
             return
         try:
             auth_hdr = ""
@@ -1598,6 +1669,8 @@ class Router:
             self.selector.record_ttfb(proxy.id, time.perf_counter() - t0)
             self.selector.record_success(proxy.id)
             self.probes_ok += 1
+            self._note_probe(proxy.id, ok=True, stage='ok', err=None,
+                             latency_ms=round((time.perf_counter() - t0) * 1000.0, 1))
             # Phase 4:CONNECT 已证明上游存活,再补一次轻量 GET 让探活贴近业务指标。
             # GET 失败不影响 CONNECT 的结论(上游仍存活),故吞掉其异常。
             await self._maybe_probe_get(proxy)
@@ -1607,6 +1680,7 @@ class Router:
                         type(e).__name__, e)
             self.selector.record_failure(proxy.id)
             self.probes_failed += 1
+            self._note_probe(proxy.id, ok=False, stage='connect-handshake', err=type(e).__name__)
         finally:
             # 有上限的关闭:此前是无超时 `await up_writer.wait_closed()`。半开上游
             # 不回 FIN 时这一句永久挂住,而它跑在 _probe_task 里 —— 从此探活再也不
@@ -3814,6 +3888,14 @@ class Router:
         logger.info("upstream attempt FAILED client=%s domain=%s target=%s pid=%s err=%s: %s "
                     "elapsed=%.1fms", client_ip or "-", domain, target, pid,
                     type(err).__name__, str(err)[:200] or "-", elapsed_ms)
+        # 竞速败者的 CancelledError 不是业务失败,不能进"最近失败"(否则每轮竞速
+        # 都会把健康代理的最后失败刷成取消,面板上全是假警报)。
+        if not isinstance(err, asyncio.CancelledError):
+            self._last_failure[pid] = {
+                "at": round(time.time(), 3),
+                "err": type(err).__name__,
+                "domain": domain or target,
+            }
 
     @staticmethod
     def _classify_error(err: BaseException) -> str:
@@ -4709,6 +4791,8 @@ class Router:
             self._flush_task = asyncio.create_task(self._flush_loop())
         if self.probe_interval_sec > 0 and (self._probe_task is None or self._probe_task.done()):
             self._probe_task = asyncio.create_task(self._probe_loop())
+        if self.trend_interval_sec > 0 and (self._trend_task is None or self._trend_task.done()):
+            self._trend_task = asyncio.create_task(self._trend_loop())
         # Cost 权重自动调参器(P1):仅在 config 显式开启时启动后台评估循环。
         self.tuner.start()
         # CONNECT 预热池(P1):refill_interval>0 时由 pools 启动后台补充循环。
@@ -4805,6 +4889,13 @@ class Router:
             except (asyncio.CancelledError, Exception):
                 pass
             self._probe_task = None
+        if self._trend_task and not self._trend_task.done():
+            self._trend_task.cancel()
+            try:
+                await self._trend_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._trend_task = None
         # shutdown(wait=True) 等落盘 worker 把已快照的载荷写完后才关库:run_in_executor
         # 里 cancel 只丢弃 await、不杀线程,若不 drain 会发生 worker 对已 close 的
         # sqlite 连接 execute。shutdown 后再进入关库临界区,与 worker 的 with 锁互斥。

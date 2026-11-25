@@ -5,6 +5,9 @@ from typing import Dict, List
 import asyncio
 import json
 import logging
+import os
+import time
+from collections import deque
 
 from .auth import check_auth
 from .config_schema import AuthConfig, ProxyInfo, is_valid_host
@@ -129,7 +132,18 @@ body.panel-dark .toolbar button:hover{background:#2b7fff}
 .panel-dark .dot.ok{background:#3fb950}
 .panel-dark .dot.warn{background:#d29922}
 .panel-dark .dot.bad{background:#f85149}
-.panel-dark .node-note{display:block;font-size:11px;color:#7b8798;margin-top:4px}
+.panel-dark .node-note{display:block;font-size:11px;color:#7b8798;margin-top:4px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.panel-dark .ok-text{color:#3fb950}
+.panel-dark .bad-text{color:#f85149}
+.panel-dark .warn-text{color:#d29922}
+.panel-dark .trend-card{margin-bottom:14px}
+.panel-dark .trend-legend{float:right;font-weight:400;color:#8b98a9;font-size:11px}
+.panel-dark .trend-legend .lg{display:inline-block;width:8px;height:8px;border-radius:2px;margin:0 4px 0 10px}
+.panel-dark .trend-legend .lg.ok{background:#3fb950}
+.panel-dark .trend-legend .lg.bad{background:#f85149}
+.panel-dark .trend-legend .lg.accent{background:#4c9aff}
+.panel-dark .trend-empty{color:#6b7787;font-size:12px;padding:18px 0;text-align:center}
+.panel-dark #trend-canvas{width:100%;display:block}
 .panel-dark .sec-title{margin:18px 0 8px;font-size:12px;color:#8b98a9;font-weight:600;letter-spacing:.4px}
 .panel-dark .sys-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-bottom:14px}
 .panel-dark .sys-card{background:linear-gradient(180deg,#141c28,#101722);border:1px solid #263041;border-radius:8px;padding:14px}
@@ -528,6 +542,26 @@ async def circuit():
     """
     if not _router:
         return {}
+    states = _router.selector.get_circuit_state()
+    # get_circuit_state 只为"出现过失败"的代理建条目;面板/探活展示需要每台上游
+    # 都有行,这里按 store 里 enabled 的代理补默认态(local 按需)。
+    known = {p.id for p in _proxy_store.list() if p.enabled} if _proxy_store else set()
+    if _router.enable_local_racing:
+        known.add("local")
+    for pid in known:
+        states.setdefault(pid, {"open": False, "open_until": None, "backoff": 0.0,
+                                "consec_fail": 0, "slow_start": False})
+    now_m = time.monotonic()
+    probe = _router.probe_state_snapshot()
+    inflight = _router.selector.get_in_flight()
+    for pid, st in states.items():
+        # open_until 是 monotonic 时钟,面板侧算不出剩余时间,这里直接换算成秒。
+        st["backoff_remaining_sec"] = (
+            round(max(0.0, float(st.get("open_until") or 0.0) - now_m), 1)
+            if st.get("open") else 0.0)
+        st["in_flight"] = inflight.get(pid, 0)
+        st["probe"] = probe.get(pid)
+        st["last_failure"] = _router.last_failure_snapshot(pid)
     return {
         "circuit_open_count": _router.selector.circuit_open_count,
         # 被归因到"目标不可达"而没有加重于代理的失败数:整池同时跳闸时,这个数
@@ -547,7 +581,7 @@ async def circuit():
         "dead_target_marked": _router.dead_target_marked,
         "dead_target_fastfails": _router.dead_target_fastfails,
         "dead_targets": _router._snapshot_dead_targets(),
-        "proxies": _router.selector.get_circuit_state(),
+        "proxies": states,
     }
 
 
@@ -575,6 +609,29 @@ async def metrics():
     proxy_metrics = _router.selector.get_proxy_metrics() if _router else {}
     return {"request_counts": counts, "attempted_counts": attempts, "domain_stats": domain_stats,
             "counters": counters, "proxy_metrics": proxy_metrics}
+
+
+@app.get("/metrics/summary")
+async def metrics_summary():
+    """只返回 counters(不带域名统计与每代理分位),供面板周期轮询。
+
+    /metrics 会在事件循环上拷贝并序列化全部域名统计(生产 4k+ 域名,~390KB),
+    面板每 30s 拉一次就是周期性停顿;这里只回 counters(几 KB)。
+    """
+    return {"counters": _router.snapshot_counters() if _router else {}}
+
+
+@app.get("/metrics/trend")
+async def metrics_trend():
+    """近 3 小时的分钟级趋势桶(增量口径),供面板画折线与后续告警。
+
+    每桶字段均为该周期的增量:probe_ok/probe_fail/probe_skip、biz_ok/biz_fail、
+    requests、circuit_opens;另带桶结束时的 circuit_open_now。进程重启后清空。
+    """
+    if not _router:
+        return {"interval_sec": 0, "buckets": []}
+    return {"interval_sec": _router.trend_interval_sec,
+            "buckets": _router.trend_snapshot()}
 
 
 @app.get("/metrics/per-destination")
@@ -618,6 +675,71 @@ async def server_stats():
     反映被测 Router 自身(而非客户端)的 CPU 饱和度与同步阻塞情况。
     """
     return _server_stats
+
+
+# ── 常开进程/事件循环观测(P1)────────────────────────────────
+# 事件循环延迟用 0.5s 定时器的"多睡了多久"近似:连续几十 ms 说明有同步阻塞
+# (大 JSON 序列化 / 同步 DB 调用)在拖尾。只在有人访问端点后启动采样。
+_lag_samples: deque = deque(maxlen=120)
+_lag_task = None
+
+
+def _proc_stats() -> dict:
+    out: dict = {}
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    out["rss_mb"] = round(int(line.split()[1]) / 1024.0, 1)
+                elif line.startswith("Threads:"):
+                    out["threads"] = int(line.split()[1])
+    except OSError:
+        pass
+    try:
+        out["fds"] = len(os.listdir("/proc/self/fd"))
+    except OSError:
+        pass
+    return out
+
+
+async def _lag_loop() -> None:
+    loop = asyncio.get_running_loop()
+    while True:
+        t0 = loop.time()
+        await asyncio.sleep(0.5)
+        _lag_samples.append(max(0.0, loop.time() - t0 - 0.5))
+
+
+def _ensure_lag_sampler() -> None:
+    global _lag_task
+    if _lag_task is None or _lag_task.done():
+        try:
+            _lag_task = asyncio.get_running_loop().create_task(_lag_loop())
+        except RuntimeError:
+            pass
+
+
+@app.get("/system-stats")
+async def system_stats():
+    """服务端资源与事件循环健康:压测 CPU 采样 + 常开的 RSS/FD/线程/loop 延迟。
+
+    /panel/metrics 的系统卡片用它展示"系统自身是否健康";压测字段与常开字段
+    合并返回,互不覆盖。
+    """
+    _ensure_lag_sampler()
+    out = dict(_server_stats)
+    out.update(_proc_stats())
+    vals = sorted(_lag_samples)
+    if vals:
+        out["event_loop_lag_ms"] = {
+            "p50": round(vals[len(vals) // 2] * 1000.0, 1),
+            "p95": round(vals[min(len(vals) - 1, int(len(vals) * 0.95))] * 1000.0, 1),
+            "max": round(vals[-1] * 1000.0, 1),
+            "samples": len(vals),
+        }
+    else:
+        out["event_loop_lag_ms"] = {"p50": None, "p95": None, "max": None, "samples": 0}
+    return out
 
 
 @app.get("/stats")
@@ -1153,26 +1275,28 @@ def _panel_metrics_html() -> str:
 <div id="table-wrap"></div>
 <div id="sys-title" class="sec-title" style="display:none">系统运行</div>
 <div id="systems"></div>
+<div id="trend"></div>
 <div id="pager" class="pager"></div>
 <div id="footer" class="footer"></div>"""
     script = """\
 let metricsSub = 'global';
 let metricsDomain = '';
 let qmeta = {}, perDest = {}, circ = {}, counters = {}, counts = {}, attempts = {};
+let sysStats = {}, trendData = {interval_sec: 60, buckets: []};
 let enabledIds = [];
-let _lastCountersAt = 0, _prevWin = null, _prevWinAt = 0;
+let _prevWin = null, _prevWinAt = 0;
 
 function doRefresh() { fetchMetrics(); }
 
 // 全局概览:只需 /quality/meta(每代理增强指标,轻量)。域名下拉的 keys 来自
 // /domains(域名统计,60KB),不拉全量 /metrics/per-destination(1175 域名 6.7MB)。
 // 域名明细在切到域名 tab / 选中域名时才按需 /metrics/per-destination?domain=X 拉单域名。
-// 系统卡片需要 counters(/metrics 394KB、89ms),按 2 分钟节流 —— 每 30s 全量重算/
-// 序列化 4k 域名统计会在事件循环上造成周期性停顿。
+// 系统卡片/趋势用 /metrics/summary(仅 counters)、/system-stats 与 /metrics/trend,
+// 都不带域名统计,可随面板周期刷新。
 async function fetchMetrics() {
-  const [r1, r2, r3, r4, r5] = await Promise.all([
-    fetch('/quality/meta'), fetch('/domains'), fetch('/circuit'),
-    fetch('/stats'), fetch('/proxies')]);
+  const [r1, r2, r3, r4, r5, r6, r7, r8] = await Promise.all([
+    fetch('/quality/meta'), fetch('/domains'), fetch('/circuit'), fetch('/stats'),
+    fetch('/proxies'), fetch('/metrics/summary'), fetch('/system-stats'), fetch('/metrics/trend')]);
   qmeta = await r1.json();
   const stamp = Object.keys((await r2.json()) || {});
   circ = (await r3.json()) || {};
@@ -1183,13 +1307,9 @@ async function fetchMetrics() {
     const px = await r5.json();
     enabledIds = (px || []).filter(p => p && p.enabled).map(p => p.id || p.name);
   } catch (e) { enabledIds = []; }
-  if (Date.now() - _lastCountersAt > 120000 || counters.conn_pool_creates == null) {
-    try {
-      const rm = await fetch('/metrics');
-      counters = ((await rm.json()) || {}).counters || {};
-      _lastCountersAt = Date.now();
-    } catch (e) { /* 保留上一次 counters */ }
-  }
+  try { counters = ((await r6.json()) || {}).counters || {}; } catch (e) { counters = {}; }
+  try { sysStats = (await r7.json()) || {}; } catch (e) { sysStats = {}; }
+  try { trendData = (await r8.json()) || {buckets: []}; } catch (e) { trendData = {buckets: []}; }
   const sel = document.getElementById('metrics-domain');
   const keys = stamp.sort();
   if (sel.options.length !== keys.length) {
@@ -1226,6 +1346,7 @@ async function renderMetrics() {
   document.getElementById('health').style.display = isGlobal ? '' : 'none';
   document.getElementById('sys-title').style.display = isGlobal ? '' : 'none';
   document.getElementById('systems').style.display = isGlobal ? '' : 'none';
+  document.getElementById('trend').style.display = isGlobal ? '' : 'none';
   if (isGlobal) { renderMetricsGlobal(wrap); return; }
   // 域名明细:timer 内已有缓存则直接用;否则按需拉单域名
   if (window._metricFetchT.need(metricsDomain)) {
@@ -1251,14 +1372,46 @@ function msPair(pr) {
   return Math.round(pr.p50 * 1000) + '/' + Math.round((pr.p95 != null ? pr.p95 : pr.p50) * 1000) + 'ms';
 }
 
+function ago(ts) {
+  if (!ts) return '—';
+  const d = Math.max(0, Date.now() / 1000 - ts);
+  if (d < 90) return Math.round(d) + 's前';
+  if (d < 5400) return Math.round(d / 60) + 'm前';
+  return (d / 3600).toFixed(1) + 'h前';
+}
+
+function probeCell(pid) {
+  const p = (((circ.proxies || {})[pid] || {}).probe) || null;
+  if (!p) return '<span class="metric-cell-muted">—</span>';
+  if (p.ok === true) {
+    const lat = p.latency_ms != null ? Math.round(p.latency_ms) + 'ms' : 'ok';
+    return '<span class="ok-text">✓ ' + lat + '</span> <span class="metric-cell-muted">' + ago(p.at) + '</span>';
+  }
+  if (p.ok === false) {
+    const why = p.stage === 'connect' ? '连不上' : '握手失败';
+    return '<span class="bad-text">✗ ' + why + '</span> <span class="metric-cell-muted">' + ago(p.at) + '</span>';
+  }
+  return '<span class="warn-text">跳过</span> <span class="metric-cell-muted">' + ago(p.at) + '</span>';
+}
+
 function nodeState(pid) {
   const s = (circ.proxies || {})[pid] || {};
   const m = qmeta[pid] || {};
-  if (s.open) return {cls:'bad', label:'熔断', note:'退避 ' + Math.round(s.backoff || 0) + 's · 连续失败 ' + (s.consec_fail || 0)};
-  if ((s.consec_fail || 0) > 0) return {cls:'warn', label:'抖动', note:'连续失败 ' + s.consec_fail};
+  let note = '';
+  const lf = s.last_failure;
+  if (lf && lf.at) note = '最近失败 ' + ago(lf.at) + ' ' + (lf.err || '');
+  if (s.open) {
+    const rem = s.backoff_remaining_sec != null
+      ? Math.max(0, Math.ceil(s.backoff_remaining_sec)) + 's'
+      : Math.round(s.backoff || 0) + 's';
+    return {cls:'bad', label:'熔断', note:'剩余 ' + rem + ' · 连续失败 ' + (s.consec_fail || 0)
+            + (note ? ' · ' + note : '')};
+  }
+  if ((s.consec_fail || 0) > 0) return {cls:'warn', label:'抖动', note:'连续失败 ' + s.consec_fail
+            + (note ? ' · ' + note : '')};
   const wr = m.window_success_rate, n = m.window_total || 0;
   if (wr != null && n >= 20 && wr < 0.9) return {cls:'warn', label:'质量差', note:'近窗成功率 ' + fmtPct(wr)};
-  return {cls:'ok', label:'在线', note:''};
+  return {cls:'ok', label:'在线', note:note};
 }
 
 function renderHealth() {
@@ -1303,6 +1456,7 @@ function sysRow(k, v) { return '<div class="row"><span>' + k + '</span><b>' + v 
 function renderSystems() {
   const el = document.getElementById('systems');
   const c = counters || {};
+  const lag = sysStats.event_loop_lag_ms || {};
   const ratio = (a, b) => (a != null && b) ? fmtPct(a / b) : '—';
   const meter = (p, goodHigh) => {
     if (p == null) return '';
@@ -1347,7 +1501,73 @@ function renderSystems() {
       + sysRow('获胜请求 / 尝试', winN + ' / ' + atN)
       + sysRow('扇出比', fanout)
       + sysRow('获胜速率', rps == null ? '—' : rps.toFixed(1) + ' req/s') + '</div>'
+    + '<div class="sys-card"><h4>进程资源</h4>'
+      + sysRow('RSS / FD / 线程', (sysStats.rss_mb != null ? sysStats.rss_mb + ' MB' : '—') + ' / '
+              + (sysStats.fds != null ? sysStats.fds : '—') + ' / '
+              + (sysStats.threads != null ? sysStats.threads : '—'))
+      + sysRow('事件循环 p50 / p95', lag.p50 != null ? lag.p50 + ' / ' + lag.p95 + ' ms' : '采样中')
+      + sysRow('loop 最大延迟', lag.max != null ? lag.max + ' ms' : '—') + '</div>'
     + '</div>';
+}
+
+function renderTrend() {
+  const el = document.getElementById('trend');
+  if (!el) return;
+  const bs = trendData.buckets || [];
+  const iv = trendData.interval_sec || 60;
+  if (bs.length < 2) {
+    el.innerHTML = '<div class="sys-card trend-card"><h4>近 3 小时趋势</h4>'
+      + '<div class="trend-empty">数据积累中 · 每 ' + iv + 's 一个点</div></div>';
+    return;
+  }
+  el.innerHTML = '<div class="sys-card trend-card"><h4>近 3 小时趋势'
+    + '<span class="trend-legend"><i class="lg ok"></i>探活成功率 <i class="lg bad"></i>业务失败率 <i class="lg accent"></i>熔断数</span></h4>'
+    + '<canvas id="trend-canvas" height="150"></canvas></div>';
+  const cv = document.getElementById('trend-canvas');
+  if (!cv || !cv.getContext) return;   // 无 canvas 环境(如无头测试)时只留图例
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth || 900, h = 150;
+  cv.width = Math.round(w * dpr);
+  cv.height = Math.round(h * dpr);
+  const ctx = cv.getContext('2d');
+  if (!ctx) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  ctx.strokeStyle = '#1d2735';
+  ctx.lineWidth = 1;
+  for (const p of [0, 0.5, 1]) {
+    const gy = 10 + (1 - p) * (h - 30);
+    ctx.beginPath(); ctx.moveTo(10, gy); ctx.lineTo(w - 10, gy); ctx.stroke();
+  }
+  const n = bs.length;
+  const X = i => 10 + i * (w - 20) / (n - 1);
+  const Y = v => 10 + (1 - Math.max(0, Math.min(1, v))) * (h - 30);
+  const line = (vals, color) => {
+    ctx.strokeStyle = color; ctx.lineWidth = 1.6; ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < n; i++) {
+      const v = vals[i];
+      if (v == null) { started = false; continue; }
+      if (!started) { ctx.moveTo(X(i), Y(v)); started = true; }
+      else ctx.lineTo(X(i), Y(v));
+    }
+    ctx.stroke();
+  };
+  const probe = bs.map(b => (b.probe_ok + b.probe_fail) ? b.probe_ok / (b.probe_ok + b.probe_fail) : null);
+  const bizFail = bs.map(b => (b.biz_ok + b.biz_fail) ? b.biz_fail / (b.biz_ok + b.biz_fail) : null);
+  const denom = Math.max(1, enabledIds.length || 1);
+  const circ = bs.map(b => (b.circuit_open_now || 0) / denom);
+  line(probe, '#3fb950');
+  line(bizFail, '#f85149');
+  line(circ, '#4c9aff');
+  ctx.fillStyle = '#6b7787';
+  ctx.font = '10px system-ui';
+  ctx.fillText('100%', 12, 9);
+  ctx.fillText('0', 12, h - 12);
+  ctx.textAlign = 'right';
+  ctx.fillText(new Date(bs[0].ts * 1000).toLocaleTimeString(), w - 10, h - 4);
+  ctx.fillText('now', w - 10, 9);
+  ctx.textAlign = 'left';
 }
 
 function renderMetricsGlobal(wrap) {
@@ -1356,12 +1576,14 @@ function renderMetricsGlobal(wrap) {
   page = 0;
   renderHealth();
   renderSystems();
+  renderTrend();
   const order = {bad: 0, warn: 1, ok: 2};
   const rows = pids.map(pid => ({pid: pid, st: nodeState(pid)}))
     .sort((a, b) => (order[a.st.cls] - order[b.st.cls]) || a.pid.localeCompare(b.pid));
-  let t = '<table class="metrics-table"><thead><tr><th>状态</th><th>代理</th><th>握手 P50/P95</th><th>首字节 P50/P95</th><th>成功率（近）</th><th>成功/失败（近）</th><th>累计请求</th><th>累计字节</th><th>协议</th></tr></thead><tbody>';
+  let t = '<table class="metrics-table"><thead><tr><th>状态</th><th>代理</th><th>探活</th><th>握手 P50/P95</th><th>首字节 P50/P95</th><th>成功率（近）</th><th>成功/失败（近）</th><th>在途</th><th>累计请求</th><th>累计字节</th></tr></thead><tbody>';
   for (const r of rows) {
     const pid = r.pid, st = r.st;
+    const s = (circ.proxies || {})[pid] || {};
     const m = qmeta[pid] || {};
     const c = m.cumulative || {};
     const tot = m.window_total || 0, succ = m.window_success_count || 0;
@@ -1369,13 +1591,14 @@ function renderMetricsGlobal(wrap) {
     t += '<td><span class="pill ' + st.cls + '"><span class="dot ' + st.cls + '"></span>' + st.label + '</span>'
        + (st.note ? '<span class="node-note">' + st.note + '</span>' : '') + '</td>';
     t += '<td class="default-proxy">' + esc(pid) + '</td>';
+    t += '<td class="metric-cell-num">' + probeCell(pid) + '</td>';
     t += '<td class="metric-cell-num">' + msPair(m.ttfb) + '</td>';
     t += '<td class="metric-cell-num">' + msPair(m.ofb) + '</td>';
     t += '<td class="metric-cell-num" title="' + errStr(m.errors) + '">' + fmtPct(m.window_success_rate) + '</td>';
     t += '<td class="metric-cell-num">' + succ + '/' + (tot - succ) + '</td>';
-    t += '<td class="metric-cell-num">' + (c.samples != null ? c.samples : (m.total_attempts || 0)) + '</td>';
-    t += '<td class="metric-cell-num">' + fmtBytes(c.total_bytes || m.total_bytes_transferred || 0) + '</td>';
-    t += '<td class="metric-cell-num">' + protoStr(m.http_versions) + '</td></tr>';
+    t += '<td class="metric-cell-num">' + (s.in_flight != null ? s.in_flight : '—') + '</td>';
+    t += '<td class="metric-cell-num" title="' + protoStr(m.http_versions) + '">' + (c.samples != null ? c.samples : (m.total_attempts || 0)) + '</td>';
+    t += '<td class="metric-cell-num">' + fmtBytes(c.total_bytes || m.total_bytes_transferred || 0) + '</td></tr>';
   }
   t += '</tbody></table>';
   wrap.innerHTML = t;

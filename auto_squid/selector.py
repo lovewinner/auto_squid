@@ -1011,6 +1011,20 @@ class ProxySelector:
                 succ += sum(outcomes)
         return succ, total
 
+    def global_cumulative(self) -> tuple[int, int]:
+        """全局终身成功/尝试计数 (success, total),供趋势桶算增量。
+
+        口径与 get_pid_quality_v2 的累计 success/total 一致:只含真实请求结果,
+        竞速取消不进样本,所以 total-success 就是"真失败"。
+        """
+        succ = 0
+        total = 0
+        for m in self._proxy_metrics.values():
+            mm = m.get("metrics", {})
+            succ += int(mm.get("success", 0))
+            total += int(mm.get("total", 0))
+        return succ, total
+
     def prune_domain_metrics(self, max_entries: int = 10_000):
         """域名级指标表容量保护:条目超上限时按**最近观测 ts** 淘汰最旧条目。
 
