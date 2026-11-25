@@ -144,6 +144,27 @@ body.panel-dark .toolbar button:hover{background:#2b7fff}
 .panel-dark .trend-legend .lg.accent{background:#4c9aff}
 .panel-dark .trend-empty{color:#6b7787;font-size:12px;padding:18px 0;text-align:center}
 .panel-dark #trend-canvas{width:100%;display:block}
+/* 域名详情:左列表(搜索/分页)+ 右明细 */
+.panel-dark .domain-picker{display:grid;grid-template-columns:340px minmax(0,1fr);gap:12px;align-items:start}
+.panel-dark .domain-list-card{background:#111823;border:1px solid #263041;border-radius:8px;padding:10px;position:sticky;top:8px}
+.panel-dark #domain-search{width:100%;padding:8px 10px;border:1px solid #263041;border-radius:6px;background:#0b1119;color:#c9d1d9;outline:none;font-size:13px}
+.panel-dark #domain-search:focus{border-color:#4c9aff}
+.panel-dark .domain-list{margin-top:8px;max-height:520px;overflow:auto}
+.panel-dark .domain-row{display:flex;justify-content:space-between;gap:8px;padding:7px 8px;border-radius:6px;cursor:pointer;font-size:12px;color:#a9c1e0}
+.panel-dark .domain-row:hover{background:#16202e}
+.panel-dark .domain-row.active{background:#16233a;color:#dbe9ff;box-shadow:inset 2px 0 0 #4c9aff}
+.panel-dark .domain-row .d{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.panel-dark .domain-row .w{color:#7b8798;font-variant-numeric:tabular-nums;white-space:nowrap}
+.panel-dark .domain-pager{display:flex;gap:6px;align-items:center;justify-content:center;margin-top:8px;font-size:12px;color:#7b8798}
+.panel-dark .domain-pager button{background:#111823;border:1px solid #263041;color:#9fb0c3;border-radius:6px;padding:3px 10px;cursor:pointer}
+.panel-dark .domain-pager button:hover{border-color:#4c9aff}
+.panel-dark .domain-pager button:disabled{opacity:.35;cursor:default}
+.panel-dark .domain-detail{min-width:0}
+.panel-dark .domain-head{display:flex;gap:14px;align-items:baseline;flex-wrap:wrap;margin-bottom:10px;font-size:12px;color:#8b98a9}
+.panel-dark .domain-head b{color:#e6edf3;font-size:15px}
+.panel-dark .domain-detail .metrics-table{background:#111823;border:1px solid #263041;border-radius:8px;border-collapse:separate;border-spacing:0;overflow:hidden}
+.panel-dark tr.default-row td{background:rgba(76,154,255,.06)}
+@media (max-width:900px){.panel-dark .domain-picker{grid-template-columns:1fr}}
 .panel-dark .sec-title{margin:18px 0 8px;font-size:12px;color:#8b98a9;font-weight:600;letter-spacing:.4px}
 .panel-dark .sys-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-bottom:14px}
 .panel-dark .sys-card{background:linear-gradient(180deg,#141c28,#101722);border:1px solid #263041;border-radius:8px;padding:14px}
@@ -1270,7 +1291,16 @@ def _panel_metrics_html() -> str:
 <button id="metricsub-global" class="view-btn active" onclick="setMetricsSub('global')">全局概览</button>
 <button id="metricsub-domain" class="view-btn" onclick="setMetricsSub('domain')">域名详情</button>
 </div>
-<select id="metrics-domain" style="display:none" onchange="metricsDomain = this.value; renderMetrics();"></select>
+<div id="domain-pane" style="display:none">
+<div class="domain-picker">
+  <div class="domain-list-card">
+    <input id="domain-search" placeholder="搜索域名…" oninput="onDomainSearch()">
+    <div id="domain-list" class="domain-list"></div>
+    <div id="domain-pager" class="domain-pager"></div>
+  </div>
+  <div id="domain-detail" class="domain-detail"></div>
+</div>
+</div>
 <div id="health"></div>
 <div id="table-wrap"></div>
 <div id="sys-title" class="sec-title" style="display:none">系统运行</div>
@@ -1283,6 +1313,9 @@ let metricsSub = 'global';
 let metricsDomain = '';
 let qmeta = {}, perDest = {}, circ = {}, counters = {}, counts = {}, attempts = {};
 let sysStats = {}, trendData = {interval_sec: 60, buckets: []};
+let domainData = {}, domainMeta = {}, domainKeys = [], domainFilter = '';
+let dpage = 0;
+const DSIZE = 20;
 let enabledIds = [];
 let _prevWin = null, _prevWinAt = 0;
 
@@ -1294,11 +1327,12 @@ function doRefresh() { fetchMetrics(); }
 // 系统卡片/趋势用 /metrics/summary(仅 counters)、/system-stats 与 /metrics/trend,
 // 都不带域名统计,可随面板周期刷新。
 async function fetchMetrics() {
-  const [r1, r2, r3, r4, r5, r6, r7, r8] = await Promise.all([
+  const [r1, r2, r3, r4, r5, r6, r7, r8, r9] = await Promise.all([
     fetch('/quality/meta'), fetch('/domains'), fetch('/circuit'), fetch('/stats'),
-    fetch('/proxies'), fetch('/metrics/summary'), fetch('/system-stats'), fetch('/metrics/trend')]);
+    fetch('/proxies'), fetch('/metrics/summary'), fetch('/system-stats'),
+    fetch('/metrics/trend'), fetch('/domains/meta')]);
   qmeta = await r1.json();
-  const stamp = Object.keys((await r2.json()) || {});
+  domainData = (await r2.json()) || {};
   circ = (await r3.json()) || {};
   const st = (await r4.json()) || {};
   counts = st.request_counts || {};
@@ -1310,13 +1344,13 @@ async function fetchMetrics() {
   try { counters = ((await r6.json()) || {}).counters || {}; } catch (e) { counters = {}; }
   try { sysStats = (await r7.json()) || {}; } catch (e) { sysStats = {}; }
   try { trendData = (await r8.json()) || {buckets: []}; } catch (e) { trendData = {buckets: []}; }
-  const sel = document.getElementById('metrics-domain');
-  const keys = stamp.sort();
-  if (sel.options.length !== keys.length) {
-    sel.innerHTML = keys.map(k => `<option value="${esc(k)}">${esc(k)}</option>`).join('');
-    sel.value = (metricsDomain && keys.includes(metricsDomain)) ? metricsDomain : '';
-    metricsDomain = sel.value;
-  }
+  try { domainMeta = (await r9.json()) || {}; } catch (e) { domainMeta = {}; }
+  // 域名列表:按最近更新时间倒序(与域名统计页一致),当前选中不存在时回到首个。
+  domainKeys = Object.keys(domainData).sort((a, b) => {
+    const ua = (domainMeta[a] || {}).updated_at || '', ub = (domainMeta[b] || {}).updated_at || '';
+    return ub.localeCompare(ua) || a.localeCompare(b);
+  });
+  if (!metricsDomain || !domainData[metricsDomain]) metricsDomain = domainKeys[0] || '';
   renderMetrics();
 }
 
@@ -1347,20 +1381,74 @@ async function renderMetrics() {
   document.getElementById('sys-title').style.display = isGlobal ? '' : 'none';
   document.getElementById('systems').style.display = isGlobal ? '' : 'none';
   document.getElementById('trend').style.display = isGlobal ? '' : 'none';
+  document.getElementById('domain-pane').style.display = isGlobal ? 'none' : '';
+  wrap.style.display = isGlobal ? '' : 'none';
   if (isGlobal) { renderMetricsGlobal(wrap); return; }
+  renderDomainList();
+  if (!metricsDomain) {
+    document.getElementById('domain-detail').innerHTML = '<div class="no-data">选择左侧域名查看各上游指标</div>';
+    document.getElementById('footer').textContent = '';
+    return;
+  }
   // 域名明细:timer 内已有缓存则直接用;否则按需拉单域名
   if (window._metricFetchT.need(metricsDomain)) {
     await fetchDomain(metricsDomain);
-    // 拉取后 perDest 已更新,但被覆盖的这套采用最新
   }
-  renderMetricsDomain(wrap);
+  renderMetricsDomain(document.getElementById('domain-detail'));
+}
+
+// ── 域名列表:搜索 + 分页(替代原先 2000+ 项的大下拉)──────────────
+function visibleDomains() {
+  const q = domainFilter.trim().toLowerCase();
+  return q ? domainKeys.filter(k => k.toLowerCase().includes(q)) : domainKeys;
+}
+
+function renderDomainList() {
+  const listEl = document.getElementById('domain-list');
+  const all = visibleDomains();
+  const pages = Math.max(1, Math.ceil(all.length / DSIZE));
+  if (dpage >= pages) dpage = pages - 1;
+  const slice = all.slice(dpage * DSIZE, dpage * DSIZE + DSIZE);
+  listEl.innerHTML = slice.map(k => {
+    const wins = Object.values(domainData[k] || {}).reduce((a, b) => a + b, 0);
+    return '<div class="domain-row' + (k === metricsDomain ? ' active' : '') + '" data-key="' + esc(k) + '">'
+      + '<span class="d" title="' + esc(k) + '">' + esc(k) + '</span>'
+      + '<span class="w">' + wins + '</span></div>';
+  }).join('') || '<div class="no-data">无匹配域名</div>';
+  if (!listEl._bound) {
+    // 事件委托 + data-key:域名可能含引号/尖括号,不能把值拼进 onclick。
+    listEl.addEventListener('click', ev => {
+      const row = ev.target.closest('.domain-row');
+      if (row && row.dataset.key) selectDomain(row.dataset.key);
+    });
+    listEl._bound = true;
+  }
+  document.getElementById('domain-pager').innerHTML =
+      '<button onclick="domainPage(-1)"' + (dpage <= 0 ? ' disabled' : '') + '>上一页</button>'
+    + '<span>' + (dpage + 1) + ' / ' + pages + ' · ' + all.length + ' 个域名</span>'
+    + '<button onclick="domainPage(1)"' + (dpage >= pages - 1 ? ' disabled' : '') + '>下一页</button>';
+}
+
+function domainPage(d) { dpage = Math.max(0, dpage + d); renderDomainList(); }
+
+function onDomainSearch() {
+  domainFilter = document.getElementById('domain-search').value || '';
+  dpage = 0;
+  renderDomainList();
+}
+
+function selectDomain(dom) {
+  if (!dom) return;
+  metricsDomain = dom;
+  window._metricFetchT.reset();   // 立即拉新域名指标,不等 30s 缓存
+  renderDomainList();
+  renderMetrics();
 }
 
 function setMetricsSub(s) {
   metricsSub = s;
   document.getElementById('metricsub-global').classList.toggle('active', s === 'global');
   document.getElementById('metricsub-domain').classList.toggle('active', s === 'domain');
-  document.getElementById('metrics-domain').style.display = s === 'domain' ? '' : 'none';
   renderMetrics();
 }
 
@@ -1608,34 +1696,39 @@ function renderMetricsGlobal(wrap) {
 }
 
 function renderMetricsDomain(wrap) {
-  if (!metricsDomain) {
-    wrap.innerHTML = '<div class="no-data">请在上方选择域名</div>';
-    document.getElementById('pager').innerHTML=''; document.getElementById('footer').textContent='';
+  const per = perDest || {};
+  const pids = Object.keys(per).sort((a, b) => (per[b].total || 0) - (per[a].total || 0));
+  const meta = domainMeta[metricsDomain] || {};
+  const wins = Object.values(domainData[metricsDomain] || {}).reduce((a, b) => a + b, 0);
+  const head = '<div class="domain-head"><b>' + esc(metricsDomain) + '</b>'
+    + '<span>默认代理 ' + esc(meta.default_proxy || '—') + '</span>'
+    + '<span>胜出 ' + wins + '</span>'
+    + '<span>更新 ' + (meta.updated_at ? toBeijing(meta.updated_at) : '—') + '</span>'
+    + '<span>' + pids.length + ' 个上游有样本</span></div>';
+  if (!pids.length) {
+    wrap.innerHTML = head + '<div class="no-data">该域名暂无代理指标</div>';
+    document.getElementById('footer').textContent = '';
     return;
   }
-  const per = perDest;  // perDest 已是选中域名的 {pid: ...}(fetchDomain 按需拉取)
-  const pids = Object.keys(per).sort((a,b) => (per[b].total||0)-(per[a].total||0));
-  if (!pids.length) { wrap.innerHTML = '<div class="no-data">该域名暂无代理指标</div>'; document.getElementById('pager').innerHTML=''; document.getElementById('footer').textContent=''; return; }
-  let banner = `<div class="filter-banner" style="display:flex"><strong>${esc(metricsDomain)}</strong>&nbsp;各代理实测指标</div>`;
-  let win = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 P50/P95/P99</th><th>源站首字节 P50/P95/P99</th><th>成功率(近)</th><th>成功/总数(近)</th><th>错误分类(近 256)</th></tr></thead><tbody>';
+  let win = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 P50/P95/P99</th><th>源站首字节 P50/P95/P99</th><th>成功率(近)</th><th>成功/失败(近)</th><th>错误分类(近 256)</th></tr></thead><tbody>';
   let cum = '<table class="metrics-table"><thead><tr><th>代理</th><th>握手 均值</th><th>源站首字节 均值</th><th>成功率</th><th>总请求</th><th>累计字节</th><th>协议(累计)</th></tr></thead><tbody>';
   for (const pid of pids) {
     const m = per[pid] || {};
-    const per_t = m.percentiles || {};
-    const total = m.total || 0;
-    const rate = total ? m.success / total : null;
+    const pt = m.percentiles || {};
     const c = m.cumulative || {};
-    win += `<tr><td class="default-proxy">${esc(pid)}</td>`;
-    win += `<td class="metric-cell-num">${pctCell(per_t.ttfb)}</td>`;
-    win += `<td class="metric-cell-num">${pctCell(per_t.ofb)}</td>`;
+    const tot = m.window_total || 0, succ = m.window_success_count || 0;
+    const rowCls = pid === meta.default_proxy ? ' class="default-row"' : '';
+    win += `<tr${rowCls}><td class="default-proxy">${esc(pid)}</td>`;
+    win += `<td class="metric-cell-num">${pctCell(pt.ttfb)}</td>`;
+    win += `<td class="metric-cell-num">${pctCell(pt.ofb)}</td>`;
     win += `<td class="metric-cell-num">${fmtPct(m.window_success_rate)}</td>`;
-    win += `<td class="metric-cell-num">${m.window_success_count||0}/${m.window_total||0}</td>`;
+    win += `<td class="metric-cell-num">${succ}/${tot - succ}</td>`;
     win += `<td class="metric-cell-num err-cell">${errStr(m.errors)}</td></tr>`;
-    cum += `<tr><td class="default-proxy">${esc(pid)}</td>`;
-    cum += `<td class="metric-cell-num">${c.avg_ttfb_ms != null ? Math.round(c.avg_ttfb_ms)+'ms' : '—'}</td>`;
-    cum += `<td class="metric-cell-num">${c.avg_ofb_ms != null ? Math.round(c.avg_ofb_ms)+'ms' : '—'}</td>`;
+    cum += `<tr${rowCls}><td class="default-proxy">${esc(pid)}</td>`;
+    cum += `<td class="metric-cell-num">${c.avg_ttfb_ms != null ? Math.round(c.avg_ttfb_ms) + 'ms' : '—'}</td>`;
+    cum += `<td class="metric-cell-num">${c.avg_ofb_ms != null ? Math.round(c.avg_ofb_ms) + 'ms' : '—'}</td>`;
     cum += `<td class="metric-cell-num">${fmtPct(c.success_rate)}</td>`;
-    cum += `<td class="metric-cell-num">${c.samples||0}</td>`;
+    cum += `<td class="metric-cell-num">${c.samples || 0}</td>`;
     cum += `<td class="metric-cell-num">${fmtBytes(c.total_bytes || 0)}</td>`;
     cum += `<td class="metric-cell-num">${protoStr(m.http_versions)}</td></tr>`;
     const lp = lifePctLine(c);
@@ -1643,13 +1736,13 @@ function renderMetricsDomain(wrap) {
   }
   win += '</tbody></table>';
   cum += '</tbody></table>';
-  let html = banner
-           + '<div class="metrics-split">'
-           + '<div class="metrics-pane"><h3 class="pane-title">窗口(近期 _OBS_WINDOW=256 · 用于路由决策)</h3>' + win + '</div>'
-           + '<div class="metrics-pane"><h3 class="pane-title">累计(永久值,跨重启 · 历史可追溯)</h3>' + cum + '</div>'
-           + '</div>';
-  wrap.innerHTML = html;
-  document.getElementById('footer').textContent = pids.length + ' proxies · 域名: ' + metricsDomain;
+  wrap.innerHTML = head
+    + '<div class="metrics-split">'
+    + '<div class="metrics-pane"><h3 class="pane-title">窗口(近期 _OBS_WINDOW=256 · 用于路由决策)</h3>' + win + '</div>'
+    + '<div class="metrics-pane"><h3 class="pane-title">累计(永久值,跨重启 · 历史可追溯)</h3>' + cum + '</div>'
+    + '</div>';
+  document.getElementById('footer').textContent = pids.length + ' 个上游 · 域名: ' + metricsDomain
+    + ' · 蓝底行为该域名当前默认代理 · 数据截止 ' + new Date().toLocaleTimeString();
 }
 
 fetchMetrics();
