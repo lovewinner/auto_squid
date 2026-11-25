@@ -49,7 +49,12 @@ html[data-theme="dark"]{
   --focus-ring:rgba(76,141,255,.18);
 }
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);padding:24px;max-width:1400px;margin:0 auto;font-size:13px;line-height:1.5}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);padding:24px;max-width:1400px;margin:0 auto;font-size:13px;line-height:1.5;font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1}
+/* 数值区域统一等宽数字:系统字体不支持 tnum 时,用等宽字体兜底,保证跨行对齐 */
+.metric-cell-num,.kpi .v,td.num,tr.cum-row td,.sys-card .row b,.domain-row .w,.pager span,.domain-pager,.status-sub,.node-note,td.updated-at,td.default-proxy,.stat-card .count,.stat-card .pid{
+  font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  font-variant-numeric:tabular-nums;
+}
 .page-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px}
 h1{font-size:20px;font-weight:600;color:var(--text)}
 .theme-toggle{height:32px;padding:0 14px;border:1px solid var(--border);border-radius:var(--radius-btn);background:var(--card);color:var(--text2);font-size:13px;cursor:pointer}
