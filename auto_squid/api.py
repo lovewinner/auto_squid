@@ -31,14 +31,29 @@ _PANEL_CSS = """\
   --bg:#F5F7FA;--card:#FFFFFF;--border:#E5E6EB;--border-weak:#F2F3F5;
   --text:#1D2129;--text2:#4E5969;--text3:#86909C;
   --primary:#165DFF;--primary-hover:#0E42D2;--primary-weak:#E8F0FF;
-  --success:#00B42A;--success-weak:#E8FFEA;
-  --warning:#FF7D00;--warning-weak:#FFF7E8;
-  --danger:#F53F3F;--danger-weak:#FFECE8;
+  --success:#00B42A;--success-weak:#E8FFEA;--success-border:#B7F0C0;
+  --warning:#FF7D00;--warning-weak:#FFF7E8;--warning-border:#FFD8A8;--warning-text:#D25F00;
+  --danger:#F53F3F;--danger-weak:#FFECE8;--danger-border:#FFC9C2;
+  --thead:#F7F8FA;--row-hover:#F7F8FA;--default-row:#F2F7FF;
+  --focus-ring:rgba(22,93,255,.12);
   --radius:8px;--radius-sm:4px;--radius-btn:6px;
+}
+html[data-theme="dark"]{
+  --bg:#141A22;--card:#1D2632;--border:#2B3643;--border-weak:#232D39;
+  --text:#E5E8EC;--text2:#A9B4C2;--text3:#7C8899;
+  --primary:#4C8DFF;--primary-hover:#6AA1FF;--primary-weak:#1B2E52;
+  --success:#23C343;--success-weak:#16341F;--success-border:#1F5A31;
+  --warning:#FF9A2E;--warning-weak:#3A2A12;--warning-border:#5C421C;--warning-text:#FF9A2E;
+  --danger:#F76560;--danger-weak:#3C1E1E;--danger-border:#5E2A28;
+  --thead:#232D39;--row-hover:#232D39;--default-row:#1E2C45;
+  --focus-ring:rgba(76,141,255,.18);
 }
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);padding:24px;max-width:1400px;margin:0 auto;font-size:13px;line-height:1.5}
-h1{font-size:20px;font-weight:600;margin-bottom:16px;color:var(--text)}
+.page-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px}
+h1{font-size:20px;font-weight:600;color:var(--text)}
+.theme-toggle{height:32px;padding:0 14px;border:1px solid var(--border);border-radius:var(--radius-btn);background:var(--card);color:var(--text2);font-size:13px;cursor:pointer}
+.theme-toggle:hover{border-color:var(--primary);color:var(--primary)}
 a{color:var(--primary)}
 /* 导航 */
 .nav{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
@@ -48,7 +63,7 @@ a{color:var(--primary)}
 /* 工具栏 */
 .toolbar{display:flex;gap:10px;margin-bottom:16px;align-items:center;flex-wrap:wrap}
 .toolbar input{flex:1;min-width:180px;height:32px;padding:0 12px;border:1px solid var(--border);border-radius:var(--radius-btn);background:var(--card);color:var(--text);font-size:13px;outline:none}
-.toolbar input:focus{border-color:var(--primary);box-shadow:0 0 0 2px rgba(22,93,255,.12)}
+.toolbar input:focus{border-color:var(--primary);box-shadow:0 0 0 2px var(--focus-ring)}
 .toolbar select{height:32px;padding:0 10px;border:1px solid var(--border);border-radius:var(--radius-btn);background:var(--card);color:var(--text);font-size:13px;outline:none;cursor:pointer}
 .toolbar select:focus{border-color:var(--primary)}
 .toolbar button{height:32px;padding:0 16px;border:1px solid var(--primary);border-radius:var(--radius-btn);background:var(--primary);color:#fff;font-size:13px;cursor:pointer}
@@ -61,11 +76,11 @@ a{color:var(--primary)}
 #table-wrap{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
 table{width:100%;border-collapse:collapse;font-size:13px}
 thead{position:sticky;top:0;z-index:1}
-th{background:#F7F8FA;padding:10px 12px;text-align:left;color:var(--text2);font-size:12px;font-weight:500;white-space:nowrap;border-bottom:1px solid var(--border);cursor:pointer;user-select:none}
-th:hover{background:#F2F3F5}
+th{background:var(--thead);padding:10px 12px;text-align:left;color:var(--text2);font-size:12px;font-weight:500;white-space:nowrap;border-bottom:1px solid var(--border);cursor:pointer;user-select:none}
+th:hover{background:var(--row-hover)}
 th .arrow{color:var(--primary);margin-left:4px}
 td{padding:10px 12px;border-bottom:1px solid var(--border-weak);white-space:nowrap}
-tr:hover td{background:#F7F8FA}
+tr:hover td{background:var(--row-hover)}
 tr:last-child td{border-bottom:none}
 td.domain{font-weight:500;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:280px;min-width:280px;width:280px}
 th:first-child{width:280px;min-width:280px;max-width:280px}
@@ -73,7 +88,7 @@ td.num{text-align:center;font-variant-numeric:tabular-nums}
 td.best{font-weight:600;color:var(--primary)}
 td.default-proxy{text-align:center;font-weight:500;color:var(--primary)}
 td.updated-at{font-size:12px;color:var(--text3);white-space:nowrap}
-tr.default-row td{background:#F2F7FF}
+tr.default-row td{background:var(--default-row)}
 .no-data{padding:40px;text-align:center;color:var(--text3)}
 /* 分页 */
 .pager{display:flex;gap:8px;margin-top:12px;align-items:center;justify-content:center;flex-wrap:wrap}
@@ -129,9 +144,9 @@ tr.cum-row td{font-size:12px;color:var(--text3);padding-top:0;padding-bottom:8px
 .kpi.bad .v{color:var(--danger)}
 /* 状态标签(统一 4px 圆角) */
 .pill{display:inline-flex;align-items:center;gap:6px;padding:1px 8px;border-radius:var(--radius-sm);font-size:12px;border:1px solid transparent;white-space:nowrap}
-.pill.ok{color:var(--success);background:var(--success-weak);border-color:#B7F0C0}
-.pill.warn{color:#D25F00;background:var(--warning-weak);border-color:#FFD8A8}
-.pill.bad{color:var(--danger);background:var(--danger-weak);border-color:#FFC9C2}
+.pill.ok{color:var(--success);background:var(--success-weak);border-color:var(--success-border)}
+.pill.warn{color:var(--warning-text);background:var(--warning-weak);border-color:var(--warning-border)}
+.pill.bad{color:var(--danger);background:var(--danger-weak);border-color:var(--danger-border)}
 .pill .dot{width:6px;height:6px;margin:0}
 .dot.ok{background:var(--success)}
 .dot.warn{background:var(--warning)}
@@ -165,10 +180,10 @@ tr.cum-row td{font-size:12px;color:var(--text3);padding-top:0;padding-bottom:8px
 .domain-picker{display:grid;grid-template-columns:340px minmax(0,1fr);gap:12px;align-items:start}
 .domain-list-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:10px;position:sticky;top:8px}
 #domain-search{width:100%;height:32px;padding:0 10px;border:1px solid var(--border);border-radius:var(--radius-btn);background:var(--card);color:var(--text);outline:none;font-size:13px}
-#domain-search:focus{border-color:var(--primary);box-shadow:0 0 0 2px rgba(22,93,255,.12)}
+#domain-search:focus{border-color:var(--primary);box-shadow:0 0 0 2px var(--focus-ring)}
 .domain-list{margin-top:8px;max-height:520px;overflow:auto}
 .domain-row{display:flex;justify-content:space-between;gap:8px;padding:7px 8px;border-radius:var(--radius-sm);cursor:pointer;font-size:13px;color:var(--text2)}
-.domain-row:hover{background:#F7F8FA}
+.domain-row:hover{background:var(--row-hover)}
 .domain-row.active{background:var(--primary-weak);color:var(--primary);font-weight:500}
 .domain-row .d{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .domain-row .w{color:var(--text3);font-variant-numeric:tabular-nums;white-space:nowrap}
@@ -298,6 +313,28 @@ function onIntervalChange(sel, refreshFn) {
     label.textContent = '';
   }
 }
+
+// ── 主题切换(浅色默认;选择存 localStorage,首屏防闪由 <head> 内联脚本完成)──
+function applyThemeLabel() {
+  const b = document.getElementById('theme-toggle');
+  const root = document.documentElement;
+  if (!b) return;
+  b.textContent = (root && root.getAttribute('data-theme') === 'dark') ? '浅色' : '深色';
+}
+
+function toggleTheme() {
+  const root = document.documentElement;
+  if (!root) return;
+  const dark = root.getAttribute('data-theme') === 'dark';
+  if (dark) root.removeAttribute('data-theme');
+  else root.setAttribute('data-theme', 'dark');
+  try { localStorage.setItem('panel-theme', dark ? 'light' : 'dark'); } catch (e) {}
+  applyThemeLabel();
+  // canvas 颜色是在渲染时取的 CSS 变量,切换主题后重渲染一次。
+  if (typeof doRefresh === 'function') doRefresh();
+}
+
+applyThemeLabel();
 """
 
 
@@ -946,13 +983,17 @@ _PANEL_SHELL = """\
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<script>try{{if(localStorage.getItem('panel-theme')==='dark')document.documentElement.setAttribute('data-theme','dark');}}catch(e){{}}</script>
 <title>auto_squid - {title}</title>
 <style>
 {css}
 </style>
 </head>
 <body>
+<div class="page-head">
 <h1>auto_squid 管理面板</h1>
+<button id="theme-toggle" type="button" class="theme-toggle" onclick="toggleTheme()">深色</button>
+</div>
 {nav}
 {toolbar}
 {body}
@@ -1603,7 +1644,14 @@ function renderTrend() {
   if (!ctx) return;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, h);
-  ctx.strokeStyle = '#1d2735';
+  // 颜色取自当前主题变量,深/浅色切换后重渲染即换色。
+  let themeVar = null;
+  try {
+    const cs = getComputedStyle(document.documentElement);
+    themeVar = n => (cs.getPropertyValue(n) || '').trim();
+  } catch (e) { themeVar = null; }
+  const TV = (n, fb) => (themeVar && themeVar(n)) || fb;
+  ctx.strokeStyle = TV('--border', '#E5E6EB');
   ctx.lineWidth = 1;
   for (const p of [0, 0.5, 1]) {
     const gy = 10 + (1 - p) * (h - 30);
@@ -1627,10 +1675,10 @@ function renderTrend() {
   const bizFail = bs.map(b => (b.biz_ok + b.biz_fail) ? b.biz_fail / (b.biz_ok + b.biz_fail) : null);
   const denom = Math.max(1, enabledIds.length || 1);
   const circ = bs.map(b => (b.circuit_open_now || 0) / denom);
-  line(probe, '#3fb950');
-  line(bizFail, '#f85149');
-  line(circ, '#4c9aff');
-  ctx.fillStyle = '#6b7787';
+  line(probe, TV('--success', '#00B42A'));
+  line(bizFail, TV('--danger', '#F53F3F'));
+  line(circ, TV('--primary', '#165DFF'));
+  ctx.fillStyle = TV('--text3', '#86909C');
   ctx.font = '10px system-ui';
   ctx.fillText('100%', 12, 9);
   ctx.fillText('0', 12, h - 12);
